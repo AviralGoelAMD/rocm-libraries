@@ -1431,7 +1431,7 @@ def _enable_gfx942_fp16_flash(problem: UnifiedAttentionProblem) -> bool:
         and problem.head_size in (64, 128)
         and problem.dtype == "fp16"
         and not problem.use_fp8
-        and problem.sliding_window == 0
+        and (problem.sliding_window == 0 or problem.head_size == 128)
         and not problem.use_sinks
         and problem.softcap == 0
         and not problem.use_alibi
@@ -1476,7 +1476,7 @@ def _enable_gfx942_bf16_flash(problem: UnifiedAttentionProblem) -> bool:
         and problem.head_size in (64, 128)
         and problem.dtype == "bf16"
         and not problem.use_fp8
-        and problem.sliding_window == 0
+        and (problem.sliding_window == 0 or problem.head_size == 128)
         and not problem.use_sinks
         and problem.softcap == 0
         and not problem.use_alibi
@@ -1614,6 +1614,8 @@ def _select_gfx942_flash_num_warps(problem: UnifiedAttentionProblem) -> int:
     # D64 and D128 prefill now share the wide (num_warps=4) sliced-K ring path
     # (the ring superseded the prior D64 nw2/single-buffer config: 13-17% faster,
     # beats Torch at S2048). See _enable_gfx942_flash_k_sliced_ring.
+    if problem.head_size == 128 and problem.sliding_window > 0:
+        return 2  # D128 sliding-window uses the non-ring nw2 wide geometry
     wide = _gfx942_flash_wide_setting()
     return wide if wide in (2, 4) else 1
 
@@ -1621,6 +1623,8 @@ def _select_gfx942_flash_num_warps(problem: UnifiedAttentionProblem) -> int:
 def _gfx942_flash_use_cfvst(problem: UnifiedAttentionProblem) -> bool:
     # cfvst (conflict-free V store) is required by the ring and used by both
     # D64 and D128 prefill under the wide ring geometry.
+    if problem.head_size == 128 and problem.sliding_window > 0:
+        return False  # D128 sliding-window non-ring geometry has no cfvst
     return _gfx942_flash_wide_setting() in (2, 4)
 
 
@@ -1668,6 +1672,10 @@ def _enable_gfx942_flash_k_sliced_ring(problem: UnifiedAttentionProblem) -> bool
     # bf16 ring is correctness-verified only for D64 — D128 bf16 ring produces
     # wrong results (max_abs ~3-5, NaN/Inf for MHA) in the kernel generator and
     # is excluded until the D128 bf16 ring path in attention_tiled_2d.py is fixed.
+    # D128 sliding-window prefill uses the non-ring wide geometry: the sliced-K
+    # ring is unvalidated under a window (fp16 SW ring measured max_abs ~1.1).
+    if problem.head_size == 128 and problem.sliding_window > 0:
+        return False
     if _enable_gfx942_bf16_flash(problem) and problem.head_size == 128:
         return False
     if not (
