@@ -5676,9 +5676,15 @@ def build_gfx942_4warp_gqa(
         kvstart = b.const_i32(0)
     loop = b.scf_for_iter(kvstart, kvend, b.const_i32(1), iters, iv_name="kv")
     with loop as (kv, carry):
+        if __import__("os").environ.get("HIPDNN_4WGQA_IGLP", "").strip() in ("1", "on", "yes", "true"):
+            b.iglp_opt(1)  # Step-0 lever: whole-loop MFMA/DS/VMEM interleave (D256 +60%)
         m_old = carry[0]
         l_old = carry[1]
         accs = list(carry[2:])
+        # WAR barrier: the previous iteration's PV MFMA reads V_lds; guard those
+        # reads before this iteration overwrites V_lds (single-buffered). Without
+        # this a fast warp clobbers V_lds while a slow warp still reads it (race).
+        b.sync()
         for c in range(v_fill_nloads):
             lin = b.add(b.mul(tid, b.const_i32(v_fill_epw)), b.const_i32(c * 8))
             key = b.div(lin, b.const_i32(HD))
