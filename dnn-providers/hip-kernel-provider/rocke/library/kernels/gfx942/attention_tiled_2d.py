@@ -5753,10 +5753,11 @@ def build_gfx942_4warp_gqa(
             b.vec_pack([P[kk // 4][(kk % 4) * 4 + j] for j in range(BPL)], dtype)
             for kk in range(NKpv)
         ]
-        newaccs = []
-        for nt in range(NDdim):
-            pv = at.zero_acc(b)
-            for kk in range(NKpv):
+        # kk-outer/nt-inner: keep NDdim pv[nt] accumulators live so NDdim independent MFMA
+        # chains are in flight (fills MFMA-dependency latency). nt-outer was 1 chain at a time.
+        pv = [at.zero_acc(b) for _ in range(NDdim)]
+        for kk in range(NKpv):
+            for nt in range(NDdim):
                 va = b.vec_pack(
                     [
                         b.vec_extract(
@@ -5764,15 +5765,9 @@ def build_gfx942_4warp_gqa(
                                 V_lds,
                                 b.add(
                                     b.mul(b.const_i32(kk), b.const_i32(K)),
-                                    b.add(
-                                        b.mul(ld.k_blk, b.const_i32(APL)),
-                                        b.const_i32(j),
-                                    ),
+                                    b.add(b.mul(ld.k_blk, b.const_i32(APL)), b.const_i32(j)),
                                 ),
-                                b.add(
-                                    b.mul(b.const_i32(nt), b.const_i32(32)),
-                                    ld.m_in_atom,
-                                ),
+                                b.add(b.mul(b.const_i32(nt), b.const_i32(32)), ld.m_in_atom),
                                 dtype=dtype,
                                 n=1,
                             ),
@@ -5782,15 +5777,17 @@ def build_gfx942_4warp_gqa(
                     ],
                     dtype,
                 )
-                pv = at.emit(b, va, Bp[kk], pv)
-            na = b.vec_pack(
+                pv[nt] = at.emit(b, va, Bp[kk], pv[nt])
+        newaccs = [
+            b.vec_pack(
                 [
-                    b.fma(b.vec_extract(accs[nt], i), alpha, b.vec_extract(pv, i))
+                    b.fma(b.vec_extract(accs[nt], i), alpha, b.vec_extract(pv[nt], i))
                     for i in range(CPL)
                 ],
                 F32,
             )
-            newaccs.append(na)
+            for nt in range(NDdim)
+        ]
         b.scf_yield(m_new, l_new, *newaccs)
     m_f = loop.results[0]
     l_f = loop.results[1]
