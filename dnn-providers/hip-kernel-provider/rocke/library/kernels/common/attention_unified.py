@@ -460,7 +460,7 @@ def supports_native_unified_attention_tiled(
         use_k_single_buffer=gfx942_flash and _gfx942_flash_use_single_buffer(problem),
         use_conflict_free_v_store=gfx942_flash and _gfx942_flash_use_cfvst(problem),
         use_k_sliced_ring=_enable_gfx942_flash_k_sliced_ring(problem),
-        use_d256_gfx942_fast=_d256_gfx942_fast(problem),
+        use_d256_gfx942_fast=_gfx942_4warp_fast(problem),
     )
 
 
@@ -657,6 +657,36 @@ def _d256_gfx942_fast(problem: "UnifiedAttentionProblem") -> bool:
     )
 
 
+def _d128_gfx942_swa_fast(problem: "UnifiedAttentionProblem") -> bool:
+    """Route the D128 gfx942 prefill cohort to the 4-warp transposed-QK paged
+    kernel (``build_gfx942_4warp_gqa``), ported from the D256 fast path
+    (AICK-1492).
+
+    P0 scope: **bf16, causal only** (``sliding_window == 0``). The sliding-window
+    mask (P1) and fp16 (P2) relax this gate later. Same discriminator + launch
+    contract as ``_d256_gfx942_fast``; D128's ``V_lds`` is 16 KB (half of D256).
+    """
+    return (
+        _resolve_attention_arch() == "gfx942"
+        and problem.head_size == 128
+        and problem.dtype in ("bf16", "fp16")  # fp16 added (P2)
+        and not problem.use_fp8
+        # SWA supported (P1): sliding_window >= 0 (kernel masks + windowed KV-skip)
+        and problem.softcap == 0
+        and not problem.use_sinks
+        and not problem.use_alibi
+        and not problem.use_qq_bias
+        and problem.max_seqlen_q > 1
+        and problem.block_size in (16, 32)
+        and not _enable_i64_kv_addr(problem)
+    )
+
+
+def _gfx942_4warp_fast(problem: "UnifiedAttentionProblem") -> bool:
+    """Any cohort routed to ``build_gfx942_4warp_gqa`` (D256 causal or D128 P0)."""
+    return _d256_gfx942_fast(problem) or _d128_gfx942_swa_fast(problem)
+
+
 def _select_2d_tile_size(problem: UnifiedAttentionProblem) -> int:
     """Choose ``tile_size`` (T) for the tiled 2D kernel.
 
@@ -686,7 +716,7 @@ def _select_2d_tile_size(problem: UnifiedAttentionProblem) -> int:
     """
     if _d256_gfx950_fast(problem):
         return 64
-    if _d256_gfx942_fast(problem):
+    if _gfx942_4warp_fast(problem):
         return 32  # BLOCK_N of the natural-QK paged kernel
     if _resolve_attention_arch() == "gfx1250":
         # gfx1250 v1 consumes exactly one 32-token paged-KV block per WMMA
@@ -832,7 +862,7 @@ def _select_2d_num_warps(problem: UnifiedAttentionProblem) -> int:
     """
     if _d256_gfx950_fast(problem):
         return 2
-    if _d256_gfx942_fast(problem):
+    if _gfx942_4warp_fast(problem):
         return 1  # 1 wave64/CTA = 64 lanes for the 32x32x8 natural-QK kernel
     if _resolve_attention_arch() == "gfx1250":
         # A gfx1250 workgroup is one wave32 in the v1 WMMA tiled path.
@@ -1085,7 +1115,7 @@ def _tiled_cache_key(problem: UnifiedAttentionProblem) -> Tuple:
         # Selects the distinct natural-QK 4-warp GQA builder (build_gfx942_4warp_gqa)
         # in `_get_2d_launcher`; keyed so its HSACO never shares a cache slot with
         # the default gfx942 builder for the same geometry.
-        _d256_gfx942_fast(problem),
+        _gfx942_4warp_fast(problem),
         _enable_mfma_32x32(problem),
         _enable_transposed_qk_32x32(problem),
         _enable_transposed_half_local_pv(problem),
@@ -1751,6 +1781,8 @@ def _enable_gfx942_flash_mask_limit(problem: UnifiedAttentionProblem) -> bool:
 
 
 def _enable_gfx942_flash_k_sliced_ring(problem: UnifiedAttentionProblem) -> bool:
+    if _gfx942_4warp_fast(problem):
+        return False  # 4-warp cohort: own builder, T=32; ring needs T in {64,128}
     # The sliced-K ring (32-wide K slices -> k_groups = HD/32) wins on BOTH head
     # sizes: D128 (k_groups=4) and D64 (k_groups=2). Measured T=64+ring+cfvst+
     # mask-limit (nw4) vs the prior per-head bests: D64 13-17% faster (beats Torch
@@ -2228,7 +2260,7 @@ def _select_2d_block_m_per_warp(problem: UnifiedAttentionProblem) -> int:
     """
     if _d256_gfx950_fast(problem):
         return 32
-    if _d256_gfx942_fast(problem):
+    if _gfx942_4warp_fast(problem):
         return 32  # BLOCK_M = 1 * 32 = 32 rows (one q-token tile per CTA)
     if _resolve_attention_arch() == "gfx1250":
         return 16
@@ -3386,7 +3418,7 @@ def _get_2d_launcher(
         arch = _resolve_attention_arch()
         _, build_unified_attention_2d_tiled, _ = _tiled_2d_impl(arch)
         spec = _tiled_spec_from_problem(problem)
-        if _d256_gfx942_fast(problem):
+        if _gfx942_4warp_fast(problem):
             # Distinct 4-warp GQA paged builder for the D256 gfx942 cohort
             # (keyed separately in `_tiled_cache_key`; grid in
             # `_get_2d_launch_meta`). Same paged ABI as the default builder.
@@ -3428,7 +3460,7 @@ def _get_2d_launch_meta(
     if meta_key in _2D_LAUNCH_META:
         return _2D_LAUNCH_META[meta_key]
     arch = _resolve_attention_arch()
-    if _d256_gfx942_fast(problem):
+    if _gfx942_4warp_fast(problem):
         # 4-warp GQA paged kernel: 4 wave64/CTA own BLOCK_M=128 q-tokens for ONE
         # query head. grid = (num_query_heads, q-token-blocks + per-seq padding).
         # block_q == BLOCK_M == 128, matching the kernel's binary_search_seq_idx.

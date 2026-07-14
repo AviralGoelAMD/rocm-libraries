@@ -5552,24 +5552,26 @@ def build_gfx942_4warp_gqa(
     from ..common.attention_arch import require_tiled_attention_arch
 
     require_tiled_attention_arch(arch)
-    if spec.dtype != "bf16":
-        raise NotImplementedError("4-warp GQA kernel is bf16-only")
+    if spec.dtype not in ("bf16", "fp16"):
+        raise NotImplementedError("4-warp GQA kernel supports dtype in {bf16, fp16}")
     dtype = spec.dtype_ir
     HD = spec.head_size
-    if HD != 256:
-        raise NotImplementedError("4-warp GQA kernel is head_size=256 only")
+    if HD not in (128, 256):
+        raise NotImplementedError("4-warp GQA kernel supports head_size in {128, 256}")
     H = spec.num_query_heads
     HKV = spec.num_kv_heads
     GQAG = spec.num_queries_per_kv
     BS = spec.block_size
     BN = 64  # 4-warp: 64-key tiles
     BPT = BN // BS
-    at = MfmaAtom.bf16_32x32x8()
+    at = MfmaAtom.bf16_32x32x8() if spec.dtype == "bf16" else MfmaAtom.f16_32x32x8()
     APL, BPL, CPL, K = at.a_per_lane, at.b_per_lane, at.c_per_lane, at.k
     NKEYT = BN // 32
     NK = HD // K
     NDdim = HD // 32
     NKpv = BN // K
+    v_fill_epw = (BN * HD) // 256  # V-fill: elements per thread (256 = 4 wave64 threads)
+    v_fill_nloads = v_fill_epw // 8  # 8-wide (dwordx4) loads per thread
     ITERS = spec.binary_search_iters
 
     b = IRBuilder(spec.kernel_name() + "_4wgqa")
@@ -5634,7 +5636,7 @@ def build_gfx942_4warp_gqa(
     ):  # padding q-block (AITER +num_seqs over-alloc) -> skip
         b.ret()
 
-    V_lds = b.smem_alloc(dtype, [64, 256], name_hint="Vlds")
+    V_lds = b.smem_alloc(dtype, [64, HD], name_hint="Vlds")
     q_desc = TensorDescriptor.naive(
         "query_ptr", lengths=[1 << 30, H, HD], coord_names=("token", "head", "dim")
     )
@@ -5659,20 +5661,28 @@ def build_gfx942_4warp_gqa(
         (f"a{nt}", at.zero_acc(b)) for nt in range(NDdim)
     ]
     context_off = b.sub(klen, qlen)  # prefix in KV cache (qlen!=klen: chunked/decode)
+    window = int(spec.sliding_window)  # 0 = causal; >0 = SWA (keep dist < window)
     causal_t = b.div(
         b.add(b.add(context_off, qbase), b.const_i32(128 + BN - 1)), b.const_i32(BN)
     )
     klen_t = b.div(b.add(klen, b.const_i32(BN - 1)), b.const_i32(BN))
     kvend = b.select(b.cmp_lt(causal_t, klen_t), causal_t, klen_t)
-    loop = b.scf_for_iter(b.const_i32(0), kvend, b.const_i32(1), iters, iv_name="kv")
+    # E6: windowed KV-loop start - skip tiles fully before the window (bounded work)
+    if window > 0:
+        _ks = b.sub(b.add(context_off, qbase), b.const_i32(window))
+        _ks = b.select(b.cmp_gt(_ks, b.const_i32(0)), _ks, b.const_i32(0))
+        kvstart = b.div(_ks, b.const_i32(BN))
+    else:
+        kvstart = b.const_i32(0)
+    loop = b.scf_for_iter(kvstart, kvend, b.const_i32(1), iters, iv_name="kv")
     with loop as (kv, carry):
         m_old = carry[0]
         l_old = carry[1]
         accs = list(carry[2:])
-        for c in range(8):
-            lin = b.add(b.mul(tid, b.const_i32(64)), b.const_i32(c * 8))
-            key = b.div(lin, b.const_i32(256))
-            hd = b.mod(lin, b.const_i32(256))
+        for c in range(v_fill_nloads):
+            lin = b.add(b.mul(tid, b.const_i32(v_fill_epw)), b.const_i32(c * 8))
+            key = b.div(lin, b.const_i32(HD))
+            hd = b.mod(lin, b.const_i32(HD))
             pk = phys_key(kv, key)
             velem = b.add(
                 b.mul(b.add(b.mul(pk, b.const_i32(HKV)), kvh), b.const_i32(HD)), hd
@@ -5712,8 +5722,12 @@ def build_gfx942_4warp_gqa(
                 q_g = b.add(context_off, b.add(qbase, b.add(wq, cc)))
                 m_causal = b.cmp_gt(key_g, q_g)
                 m_varlen = b.cmp_ge(key_g, klen)
+                mask_cond = b.lor(m_causal, m_varlen)
+                if window > 0:  # E5: SWA mask - dist >= window masked (keep dist < window)
+                    m_window = b.cmp_ge(b.sub(q_g, key_g), b.const_i32(window))
+                    mask_cond = b.lor(mask_cond, m_window)
                 Sm[kt][i] = b.select(
-                    b.lor(m_causal, m_varlen), ninf, b.vec_extract(S_T[kt], i)
+                    mask_cond, ninf, b.vec_extract(S_T[kt], i)
                 )
         local = ninf
         for kt in range(NKEYT):
