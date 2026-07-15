@@ -5562,7 +5562,8 @@ def build_gfx942_4warp_gqa(
     HKV = spec.num_kv_heads
     GQAG = spec.num_queries_per_kv
     BS = spec.block_size
-    BN = 32  # 4-warp pipeline: 32-key tiles (K+V double-buffered = 32KB -> 2 WG/CU)
+    HD128 = HD == 128  # pipeline (BN=32 LDS-staged K/V double-buffer + prefetch + swizzle) is D128-only
+    BN = 32 if HD128 else 64  # D256 keeps 64-key single-buffer path (its tiles can't double-buffer <32KB)
     BPT = BN // BS
     at = MfmaAtom.bf16_32x32x8() if spec.dtype == "bf16" else MfmaAtom.f16_32x32x8()
     APL, BPL, CPL, K = at.a_per_lane, at.b_per_lane, at.c_per_lane, at.k
@@ -5636,8 +5637,8 @@ def build_gfx942_4warp_gqa(
     ):  # padding q-block (AITER +num_seqs over-alloc) -> skip
         b.ret()
 
-    V_lds = b.smem_alloc(dtype, [64, HD], name_hint="Vlds")  # #4: [64,HD]=32KB=2 waves; XOR swizzle breaks conflicts zero-waste
-    K_lds = b.smem_alloc(dtype, [64, HD], name_hint="Klds")
+    V_lds = b.smem_alloc(dtype, [64, HD], name_hint="Vlds")  # D128: 2x 32-key buffers (swizzled); D256: 64-key single
+    K_lds = b.smem_alloc(dtype, [64, HD], name_hint="Klds") if HD128 else None  # D256 stays direct-K (32KB->2 waves)
     q_desc = TensorDescriptor.naive(
         "query_ptr", lengths=[1 << 30, H, HD], coord_names=("token", "head", "dim")
     )
@@ -5708,14 +5709,23 @@ def build_gfx942_4warp_gqa(
             pk = phys_key(tkv, key)
             velem = b.add(b.mul(b.add(b.mul(pk, b.const_i32(HKV)), kvh), b.const_i32(HD)), hd)
             row = b.add(buf_off, key)
-            b.smem_store_vN(V_lds, [row, swz(row, hd)], b.global_load_vN(Vp, velem, dtype, 8, align=16), 8)
-            b.smem_store_vN(K_lds, [row, swz(row, hd)], b.global_load_vN(Kp, velem, dtype, 8, align=16), 8)
+            b.smem_store_vN(V_lds, [row, swz(row, hd) if HD128 else hd], b.global_load_vN(Vp, velem, dtype, 8, align=16), 8)
+            if HD128:
+                b.smem_store_vN(K_lds, [row, swz(row, hd)], b.global_load_vN(Kp, velem, dtype, 8, align=16), 8)
 
     def body(kv, carry, masked):
         m_old = carry[0]
         l_old = carry[1]
         accs = list(carry[2:])
-        buf_off = b.mul(b.mod(kv, b.const_i32(2)), b.const_i32(32))  # this tile's buffer (prefilled)
+        if HD128:
+            buf_off = b.mul(b.mod(kv, b.const_i32(2)), b.const_i32(32))  # prefilled buffer (pipeline)
+            pk_kt = None
+        else:
+            buf_off = b.const_i32(0)  # D256: single buffer, fill current tile in-body
+            b.sync()  # D256 WAR: guard prev-iter PV V_lds reads before overwrite
+            fill_tile(kv, buf_off)
+            b.sync()  # D256 RAW: V_lds ready
+            pk_kt = [phys_key(kv, b.add(b.const_i32(kt * 32), ld.m_in_atom)) for kt in range(NKEYT)]
         S_T = [at.zero_acc(b) for _ in range(NKEYT)]
         for h in range(NK):
             koff = b.add(b.mul(b.const_i32(h), b.const_i32(K)), b.mul(ld.k_blk, b.const_i32(APL)))
@@ -5723,8 +5733,12 @@ def build_gfx942_4warp_gqa(
             q_off, _ = q_desc.offset(b, token=q_tok, head=qhead, dim=koff)
             q = b.global_load_vN(Q, q_off, dtype, BPL, align=BPL * 2)
             for kt in range(NKEYT):
-                row_k = b.add(buf_off, b.add(b.const_i32(kt * 32), ld.m_in_atom))
-                kf = b.smem_load_vN(K_lds, row_k, swz(row_k, koff), dtype=dtype, n=APL)
+                if HD128:
+                    row_k = b.add(buf_off, b.add(b.const_i32(kt * 32), ld.m_in_atom))
+                    kf = b.smem_load_vN(K_lds, row_k, swz(row_k, koff), dtype=dtype, n=APL)
+                else:
+                    kelem = b.add(b.mul(b.add(b.mul(pk_kt[kt], b.const_i32(HKV)), kvh), b.const_i32(HD)), koff)
+                    kf = b.global_load_vN(Kp, kelem, dtype, APL, align=APL * 2)
                 S_T[kt] = at.emit(b, kf, q, S_T[kt])
         Sm = [[None] * CPL for _ in range(NKEYT)]
         for kt in range(NKEYT):
@@ -5762,15 +5776,15 @@ def build_gfx942_4warp_gqa(
                 vparts = []
                 for j in range(APL):
                     row_v = b.add(buf_off, b.add(b.mul(b.const_i32(kk), b.const_i32(K)), b.add(b.mul(ld.k_blk, b.const_i32(APL)), b.const_i32(j))))
-                    vparts.append(b.vec_extract(b.smem_load_vN(V_lds, row_v, swz(row_v, col_v), dtype=dtype, n=1), 0))
+                    vparts.append(b.vec_extract(b.smem_load_vN(V_lds, row_v, swz(row_v, col_v) if HD128 else col_v, dtype=dtype, n=1), 0))
                 va = b.vec_pack(vparts, dtype)
                 pv[nt] = at.emit(b, va, Bp[kk], pv[nt])
         newaccs = [b.vec_pack([b.fma(b.vec_extract(accs[nt], i), alpha, b.vec_extract(pv[nt], i)) for i in range(CPL)], F32) for nt in range(NDdim)]
-        # prefetch tile kv+1 into the OTHER buffer -> its global loads overlap this tile's compute
-        knext = b.select(b.cmp_lt(b.add(kv, b.const_i32(1)), kvend), b.add(kv, b.const_i32(1)), b.sub(kvend, b.const_i32(1)))
-        nbuf_off = b.mul(b.mod(b.add(kv, b.const_i32(1)), b.const_i32(2)), b.const_i32(32))
-        fill_tile(knext, nbuf_off)
-        b.sync()  # single barrier/iter: RAW(next buf ready) + WAR(this buf reads done before reuse)
+        if HD128:
+            knext = b.select(b.cmp_lt(b.add(kv, b.const_i32(1)), kvend), b.add(kv, b.const_i32(1)), b.sub(kvend, b.const_i32(1)))
+            nbuf_off = b.mul(b.mod(b.add(kv, b.const_i32(1)), b.const_i32(2)), b.const_i32(32))
+            fill_tile(knext, nbuf_off)
+            b.sync()  # pipeline: single barrier/iter (RAW next + WAR this)
         return (m_new, l_new, *newaccs)
 
     def run_loop(start, end, init_iters, masked, iv):
@@ -5779,10 +5793,10 @@ def build_gfx942_4warp_gqa(
             b.scf_yield(*body(kv, carry, masked))
         return lp
 
-    # Pipeline prologue: prefill the first tile into buf[kvstart%2] (guard empty KV range).
-    with b.scf_if(b.cmp_lt(kvstart, kvend)):
-        fill_tile(kvstart, b.mul(b.mod(kvstart, b.const_i32(2)), b.const_i32(32)))
-    b.sync()
+    if HD128:  # pipeline prologue: prefill first tile (D256 fills in-body)
+        with b.scf_if(b.cmp_lt(kvstart, kvend)):
+            fill_tile(kvstart, b.mul(b.mod(kvstart, b.const_i32(2)), b.const_i32(32)))
+        b.sync()
     l1 = run_loop(kvstart, _a, iters, True, "kva")
     it1 = [("m2", l1.results[0]), ("l2", l1.results[1])] + [(f"b{nt}", l1.results[2 + nt]) for nt in range(NDdim)]
     l2 = run_loop(_a, _bnd, it1, False, "kvb")
