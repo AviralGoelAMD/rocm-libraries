@@ -5710,7 +5710,8 @@ def build_gfx942_4warp_gqa(
             pk = phys_key(kv, key)
             velem = b.add(b.mul(b.add(b.mul(pk, b.const_i32(HKV)), kvh), b.const_i32(HD)), hd)
             b.smem_store_vN(V_lds, [key, hd], b.global_load_vN(Vp, velem, dtype, 8, align=16), 8)
-        b.sync()
+        # RUN2: RAW barrier moved down to just before PV. QK+softmax do not read V_lds,
+        # so they overlap the V-fill LDS-write latency (hides ~216M SQ_WAIT_INST_ANY).
         S_T = [at.zero_acc(b) for _ in range(NKEYT)]
         pk_kt = [phys_key(kv, b.add(b.const_i32(kt * 32), ld.m_in_atom)) for kt in range(NKEYT)]
         for h in range(NK):
@@ -5751,6 +5752,7 @@ def build_gfx942_4warp_gqa(
                 P[kt][i] = b.cast_f32_to(p, dtype)
         l_new = b.fadd(b.fmul(l_old, alpha), b.fadd(lsum, bperm(lsum)))
         Bp = [b.vec_pack([P[kk // 4][(kk % 4) * 4 + j] for j in range(BPL)], dtype) for kk in range(NKpv)]
+        b.sync()  # RAW: V_lds writes complete before PV reads (moved down from after V-fill)
         pv = [at.zero_acc(b) for _ in range(NDdim)]
         for kk in range(NKpv):
             for nt in range(NDdim):
