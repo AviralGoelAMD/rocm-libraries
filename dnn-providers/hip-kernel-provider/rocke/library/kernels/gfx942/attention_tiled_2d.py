@@ -5712,6 +5712,22 @@ def build_gfx942_4warp_gqa(
             b.smem_store_vN(V_lds, [row, swz(row, hd) if HD128 else hd], b.global_load_vN(Vp, velem, dtype, 8, align=16), 8)
             if HD128:
                 b.smem_store_vN(K_lds, [row, swz(row, hd)], b.global_load_vN(Kp, velem, dtype, 8, align=16), 8)
+    def fill_load(tkv):  # PREFETCH phase 1: issue global loads early -> latency hides under compute
+        pf = []
+        for c in range(v_fill_nloads):
+            lin = b.add(b.mul(tid, b.const_i32(v_fill_epw)), b.const_i32(c * 8))
+            key = b.div(lin, b.const_i32(HD)); hd = b.mod(lin, b.const_i32(HD))
+            pk = phys_key(tkv, key)
+            velem = b.add(b.mul(b.add(b.mul(pk, b.const_i32(HKV)), kvh), b.const_i32(HD)), hd)
+            vr = b.global_load_vN(Vp, velem, dtype, 8, align=16)
+            kr = b.global_load_vN(Kp, velem, dtype, 8, align=16)
+            pf.append((vr, kr, key, hd))
+        return pf
+    def fill_store(pf, buf_off):  # PREFETCH phase 2: store prefetched regs (loads already drained)
+        for (vr, kr, key, hd) in pf:
+            row = b.add(buf_off, key)
+            b.smem_store_vN(V_lds, [row, swz(row, hd)], vr, 8)
+            b.smem_store_vN(K_lds, [row, swz(row, hd)], kr, 8)
 
     def body(kv, carry, masked):
         m_old = carry[0]
@@ -5720,6 +5736,9 @@ def build_gfx942_4warp_gqa(
         if HD128:
             buf_off = b.mul(b.mod(kv, b.const_i32(2)), b.const_i32(32))  # prefilled buffer (pipeline)
             pk_kt = None
+            knext = b.select(b.cmp_lt(b.add(kv, b.const_i32(1)), kvend), b.add(kv, b.const_i32(1)), b.sub(kvend, b.const_i32(1)))
+            nbuf_off = b.mul(b.mod(b.add(kv, b.const_i32(1)), b.const_i32(2)), b.const_i32(32))
+            pf = fill_load(knext)  # issue next-tile loads NOW (hide under this tile's QK/softmax/PV)
         else:
             buf_off = b.const_i32(0)  # D256: single buffer, fill current tile in-body
             b.sync()  # D256 WAR: guard prev-iter PV V_lds reads before overwrite
@@ -5781,10 +5800,8 @@ def build_gfx942_4warp_gqa(
                 pv[nt] = at.emit(b, va, Bp[kk], pv[nt])
         newaccs = [b.vec_pack([b.fma(b.vec_extract(accs[nt], i), alpha, b.vec_extract(pv[nt], i)) for i in range(CPL)], F32) for nt in range(NDdim)]
         if HD128:
-            knext = b.select(b.cmp_lt(b.add(kv, b.const_i32(1)), kvend), b.add(kv, b.const_i32(1)), b.sub(kvend, b.const_i32(1)))
-            nbuf_off = b.mul(b.mod(b.add(kv, b.const_i32(1)), b.const_i32(2)), b.const_i32(32))
-            fill_tile(knext, nbuf_off)
-            b.sync()  # pipeline: single barrier/iter (RAW next + WAR this)
+            fill_store(pf, nbuf_off)  # store prefetched tile (loads hid under compute)
+            b.sync()  # single barrier/iter (RAW next + WAR this)
         return (m_new, l_new, *newaccs)
 
     def run_loop(start, end, init_iters, masked, iv):
