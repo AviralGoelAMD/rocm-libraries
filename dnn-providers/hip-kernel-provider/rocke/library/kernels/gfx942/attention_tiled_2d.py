@@ -5674,67 +5674,68 @@ def build_gfx942_4warp_gqa(
         kvstart = b.div(_ks, b.const_i32(BN))
     else:
         kvstart = b.const_i32(0)
-    loop = b.scf_for_iter(kvstart, kvend, b.const_i32(1), iters, iv_name="kv")
-    with loop as (kv, carry):
+    # RUN1 (VALU cut): loop-split so fully-interior tiles skip the per-element causal+
+    # window mask entirely. A tile needs NO mask iff for ALL q in the block and key in
+    # [kv*BN,kv*BN+BN): causal(key<=q) AND window(q-key<window) AND varlen(key<klen).
+    q_blk_lo = b.add(context_off, qbase)                                    # min q_g
+    q_blk_hi = b.add(b.add(context_off, qbase), b.const_i32(127))           # max q_g (BLOCK_M=128)
+    _cn = b.sub(q_blk_lo, b.const_i32(BN - 1))                              # causal-interior: kv*BN+BN-1<=q_blk_lo
+    int_end_c = b.select(b.cmp_lt(_cn, b.const_i32(0)), b.const_i32(0),
+                         b.add(b.div(_cn, b.const_i32(BN)), b.const_i32(1)))
+    int_end_r = b.div(klen, b.const_i32(BN))                                # varlen-interior: (kv+1)*BN<=klen
+    int_end = b.select(b.cmp_lt(int_end_c, int_end_r), int_end_c, int_end_r)
+    if window > 0:
+        _sn = b.sub(b.add(q_blk_hi, b.const_i32(1)), b.const_i32(window))   # window-interior: kv*BN>=q_blk_hi-window+1
+        _cs = b.div(b.add(_sn, b.const_i32(BN - 1)), b.const_i32(BN))       # ceil
+        int_start = b.select(b.cmp_lt(_sn, b.const_i32(0)), kvstart, _cs)
+    else:
+        int_start = kvstart
+    def _clamp(x, lo, hi):
+        x = b.select(b.cmp_lt(x, lo), lo, x)
+        return b.select(b.cmp_lt(hi, x), hi, x)
+    _a = _clamp(int_start, kvstart, kvend)
+    _bnd = _clamp(int_end, _a, kvend)
+
+    def body(kv, carry, masked):
         if __import__("os").environ.get("HIPDNN_4WGQA_IGLP", "").strip() in ("1", "on", "yes", "true"):
-            b.iglp_opt(1)  # Step-0 lever: whole-loop MFMA/DS/VMEM interleave (D256 +60%)
+            b.iglp_opt(1)
         m_old = carry[0]
         l_old = carry[1]
         accs = list(carry[2:])
-        # WAR barrier: the previous iteration's PV MFMA reads V_lds; guard those
-        # reads before this iteration overwrites V_lds (single-buffered). Without
-        # this a fast warp clobbers V_lds while a slow warp still reads it (race).
-        b.sync()
+        b.sync()  # WAR barrier: guard prev-iter PV reads of V_lds before overwrite (single-buffered)
         for c in range(v_fill_nloads):
             lin = b.add(b.mul(tid, b.const_i32(v_fill_epw)), b.const_i32(c * 8))
             key = b.div(lin, b.const_i32(HD))
             hd = b.mod(lin, b.const_i32(HD))
             pk = phys_key(kv, key)
-            velem = b.add(
-                b.mul(b.add(b.mul(pk, b.const_i32(HKV)), kvh), b.const_i32(HD)), hd
-            )
-            b.smem_store_vN(
-                V_lds, [key, hd], b.global_load_vN(Vp, velem, dtype, 8, align=16), 8
-            )
+            velem = b.add(b.mul(b.add(b.mul(pk, b.const_i32(HKV)), kvh), b.const_i32(HD)), hd)
+            b.smem_store_vN(V_lds, [key, hd], b.global_load_vN(Vp, velem, dtype, 8, align=16), 8)
         b.sync()
         S_T = [at.zero_acc(b) for _ in range(NKEYT)]
-        pk_kt = [
-            phys_key(kv, b.add(b.const_i32(kt * 32), ld.m_in_atom))
-            for kt in range(NKEYT)
-        ]
+        pk_kt = [phys_key(kv, b.add(b.const_i32(kt * 32), ld.m_in_atom)) for kt in range(NKEYT)]
         for h in range(NK):
-            koff = b.add(
-                b.mul(b.const_i32(h), b.const_i32(K)), b.mul(ld.k_blk, b.const_i32(APL))
-            )
+            koff = b.add(b.mul(b.const_i32(h), b.const_i32(K)), b.mul(ld.k_blk, b.const_i32(APL)))
             q_tok = b.add(b.add(qstart, wq), ld.n_in_atom)
             q_off, _ = q_desc.offset(b, token=q_tok, head=qhead, dim=koff)
             q = b.global_load_vN(Q, q_off, dtype, BPL, align=BPL * 2)
             for kt in range(NKEYT):
-                kelem = b.add(
-                    b.mul(
-                        b.add(b.mul(pk_kt[kt], b.const_i32(HKV)), kvh), b.const_i32(HD)
-                    ),
-                    koff,
-                )
+                kelem = b.add(b.mul(b.add(b.mul(pk_kt[kt], b.const_i32(HKV)), kvh), b.const_i32(HD)), koff)
                 kf = b.global_load_vN(Kp, kelem, dtype, APL, align=APL * 2)
                 S_T[kt] = at.emit(b, kf, q, S_T[kt])
         Sm = [[None] * CPL for _ in range(NKEYT)]
         for kt in range(NKEYT):
             for i in range(CPL):
-                rr, cc = at.lane_to_output(b, lane, i)
-                key_g = b.add(
-                    b.add(b.mul(kv, b.const_i32(BN)), b.const_i32(kt * 32)), rr
-                )
-                q_g = b.add(context_off, b.add(qbase, b.add(wq, cc)))
-                m_causal = b.cmp_gt(key_g, q_g)
-                m_varlen = b.cmp_ge(key_g, klen)
-                mask_cond = b.lor(m_causal, m_varlen)
-                if window > 0:  # E5: SWA mask - dist >= window masked (keep dist < window)
-                    m_window = b.cmp_ge(b.sub(q_g, key_g), b.const_i32(window))
-                    mask_cond = b.lor(mask_cond, m_window)
-                Sm[kt][i] = b.select(
-                    mask_cond, ninf, b.vec_extract(S_T[kt], i)
-                )
+                raw = b.vec_extract(S_T[kt], i)
+                if masked:
+                    rr, cc = at.lane_to_output(b, lane, i)
+                    key_g = b.add(b.add(b.mul(kv, b.const_i32(BN)), b.const_i32(kt * 32)), rr)
+                    q_g = b.add(context_off, b.add(qbase, b.add(wq, cc)))
+                    mask_cond = b.lor(b.cmp_gt(key_g, q_g), b.cmp_ge(key_g, klen))
+                    if window > 0:
+                        mask_cond = b.lor(mask_cond, b.cmp_ge(b.sub(q_g, key_g), b.const_i32(window)))
+                    Sm[kt][i] = b.select(mask_cond, ninf, raw)
+                else:
+                    Sm[kt][i] = raw
         local = ninf
         for kt in range(NKEYT):
             for i in range(CPL):
@@ -5749,49 +5750,32 @@ def build_gfx942_4warp_gqa(
                 lsum = b.fadd(lsum, p)
                 P[kt][i] = b.cast_f32_to(p, dtype)
         l_new = b.fadd(b.fmul(l_old, alpha), b.fadd(lsum, bperm(lsum)))
-        Bp = [
-            b.vec_pack([P[kk // 4][(kk % 4) * 4 + j] for j in range(BPL)], dtype)
-            for kk in range(NKpv)
-        ]
-        # kk-outer/nt-inner: keep NDdim pv[nt] accumulators live so NDdim independent MFMA
-        # chains are in flight (fills MFMA-dependency latency). nt-outer was 1 chain at a time.
+        Bp = [b.vec_pack([P[kk // 4][(kk % 4) * 4 + j] for j in range(BPL)], dtype) for kk in range(NKpv)]
         pv = [at.zero_acc(b) for _ in range(NDdim)]
         for kk in range(NKpv):
             for nt in range(NDdim):
                 va = b.vec_pack(
-                    [
-                        b.vec_extract(
-                            b.smem_load_vN(
-                                V_lds,
-                                b.add(
-                                    b.mul(b.const_i32(kk), b.const_i32(K)),
-                                    b.add(b.mul(ld.k_blk, b.const_i32(APL)), b.const_i32(j)),
-                                ),
-                                b.add(b.mul(b.const_i32(nt), b.const_i32(32)), ld.m_in_atom),
-                                dtype=dtype,
-                                n=1,
-                            ),
-                            0,
-                        )
-                        for j in range(APL)
-                    ],
+                    [b.vec_extract(b.smem_load_vN(V_lds, b.add(b.mul(b.const_i32(kk), b.const_i32(K)), b.add(b.mul(ld.k_blk, b.const_i32(APL)), b.const_i32(j))), b.add(b.mul(b.const_i32(nt), b.const_i32(32)), ld.m_in_atom), dtype=dtype, n=1), 0) for j in range(APL)],
                     dtype,
                 )
                 pv[nt] = at.emit(b, va, Bp[kk], pv[nt])
-        newaccs = [
-            b.vec_pack(
-                [
-                    b.fma(b.vec_extract(accs[nt], i), alpha, b.vec_extract(pv[nt], i))
-                    for i in range(CPL)
-                ],
-                F32,
-            )
-            for nt in range(NDdim)
-        ]
-        b.scf_yield(m_new, l_new, *newaccs)
-    m_f = loop.results[0]
-    l_f = loop.results[1]
-    accs_f = loop.results[2:]
+        newaccs = [b.vec_pack([b.fma(b.vec_extract(accs[nt], i), alpha, b.vec_extract(pv[nt], i)) for i in range(CPL)], F32) for nt in range(NDdim)]
+        return (m_new, l_new, *newaccs)
+
+    def run_loop(start, end, init_iters, masked, iv):
+        lp = b.scf_for_iter(start, end, b.const_i32(1), init_iters, iv_name=iv)
+        with lp as (kv, carry):
+            b.scf_yield(*body(kv, carry, masked))
+        return lp
+
+    l1 = run_loop(kvstart, _a, iters, True, "kva")
+    it1 = [("m2", l1.results[0]), ("l2", l1.results[1])] + [(f"b{nt}", l1.results[2 + nt]) for nt in range(NDdim)]
+    l2 = run_loop(_a, _bnd, it1, False, "kvb")
+    it2 = [("m3", l2.results[0]), ("l3", l2.results[1])] + [(f"c{nt}", l2.results[2 + nt]) for nt in range(NDdim)]
+    l3 = run_loop(_bnd, kvend, it2, True, "kvc")
+    m_f = l3.results[0]
+    l_f = l3.results[1]
+    accs_f = l3.results[2:]
     recip = b.rcp_fast(l_f)
     for nt in range(NDdim):
         for i in range(CPL):
