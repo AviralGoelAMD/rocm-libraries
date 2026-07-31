@@ -78,6 +78,33 @@ class TestGfx942D128SwRouting(unittest.TestCase):
                     au._gfx942_4warp_fast(p), msg=f"D128 SW {dt} must take the 4-warp path"
                 )
 
+    def test_sw_dispatch_gate_accepts_both_dtypes(self):
+        # The production dispatcher (run_unified_attention_torch path="auto")
+        # routes to the scalar kernel unless supports_native_unified_attention_tiled
+        # returns True. The 4-warp SELECTOR firing (test_sw_routes_to_4warp) is not
+        # enough: fp16 rode the flash branch, which passes use_d256_fast=True into
+        # supports_tiled_2d, whose d256-only acceptance rejected head_size=128 ->
+        # fp16 D128 SW silently fell back to the scalar kernel (~thousands x slower,
+        # still correct). Guard the actual gate for BOTH dtypes / every block_size.
+        with _PinArch("gfx942"):
+            for dt in ("bf16", "fp16"):
+                for bs in (16, 32, 64):
+                    p = _d128_problem(dtype=dt, block_size=bs)
+                    ok, reason = au.supports_native_unified_attention_tiled(p)
+                    self.assertTrue(
+                        ok, msg=f"D128 SW {dt} bs{bs} must reach the tiled path: {reason}"
+                    )
+
+    def test_sw_ineligible_falls_back_not_4warp_gate(self):
+        # Configs the 4-warp cohort excludes must NOT be admitted by the gate as a
+        # 4-warp problem (they route to develop's wide-flash/narrow or scalar).
+        with _PinArch("gfx942"):
+            for dt in ("bf16", "fp16"):
+                p = _d128_problem(dtype=dt, softcap=30.0)
+                self.assertFalse(
+                    au._gfx942_4warp_fast(p), msg=f"{dt} softcap must not take 4-warp"
+                )
+
     def test_sw_spec_is_4warp_discriminator(self):
         # The 4-warp cohort must get the discriminator spec, NOT the flash spec.
         # (Guards the attention_spec_builder flash-branch exclusion: a flash spec
@@ -182,8 +209,12 @@ class TestGfx942D128SwRouting(unittest.TestCase):
                     self.assertFalse(
                         au._gfx942_4warp_fast(p), msg=f"{dt} {kw} must not take 4-warp"
                     )
-                    # the fallback path still produces a buildable spec (no validator error)
-                    _tiled_spec_from_problem(p)
+                    # Fallback still produces a buildable spec for configs within the
+                    # tiled block_size domain (softcap only excludes the 4-warp cohort,
+                    # not the tiled path). block_size=128 is outside {16,32,64}: the
+                    # gate rejects it outright and no tiled spec exists, so skip it.
+                    if p.block_size in (16, 32, 64):
+                        _tiled_spec_from_problem(p)
 
 
 if __name__ == "__main__":

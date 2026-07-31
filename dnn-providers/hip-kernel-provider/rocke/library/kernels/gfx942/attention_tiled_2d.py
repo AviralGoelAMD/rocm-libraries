@@ -1108,18 +1108,25 @@ def supports_tiled_2d(
                 f"tiled 2D kernel: per-wave tokens {per_wave_tokens} exceeds "
                 f"block_size={block_size}; would need lane-divergent block lookup",
             )
-    # The D256 gfx942 fast path (build_gfx942_4warp_gqa) reads paged K direct
+    # The gfx942 4-warp fast path (build_gfx942_4warp_gqa) reads paged K direct
     # HBM->reg, stages V through V_lds, and uses only its own softmax-reduction
     # LDS (5-stage swizzle) -- so the conservative staged-tile LDS model below
     # (K double-buffer + V + Q_lds + P_lds) does NOT apply. Validate the fast
     # path's hard requirements explicitly instead of trusting the flag; earlier
     # checks already covered dtype family, block_size, and tile_size % block_size.
+    # Two cohorts ride this builder (see _gfx942_4warp_fast): the D256 bf16
+    # causal path and the D128 sliding-window path (bf16 AND fp16). The caller
+    # only sets use_d256_fast for a cohort _gfx942_4warp_fast() already fully
+    # validated (arch/dtype/SW/block_size), so accept both geometries here.
     if use_d256_fast:
         if head_size == 256 and dtype == "bf16":
             return True, "supported"
+        if head_size == 128 and dtype in ("fp16", "bf16"):
+            return True, "supported"
         return (
             False,
-            "tiled 2D kernel: d256 gfx942 fast path requires bf16 head_size=256",
+            "tiled 2D kernel: gfx942 4-warp fast path requires bf16 head_size=256 "
+            "or head_size=128 (bf16/fp16)",
         )
     # LDS-budget gate (ahead-of-time compilability). The kernel stages its
     # tiles in LDS (the smem_alloc calls in build_unified_attention_2d_tiled);
