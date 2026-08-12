@@ -250,14 +250,22 @@ def bench_dense(spec: AttentionDenseSpec, *, warmup: int, iters: int, seed: int)
     qh = q.transpose(1, 2).float()
     kh = _kref.transpose(1, 2).repeat_interleave(rep, 1).float()
     vh = _vref.transpose(1, 2).repeat_interleave(rep, 1).float()
-    ref = torch.nn.functional.scaled_dot_product_attention(
-        qh, kh, vh, is_causal=causal
-    ).transpose(1, 2)
+    if spec.sliding_window and spec.sliding_window > 0:
+        _i = torch.arange(S, device=q.device)
+        _keep = (_i[None, :] <= _i[:, None]) & (_i[None, :] > _i[:, None] - spec.sliding_window)
+        _bias = torch.where(_keep, 0.0, float("-inf")).to(torch.float32)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            qh, kh, vh, attn_mask=_bias[None, None]
+        ).transpose(1, 2)
+    else:
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            qh, kh, vh, is_causal=causal
+        ).transpose(1, 2)
     max_err = (out.float() - ref).abs().max().item()
 
     ms = time_launches(call, warmup=warmup, iters=iters, stream=stream)
     synchronize_and_release(stream)
-    tf = _flops(B, S, causal, 0, Hq, D) / (ms * 1e-3) / 1e12
+    tf = _flops(B, S, causal, spec.sliding_window, Hq, D) / (ms * 1e-3) / 1e12
     # gfx942_kernel_name, not spec.kernel_name(): the latter omits batch and
     # waves_per_eu, so a B=4 row would report the B=1 symbol -- the exact confusion
     # behind the cache-collision bug this field exists to make visible.
