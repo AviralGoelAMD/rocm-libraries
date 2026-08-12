@@ -366,10 +366,11 @@ class AttentionDenseSpec:
                 raise ValueError(
                     f"paged not yet implemented for dtype={self.dtype} (fp16/bf16 only)"
                 )
-            if self.sliding_window <= 0:
-                raise ValueError(
-                    "paged not yet implemented for plain-causal (sliding_window>0 only)"
-                )
+            # NOTE: plain-causal paged (sliding_window==0) is permitted at the
+            # spec level -- it is mechanically identical to the sliding-window
+            # paged read minus the window mask. Which arch has *validated* it is
+            # decided in each arch's supports_attention_dense(): gfx942 validates
+            # causal paged; gfx950 still gates it (see its supports()).
 
     @property
     def num_waves(self) -> int:
@@ -450,6 +451,11 @@ def supports_attention_dense(
         AttentionDenseSpec(**{f.name: getattr(spec, f.name) for f in spec.__dataclass_fields__.values()})  # type: ignore[attr-defined]
     except ValueError as e:
         return False, str(e)
+    if spec.paged and spec.sliding_window <= 0:
+        return False, (
+            "gfx950 attention_dense: plain-causal paged not yet validated "
+            "(sliding_window>0 only)"
+        )
     return True, ""
 
 

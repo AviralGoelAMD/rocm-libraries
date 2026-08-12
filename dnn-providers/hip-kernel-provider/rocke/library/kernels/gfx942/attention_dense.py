@@ -784,6 +784,19 @@ def supports_attention_dense(
         return False, "gfx942 attention_dense: ragged not yet supported"
     if spec.sliding_window:
         return False, "gfx942 attention_dense: sliding_window not yet supported"
+    # Paged K/V (Increment 2a): causal, single-seq, D128. The shared AttentionDenseSpec
+    # validator (re-run above) already enforces the paged hardware invariants
+    # (block_size pow2 / divides block_n, head_size==128, batch==1, fp16/bf16, i32
+    # cache) and gfx942 rejects sliding_window at :785, so paged here is always causal.
+    # The one gfx942-specific gate is the wave count: the shared spec validates the
+    # per-wave "rows stay within one page" hoist invariant using spec.num_waves, so a
+    # non-default tuning.block_m (WAVES = block_m // 32) would break it silently.
+    if spec.paged and (tuning.block_m // 32) != spec.num_waves:
+        return False, (
+            f"gfx942 paged needs the wave count the shared per-page invariant is "
+            f"validated with: spec.num_waves={spec.num_waves} but "
+            f"tuning.block_m//32={tuning.block_m // 32} (use the default block_m)"
+        )
 
     # --- Tuning struct (gfx942-private sweep knobs). Validated here rather than only
     # in the builder because the module contract is support() => build(): a knob that
@@ -1019,6 +1032,15 @@ def _build_attention_dense_single_buffer(
         "o_ptr", PtrType(dtype, "global"), noalias=True, writeonly=True, align=16
     )
     scale = b.param("scale", F32)
+    block_tables = kv_lens = bt_stride = None
+    if spec.paged:
+        block_tables = b.param(
+            "block_tables", PtrType(I32, "global"), noalias=True, readonly=True, align=4
+        )
+        kv_lens = b.param(
+            "kv_lens", PtrType(I32, "global"), noalias=True, readonly=True, align=4
+        )
+        bt_stride = b.param("block_table_stride", I32)
     qk_scale = b.fmul(scale, b.const_f32(LOG2E))
 
     tid = b.thread_id_x()
@@ -1037,7 +1059,7 @@ def _build_attention_dense_single_buffer(
     # LDS-budget check in supports_attention_dense so the two cannot drift. The one
     # exception is when _k_group_pad_active(spec): D64 K_lds then takes the padded
     # [1, block_n // rows_per_instr, _k_group_stride] 2-row-group layout below.
-    USE_CFVST = tuning.resolved_use_cfvst(spec)  # P1 conflict-free V: D128 fp16 only
+    USE_CFVST = tuning.resolved_use_cfvst(spec) and not spec.paged  # cfvst off when paged: one naive K+V async path
     LDROW = _lds_row_stride(D, tuning)
     # Hypothesis #3 (D64 K-LDS bank conflicts): K_lds with a row-group boundary pad,
     # sized by the shared spec.lds_k_group_pad (0 disables it -- that is the A/B probe).
@@ -1092,8 +1114,14 @@ def _build_attention_dense_single_buffer(
     # cfvst feeds V via buffer_load + perm_b32 + smem_store (no async-DMA handle); the
     # naive D64 path still lands V through async_buffer_load_lds, which needs the base.
     V_lds_addr = None if USE_CFVST else b.smem_addr_of(V_lds)
-    k_rsrc = b.buffer_rsrc(k, b.const_i32(B * Skv * Hkv * D * 2))
-    v_rsrc = b.buffer_rsrc(v, b.const_i32(B * Skv * Hkv * D * 2))
+    # paged widens the buffer bound to the whole cache; contiguous keeps B*Skv. A
+    # SEPARATE b.const_i32 per rsrc (not a shared node) preserves paged=False
+    # byte-identity (develop emits two consts here).
+    _kv_cache_elems = (
+        (spec.num_kv_blocks * spec.block_size if spec.paged else B * Skv) * Hkv * D * 2
+    )
+    k_rsrc = b.buffer_rsrc(k, b.const_i32(_kv_cache_elems))
+    v_rsrc = b.buffer_rsrc(v, b.const_i32(_kv_cache_elems))
 
     # ---- conflict-free V (P1): perm_b32 store-path transpose into V_lds[dim, token] ----
     # Load V naturally [token, dim] (coalesced VMEM over the contiguous dim axis),
@@ -1207,6 +1235,21 @@ def _build_attention_dense_single_buffer(
             b.mul(b.mul(bt, b.const_i32(Skv)), b.const_i32(stride_k_tok)),
             b.mul(hkv, b.const_i32(D)),
         )
+        if spec.paged:
+            assert (
+                ROWS_PER_WAVE <= spec.block_size
+                and spec.block_size % ROWS_PER_WAVE == 0
+            ), (
+                f"per-wave block_tables hoist needs ROWS_PER_WAVE ({ROWS_PER_WAVE}) <= "
+                f"block_size ({spec.block_size}) and dividing it evenly"
+            )
+            # single-seq: seq_base folds to 0; bt*bt_stride keeps bt_stride IR-live.
+            _pg_seq_base = b.mul(bt, bt_stride)
+            _pg_kv_len = b.global_load_i32(kv_lens, bt)
+            _pg_n_pages = b.div(
+                b.add(_pg_kv_len, b.const_i32(spec.block_size - 1)),
+                b.const_i32(spec.block_size),
+            )
 
         # Q packs (QK B-operand), scaled once by qk_scale so exp2(s) is direct.
         q_tok = b.add(q_tok0, lane_m)
@@ -1225,14 +1268,35 @@ def _build_attention_dense_single_buffer(
 
         def _async_load(rsrc, lds_base, tile_key0, group_pad=False):
             if ROWS_PER_INSTR == 1:
+                if spec.paged:
+                    # All ROWS_PER_WAVE rows of this wave fall in ONE page (asserted
+                    # at setup), so the block_tables lookup is wave-uniform -- hoist it
+                    # out of the row loop. Per-row cost is then just a mod + add.
+                    _wg0 = b.add(tile_key0, b.mul(wave, b.const_i32(ROWS_PER_WAVE)))
+                    _wpage = b.div(_wg0, b.const_i32(spec.block_size))
+                    _wphys = b.masked_global_load(
+                        block_tables,
+                        b.add(_pg_seq_base, _wpage),
+                        b.cmp_lt(_wpage, _pg_n_pages),
+                        b.const_i32(0),
+                        dtype=I32,
+                        align=4,
+                    )
+                    _wphys_base = b.mul(_wphys, b.const_i32(spec.block_size))
                 for r in range(ROWS_PER_WAVE):
                     row = b.add(b.mul(wave, b.const_i32(ROWS_PER_WAVE)), b.const_i32(r))
                     row_lds_off = b.zext(b.mul(row, b.const_i32(K_LDROW_BYTES)), I64)
                     row_base = b.smem_ptr_add(lds_base, row_lds_off)
                     gkey = b.add(tile_key0, row)
+                    if spec.paged:
+                        kv_row = b.add(
+                            _wphys_base, b.mod(gkey, b.const_i32(spec.block_size))
+                        )
+                    else:
+                        kv_row = gkey
                     gcol = b.mul(lane, b.const_i32(2))
                     voff = b.add(
-                        b.add(k_base, b.mul(gkey, b.const_i32(stride_k_tok))), gcol
+                        b.add(k_base, b.mul(kv_row, b.const_i32(stride_k_tok))), gcol
                     )
                     b.async_buffer_load_lds_addr(
                         rsrc, row_base, b.mul(voff, b.const_i32(2)), zero_soff, 1
@@ -1638,15 +1702,21 @@ def attention_dense_signature(spec: AttentionDenseSpec):
     """
     from rocke.helpers.spec import SignatureBuilder
 
-    return (
+    sig = (
         SignatureBuilder()
         .ptr("q_ptr", spec.dtype)
         .ptr("k_ptr", spec.dtype)
         .ptr("v_ptr", spec.dtype)
         .ptr("o_ptr", spec.dtype)
         .scalar("scale", "f32")
-        .build()
     )
+    if spec.paged:
+        sig = (
+            sig.ptr("block_tables", "i32")
+            .ptr("kv_lens", "i32")
+            .scalar("block_table_stride", "i32")
+        )
+    return sig.build()
 
 
 _DENSE_LAUNCHER_CACHE: dict = {}
@@ -1664,6 +1734,9 @@ def run_attention_dense_torch(
     arch: str = "gfx942",
     cu_seqlens_q=None,
     cu_seqlens_kv=None,
+    block_tables=None,
+    kv_lens=None,
+    validate_paged: bool = True,
     tuning: "Gfx942DenseTuning" = _DEFAULT_TUNING,
 ):
     """High-level framework entry: compile (cached) + launch the gfx942 dense prefill
@@ -1695,6 +1768,34 @@ def run_attention_dense_torch(
             "cu_seqlens_* provided but gfx942 attention_dense is dense-only (varlen "
             "is rejected by supports_attention_dense); the ABI has no cu_seqlens args"
         )
+    if spec.paged and (block_tables is None or kv_lens is None):
+        raise ValueError("paged=True requires block_tables and kv_lens")
+    if not spec.paged and (block_tables is not None or kv_lens is not None):
+        raise ValueError("block_tables/kv_lens provided but spec.paged is False")
+    if spec.paged:
+        want = (spec.num_kv_blocks, spec.block_size, spec.num_kv_heads, spec.head_size)
+        for _name, _t in (("k", k), ("v", v)):
+            got = tuple(_t.shape)
+            if got != want:
+                raise ValueError(
+                    f"paged {_name} cache shape {got} != spec-derived "
+                    f"[num_kv_blocks, block_size, num_kv_heads, head_size]={want}"
+                )
+        if validate_paged:
+            _kvl = kv_lens.tolist() if hasattr(kv_lens, "tolist") else list(kv_lens)
+            for _i in range(spec.batch):
+                _npages = (int(_kvl[_i]) + spec.block_size - 1) // spec.block_size
+                if _npages <= 0:
+                    continue
+                _used = block_tables[_i][:_npages]
+                _used = _used.tolist() if hasattr(_used, "tolist") else list(_used)
+                for _phys in _used:
+                    _p = int(_phys)
+                    if _p < 0 or _p >= spec.num_kv_blocks:
+                        raise ValueError(
+                            f"paged block_tables[{_i}] physical block id {_p} "
+                            f"outside [0, num_kv_blocks={spec.num_kv_blocks})"
+                        )
     from rocke.helpers.compile import compile_kernel
     from rocke.runtime import KernelLauncher, LaunchConfig
 
@@ -1716,8 +1817,13 @@ def run_attention_dense_torch(
             signature=attention_dense_signature(spec),
         )
         _DENSE_LAUNCHER_CACHE[key] = launcher
+    vals = {"q_ptr": q, "k_ptr": k, "v_ptr": v, "o_ptr": out, "scale": float(scale)}
+    if spec.paged:
+        vals["block_tables"] = block_tables
+        vals["kv_lens"] = kv_lens
+        vals["block_table_stride"] = int(block_tables.stride(0))
     launcher(
-        {"q_ptr": q, "k_ptr": k, "v_ptr": v, "o_ptr": out, "scale": float(scale)},
+        vals,
         config=LaunchConfig(
             grid=attention_dense_grid(spec, tuning),
             block=attention_dense_block(spec, tuning),
