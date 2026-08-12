@@ -782,8 +782,6 @@ def supports_attention_dense(
         return False, "gfx942 attention_dense: varlen not yet supported"
     if spec.ragged:
         return False, "gfx942 attention_dense: ragged not yet supported"
-    if spec.sliding_window:
-        return False, "gfx942 attention_dense: sliding_window not yet supported"
     # Paged K/V (Increment 2a): causal, single-seq, D128. The shared AttentionDenseSpec
     # validator (re-run above) already enforces the paged hardware invariants
     # (block_size pow2 / divides block_n, head_size==128, batch==1, fp16/bf16, i32
@@ -1002,6 +1000,8 @@ def _build_attention_dense_single_buffer(
     BLOCK_M = tuning.block_m  # _BLOCK_M at the shipped default
     WAVES = BLOCK_M // 32  # 8
     BN = spec.block_n
+    SW = spec.sliding_window  # 0 = disabled (byte-identical causal path)
+    SWt = SW // BN            # window length in KV tiles (0 when disabled)
 
     N_SUB = BN // 32  # key 32-tiles per KV tile
     D_TILES = D // 32  # head-dim 32-tiles
@@ -1412,11 +1412,12 @@ def _build_attention_dense_single_buffer(
                 s_reg.append([b.vec_extract(acc, i) for i in range(16)])
             return s_reg
 
-        def do_mask(s_reg, tile_idx):
+        def do_mask(s_reg, tile_idx, lower=False):
             if not causal:
                 return
             tile_key0 = b.mul(tile_idx, b.const_i32(BN))
             query_tok = b.add(q_tok0, _mfma_32x32_c_col(b, lane, 0))
+            win_lo = b.sub(query_tok, b.const_i32(SW)) if lower else None
             for nsub in range(N_SUB):
                 sub_base = b.add(tile_key0, b.const_i32(nsub * 32))
                 for i in range(16):
@@ -1424,6 +1425,10 @@ def _build_attention_dense_single_buffer(
                     s_reg[nsub][i] = b.select(
                         b.cmp_le(ktok, query_tok), s_reg[nsub][i], neg_inf
                     )
+                    if lower:
+                        s_reg[nsub][i] = b.select(
+                            b.cmp_gt(ktok, win_lo), s_reg[nsub][i], neg_inf
+                        )
 
         # n_up: causal clamps the KV loop to the diagonal tile of this query block.
         n_ktiles_c = b.const_i32(n_ktiles)
@@ -1495,7 +1500,7 @@ def _build_attention_dense_single_buffer(
                 b.s_barrier_bare()
 
             s = do_qk()
-            do_mask(s, j)
+            do_mask(s, j, lower=(SW > 0))
 
             # tile max over keys (both lane-halves) for this query.
             local_max = neg_inf
