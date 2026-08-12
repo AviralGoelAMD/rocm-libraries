@@ -1438,6 +1438,19 @@ def _build_attention_dense_single_buffer(
         else:
             n_up = n_ktiles_c
 
+        # SW tile-skip: first KV tile any row in this block attends to. Tiles
+        # < start are fully older than the window (all -inf) -> never visited. When
+        # SW==0 the loop bound stays b.const_i32(0) created inline at the loop below,
+        # so the causal IR is byte-identical (start node only exists when SW>0).
+        if causal and SW > 0:
+            _diag0 = b.mul(qb, b.const_i32(n_per))
+            _lo_raw = b.sub(_diag0, b.const_i32(SWt))
+            _loop_lo = b.select(
+                b.cmp_gt(_lo_raw, b.const_i32(0)), _lo_raw, b.const_i32(0)
+            )
+        else:
+            _loop_lo = None
+
         # ---- online-softmax main loop (non-pipelined, single buffer) ----
         m0 = neg_inf
         l0 = b.const_f32(0.0)
@@ -1454,7 +1467,7 @@ def _build_attention_dense_single_buffer(
         # unroll=True (P3) or a sync_lds_only->sync swap cannot silently delete it.
         # Verified byte-identical codegen with and without the flag today.
         loop = b.scf_for_iter(
-            b.const_i32(0),
+            _loop_lo if _loop_lo is not None else b.const_i32(0),
             n_up,
             b.const_i32(1),
             iter_args,
