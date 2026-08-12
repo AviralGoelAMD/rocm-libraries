@@ -35,8 +35,13 @@ Concretely: at the default ``--dtype bf16 --d 64`` the shipped ``waves_per_eu`` 
 
 Scope: dense self-attention (uniform batch via the ``[B, S, H, d]`` grid), causal +
 full, bf16/fp16, D64/D128, MHA + GQA (incl. non-pow-2), default AND persistent grid.
-Sliding-window / varlen are still follow-ups: their ``--mode`` values exit with the
-distinct skip code 3 (never 0 — a gate must not report success for no work).
+``--mode paged`` adds the paged-KV load path (causal, D128, single-seq): it scatters
+the logical K/V into a paged cache through a NON-identity block table and times the
+kernel reading it back, correctness-gated vs the same SDPA reference. Paged is an
+opt-in direct-entry regime (not dispatcher-routed), so this bench adds the paged spec
+fields on top of the dispatch-resolved spec. Sliding-window / varlen are still
+follow-ups: their ``--mode`` values exit with the distinct skip code 3 (never 0 -- a
+gate must not report success for no work).
 
 Run as a library module::
 
@@ -50,6 +55,13 @@ or directly with a ROCm-torch venv python::
         rocke/library/benchmarks/gfx942/attention/prefill/benchmark_dense_prefill_live.py \\
         --mode causal --iterations 5 --warmup 2
 
+To replicate the paged-KV numbers (causal, D128, campaign GQA 32/8) on a gfx942 node::
+
+    ~/.venv/bin/python \\
+        rocke/library/benchmarks/gfx942/attention/prefill/benchmark_dense_prefill_live.py \\
+        --mode paged --dtype bf16 --hq 32 --hkv 8 --d 128 --block-size 16 \\
+        --iterations 50 --warmup 10 --output-json /tmp/paged_bf16.json
+
 ``--dry-run`` resolves and prints the spec for every shape without a GPU, which is
 how you check WHAT the gate is about to measure.
 """
@@ -61,6 +73,7 @@ import json
 import math
 import os
 import sys
+from dataclasses import replace  # noqa: E402
 
 _HERE = os.path.dirname(__file__)
 _RK = os.path.abspath(os.path.join(_HERE, "../../../../.."))
@@ -191,9 +204,12 @@ def bench_dense(spec: AttentionDenseSpec, *, warmup: int, iters: int, seed: int)
     torch.manual_seed(seed)
 
     q = (torch.randn(B, S, Hq, D, dtype=dt, device=dev) * 0.2).contiguous()
-    k = (torch.randn(B, S, Hkv, D, dtype=dt, device=dev) * 0.2).contiguous()
-    v = (torch.randn(B, S, Hkv, D, dtype=dt, device=dev) * 0.2).contiguous()
     out = torch.zeros(B, S, Hq, D, dtype=dt, device=dev)
+    # logical (contiguous) K/V -- the SDPA reference operands. In paged mode these
+    # are scattered into a paged cache below; the kernel reads them back via the
+    # block table, so the reference is identical either way.
+    _kref = (torch.randn(B, S, Hkv, D, dtype=dt, device=dev) * 0.2).contiguous()
+    _vref = (torch.randn(B, S, Hkv, D, dtype=dt, device=dev) * 0.2).contiguous()
 
     lch = _dense_launcher(spec)
     cfg = LaunchConfig(
@@ -201,7 +217,27 @@ def bench_dense(spec: AttentionDenseSpec, *, warmup: int, iters: int, seed: int)
         block=attention_dense_block(spec),
         stream=stream,
     )
-    vals = {"q_ptr": q, "k_ptr": k, "v_ptr": v, "o_ptr": out, "scale": scale}
+    if spec.paged:
+        # scatter logical K/V into a paged cache through a NON-identity block table
+        # (shuffled distinct physical pages) so the indirection is genuinely exercised.
+        bs, nkb = spec.block_size, spec.num_kv_blocks
+        n_pages = (S + bs - 1) // bs
+        g = torch.Generator().manual_seed(seed + 1)
+        phys = torch.randperm(nkb, generator=g)[:n_pages].to(torch.int32)
+        block_tables = phys.view(B, n_pages).contiguous().to(dev)
+        kv_lens = torch.full((B,), S, dtype=torch.int32, device=dev)
+        ck = torch.zeros(nkb, bs, Hkv, D, dtype=dt, device=dev)
+        cv = torch.zeros(nkb, bs, Hkv, D, dtype=dt, device=dev)
+        for _p in range(n_pages):
+            _pp = int(phys[_p])
+            ck[_pp] = _kref[0, _p * bs:(_p + 1) * bs]
+            cv[_pp] = _vref[0, _p * bs:(_p + 1) * bs]
+        vals = {"q_ptr": q, "k_ptr": ck, "v_ptr": cv, "o_ptr": out, "scale": scale,
+                "block_tables": block_tables, "kv_lens": kv_lens,
+                "block_table_stride": int(block_tables.stride(0))}
+    else:
+        vals = {"q_ptr": q, "k_ptr": _kref, "v_ptr": _vref, "o_ptr": out,
+                "scale": scale}
 
     def call():
         lch(vals, config=cfg)
@@ -212,8 +248,8 @@ def bench_dense(spec: AttentionDenseSpec, *, warmup: int, iters: int, seed: int)
     # correctness vs SDPA (batched, causal/full, GQA repeat).
     rep = Hq // Hkv
     qh = q.transpose(1, 2).float()
-    kh = k.transpose(1, 2).repeat_interleave(rep, 1).float()
-    vh = v.transpose(1, 2).repeat_interleave(rep, 1).float()
+    kh = _kref.transpose(1, 2).repeat_interleave(rep, 1).float()
+    vh = _vref.transpose(1, 2).repeat_interleave(rep, 1).float()
     ref = torch.nn.functional.scaled_dot_product_attention(
         qh, kh, vh, is_causal=causal
     ).transpose(1, 2)
@@ -273,6 +309,10 @@ def _configs(mode: str, Hq: int, Hkv: int, D: int):
                 True,
             )
         )
+    if mode == "paged":
+        # causal paged-KV (Increment 2a): D128 single-seq, the campaign GQA shape.
+        for S in (2048, 4096, 8192):
+            cfgs.append(("paged", "gqa_causal_paged", f"S={S}", S, 1, Hq, Hkv, True))
     return cfgs
 
 
@@ -321,13 +361,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument(
         "--mode",
-        choices=["causal", "mha", "gqa", "full", "swa", "varlen", "persistent", "all"],
+        choices=["causal", "mha", "gqa", "full", "swa", "varlen", "persistent",
+                 "paged", "all"],
         default="all",
     )
     ap.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     ap.add_argument("--hq", type=int, default=128, help="query heads (causal/gqa)")
     ap.add_argument("--hkv", type=int, default=8, help="kv heads (causal/gqa)")
     ap.add_argument("--d", type=int, default=128, help="head size (64 or 128)")
+    ap.add_argument("--block-size", type=int, default=16,
+                    help="paged KV page size (paged mode); power of two, divides block_n")
     ap.add_argument("--iterations", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
@@ -415,6 +458,14 @@ def main() -> int:
                 dtype=args.dtype,
             )
             spec = resolve_dense_spec(req, overrides)
+            if mode == "paged":
+                # dispatch _dense_spec has no paged fields; add them here (paged is an
+                # opt-in direct-entry regime, not dispatcher-routed). persistent is
+                # forced off -- the shared spec rejects paged+persistent.
+                _bs = args.block_size
+                _npages = (S + _bs - 1) // _bs
+                spec = replace(spec, paged=True, block_size=_bs,
+                               num_kv_blocks=_npages * 2, persistent=False)
             if args.dry_run:
                 print(f"{tag}  -> {describe_dense_spec(spec, overrides)}")
                 results.append(rec_for(None, "dry-run (not measured)"))
