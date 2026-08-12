@@ -375,6 +375,11 @@ class Gfx942DenseTuning:
     def resolved_use_exp2_fast(self, spec: AttentionDenseSpec) -> bool:
         """Resolved exp2_fast decision (``None`` -> :func:`_use_exp2_fast`)."""
         if self.use_exp2_fast is None:
+            # Paged sliding-window cohort: exp2_fast is a measured net win here
+            # (+9% bf16, kernel-bound same-run A/B), no spill regression -- unlike the
+            # non-SW bf16-D128 .1k schedule the policy default disables it for.
+            if spec.paged and spec.sliding_window > 0:
+                return True
             return _use_exp2_fast(spec.head_size, spec.dtype)
         return bool(self.use_exp2_fast)
 
@@ -442,8 +447,9 @@ def _tuning_name_tags(spec: AttentionDenseSpec, tuning: "Gfx942DenseTuning") -> 
     e2f = tuning.resolved_use_exp2_fast(spec)
     if e2f != _use_exp2_fast(spec.head_size, spec.dtype):
         parts.append("e2f1" if e2f else "e2f0")
-    if tuning.iglp != _DEFAULT_TUNING.iglp:
-        parts.append("iglp1" if tuning.iglp else "iglp0")
+    _iglp_eff = tuning.iglp or (spec.paged and spec.sliding_window > 0)
+    if _iglp_eff != _DEFAULT_TUNING.iglp:
+        parts.append("iglp1" if _iglp_eff else "iglp0")
     return "".join(f"_{p}" for p in parts)
 
 
@@ -1479,7 +1485,7 @@ def _build_attention_dense_single_buffer(
             l_i = carry[1]
             o_acc = list(carry[2 : 2 + D_TILES])
 
-            if tuning.iglp:
+            if tuning.iglp or (spec.paged and spec.sliding_window > 0):
                 # Runbook lever 7: one canned-scheduler hint at the loop-body top.
                 # Only meaningful on the cfvst path (in-loop ds_write to interleave).
                 b.iglp_opt(0)
