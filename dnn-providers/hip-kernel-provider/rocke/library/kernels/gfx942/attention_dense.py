@@ -447,7 +447,7 @@ def _tuning_name_tags(spec: AttentionDenseSpec, tuning: "Gfx942DenseTuning") -> 
     e2f = tuning.resolved_use_exp2_fast(spec)
     if e2f != _use_exp2_fast(spec.head_size, spec.dtype):
         parts.append("e2f1" if e2f else "e2f0")
-    _iglp_eff = tuning.iglp or (spec.paged and spec.sliding_window > 0)
+    _iglp_eff = tuning.iglp or spec.paged
     if _iglp_eff != _DEFAULT_TUNING.iglp:
         parts.append("iglp1" if _iglp_eff else "iglp0")
     return "".join(f"_{p}" for p in parts)
@@ -1485,9 +1485,12 @@ def _build_attention_dense_single_buffer(
             l_i = carry[1]
             o_acc = list(carry[2 : 2 + D_TILES])
 
-            if tuning.iglp or (spec.paged and spec.sliding_window > 0):
+            if tuning.iglp or spec.paged:
                 # Runbook lever 7: one canned-scheduler hint at the loop-body top.
-                # Only meaningful on the cfvst path (in-loop ds_write to interleave).
+                # Enabled for the whole paged path (causal + sliding-window) -- a
+                # measured net win on the naive paged load path (paged-SW ~+4.5% bf16;
+                # paged-causal reaches ~+13% combined with exp2_fast). Harmless (a
+                # scheduling hint) where it does not help.
                 b.iglp_opt(0)
 
             if USE_CFVST:
