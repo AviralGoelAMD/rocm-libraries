@@ -1541,6 +1541,92 @@ class TestAttentionHelpers(unittest.TestCase):
                 )
             self.assertIs(ok.exception, sentinel)
 
+    def test_gfx950_dense_paged_launcher_validates_block_table_extent(self):
+        """Sync-free EXTENT guard: block_tables must have >= ceil(seqlen_kv/
+        block_size) columns and kv_lens >= batch entries. The kernel reads those
+        block_tables columns mask-TRUE via an unbounded global_load (no SRD, unlike
+        K/V), so an undersized table is a true device OOB -- reject on `.shape`
+        before compile/launch. Host-only (`.shape` only), no torch / GPU."""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import kernels.gfx950.attention_dense as ad
+        from kernels.gfx950.attention_dense import (
+            AttentionDenseSpec,
+            run_attention_dense_torch,
+        )
+
+        spec = AttentionDenseSpec(
+            batch=1,
+            seqlen_q=256,
+            seqlen_kv=256,
+            num_query_heads=32,
+            num_kv_heads=8,
+            head_size=128,
+            causal=True,
+            dtype="fp16",
+            sliding_window=4096,
+            block_n=64,
+            paged=True,
+            block_size=64,
+            num_kv_blocks=512,
+        )
+        # min_cols = ceil(256 / 64) = 4
+        want = (spec.num_kv_blocks, spec.block_size, spec.num_kv_heads, spec.head_size)
+        qshape = (1, spec.seqlen_q, spec.num_query_heads, spec.head_size)
+        q = SimpleNamespace(shape=qshape)
+        out = SimpleNamespace(shape=qshape)
+        k = SimpleNamespace(shape=want)
+        v = SimpleNamespace(shape=want)
+        sentinel = RuntimeError("reached-compile")
+
+        # Negative: too few block_tables columns (3 < 4) -> reject on shape.
+        with self.assertRaises(ValueError) as ctx:
+            run_attention_dense_torch(
+                spec=spec,
+                q=q,
+                k=k,
+                v=v,
+                out=out,
+                scale=1.0,
+                block_tables=SimpleNamespace(shape=(1, 3)),
+                kv_lens=SimpleNamespace(shape=(1,)),
+            )
+        self.assertIn("block_tables extent", str(ctx.exception))
+
+        # Negative: too few kv_lens entries (0 < batch=1) -> reject on shape.
+        with self.assertRaises(ValueError) as kv:
+            run_attention_dense_torch(
+                spec=spec,
+                q=q,
+                k=k,
+                v=v,
+                out=out,
+                scale=1.0,
+                block_tables=SimpleNamespace(shape=(1, 4)),
+                kv_lens=SimpleNamespace(shape=(0,)),
+            )
+        self.assertIn("kv_lens length", str(kv.exception))
+
+        # Positive: adequately-sized table/kv_lens pass the extent gate -> reach
+        # compile (validate_paged=False isolates the sync-free SIZE gate from the
+        # CONTENTS checks).
+        ad._DENSE_LAUNCHER_CACHE.clear()
+        with mock.patch("rocke.helpers.compile.compile_kernel", side_effect=sentinel):
+            with self.assertRaises(RuntimeError) as ok:
+                run_attention_dense_torch(
+                    spec=spec,
+                    q=q,
+                    k=k,
+                    v=v,
+                    out=out,
+                    scale=1.0,
+                    block_tables=SimpleNamespace(shape=(1, 8)),
+                    kv_lens=SimpleNamespace(shape=(1,)),
+                    validate_paged=False,
+                )
+            self.assertIs(ok.exception, sentinel)
+
     def test_attention_3d_workspace_size_matches_shapes(self):
         p = UnifiedAttentionProblem(
             total_q=3,
