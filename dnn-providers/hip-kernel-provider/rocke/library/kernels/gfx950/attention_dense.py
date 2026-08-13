@@ -1947,6 +1947,31 @@ def run_attention_dense_torch(
                     f"[num_kv_blocks, block_size, num_kv_heads, head_size]={want}; "
                     "a mismatch mis-sizes the buffer-resource bound and can read OOB"
                 )
+        # Paged indirection EXTENT guard (sync-free metadata, like the cache shape
+        # guard above). The kernel reads block_tables[0 .. ceil(seqlen_kv/block_size)
+        # - 1] mask-TRUE via a raw global_load -- block_tables has NO buffer-resource
+        # SRD (unlike K/V), so an undersized table is a TRUE device OOB, not the
+        # SRD-contained reads-0 of the cache. The CONTENTS check below slices
+        # block_tables[_i][:_npages], which silently truncates a short row, so the
+        # SIZE must be validated here. Sizes only (`.shape` or `len`) -> no sync.
+        min_cols = (spec.seqlen_kv + spec.block_size - 1) // spec.block_size
+        if hasattr(block_tables, "shape"):
+            bt_rows, bt_cols = int(block_tables.shape[0]), int(block_tables.shape[1])
+        else:  # plain nested sequence (list callers / host tests)
+            bt_rows = len(block_tables)
+            bt_cols = len(block_tables[0]) if bt_rows else 0
+        if bt_rows < spec.batch or bt_cols < min_cols:
+            raise ValueError(
+                f"paged block_tables extent {bt_rows}x{bt_cols} too small; need "
+                f"[batch>={spec.batch}, cols>=ceil(seqlen_kv/block_size)={min_cols}] "
+                "-- the kernel reads all those columns mask-TRUE via an unbounded "
+                "global_load, so a short table reads OOB"
+            )
+        kvl_len = int(kv_lens.shape[0]) if hasattr(kv_lens, "shape") else len(kv_lens)
+        if kvl_len < spec.batch:
+            raise ValueError(
+                f"paged kv_lens length {kvl_len} too small; need >= batch ({spec.batch})"
+            )
         if validate_paged:
             # Physical block-id bounds (a CONTENTS check, unlike the metadata checks
             # above). An entry outside [0, num_kv_blocks) addresses a page outside the
