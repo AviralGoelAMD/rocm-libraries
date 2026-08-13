@@ -518,22 +518,21 @@ def _rows_per_instr(head_size: int) -> int:
 def _use_exp2_fast(head_size: int, dtype: str) -> bool:
     """Whether softmax uses ``exp2_fast`` (one v_exp_f32, no range-reduction guard).
 
-    Enabled everywhere EXCEPT bf16 D128. exp2_fast is a strict VALU reduction and the
-    dominant P2 lever on the (post-P1) VALU-bound path, and is always numerically safe
-    here -- both softmax args (alpha's m_i - m_new and p's s - m_new) are <= 0, exactly
-    exp2_fast's precondition.
+    Enabled for all configs. exp2_fast is a strict VALU reduction and the dominant P2
+    lever on the (post-P1) VALU-bound path, and is always numerically safe here -- both
+    softmax args (alpha's m_i - m_new and p's s - m_new) are <= 0, exactly exp2_fast's
+    precondition.
 
-    bf16 D128 is the sole holdout. Its ``.1k`` MFMA schedule keeps more registers live,
-    and exp2_fast makes the exp result available in one instruction (vs plain exp2's
-    ~5-op range reduction), which the scheduler hoists -- lengthening the exp live
-    ranges. Measured post-fused-rescale (plan §6.1): bf16 D128 goes 175 VGPR / 0 spill
-    (plain exp2) -> 256 VGPR / 22 spill (exp2_fast), over the waves-per-eu=2 cap. The
-    fused rescale freed ~28 VGPR but not enough to absorb that hoist on the .1k path;
-    fp16 D128 (213, cfvst) and bf16 D64 (215) both have the headroom. A bf16 D128
-    exp2_fast unblock is a P3 occupancy/scheduling item. Spill re-verified across the
-    fp16/bf16 x D64/D128 cohort.
+    bf16 D128 was previously the sole holdout. An earlier fused-rescale schedule
+    (plan §6.1) spilled with exp2_fast (175 -> 256 VGPR / 22 spill, over the
+    waves-per-eu=2 cap), so the policy disabled it. The current lazy-rescale schedule
+    does not spill: rocprofv3 register capture on the shipped bf16-D128 causal kernel
+    (GQA 32/8, Sq 1024-16384, both the default and persistent grids) reads 128 VGPR
+    plain -> 48 VGPR with exp2_fast, 0 scratch, numerically identical to plain exp2.
+    The holdout is therefore stale and removed. (The stale numbers were measured
+    against the pre-lazy-rescale body; the register profile has since changed sign.)
     """
-    return dtype == "fp16" or head_size != 128
+    return True
 
 
 def _use_cfvst(head_size: int, dtype: str) -> bool:
