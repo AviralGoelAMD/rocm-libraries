@@ -84,7 +84,9 @@ jobs:
             5. WRITE the complete markdown report to `rocke-review.md` in the repo root,
                beginning with `## 🤖 rocKE PR Review` and a one-line PR stat header
                (`**PR #N** · <k> files · +a/-b`). Do not post it; end your turn with a
-               one-line confirmation only.
+               one-line confirmation only. If writing the file fails for any reason,
+               emit the COMPLETE report (from the `## 🤖 rocKE PR Review` header onward)
+               as your final message so it can be recovered.
 
       - name: Post review with token usage
         if: always()
@@ -96,8 +98,13 @@ jobs:
         run: |
           set -uo pipefail
           BODY=rocke-review.md
-          if [ ! -f "$BODY" ]; then
-            printf '## 🤖 rocKE PR Review — no report produced\nThe reviewer did not write `rocke-review.md`; see the Actions log for this run.\n' > "$BODY"
+          # Prefer the file Claude wrote; if absent/empty, recover the report from the
+          # action's execution file (Claude may have emitted it inline instead).
+          if [ ! -s "$BODY" ] && [ -n "${EXEC:-}" ] && [ -f "$EXEC" ]; then
+            jq -r '[.[] | select(.type=="result")][-1].result // empty' "$EXEC" > "$BODY" 2>/dev/null || true
+          fi
+          if [ ! -s "$BODY" ]; then
+            printf '## 🤖 rocKE PR Review — no report produced\nThe reviewer produced no report; see the Actions log for this run.\n' > "$BODY"
           fi
           if [ -n "${EXEC:-}" ] && [ -f "$EXEC" ]; then
             echo "::group::claude result object (for token-field confirmation)"
