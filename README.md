@@ -127,3 +127,4 @@ Be sure to check out the [hipblaslt runtime error triage checklist](./docs/hipbl
 for a detailed step-by-step process for identifying and reporting runtime errors so we have all of the
 information necessary to help resolve the issue quickly. While this checklist is specific to hipblaslt
 the same process is generally applicable to other rocm-libraries components.
+<!-- rocke-review negative test: non-rocke change -->
