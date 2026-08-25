@@ -6,6 +6,10 @@ on:
     paths:
       - "dnn-providers/hip-kernel-provider/**"
 
+
+permissions:
+  contents: read
+  pull-requests: write
 jobs:
   review:
     uses: ./.github/workflows/reusable-reviewer.yml
