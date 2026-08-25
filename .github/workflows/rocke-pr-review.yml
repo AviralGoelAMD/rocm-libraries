@@ -49,6 +49,7 @@ jobs:
           anthropic_api_key: dummy
           claude_args: >-
             --model Claude-Sonnet-4.6
+            --max-turns 80
             --allowedTools "Read,Write,Task,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(cat:*),Bash(sed:*),Bash(grep:*),Bash(ls:*)"
           prompt: |
             REPO: ${{ github.repository }}
@@ -69,24 +70,30 @@ jobs:
             1. Get the diff: `gh pr diff ${{ github.event.pull_request.number }}`.
                Read the precedent files each hunk touches, and the C++ twin of any
                changed selector/spec/lowering (GF1: C++ is live).
-            2. Fan out ONE subagent per section A–I via the Task tool, in parallel.
-               Each subagent grades EVERY item in its section with a verdict
-               (PASS | FAIL | N/A) and evidence — file:line for PASS/FAIL, a one-line
-               reason for N/A — and returns a table plus `graded X/Y` where X==Y.
-               No agent grades more than its one section (this is what defeats the skim).
-            3. If the diff is paged/indirection code, the §H subagent MUST first produce
-               the trace table: one row per device-side mask/bound =
-               (extent source) vs (compile-time visited range), and whether they agree.
-            4. Aggregate: concatenate the per-section tables verbatim, then a rollup —
+            2. Grade ALL nine sections A–I. You SHOULD use the Task tool to run
+               sections concurrently — but Task subagents return SYNCHRONOUSLY: you
+               receive each subagent's result inside THIS same session. Never treat them
+               as background jobs, never "wait" for them, and never emit a progress or
+               status message. Each section subagent grades EVERY item in its section
+               with a verdict (PASS | FAIL | N/A) and evidence — file:line for PASS/FAIL,
+               a one-line reason for N/A — and MUST WRITE its finished table to
+               `.rocke-review/section-<X>.md` (X = A..I), starting with a heading
+               `## <X>. <title> — graded <n>/<n>`. No agent grades more than its section.
+            3. If the diff is paged/indirection code, the §H subagent MUST put the trace
+               table (one row per device-side mask/bound = (extent source) vs
+               (compile-time visited range) and whether they agree) at the top of
+               `.rocke-review/section-H.md`.
+            4. After ALL nine section files exist, aggregate them: concatenate
+               `.rocke-review/section-A.md` … `section-I.md` in order, then a rollup —
                total graded/total, findings sorted BLOCKER > HIGH > MEDIUM > LOW each as
                `§item · file:line · fix`, and a final verdict PASS/FAIL (any BLOCKER or
                ungraded item => FAIL).
-            5. WRITE the complete markdown report to `rocke-review.md` in the repo root,
-               beginning with `## 🤖 rocKE PR Review` and a one-line PR stat header
-               (`**PR #N** · <k> files · +a/-b`). Do not post it; end your turn with a
-               one-line confirmation only. If writing the file fails for any reason,
-               emit the COMPLETE report (from the `## 🤖 rocKE PR Review` header onward)
-               as your final message so it can be recovered.
+            5. WRITE the assembled report to `rocke-review.md` in the repo root, starting
+               with `## 🤖 rocKE PR Review` and a one-line PR stat header
+               (`**PR #N** · <k> files · +a/-b`). Do NOT end your turn until
+               `rocke-review.md` exists and is non-empty; your ONLY final message is a
+               one-line confirmation AFTER the file is written. Never end on a progress
+               update or a "waiting for sections" message.
 
       - name: Post review with token usage
         if: always()
@@ -98,8 +105,16 @@ jobs:
         run: |
           set -uo pipefail
           BODY=rocke-review.md
-          # Prefer the file Claude wrote; if absent/empty, recover the report from the
-          # action's execution file (Claude may have emitted it inline instead).
+          # 1) Prefer the assembled report Claude wrote.
+          # 2) Else assemble from any per-section files the subagents wrote.
+          if [ ! -s "$BODY" ] && ls .rocke-review/section-*.md >/dev/null 2>&1; then
+            {
+              echo "## 🤖 rocKE PR Review (assembled from section files)"
+              echo "**PR #${PR}**"
+              for f in $(ls .rocke-review/section-*.md | sort); do echo; cat "$f"; done
+            } > "$BODY"
+          fi
+          # 3) Else recover Claude's inline final message from the execution file.
           if [ ! -s "$BODY" ] && [ -n "${EXEC:-}" ] && [ -f "$EXEC" ]; then
             jq -r '[.[] | select(.type=="result")][-1].result // empty' "$EXEC" > "$BODY" 2>/dev/null || true
           fi
