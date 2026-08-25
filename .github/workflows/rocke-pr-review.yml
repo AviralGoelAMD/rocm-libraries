@@ -1,7 +1,7 @@
 name: rocKE PR Review
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, reopened]
     paths:
       - "dnn-providers/hip-kernel-provider/**"
 
@@ -144,4 +144,14 @@ jobs:
           else
             printf '\n---\n_token usage unavailable (no execution file from the action)_\n' >> "$BODY"
           fi
-          gh pr comment "$PR" --repo "$REPO" --body-file "$BODY"
+          MARKER='<!-- rocke-pr-review-bot -->'
+          { printf '%s\n' "$MARKER"; cat "$BODY"; } > .rocke-post.md
+          EXISTING=$(gh api "repos/$REPO/issues/$PR/comments" --paginate --jq "[.[] | select(.body | contains(\"$MARKER\"))][0].id // empty")
+          if [ -n "$EXISTING" ]; then
+            jq -n --rawfile b .rocke-post.md '{body:$b}' > .rocke-patch.json
+            gh api --method PATCH "repos/$REPO/issues/comments/$EXISTING" --input .rocke-patch.json --jq '.id' >/dev/null
+            echo "updated sticky comment $EXISTING"
+          else
+            gh pr comment "$PR" --repo "$REPO" --body-file .rocke-post.md
+            echo "created new sticky comment"
+          fi
