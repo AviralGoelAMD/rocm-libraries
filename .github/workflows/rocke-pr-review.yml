@@ -19,12 +19,24 @@ jobs:
             dnn-providers/hip-kernel-provider
             .github
 
-      - name: Stage rocKE review assets (skill + live checklist, off-repo)
+      - name: Stage rocKE review assets (private guidance repo; local-vault fallback)
+        env:
+          GUIDANCE_REPO: AviralGoelAMD/rocke-review-guidance
+          GUIDANCE_REPO_TOKEN: ${{ secrets.GUIDANCE_REPO_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p .rocke-review
-          cp /home/AMD/avirgoel/.omp/agent/skills/rocke-pr-review/SKILL.md .rocke-review/SKILL.md
-          cp /home/AMD/avirgoel/rockKE/vault/wiki/rockKE/rocke-pr-review-checklist.md .rocke-review/checklist.md
+          if [ -n "${GUIDANCE_REPO_TOKEN:-}" ]; then
+            echo "staging from private guidance repo: $GUIDANCE_REPO"
+            git clone --depth 1 "https://x-access-token:${GUIDANCE_REPO_TOKEN}@github.com/${GUIDANCE_REPO}.git" .rocke-guidance
+            cp .rocke-guidance/SKILL.md .rocke-review/SKILL.md
+            cp .rocke-guidance/rocke-pr-review-checklist.md .rocke-review/checklist.md
+            rm -rf .rocke-guidance
+          else
+            echo "GUIDANCE_REPO_TOKEN not set; falling back to local vault"
+            cp /home/AMD/avirgoel/.omp/agent/skills/rocke-pr-review/SKILL.md .rocke-review/SKILL.md
+            cp /home/AMD/avirgoel/rockKE/vault/wiki/rockKE/rocke-pr-review-checklist.md .rocke-review/checklist.md
+          fi
           echo "staged: $(wc -l < .rocke-review/checklist.md) checklist lines"
 
       - id: review
