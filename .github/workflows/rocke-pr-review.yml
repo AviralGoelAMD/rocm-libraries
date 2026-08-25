@@ -1,0 +1,113 @@
+name: rocKE PR Review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "dnn-providers/hip-kernel-provider/**"
+
+jobs:
+  rocke-review:
+    runs-on: [self-hosted]
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            dnn-providers/hip-kernel-provider
+            .github
+
+      - name: Stage rocKE review assets (skill + live checklist, off-repo)
+        run: |
+          set -euo pipefail
+          mkdir -p .rocke-review
+          cp /home/AMD/avirgoel/.omp/agent/skills/rocke-pr-review/SKILL.md .rocke-review/SKILL.md
+          cp /home/AMD/avirgoel/rockKE/vault/wiki/rockKE/rocke-pr-review-checklist.md .rocke-review/checklist.md
+          echo "staged: $(wc -l < .rocke-review/checklist.md) checklist lines"
+
+      - id: review
+        uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: https://llm-api.amd.com/Anthropic
+          ANTHROPIC_CUSTOM_HEADERS: "Ocp-Apim-Subscription-Key: ${{ secrets.LLM_GATEWAY_KEY }}"
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          anthropic_api_key: dummy
+          claude_args: >-
+            --model Claude-Sonnet-4.6
+            --allowedTools "Read,Write,Task,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(cat:*),Bash(sed:*),Bash(grep:*),Bash(ls:*)"
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            You are the rocKE PR reviewer running in CI. Do the full review and WRITE
+            the result to a file. This is an automated trigger: do NOT ask for
+            confirmation, and do NOT post any PR comment yourself — a later workflow
+            step posts the report.
+
+            Follow the rocKE PR-review skill EXACTLY. Read these two files first:
+              SKILL:     .rocke-review/SKILL.md
+              CHECKLIST: .rocke-review/checklist.md
+            The checklist is the LIVE source of truth. Parse its `## <A-I>. <title>`
+            section headers and every `- [ ]` item; count items per section (Y).
+
+            Process (per the skill):
+            1. Get the diff: `gh pr diff ${{ github.event.pull_request.number }}`.
+               Read the precedent files each hunk touches, and the C++ twin of any
+               changed selector/spec/lowering (GF1: C++ is live).
+            2. Fan out ONE subagent per section A–I via the Task tool, in parallel.
+               Each subagent grades EVERY item in its section with a verdict
+               (PASS | FAIL | N/A) and evidence — file:line for PASS/FAIL, a one-line
+               reason for N/A — and returns a table plus `graded X/Y` where X==Y.
+               No agent grades more than its one section (this is what defeats the skim).
+            3. If the diff is paged/indirection code, the §H subagent MUST first produce
+               the trace table: one row per device-side mask/bound =
+               (extent source) vs (compile-time visited range), and whether they agree.
+            4. Aggregate: concatenate the per-section tables verbatim, then a rollup —
+               total graded/total, findings sorted BLOCKER > HIGH > MEDIUM > LOW each as
+               `§item · file:line · fix`, and a final verdict PASS/FAIL (any BLOCKER or
+               ungraded item => FAIL).
+            5. WRITE the complete markdown report to `rocke-review.md` in the repo root,
+               beginning with `## 🤖 rocKE PR Review` and a one-line PR stat header
+               (`**PR #N** · <k> files · +a/-b`). Do not post it; end your turn with a
+               one-line confirmation only.
+
+      - name: Post review with token usage
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          EXEC: ${{ steps.review.outputs.execution_file }}
+        run: |
+          set -uo pipefail
+          BODY=rocke-review.md
+          if [ ! -f "$BODY" ]; then
+            printf '## 🤖 rocKE PR Review — no report produced\nThe reviewer did not write `rocke-review.md`; see the Actions log for this run.\n' > "$BODY"
+          fi
+          if [ -n "${EXEC:-}" ] && [ -f "$EXEC" ]; then
+            echo "::group::claude result object (for token-field confirmation)"
+            jq -c '[.[] | select(.type=="result")][-1]' "$EXEC" 2>/dev/null || echo "(could not parse $EXEC)"
+            echo "::endgroup::"
+            STATS=$(jq -r '
+              ([.[] | select(.type=="result")][-1]) as $r
+              | (($r.modelUsage // {}) | [.[]]) as $m
+              | (( [$m[] | (.inputTokens  // .input_tokens  // 0)] | add ) // ($r.usage.input_tokens  // 0)) as $in
+              | (( [$m[] | (.outputTokens // .output_tokens // 0)] | add ) // ($r.usage.output_tokens // 0)) as $out
+              | (( [$m[] | ((.cacheReadInputTokens // 0) + (.cacheCreationInputTokens // 0))] | add ) // 0) as $cache
+              | "\($in) \($out) \($cache) \($r.total_cost_usd // 0)"' "$EXEC" 2>/dev/null || echo "0 0 0 0")
+            set -- $STATS
+            IN=${1:-0}; OUT=${2:-0}; CACHE=${3:-0}; COST=${4:-0}
+            TOTAL=$(( IN + OUT + CACHE ))
+            {
+              printf '\n---\n'
+              printf '**Token usage** (Claude-Sonnet-4.6 via AMD LLM gateway): input %s · output %s · cache %s · **total %s**' "$IN" "$OUT" "$CACHE" "$TOTAL"
+              if [ "$COST" != "0" ] && [ "$COST" != "null" ]; then printf ' · est. $%s' "$COST"; fi
+              printf '\n'
+            } >> "$BODY"
+          else
+            printf '\n---\n_token usage unavailable (no execution file from the action)_\n' >> "$BODY"
+          fi
+          gh pr comment "$PR" --repo "$REPO" --body-file "$BODY"
