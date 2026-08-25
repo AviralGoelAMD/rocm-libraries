@@ -1,0 +1,182 @@
+name: Reusable PR Reviewer
+# Library-agnostic review engine. Callers pass their paths (in their own
+# `on.pull_request.paths`), their private guidance repo, and a unique sticky marker.
+# All library-specific rules live in the guidance repo's SKILL.md + checklist.md —
+# NOT here.
+on:
+  workflow_call:
+    inputs:
+      review_title:
+        description: "Heading for the posted report (e.g. 'rocKE PR Review')."
+        type: string
+        default: "PR Review"
+      guidance_repo:
+        description: "owner/repo of the PRIVATE guidance repo holding SKILL.md + checklist.md."
+        type: string
+        required: true
+      comment_marker:
+        description: "Unique hidden HTML marker for this library's sticky comment (e.g. '<!-- rocke-review-bot -->')."
+        type: string
+        required: true
+      model:
+        type: string
+        default: "Claude-Sonnet-4.6"
+      max_turns:
+        type: string
+        default: "80"
+      runner_label:
+        description: "Self-hosted runner label with AMD-network (gateway) access."
+        type: string
+        default: "self-hosted"
+      sparse_checkout:
+        description: "Newline-separated sparse-checkout paths; empty = full checkout."
+        type: string
+        default: ""
+      gateway_base_url:
+        type: string
+        default: "https://llm-api.amd.com/Anthropic"
+    secrets:
+      LLM_GATEWAY_KEY:
+        description: "AMD LLM gateway subscription key (Ocp-Apim-Subscription-Key)."
+        required: true
+      GUIDANCE_REPO_TOKEN:
+        description: "Fine-grained, READ-ONLY PAT scoped to THIS library's guidance repo only."
+        required: true
+
+jobs:
+  review:
+    runs-on: ${{ inputs.runner_label }}
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: ${{ inputs.sparse_checkout }}
+
+      - name: Stage review guidance (private repo, read-only)
+        env:
+          GUIDANCE_REPO: ${{ inputs.guidance_repo }}
+          GUIDANCE_REPO_TOKEN: ${{ secrets.GUIDANCE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -rf .review-assets .review-guidance
+          mkdir -p .review-assets
+          git clone --depth 1 "https://x-access-token:${GUIDANCE_REPO_TOKEN}@github.com/${GUIDANCE_REPO}.git" .review-guidance
+          cp .review-guidance/SKILL.md .review-assets/SKILL.md
+          if [ -f .review-guidance/checklist.md ]; then
+            cp .review-guidance/checklist.md .review-assets/checklist.md
+          else
+            cp "$(ls .review-guidance/*checklist*.md | head -1)" .review-assets/checklist.md
+          fi
+          rm -rf .review-guidance
+          echo "staged from $GUIDANCE_REPO: $(wc -l < .review-assets/checklist.md) checklist lines"
+
+      - id: review
+        uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ inputs.gateway_base_url }}
+          ANTHROPIC_CUSTOM_HEADERS: "Ocp-Apim-Subscription-Key: ${{ secrets.LLM_GATEWAY_KEY }}"
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          anthropic_api_key: dummy
+          claude_args: >-
+            --model ${{ inputs.model }}
+            --max-turns ${{ inputs.max_turns }}
+            --allowedTools "Read,Write,Task,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(cat:*),Bash(sed:*),Bash(grep:*),Bash(ls:*)"
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            You are an automated PR reviewer running in CI. Do the full review and WRITE
+            the result to a file. Automated trigger: do NOT ask for confirmation and do
+            NOT post any PR comment yourself — a later step posts it.
+
+            Read these two files first and follow the skill EXACTLY:
+              SKILL:     .review-assets/SKILL.md
+              CHECKLIST: .review-assets/checklist.md
+            The checklist is the LIVE source of truth. Parse its section headers (lines
+            beginning `## `) and every `- [ ]` item under them; count items per section (Y).
+
+            Process:
+            1. Get the diff: `gh pr diff ${{ github.event.pull_request.number }}`. Read the
+               precedent files each hunk touches, plus any mirror/twin files the SKILL
+               tells you to check.
+            2. Grade ALL sections. Use the Task tool to run sections concurrently — Task
+               subagents return SYNCHRONOUSLY (you receive each result in THIS session);
+               never treat them as background, never "wait", never emit a progress or
+               status message. Each section subagent grades EVERY item with a verdict
+               (PASS | FAIL | N/A) and evidence (file:line for PASS/FAIL, a one-line reason
+               for N/A), and MUST WRITE its finished table to `.review-assets/section-<k>.md`
+               starting with a heading `## <section title> — graded <n>/<n>`. No agent
+               grades more than one section.
+            3. Follow any section-specific procedures the SKILL defines (e.g. a required
+               trace table) before grading those sections.
+            4. After ALL section files exist, aggregate them in order, then a rollup: total
+               graded/total, findings sorted BLOCKER > HIGH > MEDIUM > LOW as
+               `item · file:line · fix`, and a final verdict PASS/FAIL (any BLOCKER or
+               ungraded item => FAIL).
+            5. WRITE the assembled report to `review.md` in the repo root, starting with
+               `## 🤖 ${{ inputs.review_title }}` and a one-line PR stat header
+               (`**PR #N** · <k> files · +a/-b`). Do NOT end your turn until `review.md`
+               exists and is non-empty; your ONLY final message is a one-line confirmation
+               AFTER the file is written. Never end on a progress update.
+
+      - name: Post sticky review comment with token usage
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          EXEC: ${{ steps.review.outputs.execution_file }}
+          MARKER: ${{ inputs.comment_marker }}
+          TITLE: ${{ inputs.review_title }}
+        run: |
+          set -uo pipefail
+          BODY=review.md
+          # 1) Prefer the assembled report; 2) else assemble per-section files;
+          # 3) else recover Claude's inline final message; 4) else a failure note.
+          if [ ! -s "$BODY" ] && ls .review-assets/section-*.md >/dev/null 2>&1; then
+            {
+              echo "## 🤖 ${TITLE} (assembled from section files)"
+              echo "**PR #${PR}**"
+              for f in $(ls .review-assets/section-*.md | sort); do echo; cat "$f"; done
+            } > "$BODY"
+          fi
+          if [ ! -s "$BODY" ] && [ -n "${EXEC:-}" ] && [ -f "$EXEC" ]; then
+            jq -r '[.[] | select(.type=="result")][-1].result // empty' "$EXEC" > "$BODY" 2>/dev/null || true
+          fi
+          if [ ! -s "$BODY" ]; then
+            printf '## 🤖 %s — no report produced\nThe reviewer produced no report; see the Actions log.\n' "$TITLE" > "$BODY"
+          fi
+          # token usage footer
+          if [ -n "${EXEC:-}" ] && [ -f "$EXEC" ]; then
+            STATS=$(jq -r '
+              ([.[] | select(.type=="result")][-1]) as $r
+              | (($r.modelUsage // {}) | [.[]]) as $m
+              | (( [$m[] | (.inputTokens  // .input_tokens  // 0)] | add ) // ($r.usage.input_tokens  // 0)) as $in
+              | (( [$m[] | (.outputTokens // .output_tokens // 0)] | add ) // ($r.usage.output_tokens // 0)) as $out
+              | (( [$m[] | ((.cacheReadInputTokens // 0) + (.cacheCreationInputTokens // 0))] | add ) // 0) as $cache
+              | "\($in) \($out) \($cache) \($r.total_cost_usd // 0)"' "$EXEC" 2>/dev/null || echo "0 0 0 0")
+            set -- $STATS
+            IN=${1:-0}; OUT=${2:-0}; CACHE=${3:-0}; COST=${4:-0}
+            TOTAL=$(( IN + OUT + CACHE ))
+            {
+              printf '\n---\n'
+              printf '**Token usage** (%s via AMD LLM gateway): input %s · output %s · cache %s · **total %s**' "${{ inputs.model }}" "$IN" "$OUT" "$CACHE" "$TOTAL"
+              if [ "$COST" != "0" ] && [ "$COST" != "null" ]; then printf ' · est. $%s' "$COST"; fi
+              printf '\n'
+            } >> "$BODY"
+          fi
+          # sticky upsert: one comment per library, keyed by the marker
+          { printf '%s\n' "$MARKER"; cat "$BODY"; } > .review-post.md
+          EXISTING=$(gh api "repos/$REPO/issues/$PR/comments" --paginate --jq "[.[] | select(.body | contains(\"$MARKER\"))][0].id // empty")
+          if [ -n "$EXISTING" ]; then
+            jq -n --rawfile b .review-post.md '{body:$b}' > .review-patch.json
+            gh api --method PATCH "repos/$REPO/issues/comments/$EXISTING" --input .review-patch.json --jq '.id' >/dev/null
+            echo "updated sticky comment $EXISTING"
+          else
+            gh pr comment "$PR" --repo "$REPO" --body-file .review-post.md
+            echo "created new sticky comment"
+          fi
