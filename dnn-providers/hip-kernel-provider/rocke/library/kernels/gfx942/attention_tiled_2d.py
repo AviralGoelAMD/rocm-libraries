@@ -5910,11 +5910,14 @@ def build_gfx942_4warp_gqa(
             b.mod(col, b.const_i32(8)),
         )
 
-    # fp16 swizzle-hoist: precompute the LDS swizzle columns once per lane (buf_off drops
-    # out - it is 0 mod 16 - so swz depends only on key/col) instead of recomputing swz()
-    # on every K/V store and read. fp16-only: trims ~12 VGPR + ~6% wall-clock; bf16 regresses
-    # (spills at the 256-VGPR cap), so bf16 keeps the byte-identical per-access swz path.
-    _SWZH = HD128_PIPE and spec.dtype == "fp16"
+    # LDS swizzle-hoist: precompute the bank-swizzle columns once per lane instead
+    # of recomputing swz() (div/mod/xor/mul/add integer VALU) on every K/V store
+    # and read. Enabled for bf16 as well as fp16: this cohort is the small-tile
+    # BN=32 wide-flash path (HD128_PIPE => BS<=32), whose register pressure leaves
+    # headroom for the precomputed columns (the earlier bf16 spill concern was for
+    # larger tiles this path never uses). buf_off is 0 mod 16 so swz depends only
+    # on key/col, letting the columns be hoisted out of the tile loop.
+    _SWZH = HD128_PIPE and spec.dtype in ("fp16", "bf16")
     SWZ_ST, SWZ_K, SWZ_V = [], {}, {}
     if _SWZH:
         _mia = ld.m_in_atom
@@ -6060,12 +6063,16 @@ def build_gfx942_4warp_gqa(
             for i in range(CPL):
                 local = b.fmax(local, b.fmul(Sm[kt][i], sc))
         m_new = b.fmax(m_old, b.fmax(local, bperm(local)))
-        alpha = b.exp2(b.fsub(m_old, m_new))
+        # exp2_fast is safe here: the argument (m_old - m_new) is <= 0 by the
+        # running-max invariant, so the exp2 overflow/underflow range-reduction
+        # guard is unnecessary and v_exp_f32 flushes the tail correctly.
+        alpha = b.exp2_fast(b.fsub(m_old, m_new))
         P = [[None] * CPL for _ in range(NKEYT)]
         lsum = zf
         for kt in range(NKEYT):
             for i in range(CPL):
-                p = b.exp2(b.fsub(b.fmul(Sm[kt][i], sc), m_new))
+                # exp2_fast: (Sm*sc - m_new) <= 0 (running max), guard not needed.
+                p = b.exp2_fast(b.fsub(b.fmul(Sm[kt][i], sc), m_new))
                 lsum = b.fadd(lsum, p)
                 P[kt][i] = b.cast_f32_to(p, dtype)
         l_new = b.fadd(b.fmul(l_old, alpha), b.fadd(lsum, bperm(lsum)))
