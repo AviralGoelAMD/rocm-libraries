@@ -3711,6 +3711,23 @@ class _Lowerer:
             f"i32 {dpp_ctrl}, i32 15, i32 15, i1 true)"
         )
 
+    def _op_tile_quad_perm(self, op: Op) -> None:
+        """``v_mov_b32_dpp`` quad_perm (VALU, not LDS). ``dpp_ctrl`` is the
+        8-bit quad-permute encoding (0x00-0xFF): lane ``4q+i`` reads lane
+        ``4q + ((ctrl >> 2i) & 3)``. Base-DPP, present on gfx9/CDNA (unlike
+        the RDNA ``row_xmask``/``dpp8``). ``row_mask``/``bank_mask`` = 0xF,
+        ``bound_ctrl=true``; passing ``src`` as ``old`` lets the DPP-combine
+        pass fuse a single-use result into ``v_add_f32_dpp``.
+        """
+        (data,) = op.operands
+        self._need("update.dpp.i32")
+        ctrl = int(op.attrs["ctrl"]) & 0xFF
+        self._current().emit(
+            f"  {op.result.name} = call i32 @llvm.amdgcn.update.dpp.i32("
+            f"i32 {self._operand(data)}, i32 {self._operand(data)}, "
+            f"i32 {ctrl}, i32 15, i32 15, i1 true)"
+        )
+
     def _op_tile_ds_swizzle_xor(self, op: Op) -> None:
         """``ds_swizzle_b32`` with XOR butterfly via SWAP-mode encoding.
 

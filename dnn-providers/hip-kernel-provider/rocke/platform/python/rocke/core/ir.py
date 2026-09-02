@@ -2753,6 +2753,50 @@ class IRBuilder:
             result_name_hint="dppx",
         ).result
 
+    def quad_perm(self, data: Value, perm) -> Value:
+        """``v_mov_b32_dpp`` ``quad_perm:[p0,p1,p2,p3]`` — intra-quad (4-lane)
+        permute on the **VALU** (NOT the LDS port). Lane ``4q + i`` reads
+        ``data`` from lane ``4q + perm[i]``.
+
+        Unlike :meth:`dpp_xor` (RDNA-only ``row_xmask``) and :meth:`mov_dpp8`
+        (RDNA-only ``dpp8``), quad_perm is base-DPP present on gfx9/CDNA
+        (incl. gfx942/gfx950), so it is the no-LDS cross-lane primitive for
+        the ``ds_swizzle`` xor-1/xor-2 reduction stages on CDNA. Lowered
+        through ``llvm.amdgcn.update.dpp.i32`` with ``dpp_ctrl =
+        p0|p1<<2|p2<<4|p3<<6`` (0x00-0xFF). Data must be ``i32``."""
+        perm = list(perm)
+        if len(perm) != 4 or any(not (0 <= p <= 3) for p in perm):
+            raise ValueError(f"quad_perm perm must be 4 values in 0..3, got {perm}")
+        if data.type.name != "i32":
+            raise ValueError("quad_perm requires i32 data")
+        ctrl = perm[0] | (perm[1] << 2) | (perm[2] << 4) | (perm[3] << 6)
+        return self._op(
+            "tile.quad_perm",
+            [data],
+            [I32],
+            attrs={"ctrl": int(ctrl)},
+            result_name_hint="qperm",
+        ).result
+
+    def warp_shuffle_xor_quad(self, v: Value, xor_mask: int) -> Value:
+        """f32/i32 XOR shuffle within a 4-lane quad via :meth:`quad_perm`
+        (CDNA VALU, no LDS). ``xor_mask`` must be 1 or 2 (stays in-quad);
+        for larger masks use :meth:`warp_shuffle_xor` (``ds_swizzle``).
+        Handles f32 by bitcasting through i32."""
+        if xor_mask == 1:
+            perm = [1, 0, 3, 2]
+        elif xor_mask == 2:
+            perm = [2, 3, 0, 1]
+        else:
+            raise ValueError(
+                f"warp_shuffle_xor_quad supports xor_mask 1 or 2, got {xor_mask}"
+            )
+        if v.type.name == "f32":
+            return self.bitcast(self.quad_perm(self.bitcast(v, I32), perm), F32)
+        if v.type.name == "i32":
+            return self.quad_perm(v, perm)
+        raise ValueError(f"warp_shuffle_xor_quad: unsupported type {v.type.name}")
+
     def ds_bpermute_b64(self, addr: Value, data: Value) -> Value:
         """Packed 64-bit ``ds_bpermute`` — single LDS op for paired
         ``(val, idx)`` cross-lane shuffles (gfx9+).
