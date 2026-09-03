@@ -88,6 +88,18 @@ Coverage: fp16 / bf16, head_size in `{64, 128, 256}`, block_size in `{16, 64}`, 
 
 FP8 K/V cache + output scale/clamp is wired through `UnifiedAttentionProblem.use_fp8` (the kernel takes per-tensor `k_scale` / `v_scale` and stores the cache as `fp8e4m3`); see attention parity README.
 
+## Linear Attention Family
+
+| File | Spec | Doc |
+|-----------------------------------|-------------------------------------------------------------------|------------------------------|
+| `gdn_decode.py` | `GdnDecodeSpec` (gated delta rule; single-token decode over a paged recurrent state) | `instances/gdn_decode.md` |
+
+Runtime entry point: `dispatch_gdn_decode(GdnDecodeRequest(...))`.
+
+Linear attention carries a fixed-size recurrent state per value head instead of re-reading past tokens, so cost per token does not grow with sequence length. Decode only (one token per sequence); gfx950.
+
+Tile selection is tuned per decode batch band, because the knob that splits a head's value dimension across workgroups buys occupancy at small batch and costs overhead at large batch.
+
 ## Small Ops
 
 | File | Spec | Doc |

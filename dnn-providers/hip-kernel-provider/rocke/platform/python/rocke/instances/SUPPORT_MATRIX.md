@@ -91,6 +91,13 @@ These emit generic AMDGPU IR; arch only sets the comgr target triple.
 
 ---
 
+## Linear attention / recurrent-state decode
+
+| Instance | gfx942 | gfx950 | gfx1151 | Notes |
+|---|:--:|:--:|:--:|---|
+| `gdn_decode` | ❌ | ✅ | ❌ | gated delta rule, single-token decode over a paged recurrent state; no softmax |
+---
+
 ## Arch-specific native instances
 
 | Instance | gfx942 | gfx950 | gfx1151 | Notes |
@@ -142,3 +149,11 @@ These emit generic AMDGPU IR; arch only sets the comgr target triple.
 - gfx942/gfx950 cells use a portable f16 16x16x16 config; an instance marked ❌
   for a CDNA arch lacks the specific atom that config selects (e.g. `mfma_gemm`
   and `direct_conv_16c` need the CDNA4 16x16x32 atom absent on gfx942).
+- **`gdn_decode` is gfx950-only by registration, not by capability.** The kernel
+  itself is arch-neutral SSA and its validator accepts any target whose
+  `max_threads_per_block` fits the chosen tiling; the ❌ cells mean no candidate
+  is registered for those arches and the tile table has only been measured on
+  gfx950. Adding an arch is a new module under `library/dispatch/gdn/` plus a
+  tuning run, not a kernel change. This instance is GPU-numeric-verified on
+  gfx950 against an fp32 reference, covering both the output and the in-place
+  recurrent-state update.
