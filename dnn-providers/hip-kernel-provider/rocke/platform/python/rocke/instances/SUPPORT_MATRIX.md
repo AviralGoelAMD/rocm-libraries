@@ -106,7 +106,7 @@ as described in the notes.
 
 | Instance | gfx942 | gfx950 | gfx1151 | Notes |
 |---|:--:|:--:|:--:|---|
-| `gdn_decode` | ❌ | ✅ | ❌ | gated delta rule, single-token decode over a paged recurrent state; no softmax |
+| `gdn_decode` | ✅ | ✅ | ❌ | gated delta rule, single-token decode over a paged recurrent state; no softmax |
 ---
 
 ## Arch-specific native instances
@@ -168,11 +168,14 @@ as described in the notes.
 - gfx942/gfx950 cells use a portable f16 16x16x16 config; an instance marked ❌
   for a CDNA arch lacks the specific atom that config selects (e.g. `mfma_gemm`
   and `direct_conv_16c` need the CDNA4 16x16x32 atom absent on gfx942).
-- **`gdn_decode` is gfx950-only by registration, not by capability.** The kernel
-  itself is arch-neutral SSA and its validator accepts any target whose
-  `max_threads_per_block` fits the chosen tiling; the ❌ cells mean no candidate
-  is registered for those arches and the tile table has only been measured on
-  gfx950. Adding an arch is a new module under `library/dispatch/gdn/` plus a
-  tuning run, not a kernel change. This instance is GPU-numeric-verified on
-  gfx950 against an fp32 reference, covering both the output and the in-place
-  recurrent-state update.
+- **`gdn_decode` is registered for gfx942 and gfx950.** The kernel itself is
+  arch-neutral SSA and its validator accepts any target whose
+  `max_threads_per_block` fits the chosen tiling, so an arch is added by a new
+  module under `library/dispatch/gdn/` plus a tuning run, not by a kernel
+  change — which is exactly how gfx942 was added. Each arch carries its **own
+  measured tile table**; the tables are not interchangeable, because the bands
+  encode CU count and occupancy. This instance is GPU-numeric-verified on
+  **both** arches against an fp32 reference, covering the output and the
+  in-place recurrent-state update separately (the bf16 state write carries
+  far larger absolute error than the output, so a combined bound would hide
+  both). A remaining ❌ cell means no candidate is registered for that arch.

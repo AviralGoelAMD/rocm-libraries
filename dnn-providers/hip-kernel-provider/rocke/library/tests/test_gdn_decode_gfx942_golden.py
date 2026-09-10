@@ -7,15 +7,17 @@ The gfx950 sibling (``test_gdn_decode_golden.py``) documents why a golden IR
 hash is worth having: it catches an emitter refactor that changes the emitted
 code without making it wrong, which no numeric test can see.
 
-This file is the gfx942 arm of that check, and it carries one extra job. The
-gfx942 tile table is *provisional* -- seeded from the gfx950 optimum and due to
-be replaced by an on-silicon sweep. When that sweep lands and the tiles move,
-these hashes must move with them, in the same change, out loud.
+This file is the gfx942 arm of that check. The gfx942 tile table it covers is
+**measured on gfx942 silicon**, not inherited: every tile the emitter accepts
+was enumerated, correctness-gated, and timed. If the table is ever re-tuned and
+the tiles move, these hashes must move with them, in the same change, out loud.
 
-Measured note, so nobody reads more into a match than is there: at the time the
-fixture was recorded the lowered IR for gfx942 was **byte-identical** to gfx950
-for every case. The arch does not reach the emitter or the Python lowerer; it
-enters later, at assembly. So this fixture is a *drift detector for the gfx942
+Measured note, so nobody reads more into a match than is there: for the cases
+the two arches share, the lowered IR for gfx942 is **byte-identical** to gfx950.
+The arch does not reach the emitter or the Python lowerer; it enters later, at
+assembly. (The ``tuned_*`` case ids no longer overlap between the arches, since
+each now carries its own band names, so the identity claim covers the shared
+cases only.) This fixture is therefore a *drift detector for the gfx942
 configuration set*, not evidence that anything arch-specific happens here. The
 arch-specific evidence is the assembled ISA, not this file.
 
