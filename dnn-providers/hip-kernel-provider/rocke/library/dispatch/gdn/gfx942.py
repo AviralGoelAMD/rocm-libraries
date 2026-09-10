@@ -35,18 +35,37 @@ ARCH = "gfx942"
 
 # (max_batch, (num_warps, warp_threads_k, blocks_per_v_dim), spec_id)
 #
-# PROVISIONAL: seeded from the gfx950 measured optimum so the arch is
-# dispatchable. These values are NOT measured on gfx942. MI300X has a
-# different CU count and memory system, and blocks_per_v_dim exists purely to
-# manufacture parallelism to fill the machine at small batch, so it is the
-# knob most likely to move. A later task replaces this table with an
-# on-silicon sweep; until then, treat any gfx942 number produced through this
-# table as untuned.
+# MEASURED on gfx942 silicon: an MI300X (304 CUs, gfx942:sramecc+:xnack-) at
+# the production decode shape -- 16 K heads, 32 V heads, D128, one token,
+# bf16 activations and bf16 state.
+#
+# How these were chosen. Every tile the emitter accepts on this arch was
+# enumerated through ``is_valid_spec``, each one was gated against an
+# independent fp32 reference, and the survivors were timed with a device
+# clock (chained HIP-graph replay, so host submission is off the critical
+# path). The batch anchors actually measured are
+# 1, 2, 4, 6, 8, 16, 24, 32, 48, 64, 96, 128 and 256, across three runs with
+# different seeds. Bands are then the fewest contiguous ranges that keep every
+# measured anchor within a few percent of that anchor's own best tile.
+#
+# What is *not* measured: batches strictly between two anchors. A band edge
+# such as ``<= 24`` is interpolation between the 16 and 24 anchors on one side
+# and 32 on the other, not a measured crossover point.
+#
+# What the table claims. Only that, at the anchors above, the chosen tile is
+# close to the best of the legal tiles for that batch -- i.e. it is a claim
+# against rocKE's own tile space, and nothing else. It is not a claim about
+# any other implementation, and the campaign's competitive numbers live in the
+# benchmark artifacts, never in this file.
+#
+# ``blocks_per_v_dim`` splits one head's V dimension across workgroups purely
+# to manufacture parallelism when the batch cannot fill 304 CUs, which is why
+# it only exceeds 1 in the smallest band and collapses to 1 everywhere else.
 _TUNED_TILES = (
-    (4, (4, 16, 8), "b4"),
-    (32, (2, 8, 2), "b32"),
-    (128, (1, 8, 1), "b128"),
-    (None, (8, 16, 1), "b_large"),
+    (2, (4, 8, 4), "b2"),
+    (8, (8, 8, 1), "b8"),
+    (24, (4, 8, 1), "b24"),
+    (None, (2, 8, 1), "b_large"),
 )
 
 # Every tile the table can produce, for tuners and for the sweep space.

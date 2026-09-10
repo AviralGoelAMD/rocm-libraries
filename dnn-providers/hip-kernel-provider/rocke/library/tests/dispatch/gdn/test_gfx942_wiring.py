@@ -3,9 +3,9 @@
 
 """gfx942 GDN decode wiring: bands select, and every selection is buildable.
 
-The gfx942 tile table is still provisional, so these tests pin the *wiring*
-(arch gate, band -> tile -> spec agreement, buildability) rather than any
-particular measured tile.
+These tests pin the *wiring* -- arch gate, band -> tile -> spec agreement,
+buildability -- and deliberately not any particular tile value. The tile table
+is measured and will be re-measured; the wiring must hold whatever it says.
 """
 
 from __future__ import annotations

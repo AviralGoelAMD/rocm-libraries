@@ -38,7 +38,12 @@ def _req(batch: int, **kw) -> GdnDecodeRequest:
 
 class TestRegistration(unittest.TestCase):
     def test_every_tuned_tile_is_registered(self):
-        names = {c.spec_id for c in gdn_candidates()}
+        # Filter by arch: the registry holds every arch's candidates, and two
+        # arches are free to name their bands differently. Comparing the whole
+        # registry against one arch's spec ids only ever passed by coincidence.
+        names = {
+            c.spec_id for c in gdn_candidates() if ARCH in c.capability.arches
+        }
         self.assertEqual(names, set(TUNED_SPEC_IDS))
 
     def test_registry_family_is_consistent(self):

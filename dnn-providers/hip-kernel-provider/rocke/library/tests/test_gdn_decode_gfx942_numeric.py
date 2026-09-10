@@ -35,6 +35,7 @@ from dispatch.gdn.gfx942 import (  # noqa: E402
     ARCH,
     TUNED_SPEC_IDS,
     make_spec,
+    spec_id_for_batch,
     tile_for_batch,
 )
 
@@ -95,16 +96,31 @@ def test_matches_fp32_reference(harness, batch):
     assert state_err <= harness["TOL"], f"batch {batch}: state error {state_err:.3e}"
 
 
+def _one_batch_per_band() -> dict:
+    """spec_id -> the smallest batch that lands in that band.
+
+    Derived from the table rather than hard-coded. A hard-coded list of
+    representative batches silently stops covering a tile the moment the bands
+    are re-tuned, which is exactly when coverage matters most.
+    """
+    seen: dict = {}
+    for batch in range(1, 4097):
+        seen.setdefault(spec_id_for_batch(batch), batch)
+        if len(seen) == len(TUNED_SPEC_IDS):
+            break
+    return seen
+
+
 @requires_gfx942
 def test_every_dispatched_tile_is_correct(harness):
     """Every tile the gfx942 table can select must be numerically sound.
 
-    One batch inside each band, so all four tuned tiles are really built and
-    run. A tuning table that can route a request to a wrong kernel is worse
-    than no tuning at all.
+    One batch inside each band, so every tuned tile is really built and run. A
+    tuning table that can route a request to a wrong kernel is worse than no
+    tuning at all.
     """
     seen = set()
-    for batch in (1, 16, 64, 256):
+    for batch in sorted(_one_batch_per_band().values()):
         result = dispatch_gdn_decode(_req(batch))
         spec = result.spec
         assert _tile(spec) == tile_for_batch(batch), (
