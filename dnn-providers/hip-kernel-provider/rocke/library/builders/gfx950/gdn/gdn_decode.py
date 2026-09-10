@@ -51,11 +51,14 @@ from rocke.runtime.launcher import KernelLauncher, LaunchConfig, no_fence
 # magnitude of a real indexing or reduction bug.
 TOL = 1e-2
 
-_ARCH = "gfx950"
+# Fallback only. Every entry point below takes an explicit ``arch`` and passes
+# it on at the call site, so a gfx942 caller is never silently graded, compiled
+# or timed against gfx950 rules.
+DEFAULT_ARCH = "gfx950"
 _LAUNCHER_CACHE: Dict[Tuple, KernelLauncher] = {}
 
 
-def launcher_for(spec: GdnDecodeSpec, arch: str = _ARCH) -> KernelLauncher:
+def launcher_for(spec: GdnDecodeSpec, arch: str = DEFAULT_ARCH) -> KernelLauncher:
     """Compile ``spec`` and wrap it in a launcher, memoised per spec.
 
     Keyed on ``kernel_name()`` because that string is what the compiled code
@@ -191,14 +194,32 @@ def _validate_decode_inputs(
             )
 
 
-def prepare(spec: GdnDecodeSpec, inp, batch: int, *, validate_indices: bool = True):
+def prepare(
+    spec: GdnDecodeSpec,
+    inp,
+    batch: int,
+    *,
+    arch: str = DEFAULT_ARCH,
+    validate_indices: bool = True,
+):
     """Allocate the kernel's outputs and freeze a launch config.
 
     Split out from :func:`launch` deliberately. Allocating inside a timing loop
     measures the allocator rather than the kernel, and allocating inside a HIP
     graph capture is illegal, so every caller that repeats a launch prepares
     once and then only launches.
+
+    ``arch`` names the target this launch geometry is frozen for. The spec is
+    judged against it here as well as in :func:`launcher_for`, because a caller
+    that reuses a pre-built launcher (HIP graph capture, the tuner) never goes
+    through ``launcher_for`` and would otherwise get no arch check at all. The
+    rules come from ``is_valid_spec`` rather than a second copy of them, and the
+    cost is a handful of integer comparisons once per prepare -- never per
+    launch.
     """
+    ok, why = is_valid_spec(spec, arch=arch)
+    if not ok:
+        raise ValueError(f"invalid gdn_decode spec for {arch}: {why}")
     _validate_decode_inputs(spec, inp, batch, validate_indices=validate_indices)
     torch_dtype = {"bf16": torch.bfloat16, "f16": torch.float16}[spec.dtype]
     out = torch.zeros(
@@ -227,19 +248,33 @@ def launch(launcher: KernelLauncher, values, cfg) -> None:
         launcher(values, config=cfg)
 
 
-def run(spec: GdnDecodeSpec, inp, launcher: KernelLauncher, batch: int):
+def run(
+    spec: GdnDecodeSpec,
+    inp,
+    launcher: KernelLauncher,
+    batch: int,
+    *,
+    arch: str = DEFAULT_ARCH,
+):
     """Prepare, launch once, synchronise. Returns ``(out, state_after)``."""
-    values, cfg = prepare(spec, inp, batch)
+    values, cfg = prepare(spec, inp, batch, arch=arch)
     launch(launcher, values, cfg)
     torch.cuda.synchronize()
     return values["out"], values["state"]
 
 
-def check(spec: GdnDecodeSpec, batch: int, seed: int = 0) -> Tuple[float, float]:
-    """Run and compare against the reference. Returns ``(out_err, state_err)``."""
+def check(
+    spec: GdnDecodeSpec, batch: int, seed: int = 0, *, arch: str = DEFAULT_ARCH
+) -> Tuple[float, float]:
+    """Run and compare against the reference. Returns ``(out_err, state_err)``.
+
+    Two errors, never one. The kernel writes ``out`` in bf16 *and* mutates the
+    state pool in place; the state write carries far more error, so a single
+    collapsed number would hide a state regression behind the output.
+    """
     inp = make_inputs(spec, batch, seed=seed)
     ref_out, ref_state = ref_fp32(spec, inp)
-    out, state = run(spec, inp, launcher_for(spec), batch)
+    out, state = run(spec, inp, launcher_for(spec, arch=arch), batch, arch=arch)
     out_err = (out.float() - ref_out).abs().max().item()
     # Compare only the pages the kernel was told to write.
     written = inp["write_indices"].long()
@@ -247,10 +282,12 @@ def check(spec: GdnDecodeSpec, batch: int, seed: int = 0) -> Tuple[float, float]
     return out_err, state_err
 
 
-def bench(spec: GdnDecodeSpec, batch: int, reps: int = 200) -> float:
+def bench(
+    spec: GdnDecodeSpec, batch: int, reps: int = 200, *, arch: str = DEFAULT_ARCH
+) -> float:
     """Median host-observed launch latency in microseconds."""
-    launcher = launcher_for(spec)
-    values, cfg = prepare(spec, make_inputs(spec, batch), batch)
+    launcher = launcher_for(spec, arch=arch)
+    values, cfg = prepare(spec, make_inputs(spec, batch), batch, arch=arch)
     for _ in range(50):
         launch(launcher, values, cfg)
     torch.cuda.synchronize()
@@ -272,6 +309,12 @@ def main() -> int:
         default="tiled",
         help="tiled = default warp-tiled path; simple = one-thread-per-row reference",
     )
+    ap.add_argument(
+        "--arch",
+        default=DEFAULT_ARCH,
+        help=f"target gfx architecture to validate, compile and time against "
+        f"(default {DEFAULT_ARCH})",
+    )
     ap.add_argument("--bench", action="store_true", help="also report per-launch time")
     ap.add_argument("--no-check", action="store_true", help="skip the correctness gate")
     ap.add_argument("--seed", type=int, default=0)
@@ -282,23 +325,23 @@ def main() -> int:
         return 2
 
     spec = GdnDecodeSpec(simple=(args.variant == "simple"))
-    ok, why = is_valid_spec(spec, arch=_ARCH)
+    ok, why = is_valid_spec(spec, arch=args.arch)
     if not ok:
         print(f"spec rejected: {why}", file=sys.stderr)
         return 2
-    print(f"kernel: {spec.kernel_name()}  block={spec.block_size}")
+    print(f"kernel: {spec.kernel_name()}  block={spec.block_size}  arch={args.arch}")
 
     worst = 0.0
     for batch in (int(x) for x in args.batches.split(",")):
         grid = gdn_decode_grid(batch, spec)
         line = f"B={batch:<5d} grid={grid[0]:<7d}"
         if not args.no_check:
-            out_err, state_err = check(spec, batch, seed=args.seed)
+            out_err, state_err = check(spec, batch, seed=args.seed, arch=args.arch)
             worst = max(worst, out_err, state_err)
             verdict = "OK" if max(out_err, state_err) <= TOL else "FAIL"
             line += f" out_err={out_err:.3e} state_err={state_err:.3e} {verdict}"
         if args.bench:
-            line += f" {bench(spec, batch):8.2f}us"
+            line += f" {bench(spec, batch, arch=args.arch):8.2f}us"
         print(line)
 
     if args.no_check:
