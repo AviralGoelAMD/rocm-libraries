@@ -96,10 +96,13 @@ class TestTunedSelection(unittest.TestCase):
 
 
 class TestRequestRejection(unittest.TestCase):
-    def test_other_arch_is_rejected(self):
+    def test_unregistered_arch_is_rejected(self):
+        # gfx942 is registered now, so it can no longer stand in for "unknown
+        # arch". The rejection path still has to work, so this moved to gfx90a,
+        # which is genuinely absent from _ARCH_MODULES.
         with self.assertRaises(ValueError) as ctx:
-            dispatch_gdn_decode(_req(8, arch="gfx942"))
-        self.assertIn("gfx942", str(ctx.exception))
+            dispatch_gdn_decode(_req(8, arch="gfx90a"))
+        self.assertIn("gfx90a", str(ctx.exception))
 
     def test_head_ratio_must_divide(self):
         with self.assertRaises(ValueError) as ctx:

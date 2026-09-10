@@ -24,6 +24,7 @@ from rocke.dispatch.core import (
     stable_json_hash,
 )
 
+from . import gfx942
 from . import gfx950
 from . import prefill_gfx950
 from .common import (
@@ -41,7 +42,8 @@ from .prefill_common import (
     GdnPrefillRequest,
 )
 
-_ARCH_MODULES = (gfx950,)
+# gfx950 stays first so registration (and therefore candidate) order is stable.
+_ARCH_MODULES = (gfx950, gfx942)
 
 GDN_REGISTRY = CandidateRegistry(
     FAMILY, dim_vocabulary=GDN_DIM_VOCABULARY, require_build=True
