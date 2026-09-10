@@ -102,6 +102,12 @@ class GdnDecodeSpec:
         8  # split a head's V-dim across this many CTAs (small-B fill)
     )
     simple: bool = False  # True => v1 one-thread-per-row reference path
+    # exp() base: the native single-instruction v_exp_f32 (True) or the guarded
+    # llvm.exp2 with its range-reduction clamp (False). Every other exp2_fast
+    # site in this tree is justified by a softmax argument that is always <= 0;
+    # GDN exponentiates unbounded A_log, a+dt_bias and -b, so this is a knob
+    # rather than a free win. See test_exp2_fast_matches_guarded_exp2.
+    use_exp2_fast: bool = True
     name: str = "rocke_gdn_decode"
 
     @property
@@ -132,7 +138,13 @@ class GdnDecodeSpec:
         return kernel_name_join(
             self.name,
             *parts,
-            flags={"l2": self.use_qk_l2norm, "s": self.simple},
+            # "gexp" marks the *deviation* (guarded exp2), so the default fast
+            # path keeps the name every existing caller already compiled under.
+            flags={
+                "l2": self.use_qk_l2norm,
+                "s": self.simple,
+                "gexp": not self.use_exp2_fast,
+            },
         )
 
 
@@ -254,8 +266,10 @@ def _build_simple(spec: GdnDecodeSpec) -> KernelDef:
     )
     with b.scf_if(active):
         # ---- exp/sigmoid/softplus composed from exp2/log2/rcp (no native) ----
+        _exp2 = b.exp2_fast if spec.use_exp2_fast else b.exp2
+
         def exp_f32(x):
-            return b.exp2_fast(b.fmul(x, b.const_f32(LOG2E)))
+            return _exp2(b.fmul(x, b.const_f32(LOG2E)))
 
         def log1p_f32(x):
             return b.fmul(b.log2(b.fadd(b.const_f32(1.0), x)), b.const_f32(LN2))
@@ -416,8 +430,10 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
     )
     with b.scf_if(active):
 
+        _exp2 = b.exp2_fast if spec.use_exp2_fast else b.exp2
+
         def exp_f32(x):
-            return b.exp2_fast(b.fmul(x, b.const_f32(LOG2E)))
+            return _exp2(b.fmul(x, b.const_f32(LOG2E)))
 
         def log1p_f32(x):
             return b.fmul(b.log2(b.fadd(b.const_f32(1.0), x)), b.const_f32(LN2))

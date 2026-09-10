@@ -132,6 +132,7 @@ class TestKernelNameIdentity(unittest.TestCase):
             "blocks_per_v_dim": dc.replace(base, blocks_per_v_dim=4),
             "use_qk_l2norm": dc.replace(base, use_qk_l2norm=False),
             "simple": dc.replace(base, simple=True),
+            "use_exp2_fast": dc.replace(base, use_exp2_fast=False),
             "num_k_heads": dc.replace(base, num_k_heads=8),
             "head_k_dim": dc.replace(base, head_k_dim=64),
         }
