@@ -37,10 +37,11 @@ product is thread-local and needs no cross-thread reduction. Q/K L2 norms and
 VGPR-heavy by design; the warp-tiled reduction is the first optimization pass,
 not part of the correctness baseline.
 
-Built for gfx950 (wave64) and placed alongside the KDA chunkwise kernel in
-``kernels/gfx950/``; the ``arch`` argument is a validation/target hook, not a
-portability claim -- a new arch adds its own tuned specs here rather than
-importing across folders.
+Written against wave64 and placed with the other arch-neutral emitters in
+``kernels/common/``; the emitted SSA carries no arch-only instructions. The
+``arch`` argument is a validation/target hook, not a portability claim -- each
+arch registers its own tuned specs in its dispatcher rather than forking the
+emitter.
 """
 
 from __future__ import annotations

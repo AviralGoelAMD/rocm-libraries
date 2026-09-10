@@ -52,7 +52,7 @@ def _cases():
     can select, so a change to any shipped configuration is visible.
     """
     from dispatch.gdn.gfx950 import _TUNED_TILES
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec, build_gdn_decode
+    from kernels.common.gdn_decode import GdnDecodeSpec, build_gdn_decode
 
     def build(**overrides):
         spec = dc.replace(GdnDecodeSpec(), **overrides)

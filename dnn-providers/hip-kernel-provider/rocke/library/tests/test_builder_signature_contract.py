@@ -244,7 +244,7 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
         "num_query_heads",
         "num_segments",
     ),
-    "kernels.gfx950.gdn_decode.GdnDecodeSpec": (),
+    "kernels.common.gdn_decode.GdnDecodeSpec": (),
     "kernels.gfx950.kda_chunkwise.KdaChunkFusedSpec": (),
     "kernels.gfx950.kda_chunkwise.KdaChunkPrepSpec": (),
     "kernels.gfx950.kda_chunkwise.KdaChunkScanSpec": (),

@@ -22,7 +22,7 @@ from dispatch.gdn import (
     gdn_sweep_space,
 )
 from dispatch.gdn.gfx950 import ARCH, TUNED_SPEC_IDS, tile_for_batch
-from kernels.gfx950.gdn_decode import (
+from kernels.common.gdn_decode import (
     gdn_decode_grid,
     gdn_decode_signature,
     is_valid_spec,

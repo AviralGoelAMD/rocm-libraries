@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 """Host-side driver for the GDN single-token decode kernel.
 
-The kernel emitter in ``kernels/gfx950/gdn_decode.py`` produces device code.
+The kernel emitter in ``kernels/common/gdn_decode.py`` produces device code.
 This module is everything on the host needed to actually exercise it: compile a
 spec, build inputs, run it, judge the result against an independent reference,
 and time it.
@@ -35,7 +35,7 @@ from typing import Dict, Tuple
 
 import torch
 
-from kernels.gfx950.gdn_decode import (
+from kernels.common.gdn_decode import (
     GdnDecodeSpec,
     build_gdn_decode,
     gdn_decode_grid,

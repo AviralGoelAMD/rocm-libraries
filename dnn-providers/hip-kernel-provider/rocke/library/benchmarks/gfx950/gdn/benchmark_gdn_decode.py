@@ -46,7 +46,7 @@ from builders.gfx950.gdn.gdn_decode import (
     prepare,
 )
 from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode
-from kernels.gfx950.gdn_decode import GdnDecodeSpec
+from kernels.common.gdn_decode import GdnDecodeSpec
 
 ARCH = "gfx950"
 

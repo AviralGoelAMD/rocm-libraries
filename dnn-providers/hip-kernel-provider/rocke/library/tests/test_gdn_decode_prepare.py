@@ -18,7 +18,7 @@ import pytest
 torch = pytest.importorskip("torch", reason="torch required (CPU build is fine)")
 
 from builders.gfx950.gdn.gdn_decode import make_inputs, prepare
-from kernels.gfx950.gdn_decode import GdnDecodeSpec
+from kernels.common.gdn_decode import GdnDecodeSpec
 
 DEVICE = "cpu"
 

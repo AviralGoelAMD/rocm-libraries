@@ -37,7 +37,7 @@ from builders.gfx950.gdn.gdn_decode import (
     prepare,
     ref_fp32,
 )
-from kernels.gfx950.gdn_decode import GdnDecodeSpec, is_valid_spec
+from kernels.common.gdn_decode import GdnDecodeSpec, is_valid_spec
 
 ARCH = "gfx950"
 DEFAULT_BATCHES = (1, 16, 64, 256)

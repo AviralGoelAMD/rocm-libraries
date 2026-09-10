@@ -22,7 +22,7 @@ from __future__ import annotations
 import dataclasses as dc
 from typing import Tuple
 
-from kernels.gfx950.gdn_decode import (
+from kernels.common.gdn_decode import (
     GdnDecodeSpec,
     build_gdn_decode,
     gdn_decode_grid,
