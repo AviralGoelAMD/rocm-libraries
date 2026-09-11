@@ -3,9 +3,16 @@
 # SPDX-License-Identifier: MIT
 """Re-measure the GDN decode tuning table.
 
-The per-batch tile table in ``dispatch/gdn/gfx950.py`` is an empirical claim,
+The per-batch tile table in ``dispatch/gdn/<arch>.py`` is an empirical claim,
 so the measurement that produced it lives here rather than outside the tree:
 anyone can re-run it, challenge a band, or re-tune after a kernel change.
+
+Every registered arch has its **own** table, because the bands encode CU count
+and occupancy and do not transfer between arches — carrying gfx950's table to
+gfx942 was measured to lose at small batch. Pick the one you mean with
+``--arch``; it must match the visible device, and the tool refuses to run if it
+does not. A table timed on the wrong machine looks authoritative and is wrong,
+which is worse than having none.
 
 Device time is the metric. Host launch cost is identical across tiles and, at
 small batch, larger than the kernel itself, so wall time would mask exactly the
@@ -18,6 +25,7 @@ reused across the whole configuration space.
 Run::
 
     PYTHONPATH=<rocke>/library:<rocke>/platform/python python3 tune.py
+    PYTHONPATH=... python3 tune.py --arch gfx942 --batches 1,8,16,32,64,128
     PYTHONPATH=... python3 tune.py --batches 1,16 --top 5
 """
 
@@ -39,7 +47,8 @@ from builders.gfx950.gdn.gdn_decode import (
 )
 from kernels.common.gdn_decode import GdnDecodeSpec, is_valid_spec
 
-ARCH = "gfx950"
+DEFAULT_ARCH = "gfx950"
+SUPPORTED_ARCHES = ("gfx950", "gfx942")
 DEFAULT_BATCHES = (1, 16, 64, 256)
 
 # Search space. Anything illegal for the requested shape is pruned by the
@@ -49,7 +58,7 @@ _WARP_THREADS_K = (1, 2, 4, 8, 16, 32)
 _BLOCKS_PER_V = (1, 2, 4, 8, 16, 32)
 
 
-def legal_configs(base: GdnDecodeSpec):
+def legal_configs(base: GdnDecodeSpec, arch: str):
     out = []
     for num_warps in _NUM_WARPS:
         for warp_threads_k in _WARP_THREADS_K:
@@ -60,7 +69,7 @@ def legal_configs(base: GdnDecodeSpec):
                     warp_threads_k=warp_threads_k,
                     blocks_per_v_dim=blocks_per_v_dim,
                 )
-                ok, _ = is_valid_spec(spec, arch=ARCH)
+                ok, _ = is_valid_spec(spec, arch=arch)
                 if ok:
                     out.append((num_warps, warp_threads_k, blocks_per_v_dim))
     return out
@@ -94,7 +103,7 @@ def device_us(values, cfg, launcher, reps: int = 32):
     return best
 
 
-def sweep_batch(base: GdnDecodeSpec, batch: int, configs):
+def sweep_batch(base: GdnDecodeSpec, batch: int, configs, arch: str):
     """Correct, timed configurations for one batch, fastest first."""
     inp = make_inputs(base, batch)
     ref_out, ref_state = ref_fp32(base, inp)
@@ -109,11 +118,11 @@ def sweep_batch(base: GdnDecodeSpec, batch: int, configs):
             blocks_per_v_dim=tile[2],
         )
         try:
-            launcher = launcher_for(spec, arch=ARCH)
+            launcher = launcher_for(spec, arch=arch)
         except Exception as exc:
             print(f"  {tile} compile failed: {type(exc).__name__}", file=sys.stderr)
             continue
-        values, cfg = prepare(spec, inp, batch)
+        values, cfg = prepare(spec, inp, batch, arch=arch)
         launch(launcher, values, cfg)
         torch.cuda.synchronize()
         err = max(
@@ -138,19 +147,39 @@ def main() -> int:
         help="comma-separated decode batch sizes to tune for",
     )
     ap.add_argument("--top", type=int, default=8, help="rows to print per batch")
+    ap.add_argument(
+        "--arch",
+        default=DEFAULT_ARCH,
+        choices=SUPPORTED_ARCHES,
+        help="architecture to tune for; each arch has its own tuned table, "
+             "because the bands encode CU count and occupancy",
+    )
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
         print("no HIP device visible", file=sys.stderr)
         return 2
 
+    # Tuning is a measurement, so it has to run on the arch it claims to
+    # describe. Timing a gfx942 table on a gfx950 device would produce numbers
+    # that look authoritative and describe the wrong machine -- worse than no
+    # table, because nothing downstream can tell.
+    live = torch.cuda.get_device_properties(0).gcnArchName
+    if args.arch not in live:
+        print(
+            f"refusing to tune: --arch {args.arch} but the visible device is "
+            f"{live!r}. Run this on the target arch.",
+            file=sys.stderr,
+        )
+        return 2
+
     base = GdnDecodeSpec()
-    configs = legal_configs(base)
+    configs = legal_configs(base, args.arch)
     print(f"legal configurations for this shape: {len(configs)}")
 
     winners = {}
     for batch in (int(x) for x in args.batches.split(",")):
-        rows = sweep_batch(base, batch, configs)
+        rows = sweep_batch(base, batch, configs, args.arch)
         if not rows:
             print(f"batch {batch}: no configuration was both correct and timeable")
             return 1
@@ -166,8 +195,8 @@ def main() -> int:
     for batch, (micros, tile, _) in winners.items():
         print(f"  batch {batch:<6d} {tile}  {micros:.3f}us")
     print(
-        "\nUpdate _TUNED_TILES in dispatch/gdn/gfx950.py if these disagree "
-        "with the table, and re-run the wiring test."
+        f"\nUpdate _TUNED_TILES in dispatch/gdn/{args.arch}.py if these "
+        f"disagree with the table, and re-run the wiring test."
     )
     return 0
 
