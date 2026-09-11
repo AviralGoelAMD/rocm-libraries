@@ -86,6 +86,13 @@ The drain was never redundant work -- it was the same load dependency, charged
 to a different counter. Cheapening these waits is therefore not a lever on this
 kernel; the barrier waits on wave arrival, and wave arrival waits on the loads
 either way.
+
+What *is* a lever is where the load dependency sits.
+``KdaChunkScanSpec.prefetch_tiles`` moves it: the staged loads still land in
+registers, but they are issued a whole chunk body ahead of the ``ds_write``
+that consumes them, so the ``vmcnt`` wait falls behind the recurrence's matmuls
+instead of in front of them. That is only legal with a second copy of each
+staged tile, which is what the flag pays for.
 """
 
 from __future__ import annotations
@@ -1129,6 +1136,14 @@ class _InputPrefetch:
     matmuls instead of at the head of the next chunk.
     """
 
+    # Where in :func:`_emit_scan_body` the two halves land. The fused kernel
+    # parks V in LDS during the solve, so nothing in its scan body loads from
+    # HBM and the issue can be the body's first instruction; and its single
+    # staging buffer has to be written before the products that overwrite the
+    # tiles it aliases, so the commit cannot slide to the end.
+    issue_after_v = False
+    commit_at_end = False
+
     def __init__(self, ctx: _ChunkCtx, ch_next):
         self.ctx = ctx
         self.ch = ch_next
@@ -2034,6 +2049,11 @@ class _ScanCtx:
         self.v_lds = v_lds
         self.tid, self.lane = tid, lane
         self.dec_is_log = dec_is_log
+        # Row offsets that select which half of a double-buffered staged tile
+        # this chunk reads, as ``(C-extent, DK-extent)``. ``None`` is the
+        # single-buffered default: every staged tile starts at row 0 and the
+        # accessors below emit exactly the unbiased index expression.
+        self.buf_bias = None
         self.NS = head_k // atom.n
         self.KS_DK = head_k // atom.k
         self.KS_C = (chunk + atom.k - 1) // atom.k
@@ -2113,7 +2133,22 @@ class _ScanCtx:
         extent. ``off`` shifts within the tile for the state's ``DK`` extent.
         """
         base = j * self.atom.m if off is None else off
-        return self.b.add(self.b.const_i32(base), self.lane_m)
+        row = self.b.add(self.b.const_i32(base), self.lane_m)
+        if self.buf_bias is None:
+            return row
+        return self.b.add(self.buf_bias[0], row)
+
+    def dkrow(self, base, off):
+        """Index ``base + off`` along a staged tile's ``DK`` extent.
+
+        Both the ``Kt`` tile's row and the ``dec`` tile's column are indices
+        into that extent, so one accessor carries the double-buffer offset for
+        both.
+        """
+        idx = self.b.add(self.b.const_i32(base), off)
+        if self.buf_bias is None:
+            return idx
+        return self.b.add(self.buf_bias[1], idx)
 
     def state_idx(self, base, i, ti):
         """Global (ev, dk) offset of accumulator slot ``i`` of state tile ``ti``."""
@@ -2193,7 +2228,9 @@ def _emit_scan_body(sc: _ScanCtx, state, tile, *, prefetch: "_InputPrefetch" = N
 
     ``prefetch`` stages the next chunk's inputs across this body: the loads go
     out first and the writes land after the ``V~`` rendezvous, so the scan's own
-    matmuls sit between them and the closing barrier publishes the result.
+    matmuls sit between them and the closing barrier publishes the result. Both
+    sites move for a prefetcher that asks for it -- see
+    ``_InputPrefetch.issue_after_v`` and ``.commit_at_end``.
     """
     b, atom = sc.b, sc.atom
     lane_m, wrow, CPL = sc.lane_m, sc.wrow, sc.CPL
@@ -2203,7 +2240,9 @@ def _emit_scan_body(sc: _ScanCtx, state, tile, *, prefetch: "_InputPrefetch" = N
 
     # Issued before anything else in the scan so the whole body covers the HBM
     # latency; the staging tiles are already dead by here.
-    issued = prefetch.issue() if prefetch is not None else None
+    issued = None
+    if prefetch is not None and not prefetch.issue_after_v:
+        issued = prefetch.issue()
 
     # C=16 uses the 16x16x32 atom. V~/residual has only 16 real chunk columns,
     # so zero the padded K half before any of the three C-contracted products.
@@ -2283,6 +2322,11 @@ def _emit_scan_body(sc: _ScanCtx, state, tile, *, prefetch: "_InputPrefetch" = N
                     value=b.cast_f32_to(res, ELEM),
                     n=1,
                 )
+    # A prefetcher that reads V from HBM issues here instead of at the top:
+    # ``vmcnt`` retires in order, so loads issued ahead of the residual's own V
+    # load would be dragged in by the wait that load forces.
+    if prefetch is not None and prefetch.issue_after_v:
+        issued = prefetch.issue()
     b.sync_lds_only()
 
     # ---- V~^T = R^T A^T -------------------------------------------------
@@ -2309,8 +2353,10 @@ def _emit_scan_body(sc: _ScanCtx, state, tile, *, prefetch: "_InputPrefetch" = N
     # The next chunk's inputs land here: late enough that the loads issued at
     # the top of this body have had the Z and V~ matmul groups to retire behind,
     # and still ahead of the rendezvous that closes the body, which is what
-    # publishes them to every wave.
-    if prefetch is not None:
+    # publishes them to every wave. A double-buffered prefetcher pushes the
+    # writes past the two products below instead; nothing there reads the buffer
+    # it is filling.
+    if prefetch is not None and not prefetch.commit_at_end:
         prefetch.commit(issued)
 
     # ---- O = GQ S + Aqk V~ ----------------------------------------------
@@ -2347,7 +2393,7 @@ def _emit_scan_body(sc: _ScanCtx, state, tile, *, prefetch: "_InputPrefetch" = N
                 _ld(
                     b,
                     sc.dec_lds,
-                    b.add(b.const_i32(ti * atom.n), col),
+                    sc.dkrow(ti * atom.n, col),
                     dtype=F32,
                     n=1,
                 ),
@@ -2360,11 +2406,15 @@ def _emit_scan_body(sc: _ScanCtx, state, tile, *, prefetch: "_InputPrefetch" = N
             sc.vn_lds,
             b.add(wrow, lane_m),
             sc.kt_lds,
-            b.add(b.const_i32(ti * atom.n), lane_m),
+            sc.dkrow(ti * atom.n, lane_m),
             sc.KS_C,
             b.vec_pack(scaled, F32),
         )
         new_state.append(acc)
+    # Last legal moment: every read of the buffer being filled is behind us and
+    # the rendezvous below publishes the writes to the next chunk.
+    if prefetch is not None and prefetch.commit_at_end:
+        prefetch.commit(issued)
     b.sync_lds_only()
     return new_state
 
@@ -2589,6 +2639,11 @@ class KdaChunkScanSpec:
     value_splits: int = 1
     # Read/write token-major [B,T,H,D] tensors instead of chunk-packed views.
     token_major_io: bool = False
+    # Double-buffer the per-chunk staged tiles so chunk ``n+1``'s loads can be
+    # issued inside chunk ``n``'s recurrence and written only at the end of it.
+    # Costs one extra copy of every staged tile in LDS plus the registers to
+    # hold a chunk's payload across the body; see :func:`build_kda_chunk_scan`.
+    prefetch_tiles: bool = False
     name: str = "rocke_kda_chunk_scan"
 
     @property
@@ -2628,20 +2683,28 @@ class KdaChunkScanSpec:
         the fused one. Unlike the fused kernel there is nothing to overlap them
         with, so each is its own allocation -- which is still the smaller
         footprint, because none of the tile builder's staging tiles exist here.
+
+        ``prefetch_tiles`` doubles all six staged tiles and nothing else. The
+        state mirror and ``V~`` are rebuilt from registers inside every chunk
+        body rather than staged from HBM, so they have no second buffer. ``dec``
+        is doubled even though it is only 4*DK bytes: it is read by the very
+        last product in the body, so a single buffer would be overwritten by the
+        next chunk's in-flight staging while it is still live.
         """
         t = self.tile
         C, DK, EV = t.chunk, self.head_k, self.head_v
         ev = EV // self.value_splits
         PDK, PCB = DK + t.pad_dk, C + t.pad_cb
+        bufs = 2 if self.prefetch_tiles else 1
         return (
-            2 * C * PDK  # gk_s   bf16 (C x DK)
-            + 2 * C * PDK  # gq_s  bf16 (C x DK)
-            + 2 * C * PCB  # a_s   bf16 (C x C)
-            + 2 * C * PCB  # aqk_s bf16 (C x C)
-            + 2 * DK * PCB  # kt_s bf16 (DK x C)
+            bufs * 2 * C * PDK  # gk_s   bf16 (C x DK)
+            + bufs * 2 * C * PDK  # gq_s  bf16 (C x DK)
+            + bufs * 2 * C * PCB  # a_s   bf16 (C x C)
+            + bufs * 2 * C * PCB  # aqk_s bf16 (C x C)
+            + bufs * 2 * DK * PCB  # kt_s bf16 (DK x C)
             + 2 * ev * PDK  # stb_s bf16 mirror of S^T
             + 2 * ev * PCB  # vn_s  bf16 (EV x C)
-            + 4 * DK  # dec_s   fp32 (DK)
+            + bufs * 4 * DK  # dec_s fp32 (DK)
         )
 
     def kernel_name(self) -> str:
@@ -2655,6 +2718,8 @@ class KdaChunkScanSpec:
             parts += (f"vs{self.value_splits}",)
         if self.token_major_io:
             parts += ("tm",)
+        if self.prefetch_tiles:
+            parts += ("pf",)
         return kernel_name_join(self.name, *parts)
 
 
@@ -2761,6 +2826,35 @@ def build_kda_chunk_scan(spec: KdaChunkScanSpec, arch: str = "gfx950") -> "Kerne
     length costs nothing in registers, and ``dec`` arrives already
     exponentiated (the tile builder stored it that way), which is the one place
     this body diverges from the fused one.
+
+    ``spec.prefetch_tiles`` software-pipelines that staging. The kernel is
+    latency-bound, not bandwidth-bound: at the tuned GDN geometry it runs one
+    wave per CU, hits in L2 0.6% of the time, and has a VMEM request
+    outstanding through 93% of its stall. So the lever is *when* the loads are
+    issued, not how many bytes they move. Each staged tile gets a second buffer
+    and the loop becomes
+
+    .. code-block:: text
+
+        prologue     load + write chunk 0             -> buffer 0
+        chunk n      scan body on chunk n             <- buffer b
+                       ... after the residual's V load:
+                       issue chunk n+1's loads          (no wait)
+                       ... after the state update:
+                       write them                     -> buffer 1-b
+
+    The loads go out mid-body and are not touched again until the writes at the
+    end, so their ``vmcnt`` wait lands behind every matmul in the recurrence
+    rather than in front of the next chunk's. Two details fix those two sites.
+    The issue cannot be any earlier than the residual's own ``V`` load, because
+    ``vmcnt`` retires in order and that load's wait would drag the tile loads in
+    with it. The commit cannot be this late without the second buffer, because
+    ``GQ``, ``Aqk`` and ``Kt`` are read after the point where the single-buffer
+    fused kernel lands its writes.
+
+    Default off. It costs one extra copy of every staged tile in LDS and keeps
+    a chunk's whole staging payload live in registers across two thirds of the
+    body (228 -> 330 VGPRs at the tuned geometry, still no scratch).
     """
     ok, why = is_valid_scan_spec(spec, arch=arch)
     if not ok:
@@ -2805,12 +2899,17 @@ def build_kda_chunk_scan(spec: KdaChunkScanSpec, arch: str = "gfx950") -> "Kerne
             dk=DK,
         )
 
-    gk_lds = b.smem_alloc(ELEM, [C, PDK], "gk_s")
-    gq_lds = b.smem_alloc(ELEM, [C, PDK], "gq_s")
-    ab_lds = b.smem_alloc(ELEM, [C, PCB], "a_s")
-    aqb_lds = b.smem_alloc(ELEM, [C, PCB], "aqk_s")
-    kt_lds = b.smem_alloc(ELEM, [DK, PCB], "kt_s")
-    dec_lds = b.smem_alloc(F32, [DK], "dec_s")
+    # Two buffers per staged tile under ``prefetch_tiles``: chunk n reads the
+    # low half while chunk n+1's staging fills the high half, or the other way
+    # round. The buffer is selected by a row offset (``_ScanCtx.buf_bias``)
+    # rather than by a second allocation, so the scan body is untouched.
+    nbuf = 2 if spec.prefetch_tiles else 1
+    gk_lds = b.smem_alloc(ELEM, [nbuf * C, PDK], "gk_s")
+    gq_lds = b.smem_alloc(ELEM, [nbuf * C, PDK], "gq_s")
+    ab_lds = b.smem_alloc(ELEM, [nbuf * C, PCB], "a_s")
+    aqb_lds = b.smem_alloc(ELEM, [nbuf * C, PCB], "aqk_s")
+    kt_lds = b.smem_alloc(ELEM, [nbuf * DK, PCB], "kt_s")
+    dec_lds = b.smem_alloc(F32, [nbuf * DK], "dec_s")
     stb_lds = b.smem_alloc(ELEM, [ev_slice, PDK], "stb_s")
     vn_lds = b.smem_alloc(ELEM, [ev_slice, PCB], "vn_s")
 
@@ -2856,62 +2955,197 @@ def build_kda_chunk_scan(spec: KdaChunkScanSpec, arch: str = "gfx950") -> "Kerne
         sc.load_state(h0_ptr, state_base) if spec.has_initial_state else sc.zero_state()
     )
 
-    def stage(src, dst, rows, cols, base):
-        """One flat ``rows x cols`` HBM tile into its padded LDS tile.
+    if spec.prefetch_tiles:
+        # (source, destination, rows, cols, which chunk base) for the five 2-D
+        # tiles. ``dec`` is separate: it is fp32, 1-D and a quarter as wide.
+        staged = (
+            (gk_ptr, gk_lds, C, DK, C * DK),
+            (gq_ptr, gq_lds, C, DK, C * DK),
+            (kt_ptr, kt_lds, DK, C, C * DK),
+            (a_ptr, ab_lds, C, C, C * C),
+            (aqk_ptr, aqb_lds, C, C, C * C),
+        )
 
-        Both sides are 128-bit: the source row length is a multiple of 8, so a
-        thread's eight consecutive elements never straddle a row and the only
-        difference between the two addresses is the destination's pad. A tile
-        smaller than one workgroup sweep (the ``C x C`` pair, at half) just
-        leaves the upper threads idle rather than giving them a second, narrower
-        access pattern.
-        """
-        n_slot = rows * cols // 8
-        for i in range(max(1, n_slot // BLOCK)):
-            vidx = b.add(tid, b.const_i32(i * BLOCK))
-            guard = (
-                nullcontext()
-                if n_slot >= BLOCK
-                else b.scf_if(b.cmp_gt(b.const_i32(n_slot), vidx))
+        def issue(tile_idx):
+            """Put the next chunk's six tiles in flight. Loads only.
+
+            Nothing here touches LDS, so nothing here forces a wait: the values
+            stay in registers until :func:`commit` writes them, and the wait
+            they need lands there. Tail threads reload the last slot against a
+            clamped index instead of branching, because a value defined inside
+            an ``scf.if`` cannot outlive it (same trick as
+            :func:`_emit_stage_issue`).
+            """
+            got = []
+            for src, dst, rows, cols, base_n in staged:
+                n_slot = rows * cols // 8
+                base = b.mul(tile_idx, b.const_i32(base_n))
+                for i in range((n_slot + BLOCK - 1) // BLOCK):
+                    vidx = b.add(tid, b.const_i32(i * BLOCK))
+                    valid = None
+                    safe = vidx
+                    if n_slot % BLOCK:
+                        valid = b.cmp_gt(b.const_i32(n_slot), vidx)
+                        safe = b.select(valid, vidx, b.const_i32(n_slot - 1))
+                    off = b.mul(safe, b.const_i32(8))
+                    got.append(
+                        (
+                            dst,
+                            rows,
+                            cols,
+                            off,
+                            b.global_load_vN(src, b.add(base, off), ELEM, 8),
+                            8,
+                            valid,
+                        )
+                    )
+            dvalid = b.cmp_gt(b.const_i32(DK // 4), tid)
+            dcol = b.mul(
+                b.select(dvalid, tid, b.const_i32(DK // 4 - 1)), b.const_i32(4)
             )
-            with guard:
-                off = b.mul(vidx, b.const_i32(8))
-                b.smem_store_vN(
-                    dst,
-                    [b.div(off, b.const_i32(cols)), b.mod(off, b.const_i32(cols))],
-                    b.global_load_vN(src, b.add(base, off), ELEM, 8),
-                    8,
+            got.append(
+                (
+                    dec_lds,
+                    1,
+                    DK,
+                    dcol,
+                    b.global_load_vN(
+                        dec_ptr,
+                        b.add(b.mul(tile_idx, b.const_i32(DK)), dcol),
+                        F32,
+                        4,
+                    ),
+                    4,
+                    dvalid,
                 )
-
-    loop = b.scf_for_iter(
-        b.const_i32(0),
-        nc,
-        b.const_i32(1),
-        [(f"s{ti}", s_init[ti]) for ti in range(sc.NS)],
-        iv_name="chunk",
-        elide_trailing_barrier=False,
-    )
-    with loop as (n, carried):
-        tile = b.add(b.mul(bh, nc), n)
-        cd = b.mul(tile, b.const_i32(C * DK))
-        cc = b.mul(tile, b.const_i32(C * C))
-        stage(gk_ptr, gk_lds, C, DK, cd)
-        stage(gq_ptr, gq_lds, C, DK, cd)
-        stage(kt_ptr, kt_lds, DK, C, cd)
-        stage(a_ptr, ab_lds, C, C, cc)
-        stage(aqk_ptr, aqb_lds, C, C, cc)
-        with b.scf_if(b.cmp_gt(b.const_i32(DK // 4), tid)):
-            col4 = b.mul(tid, b.const_i32(4))
-            b.smem_store_vN(
-                dec_lds,
-                [col4],
-                b.global_load_vN(
-                    dec_ptr, b.add(b.mul(tile, b.const_i32(DK)), col4), F32, 4
-                ),
-                4,
             )
+            return got
+
+        def commit(got, bias):
+            """Land what :func:`issue` loaded in the half nobody is reading.
+
+            This is where the chunk's HBM latency is finally charged, and it is
+            a whole recurrence downstream of the loads. Without the second
+            buffer it could not be here at all: ``GQ``, ``Aqk`` and ``Kt`` are
+            still live at this point in the body.
+            """
+            for dst, rows, cols, off, value, n, valid in got:
+                with b.scf_if(valid) if valid is not None else nullcontext():
+                    if rows == 1:
+                        b.smem_store_vN(dst, [b.add(bias[1], off)], value, n)
+                        continue
+                    row = b.add(
+                        bias[0] if rows == C else bias[1],
+                        b.div(off, b.const_i32(cols)),
+                    )
+                    b.smem_store_vN(dst, [row, b.mod(off, b.const_i32(cols))], value, n)
+
+        class _TilePrefetch:
+            """The next chunk's tiles, straddling this chunk's recurrence."""
+
+            issue_after_v = True
+            commit_at_end = True
+
+            def __init__(self, tile_idx, bias):
+                self.tile_idx, self.bias = tile_idx, bias
+
+            def issue(self):
+                return issue(self.tile_idx)
+
+            def commit(self, got) -> None:
+                commit(got, self.bias)
+
+        # Chunk 0 into buffer 0 up front; from then on every body fills the
+        # half the next one reads. Guarded because an empty stream runs zero
+        # bodies and must not read a chunk that does not exist -- the default
+        # path gets that for free by staging inside the loop.
+        with b.scf_if(b.cmp_gt(nc, b.const_i32(0))):
+            commit(issue(b.mul(bh, nc)), (b.const_i32(0), b.const_i32(0)))
         b.sync_lds_only()
-        b.scf_yield(*_emit_scan_body(sc, list(carried), tile))
+
+        loop = b.scf_for_iter(
+            b.const_i32(0),
+            nc,
+            b.const_i32(1),
+            [(f"s{ti}", s_init[ti]) for ti in range(sc.NS)] + [("buf", b.const_i32(0))],
+            iv_name="chunk",
+            elide_trailing_barrier=False,
+        )
+        with loop as (n, carried):
+            buf = carried[sc.NS]
+            other = b.sub(b.const_i32(1), buf)
+            tile = b.add(b.mul(bh, nc), n)
+            # The last chunk prefetches itself again rather than branching: the
+            # loads have to stay outside any ``scf.if`` to be committed later,
+            # and the buffer they land in is never read.
+            nxt = b.add(n, b.const_i32(1))
+            nxt = b.select(b.cmp_gt(nc, nxt), nxt, n)
+            sc.buf_bias = (b.mul(buf, b.const_i32(C)), b.mul(buf, b.const_i32(DK)))
+            pf = _TilePrefetch(
+                b.add(b.mul(bh, nc), nxt),
+                (b.mul(other, b.const_i32(C)), b.mul(other, b.const_i32(DK))),
+            )
+            b.scf_yield(
+                *_emit_scan_body(sc, list(carried[: sc.NS]), tile, prefetch=pf), other
+            )
+    else:
+
+        def stage(src, dst, rows, cols, base):
+            """One flat ``rows x cols`` HBM tile into its padded LDS tile.
+
+            Both sides are 128-bit: the source row length is a multiple of 8, so
+            a thread's eight consecutive elements never straddle a row and the
+            only difference between the two addresses is the destination's pad.
+            A tile smaller than one workgroup sweep (the ``C x C`` pair, at half)
+            just leaves the upper threads idle rather than giving them a second,
+            narrower access pattern.
+            """
+            n_slot = rows * cols // 8
+            for i in range(max(1, n_slot // BLOCK)):
+                vidx = b.add(tid, b.const_i32(i * BLOCK))
+                guard = (
+                    nullcontext()
+                    if n_slot >= BLOCK
+                    else b.scf_if(b.cmp_gt(b.const_i32(n_slot), vidx))
+                )
+                with guard:
+                    off = b.mul(vidx, b.const_i32(8))
+                    b.smem_store_vN(
+                        dst,
+                        [b.div(off, b.const_i32(cols)), b.mod(off, b.const_i32(cols))],
+                        b.global_load_vN(src, b.add(base, off), ELEM, 8),
+                        8,
+                    )
+
+        loop = b.scf_for_iter(
+            b.const_i32(0),
+            nc,
+            b.const_i32(1),
+            [(f"s{ti}", s_init[ti]) for ti in range(sc.NS)],
+            iv_name="chunk",
+            elide_trailing_barrier=False,
+        )
+        with loop as (n, carried):
+            tile = b.add(b.mul(bh, nc), n)
+            cd = b.mul(tile, b.const_i32(C * DK))
+            cc = b.mul(tile, b.const_i32(C * C))
+            stage(gk_ptr, gk_lds, C, DK, cd)
+            stage(gq_ptr, gq_lds, C, DK, cd)
+            stage(kt_ptr, kt_lds, DK, C, cd)
+            stage(a_ptr, ab_lds, C, C, cc)
+            stage(aqk_ptr, aqb_lds, C, C, cc)
+            with b.scf_if(b.cmp_gt(b.const_i32(DK // 4), tid)):
+                col4 = b.mul(tid, b.const_i32(4))
+                b.smem_store_vN(
+                    dec_lds,
+                    [col4],
+                    b.global_load_vN(
+                        dec_ptr, b.add(b.mul(tile, b.const_i32(DK)), col4), F32, 4
+                    ),
+                    4,
+                )
+            b.sync_lds_only()
+            b.scf_yield(*_emit_scan_body(sc, list(carried), tile))
 
     if spec.store_final_state:
         sc.store_state(ht_ptr, state_base, loop.results)

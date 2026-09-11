@@ -81,6 +81,10 @@
         "kda_gfx950/split_c32_scan_vs8": {
           "bytes": 112923,
           "sha256": "68e555bb083fe21e7e21145af5b30fb18743412b599716fdb7bbc7756f057f6a"
+        },
+        "kda_gfx950/split_c32_scan_vs8_prefetch": {
+          "bytes": 152081,
+          "sha256": "64234347a062db24bda67b5dc4048f2520590777cd8040785632a0d3836f76a9"
         }
       }
     },
@@ -165,6 +169,10 @@
         "kda_gfx950/split_c32_scan_vs8": {
           "bytes": 112930,
           "sha256": "d83c10ee4f4c74080574210073ae14eb46df0600d73b8978b039d8180345f4de"
+        },
+        "kda_gfx950/split_c32_scan_vs8_prefetch": {
+          "bytes": 152088,
+          "sha256": "c3185f0ce370b628f71306cccc3a43276ad035178595c256b4b0b083285e8e96"
         }
       }
     },
@@ -249,6 +257,10 @@
         "kda_gfx950/split_c32_scan_vs8": {
           "bytes": 112934,
           "sha256": "000fb3bcf7d12a98061eca22f0b74efd27913fa94850ef0748ed9f92003c89b2"
+        },
+        "kda_gfx950/split_c32_scan_vs8_prefetch": {
+          "bytes": 152092,
+          "sha256": "cae57d4f032f46c5b581b0af6545507b13c3250c6882a96de239aabf9dbfa94d"
         }
       }
     }
