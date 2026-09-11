@@ -15,7 +15,7 @@ times the absolute error of the output; one combined number would let a state
 regression hide behind a healthy output.
 
 Specs are built through the real dispatch path (``make_spec`` fed by
-``tile_for_batch``) and every builder entry point is given ``arch=ARCH``, so
+``tile_for_work``) and every builder entry point is given ``arch=ARCH``, so
 these lanes grade the gfx942 kernel rather than silently grading gfx950.
 
 These lanes need a real gfx942 and ROCm torch, so they are marked ``gpu``. The
@@ -35,8 +35,9 @@ from dispatch.gdn.gfx942 import (  # noqa: E402
     ARCH,
     TUNED_SPEC_IDS,
     make_spec,
-    spec_id_for_batch,
-    tile_for_batch,
+    spec_id_for_work,
+    tile_for_work,
+    work_for,
 )
 
 pytestmark = pytest.mark.gpu
@@ -63,7 +64,8 @@ def _req(batch: int, **kw) -> GdnDecodeRequest:
 
 def _spec_for(batch: int, **kw):
     """The spec the dispatcher would pick for ``batch`` on gfx942."""
-    return make_spec(_req(batch, **kw), tile_for_batch(batch))
+    req = _req(batch, **kw)
+    return make_spec(req, tile_for_work(work_for(batch, req.num_v_heads)))
 
 
 def _tile(spec):
@@ -96,18 +98,25 @@ def test_matches_fp32_reference(harness, batch):
     assert state_err <= harness["TOL"], f"batch {batch}: state error {state_err:.3e}"
 
 
-def _one_batch_per_band() -> dict:
-    """spec_id -> the smallest batch that lands in that band.
+def _one_case_per_band() -> dict:
+    """spec_id -> (batch, num_k_heads, num_v_heads) landing in that band.
 
-    Derived from the table rather than hard-coded. A hard-coded list of
-    representative batches silently stops covering a tile the moment the bands
-    are re-tuned, which is exactly when coverage matters most.
+    Derived from the table rather than hard-coded. A hard-coded list silently
+    stops covering a tile the moment the bands are re-tuned, which is exactly
+    when coverage matters most.
+
+    The search varies HEAD COUNT as well as batch, because the table is keyed
+    on work = batch * num_v_heads. At the production geometry (Hv=32) the
+    smallest band is unreachable -- batch 1 already means work 32 -- so a
+    batch-only search would silently never exercise it. Tensor-parallel shards
+    (Hv of 16/8/4) are what reach the low-work bands, and they are real
+    deployments, not synthetic cases.
     """
+    geometries = ((16, 32), (8, 16), (4, 8), (2, 4))
     seen: dict = {}
-    for batch in range(1, 4097):
-        seen.setdefault(spec_id_for_batch(batch), batch)
-        if len(seen) == len(TUNED_SPEC_IDS):
-            break
+    for hk, hv in geometries:
+        for batch in (1, 2, 4, 8, 16, 32, 64, 128, 256, 1024, 4096):
+            seen.setdefault(spec_id_for_work(work_for(batch, hv)), (batch, hk, hv))
     return seen
 
 
@@ -120,20 +129,23 @@ def test_every_dispatched_tile_is_correct(harness):
     tuning at all.
     """
     seen = set()
-    for batch in sorted(_one_batch_per_band().values()):
-        result = dispatch_gdn_decode(_req(batch))
+    for spec_id, (batch, hk, hv) in sorted(_one_case_per_band().items()):
+        result = dispatch_gdn_decode(_req(batch, num_k_heads=hk, num_v_heads=hv))
         spec = result.spec
-        assert _tile(spec) == tile_for_batch(batch), (
-            f"batch {batch}: dispatcher picked {_tile(spec)}, "
-            f"table says {tile_for_batch(batch)}"
+        work = work_for(batch, hv)
+        assert _tile(spec) == tile_for_work(work), (
+            f"batch {batch} x {hv} v-heads (work {work}): dispatcher picked "
+            f"{_tile(spec)}, table says {tile_for_work(work)}"
         )
         seen.add(result.candidate.spec_id)
         out_err, state_err = harness["check"](spec, batch, arch=ARCH)
         assert out_err <= harness["TOL"], (
-            f"batch {batch} tile {_tile(spec)}: output error {out_err:.3e}"
+            f"batch {batch} x {hv} heads tile {_tile(spec)}: "
+            f"output error {out_err:.3e}"
         )
         assert state_err <= harness["TOL"], (
-            f"batch {batch} tile {_tile(spec)}: state error {state_err:.3e}"
+            f"batch {batch} x {hv} heads tile {_tile(spec)}: "
+            f"state error {state_err:.3e}"
         )
     assert seen == set(TUNED_SPEC_IDS), f"tiles never exercised: {set(TUNED_SPEC_IDS) - seen}"
 

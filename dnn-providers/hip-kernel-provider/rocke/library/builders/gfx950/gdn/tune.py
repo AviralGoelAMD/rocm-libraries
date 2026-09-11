@@ -154,6 +154,20 @@ def main() -> int:
         help="architecture to tune for; each arch has its own tuned table, "
              "because the bands encode CU count and occupancy",
     )
+    ap.add_argument(
+        "--num-k-heads", type=int, default=GdnDecodeSpec().num_k_heads,
+        help="key/query heads; shrinks with tensor-parallel sharding",
+    )
+    ap.add_argument(
+        "--num-v-heads", type=int, default=GdnDecodeSpec().num_v_heads,
+        help="value heads; the grid is batch * num_v_heads * blocks_per_v_dim, "
+             "so this is a direct multiplier on available parallelism",
+    )
+    ap.add_argument(
+        "--csv", default=None,
+        help="append EVERY timed configuration here, not just the top rows, "
+             "so the full space can be re-examined without re-measuring",
+    )
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -173,9 +187,27 @@ def main() -> int:
         )
         return 2
 
-    base = GdnDecodeSpec()
+    base = dc.replace(
+        GdnDecodeSpec(),
+        num_k_heads=args.num_k_heads,
+        num_v_heads=args.num_v_heads,
+    )
+    ok, why = is_valid_spec(base, arch=args.arch)
+    if not ok:
+        print(f"refusing to tune: base shape rejected: {why}", file=sys.stderr)
+        return 2
     configs = legal_configs(base, args.arch)
+    print(f"=== Hk={base.num_k_heads} Hv={base.num_v_heads} on {args.arch} "
+          f"({torch.cuda.get_device_properties(0).multi_processor_count} CUs) ===")
     print(f"legal configurations for this shape: {len(configs)}")
+
+    csv_fh = None
+    if args.csv:
+        new = not __import__("os").path.exists(args.csv)
+        csv_fh = open(args.csv, "a")
+        if new:
+            csv_fh.write("arch,num_k_heads,num_v_heads,batch,num_warps,"
+                         "warp_threads_k,blocks_per_v_dim,device_us,err,rank\n")
 
     winners = {}
     for batch in (int(x) for x in args.batches.split(",")):
@@ -190,6 +222,13 @@ def main() -> int:
                 f"blocks_per_v_dim={tile[2]}  err={err:.2e}"
             )
         winners[batch] = rows[0]
+        if csv_fh:
+            for rank, (micros, tile, err) in enumerate(rows, 1):
+                csv_fh.write(
+                    f"{args.arch},{base.num_k_heads},{base.num_v_heads},{batch},"
+                    f"{tile[0]},{tile[1]},{tile[2]},{micros:.4f},{err:.4e},{rank}\n"
+                )
+            csv_fh.flush()
 
     print("\n=== fastest per batch ===")
     for batch, (micros, tile, _) in winners.items():
@@ -198,6 +237,9 @@ def main() -> int:
         f"\nUpdate _TUNED_TILES in dispatch/gdn/{args.arch}.py if these "
         f"disagree with the table, and re-run the wiring test."
     )
+    if csv_fh:
+        csv_fh.close()
+        print(f"full sweep written to {args.csv}")
     return 0
 
 

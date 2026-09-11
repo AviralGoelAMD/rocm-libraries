@@ -14,19 +14,19 @@
           "bytes": 153817,
           "sha256": "54a121586fd63fd87c8f2f449ee13fd940843cd65c7734709d71bf231e5aba7c"
         },
-        "tuned_b2": {
-          "bytes": 27277,
-          "sha256": "a5ee1ff1d3d6a8d3d9f4abd752fe16056eb4395796a61a2a3da82d89ae1ef01e"
+        "tuned_w16": {
+          "bytes": 19129,
+          "sha256": "881e9f7b2340033cf2d1b5f1452fe00ad41fd947593662a4619cbf829589c319"
         },
-        "tuned_b24": {
-          "bytes": 62112,
-          "sha256": "ac0b32e742c45d011eb69c346aa68ba59dc91f298d4bf65a343542749a334ed5"
-        },
-        "tuned_b8": {
+        "tuned_w512": {
           "bytes": 38764,
           "sha256": "142aacffd0d15dac86c6464d4b4a844b2d7d037f1188dcb938107e6ff5839b6e"
         },
-        "tuned_b_large": {
+        "tuned_w64": {
+          "bytes": 27277,
+          "sha256": "a5ee1ff1d3d6a8d3d9f4abd752fe16056eb4395796a61a2a3da82d89ae1ef01e"
+        },
+        "tuned_w_large": {
           "bytes": 110007,
           "sha256": "8050f34577a60c91751dc0d85aaff5b1e9fd71233aae8a933b604585003c7de5"
         }
@@ -46,19 +46,19 @@
           "bytes": 153824,
           "sha256": "a3332ca02098690341ff803ddfcdd8da05bf49fdcd3e64bc06654975b74f2eaa"
         },
-        "tuned_b2": {
-          "bytes": 27284,
-          "sha256": "5180673dbd21d4d8e2c682beb33194e33a1b6b6ba88e78e0c935a30caa0557f1"
+        "tuned_w16": {
+          "bytes": 19136,
+          "sha256": "cb1b998ee423a52f298d1ea4db66888df9efa5ee44b3301a816ba96cbdd0d0f1"
         },
-        "tuned_b24": {
-          "bytes": 62119,
-          "sha256": "7bc4cb5a277cb9bb44970996988d93954df7451ef4f71f58fa48f2ccf52bd7eb"
-        },
-        "tuned_b8": {
+        "tuned_w512": {
           "bytes": 38771,
           "sha256": "d31fff0e321614787de577cc6aa9387288a6814de6f923d7ef1eaed1a9f25d48"
         },
-        "tuned_b_large": {
+        "tuned_w64": {
+          "bytes": 27284,
+          "sha256": "5180673dbd21d4d8e2c682beb33194e33a1b6b6ba88e78e0c935a30caa0557f1"
+        },
+        "tuned_w_large": {
           "bytes": 110014,
           "sha256": "125a692f6809b33afdf0cc4e94092bc0b55197cfcb33bce6eb8cb2c5a413833c"
         }
@@ -78,19 +78,19 @@
           "bytes": 153828,
           "sha256": "b02083570119dfc06c3d32062ecc7fbc6ded99242d954ef6adbcbd906dd8094c"
         },
-        "tuned_b2": {
-          "bytes": 27288,
-          "sha256": "44752f9477a04f1e7d5dd2e548d79a702c8b8d33554d48683b6e02d7b3dea6bf"
+        "tuned_w16": {
+          "bytes": 19140,
+          "sha256": "4a91e6d7c490e8cf5a99fd1a82b723cc9342731ac1d0db8ea8df47500e8fc2f3"
         },
-        "tuned_b24": {
-          "bytes": 62123,
-          "sha256": "e2a2d1f2f56116f97cbc94efc57f34e2a4996cac741340e81b70596da89cf61d"
-        },
-        "tuned_b8": {
+        "tuned_w512": {
           "bytes": 38775,
           "sha256": "2720add795c119bd1a855f748c75e4157bc838f84a00a14988f045511fb42367"
         },
-        "tuned_b_large": {
+        "tuned_w64": {
+          "bytes": 27288,
+          "sha256": "44752f9477a04f1e7d5dd2e548d79a702c8b8d33554d48683b6e02d7b3dea6bf"
+        },
+        "tuned_w_large": {
           "bytes": 110018,
           "sha256": "2d4034cb0c5a9ea4e87e22110811751a46fd63cc752794244bb6cca2d0e3f23d"
         }
