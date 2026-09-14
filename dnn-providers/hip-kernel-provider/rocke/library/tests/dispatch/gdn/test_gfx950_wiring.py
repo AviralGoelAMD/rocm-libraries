@@ -125,11 +125,29 @@ class TestSpecIdPin(unittest.TestCase):
         self.assertEqual(result.candidate.spec_id, "w128")
         self.assertEqual(_TILE(result.spec), (4, 16, 8))
 
-    def test_every_pin_is_reachable_at_any_batch(self):
+    def test_every_pin_is_reachable_with_its_own_gate_kind(self):
+        # Each tuned tile belongs to exactly one gate kind's table, so a pin is
+        # reachable from a request of that kind and only that kind.
         for spec_id in TUNED_SPEC_IDS:
-            with self.subTest(spec_id=spec_id):
-                got = dispatch_gdn_decode(_req(64, spec_id=spec_id))
+            gate_kind = "kda" if spec_id.startswith("kda_") else "gdn"
+            with self.subTest(spec_id=spec_id, gate_kind=gate_kind):
+                got = dispatch_gdn_decode(
+                    GdnDecodeRequest(
+                        batch=64, arch=ARCH, spec_id=spec_id, gate_kind=gate_kind
+                    )
+                )
                 self.assertEqual(got.candidate.spec_id, spec_id)
+                self.assertEqual(got.spec.gate_kind, gate_kind)
+
+    def test_a_pin_cannot_cross_gate_kinds(self):
+        # Serving a KDA pin to a GDN request would hand it a tile tuned for a
+        # different kernel. That must fail loudly, not silently fall back.
+        with self.assertRaises(ValueError):
+            dispatch_gdn_decode(
+                GdnDecodeRequest(
+                    batch=64, arch=ARCH, spec_id="kda_w128", gate_kind="gdn"
+                )
+            )
 
 
 class TestLaunchGeometry(unittest.TestCase):

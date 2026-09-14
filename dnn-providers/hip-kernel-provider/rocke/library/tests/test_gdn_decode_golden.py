@@ -51,7 +51,7 @@ def _cases():
     Covers the default spec, the reference path, and every tile the dispatcher
     can select, so a change to any shipped configuration is visible.
     """
-    from dispatch.gdn.gfx950 import _TUNED_TILES
+    from dispatch.gdn.gfx950 import _TUNED_TILES_GDN, _TUNED_TILES_KDA
     from kernels.gfx950.gdn_decode import GdnDecodeSpec, build_gdn_decode
 
     def build(**overrides):
@@ -69,13 +69,17 @@ def _cases():
         "kda_simple": build(gate_kind="kda", simple=True),
         "kda_raw_gate": build(gate_kind="kda", fuse_gate=False),
     }
-    for _, tile, spec_id in _TUNED_TILES:
+    # Each gate kind has its own tuned table, so each is pinned against its own
+    # tiles. Pinning KDA against GDN's tiles would cover a configuration the
+    # dispatcher can never select.
+    for _, tile, spec_id in _TUNED_TILES_GDN:
         cases[f"tuned_{spec_id}"] = build(
             num_warps=tile[0],
             warp_threads_k=tile[1],
             blocks_per_v_dim=tile[2],
         )
-        cases[f"kda_tuned_{spec_id}"] = build(
+    for _, tile, spec_id in _TUNED_TILES_KDA:
+        cases[f"tuned_{spec_id}"] = build(
             gate_kind="kda",
             num_warps=tile[0],
             warp_threads_k=tile[1],
@@ -180,14 +184,23 @@ def test_gdn_cases_carry_no_kda_marker():
     Guards the additive claim from the fixture side: if a GDN case id ever
     starts resolving to a KDA spec, the "GDN goldens unchanged" evidence is
     quietly measuring the wrong kernel.
+
+    KDA appears in an id two ways -- as a prefix for the hand-written cases
+    (``kda_default``) and as an infix for the tuned ones (``tuned_kda_w128``,
+    which inherits its gate kind from the spec id in the KDA table) -- so the
+    split is on containment, not prefix.
     """
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
 
     assert GdnDecodeSpec().gate_kind == "gdn"
-    gdn_ids = [cid for cid in _cases() if not cid.startswith("kda_")]
-    for cid in gdn_ids:
-        assert "kda" not in cid
+    ids = list(_cases())
+    gdn_ids = [cid for cid in ids if "kda" not in cid]
+    kda_ids = [cid for cid in ids if "kda" in cid]
+
+    # The original GDN set: default, simple, no_l2norm + one per GDN tuned tile.
     assert len(gdn_ids) >= 7, f"expected the original GDN case set, got {gdn_ids}"
+    assert kda_ids, "the KDA gate kind is unpinned"
+    assert not set(gdn_ids) & set(kda_ids)
 
 
 if __name__ == "__main__":

@@ -51,50 +51,92 @@ ARCH = "gfx950"
 # 4): a batch-keyed table tuned at Hv=32 picks the wrong tile on every
 # multi-GPU deployment, including rungs no sweep ever visited.
 #
-# !!! PROVISIONAL -- DO NOT SHIP !!!
-# These entries are the previous batch-keyed values re-expressed at Hv=32
-# (batch b -> work 32b). They have NOT been measured against the per-channel
-# KDA gate, which adds loads and registers and can move the optimum, and the
-# work axis itself has not been swept. Task 8 of the implementation plan
-# replaces this table with measured values and rewrites this comment with the
-# usual provenance: what was measured, what is interpolated, and what the
-# table does not claim.
-_TUNED_TILES = (
+# ONE TABLE PER GATE KIND. The per-channel KDA gate carries extra loads and
+# registers that the scalar GDN gate does not, so the two do not share an
+# optimum and must not share a table -- overwriting one with the other's
+# values would silently retune a shipped kernel.
+
+# GDN: the shipped tiles, re-expressed on the work axis (batch b at Hv=32 ->
+# work 32b). The tile VALUES are the original batch-keyed measurements; only
+# the key changed, so Hv=32 selection is unchanged and other head counts now
+# land on the tile their work implies rather than on Hv=32's.
+_TUNED_TILES_GDN = (
     (128, (4, 16, 8), "w128"),
     (1024, (2, 8, 2), "w1024"),
     (4096, (1, 8, 1), "w4096"),
     (None, (8, 16, 1), "w_large"),
 )
 
-# Every tile the table can produce, for tuners and for the sweep space.
-TUNED_SPEC_IDS = tuple(entry[2] for entry in _TUNED_TILES)
+# KDA: measured on gfx950 with the per-channel gate. All 54 legal tiles were
+# enumerated through is_valid_spec and correctness-gated against the fp32
+# reference before timing; survivors were timed with a device clock (replayed
+# HIP graph, so host submission is off the critical path).
+#
+# Measured: work in {8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096}, realised
+# across three head geometries (Hk/Hv of 16/32, 8/16, 4/8) x eight batches --
+# 24 cells, 54 configurations each. Band edges BETWEEN those anchors are
+# interpolation, not measured crossovers.
+#
+# Three bands, not more. Four bands improve the geomean by 0.75pp and five by a
+# further 0.37pp, both inside the 0.3-2.2% spread measured between adjacent
+# configurations at the same anchor -- and the extra edges land at work 32/64,
+# exactly where the sweep shows tile choice is already inside run-to-run
+# variation. More bands here would be fitting noise.
+#
+# What this table claims: only that the chosen tile is close to the best LEGAL
+# ROCKE tile at the measured anchors -- geomean 1.016, worst 1.042 against the
+# per-anchor optimum, against 1.088 / 1.304 for the best single universal tile.
+# It is a claim against our own tile space and nothing else.
+#
+# Validated out of sample on the MHA shape that ships (Hk=Hv=32), which was
+# NOT in the fit, and this banding scores geomean 1.015, worst 1.053 there.
+_TUNED_TILES_KDA = (
+    (128, (4, 16, 4), "kda_w128"),
+    (512, (1, 16, 4), "kda_w512"),
+    (None, (2, 16, 1), "kda_w_large"),
+)
+
+
+def _tuned_tiles(gate_kind: str):
+    return _TUNED_TILES_KDA if gate_kind == "kda" else _TUNED_TILES_GDN
+
+
+# Every tile the tables can produce, for tuners and for the sweep space.
+TUNED_SPEC_IDS = tuple(e[2] for e in _TUNED_TILES_GDN + _TUNED_TILES_KDA)
 
 
 def work_for(batch: int, num_v_heads: int) -> int:
-    """The quantity the tile table is keyed on."""
+    """The quantity the tile tables are keyed on."""
     return int(batch) * int(num_v_heads)
 
 
-def tile_for_work(work: int) -> Tuple[int, int, int]:
+def tile_for_work(work: int, gate_kind: str = "gdn") -> Tuple[int, int, int]:
     """Tuned ``(num_warps, warp_threads_k, blocks_per_v_dim)`` for ``work``."""
-    for max_work, tile, _ in _TUNED_TILES:
+    for max_work, tile, _ in _tuned_tiles(gate_kind):
         if max_work is None or work <= max_work:
             return tile
     raise AssertionError("unreachable: table has an open-ended final band")
 
 
-def spec_id_for_work(work: int) -> str:
-    for max_work, _, spec_id in _TUNED_TILES:
+def spec_id_for_work(work: int, gate_kind: str = "gdn") -> str:
+    for max_work, _, spec_id in _tuned_tiles(gate_kind):
         if max_work is None or work <= max_work:
             return spec_id
     raise AssertionError("unreachable: table has an open-ended final band")
 
 
 def _tile_for_spec_id(spec_id: str) -> Tuple[int, int, int]:
-    for _, tile, sid in _TUNED_TILES:
+    for _, tile, sid in _TUNED_TILES_GDN + _TUNED_TILES_KDA:
         if sid == spec_id:
             return tile
     raise KeyError(spec_id)
+
+
+def _gate_kind_for_spec_id(spec_id: str) -> str:
+    """Which gate kind's table a spec id belongs to."""
+    if any(sid == spec_id for _, _, sid in _TUNED_TILES_KDA):
+        return "kda"
+    return "gdn"
 
 
 def make_spec(req: GdnDecodeRequest, tile: Tuple[int, int, int]) -> GdnDecodeSpec:
@@ -135,6 +177,15 @@ def _make_candidate(*, tile: Tuple[int, int, int], spec_id: str, priority: int):
         assert isinstance(req, GdnDecodeRequest)
         if req.arch != ARCH:
             return False, f"candidate arch {ARCH} != request arch {req.arch!r}"
+        # A candidate belongs to exactly one gate kind's table. Serving the
+        # other kind would hand the request a tile tuned for a different
+        # kernel, which is the failure the split table exists to prevent.
+        if req.gate_kind != _gate_kind_for_spec_id(spec_id):
+            return False, (
+                f"candidate {spec_id!r} is tuned for the "
+                f"{_gate_kind_for_spec_id(spec_id)!r} gate, request asks for "
+                f"{req.gate_kind!r}"
+            )
         ok, why = selector_matches(req, candidate)
         if not ok:
             return False, why
@@ -143,7 +194,9 @@ def _make_candidate(*, tile: Tuple[int, int, int], spec_id: str, priority: int):
         # registration order. An explicit ``spec_id`` pin bypasses this, which
         # is what makes a tuning sweep able to force a non-default tile.
         if req.spec_id.strip().lower() == "auto":
-            wanted = spec_id_for_work(work_for(req.batch, req.num_v_heads))
+            wanted = spec_id_for_work(
+                work_for(req.batch, req.num_v_heads), req.gate_kind
+            )
             # Prefer the tuned tile, but only when it is valid for this geometry.
             # If it is not, fall through so any valid candidate may serve (the
             # registry picks by priority) rather than failing a kernel-supported
@@ -189,10 +242,15 @@ def _make_candidate(*, tile: Tuple[int, int, int], spec_id: str, priority: int):
 
 
 def candidates() -> Tuple[KernelCandidate, ...]:
-    """One candidate per tuned tile, in table order."""
+    """One candidate per tuned tile, GDN's table then KDA's, in table order.
+
+    Both kinds are registered together; each candidate's ``support`` admits
+    only its own gate kind, so the tables cannot cross-serve.
+    """
+    entries = _TUNED_TILES_GDN + _TUNED_TILES_KDA
     return tuple(
         _make_candidate(tile=tile, spec_id=spec_id, priority=10 + i)
-        for i, (_, tile, spec_id) in enumerate(_TUNED_TILES)
+        for i, (_, tile, spec_id) in enumerate(entries)
     )
 
 

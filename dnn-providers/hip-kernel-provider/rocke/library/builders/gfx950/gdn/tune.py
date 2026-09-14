@@ -137,37 +137,90 @@ def main() -> int:
         default=",".join(str(b) for b in DEFAULT_BATCHES),
         help="comma-separated decode batch sizes to tune for",
     )
-    ap.add_argument("--top", type=int, default=8, help="rows to print per batch")
+    ap.add_argument(
+        "--gate-kind",
+        default="gdn",
+        choices=("gdn", "kda"),
+        help="forget-gate granularity to tune for",
+    )
+    ap.add_argument(
+        "--geometries",
+        default="16/32",
+        help=(
+            "comma-separated num_k_heads/num_v_heads pairs. More than one turns "
+            "the run into a test of the work-keying hypothesis: cells sharing "
+            "batch * num_v_heads should agree on the best tile."
+        ),
+    )
+    ap.add_argument("--top", type=int, default=8, help="rows to print per cell")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
         print("no HIP device visible", file=sys.stderr)
         return 2
 
-    base = GdnDecodeSpec()
-    configs = legal_configs(base)
-    print(f"legal configurations for this shape: {len(configs)}")
+    geometries = []
+    for item in args.geometries.split(","):
+        hk, hv = item.split("/")
+        geometries.append((int(hk), int(hv)))
+    batches = [int(x) for x in args.batches.split(",")]
 
-    winners = {}
-    for batch in (int(x) for x in args.batches.split(",")):
-        rows = sweep_batch(base, batch, configs)
-        if not rows:
-            print(f"batch {batch}: no configuration was both correct and timeable")
-            return 1
-        print(f"\n=== batch {batch}: top {args.top} of {len(rows)} ===")
-        for micros, tile, err in rows[: args.top]:
+    by_work = {}  # work -> [(us, tile, batch, hv), ...]
+
+    for hk, hv in geometries:
+        base = dc.replace(
+            GdnDecodeSpec(),
+            gate_kind=args.gate_kind,
+            num_k_heads=hk,
+            num_v_heads=hv,
+        )
+        configs = legal_configs(base)
+        print(f"\n### geometry Hk={hk} Hv={hv}: {len(configs)} legal configurations")
+        for batch in batches:
+            rows = sweep_batch(base, batch, configs)
+            if not rows:
+                print(f"  batch {batch}: nothing both correct and timeable")
+                continue
+            work = batch * hv
             print(
-                f"  {micros:9.3f}us  num_warps={tile[0]} warp_threads_k={tile[1]} "
-                f"blocks_per_v_dim={tile[2]}  err={err:.2e}"
+                f"\n=== Hk{hk}/Hv{hv} batch {batch} (work {work}): "
+                f"top {args.top} of {len(rows)} ==="
             )
-        winners[batch] = rows[0]
+            for micros, tile, err in rows[: args.top]:
+                print(
+                    f"  {micros:9.3f}us  num_warps={tile[0]} "
+                    f"warp_threads_k={tile[1]} blocks_per_v_dim={tile[2]}  "
+                    f"err={err:.2e}"
+                )
+            by_work.setdefault(work, []).append((rows[0][0], rows[0][1], batch, hv))
 
-    print("\n=== fastest per batch ===")
-    for batch, (micros, tile, _) in winners.items():
-        print(f"  batch {batch:<6d} {tile}  {micros:.3f}us")
+    # Does the best tile depend only on the product? Cells sharing a work value
+    # but differing in (batch, heads) are the evidence either way. A real
+    # disagreement here invalidates the table's KEY, not just its values.
+    print("\n=== work -> best tile, across geometries ===")
+    print(f"{'work':>7}  {'best tile':16} {'us':>9}  cells (batch x Hv)")
+    disagreements = []
+    for work in sorted(by_work):
+        cells = by_work[work]
+        tiles = {c[1] for c in cells}
+        fastest = min(cells)
+        cellstr = " ".join(f"{b}x{h}" for _, _, b, h in cells)
+        flag = "" if len(tiles) == 1 else "   <-- TILES DISAGREE"
+        if len(tiles) > 1:
+            disagreements.append((work, sorted(tiles)))
+        print(f"{work:>7}  {str(fastest[1]):16} {fastest[0]:9.3f}  {cellstr}{flag}")
+
+    if disagreements:
+        print(
+            f"\nWARNING: work alone did not fix the best tile at "
+            f"{len(disagreements)} work value(s). Before banding, check whether "
+            "the disagreeing times sit inside run-to-run variation. If they do "
+            "not, the table must not be keyed on work."
+        )
     print(
-        "\nUpdate _TUNED_TILES in dispatch/gdn/gfx950.py if these disagree "
-        "with the table, and re-run the wiring test."
+        "\nBand _TUNED_TILES in dispatch/gdn/gfx950.py from the work column, "
+        "record which work values were measured and which band edges are "
+        "interpolated, and re-run the wiring test."
     )
     return 0
 

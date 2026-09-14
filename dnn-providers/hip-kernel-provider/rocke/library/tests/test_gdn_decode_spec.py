@@ -263,17 +263,24 @@ class TestEmission(unittest.TestCase):
                 self.assertIn("define amdgpu_kernel", llvm)
 
     def test_every_tuned_tile_emits(self):
-        from dispatch.gdn.gfx950 import _TUNED_TILES
+        # Both tables, each with its own gate kind: a tile is only ever selected
+        # together with the gate it was tuned for, so that is how it is checked.
+        from dispatch.gdn.gfx950 import _TUNED_TILES_GDN, _TUNED_TILES_KDA
 
-        for _, tile, spec_id in _TUNED_TILES:
-            with self.subTest(spec_id=spec_id):
-                spec = dc.replace(
-                    GdnDecodeSpec(),
-                    num_warps=tile[0],
-                    warp_threads_k=tile[1],
-                    blocks_per_v_dim=tile[2],
-                )
-                self.assertIn("define amdgpu_kernel", _lower(spec))
+        for gate_kind, table in (
+            ("gdn", _TUNED_TILES_GDN),
+            ("kda", _TUNED_TILES_KDA),
+        ):
+            for _, tile, spec_id in table:
+                with self.subTest(spec_id=spec_id, gate_kind=gate_kind):
+                    spec = dc.replace(
+                        GdnDecodeSpec(),
+                        gate_kind=gate_kind,
+                        num_warps=tile[0],
+                        warp_threads_k=tile[1],
+                        blocks_per_v_dim=tile[2],
+                    )
+                    self.assertIn("define amdgpu_kernel", _lower(spec))
 
     def test_distinct_tiles_emit_distinct_code(self):
         # If two tiles produced identical IR the tuning table would be choosing
