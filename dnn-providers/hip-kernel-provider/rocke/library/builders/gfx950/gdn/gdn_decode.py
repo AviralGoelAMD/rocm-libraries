@@ -136,6 +136,21 @@ def make_inputs(spec: GdnDecodeSpec, batch: int, seed: int = 0, device: str = "c
     }
 
 
+def precompute_kda_log_decay(spec: GdnDecodeSpec, inp) -> torch.Tensor:
+    """Natural-log decay for the benchmark-only precomputed KDA mode.
+
+    The fp32 oracle deliberately does not call this helper: benchmark
+    preparation and the correctness reference must not share formula code, or
+    the same bug can make both arms agree.
+    """
+    if spec.gate_kind != "kda" or not spec.fuse_gate:
+        raise ValueError("precompute_kda_log_decay requires fused KDA raw logits")
+    inner = torch.exp(inp["A_log"].float())[None, :, None] * (
+        inp["a"][:, 0].float() + inp["dt_bias"].float()
+    )
+    return spec.lower_bound * torch.sigmoid(inner)
+
+
 def ref_fp32(spec: GdnDecodeSpec, inp) -> Tuple[torch.Tensor, torch.Tensor]:
     """Whole-tensor fp32 reference for one decode step.
 

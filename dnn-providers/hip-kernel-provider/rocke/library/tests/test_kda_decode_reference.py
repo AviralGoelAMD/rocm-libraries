@@ -30,6 +30,33 @@ def _kda_spec(**kw):
     return dc.replace(GdnDecodeSpec(), gate_kind="kda", **kw)
 
 
+class TestLogDecayPreparation(unittest.TestCase):
+    """Benchmark preparation shares a helper; the oracle stays independent."""
+
+    def test_matches_an_independent_longhand_formula(self):
+        from builders.gfx950.gdn.gdn_decode import precompute_kda_log_decay
+
+        spec = _kda_spec()
+        inp = make_inputs(spec, batch=2, device="cpu")
+
+        got = precompute_kda_log_decay(spec, inp)
+        inner = torch.exp(inp["A_log"].float())[None, :, None] * (
+            inp["a"][:, 0].float() + inp["dt_bias"].float()
+        )
+        expected = spec.lower_bound * torch.sigmoid(inner)
+
+        self.assertEqual(tuple(got.shape), (2, spec.num_v_heads, spec.head_k_dim))
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+    def test_rejects_modes_without_raw_kda_logits(self):
+        from builders.gfx950.gdn.gdn_decode import precompute_kda_log_decay
+
+        for spec in (GdnDecodeSpec(), _kda_spec(fuse_gate=False)):
+            inp = make_inputs(spec, batch=2, device="cpu")
+            with self.assertRaisesRegex(ValueError, "fused KDA"):
+                precompute_kda_log_decay(spec, inp)
+
+
 class TestInputShapes(unittest.TestCase):
     """The KDA gate is per-channel, and its bias is f32. Both are contract."""
 
