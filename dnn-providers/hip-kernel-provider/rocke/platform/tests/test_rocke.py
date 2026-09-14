@@ -667,6 +667,59 @@ class TestHelpers(unittest.TestCase):
         with self.assertRaises(ValueError):
             LdsLayout(logical_cols=64, swizzle="xor").validate_for_async()
 
+    def test_wgrad_async_rejects_non_packed_lds_layout(self):
+        """An explicit lds_layout must reach validate_for_async() for wgrad too.
+
+        The scalar ``lds_k_pad`` guard cannot stand in for this: an explicit
+        ``lds_layout`` object beats the scalar in ``effective_lds_layout()``, and
+        the xor swizzle has no scalar analogue at all. Without the call these
+        specs build and only fail deep inside the emitter, which the sweep
+        drivers turn into a silent skip. Mirrors the conv/dgrad behaviour.
+        """
+        from rocke.instances.common._conv_implicit_gemm_common import ConvProblem
+        from rocke.instances.common.conv_implicit_gemm import ConvDataSpec
+        from rocke.instances.common.conv_implicit_gemm_wgrad import (
+            WgradConvSpec,
+            is_valid_wgrad_spec,
+        )
+
+        def _spec(**over):
+            return WgradConvSpec(
+                problem=ConvProblem(N=1, Hi=8, Wi=8, C=32, K=32, Y=3, X=3, pH=1, pW=1),
+                name="wgrad_async_guard",
+                data=ConvDataSpec(dtype_a="bf16", dtype_b="bf16", dtype_d="bf16"),
+                tile_m=64,
+                tile_n=64,
+                tile_k=64,
+                warp_m=2,
+                warp_n=2,
+                warp_tile_m=32,
+                warp_tile_n=32,
+                warp_tile_k=16,
+                wave_size=64,
+                pipeline="mem",
+                epilogue="cshuffle",
+                split_k=1,
+                lds_k_outer=True,
+                async_dma=True,
+                **over,
+            )
+
+        # The packed layout the async intrinsic actually writes is accepted.
+        _spec(lds_layout=LdsLayout.packed_async(64)).validate()
+
+        for bad in (
+            LdsLayout.padded_k(64, 8),
+            LdsLayout(logical_cols=64, swizzle="xor"),
+        ):
+            spec = _spec(lds_layout=bad)
+            with self.assertRaises(ValueError):
+                spec.validate()
+            # And the soft validator reports it rather than skipping silently.
+            ok, why = is_valid_wgrad_spec(spec, "gfx950")
+            self.assertFalse(ok)
+            self.assertTrue(why)
+
     def test_schedule_policy_emits_expected_hints(self):
         b = IRBuilder("sched_smoke")
         policy = SchedulePolicy.for_pipeline("compv4")
@@ -3206,6 +3259,62 @@ class TestNewTargetIntrinsics(unittest.TestCase):
         # Regression: the handler used to request a decl key ("ds.swizzle") that
         # does not exist, so the declare was silently omitted.
         self.assertIn("declare i32 @llvm.amdgcn.ds.swizzle(i32, i32 immarg)", ll)
+
+    # ---- quad_perm ----
+    def test_quad_perm_encodes_lane_selection(self):
+        # [1,0,3,2] -> 1 | (0 << 2) | (3 << 4) | (2 << 6) == 177.
+        ll = self._lower("qperm", lambda b: b.quad_perm(b.const_i32(1), [1, 0, 3, 2]))
+        self.assertIn("declare i32 @llvm.amdgcn.update.dpp.i32(", ll)
+        self.assertIn(
+            "call i32 @llvm.amdgcn.update.dpp.i32("
+            "i32 1, i32 1, i32 177, i32 15, i32 15, i1 true)",
+            ll,
+        )
+
+    def test_quad_perm_emits_hip_builtin(self):
+        from rocke.core.ir import IRBuilder
+        from rocke.core.lower_hip import lower_kernel_to_hip
+
+        b = IRBuilder("qperm_hip")
+        b.quad_perm(b.const_i32(1), [1, 0, 3, 2])
+        hip = lower_kernel_to_hip(b.kernel)
+        self.assertIn(
+            "__builtin_amdgcn_update_dpp(c1, c1, 177, 15, 15, 1)",
+            hip,
+        )
+
+    def test_quad_perm_is_pure(self):
+        from rocke.core.ir import is_pure_op_name
+
+        b = self._builder("qperm_pure")
+        value = b.quad_perm(b.const_i32(1), [1, 0, 3, 2])
+        self.assertTrue(value.op.is_pure)
+        self.assertTrue(is_pure_op_name("tile.quad_perm"))
+
+    def test_quad_perm_rejects_bad_perm_and_type(self):
+        b = self._builder("qperm_bad")
+        with self.assertRaises(ValueError):
+            b.quad_perm(b.const_i32(1), [0, 1, 2])
+        with self.assertRaises(ValueError):
+            b.quad_perm(b.const_i32(1), [0, 1, 2, 4])
+        with self.assertRaises(ValueError):
+            b.quad_perm(b.const_f32(1.0), [0, 1, 2, 3])
+
+    def test_warp_shuffle_xor_quad_maps_masks(self):
+        ll = self._lower(
+            "qperm_xor",
+            lambda b: (
+                b.warp_shuffle_xor_quad(b.const_i32(1), 1),
+                b.warp_shuffle_xor_quad(b.const_i32(1), 2),
+            ),
+        )
+        self.assertIn("i32 177, i32 15, i32 15, i1 true)", ll)
+        self.assertIn("i32 78, i32 15, i32 15, i1 true)", ll)
+
+    def test_warp_shuffle_xor_quad_rejects_out_of_quad_mask(self):
+        b = self._builder("qperm_xor_bad")
+        with self.assertRaises(ValueError):
+            b.warp_shuffle_xor_quad(b.const_i32(1), 4)
 
     # ---- mov_dpp8 ----
     def test_mov_dpp8_i32_emits_typed_intrinsic(self):
@@ -6381,6 +6490,33 @@ class TestPackArgsKernargABI(unittest.TestCase):
             pack_args(
                 [{"name": "p", "type": "ptr<f16,global>"}], {"p": "not a pointer"}
             )
+
+    def test_compile_packer_matches_pack_args_byte_for_byte(self):
+        # KernelLauncher swaps in ``compile_packer`` for the per-launch
+        # pack, so it must be a byte-identical oracle for ``pack_args`` on
+        # the same signature -- any divergence silently corrupts kernargs.
+        from rocke.runtime.packing import compile_packer, pack_args
+
+        for sig, vals in (
+            (self._MIXED_SIG, self._MIXED_VALS),
+            (
+                [
+                    {"name": "p", "type": "ptr<f32,global>"},
+                    {"name": "i", "type": "i32"},
+                    {"name": "q", "type": "i64"},
+                    {"name": "f", "type": "f32"},
+                ],
+                {"p": 0x10, "i": 7, "q": 0x1122334455, "f": 1.5},
+            ),
+            ([{"name": "p", "type": "ptr<f16,global>"}], {"p": None}),
+        ):
+            self.assertEqual(compile_packer(sig)(vals), pack_args(sig, vals))
+        # Error parity: unknown type is rejected when the packer is built,
+        # a missing arg when the packer is called.
+        with self.assertRaises(ValueError):
+            compile_packer([{"name": "x", "type": "f16"}])
+        with self.assertRaises(KeyError):
+            compile_packer([{"name": "x", "type": "i32"}])({})
 
 
 class TestHostBufferReExportShim(unittest.TestCase):
