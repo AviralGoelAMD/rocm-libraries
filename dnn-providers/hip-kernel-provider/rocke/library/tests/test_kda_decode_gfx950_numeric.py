@@ -134,3 +134,50 @@ def test_kda_mha_shape_matches_reference(harness):
 
     assert out_err <= harness["TOL"], f"KDA MHA output error {out_err:.3e}"
     assert state_err <= harness["TOL"], f"KDA MHA state error {state_err:.3e}"
+
+
+@requires_gfx950
+@pytest.mark.parametrize("batch", [1, 16])
+def test_precomputed_decay_matches_reference(harness, batch):
+    """fuse_gate=False: `a` carries log-decay, the kernel only exponentiates."""
+    out_err, state_err = harness["check"](_kda(fuse_gate=False), batch)
+
+    assert out_err <= harness["TOL"], f"raw-gate output error {out_err:.3e}"
+    assert state_err <= harness["TOL"], f"raw-gate state error {state_err:.3e}"
+
+
+@requires_gfx950
+def test_precomputed_decay_agrees_with_fused_gate():
+    """The two gate-input modes must agree given the same decay.
+
+    This is what makes the later benchmark honest. The modes differ only in
+    who computes the gate, so once they agree numerically, any timing gap
+    between them is gate-activation cost and nothing else. Without this, an
+    arm-1 number could be comparing two different computations.
+    """
+    import torch
+
+    from builders.gfx950.gdn.gdn_decode import launcher_for, make_inputs, run
+
+    fused = _kda()
+    raw = _kda(fuse_gate=False)
+    batch = 8
+
+    inp = make_inputs(fused, batch)
+
+    # Precompute exactly what the fused kernel's gate produces, in log domain.
+    gx = inp["a"][:, 0].float() + inp["dt_bias"].float()
+    inner = torch.exp(inp["A_log"].float())[None, :, None] * gx
+    log_decay = fused.lower_bound * torch.sigmoid(inner)  # [B, HV, DK]
+
+    raw_inp = dict(inp)
+    raw_inp["a"] = log_decay[:, None].to(inp["a"].dtype).contiguous()
+    raw_inp["state"] = inp["state"].clone()
+
+    out_f, state_f = run(fused, inp, launcher_for(fused), batch)
+    out_r, state_r = run(raw, raw_inp, launcher_for(raw), batch)
+
+    # bf16 gate logits round differently on the two paths, so this is an
+    # agreement check at input precision, not bit-equality.
+    assert (out_f.float() - out_r.float()).abs().max().item() <= 2e-2
+    assert (state_f.float() - state_r.float()).abs().max().item() <= 2e-2

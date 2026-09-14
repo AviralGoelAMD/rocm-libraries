@@ -79,6 +79,26 @@ def launcher_for(spec: GdnDecodeSpec, arch: str = _ARCH) -> KernelLauncher:
     return launcher
 
 
+def _gate_input(spec: GdnDecodeSpec, rnd, batch: int, hv: int, dk: int):
+    """The `a` tensor, whose meaning depends on the gate mode.
+
+    * GDN: one raw logit per head, `[B, 1, HV]`.
+    * KDA, fuse_gate=True: one raw logit per K channel, `[B, 1, HV, DK]`; the
+      kernel turns it into a decay.
+    * KDA, fuse_gate=False: the natural-log-domain decay itself. Forced
+      non-positive so `exp(a)` lands in (0, 1] -- a positive value would
+      amplify the state every step rather than fade it, which the fused path
+      cannot produce and so is not worth generating.
+
+    Draws exactly one tensor in every mode, so callers can keep this at a fixed
+    position in the input dict and leave the random stream undisturbed.
+    """
+    if spec.gate_kind != "kda":
+        return rnd(batch, 1, hv)
+    g = rnd(batch, 1, hv, dk, scale=0.5)
+    return g if spec.fuse_gate else -g.abs()
+
+
 def make_inputs(spec: GdnDecodeSpec, batch: int, seed: int = 0, device: str = "cuda"):
     """Deterministic inputs matching the kernel's packed decode contract."""
     torch_dtype = {"bf16": torch.bfloat16, "f16": torch.float16}[spec.dtype]
@@ -95,15 +115,10 @@ def make_inputs(spec: GdnDecodeSpec, batch: int, seed: int = 0, device: str = "c
         "query": rnd(batch, 1, hk, dk),
         "key": rnd(batch, 1, hk, dk),
         "value": rnd(batch, 1, hv, dv),
-        # The KDA gate is per K channel, so `a` carries DK logits per head and
-        # dt_bias gains the same axis. Both stay at this position in the dict so
-        # the GDN draw order -- and therefore every seeded GDN input ever
-        # recorded -- is bit-for-bit unchanged.
-        "a": (
-            rnd(batch, 1, hv, dk, scale=0.5)
-            if spec.gate_kind == "kda"
-            else rnd(batch, 1, hv)
-        ),
+        # `a` stays at this position in the dict so the GDN draw order -- and
+        # therefore every seeded GDN input ever recorded -- is bit-for-bit
+        # unchanged. See _gate_input for what it holds in each mode.
+        "a": _gate_input(spec, rnd, batch, hv, dk),
         "b": rnd(batch, 1, hv),
         # f32 for KDA: the gate is evaluated in f32 and KDA prefill already
         # declares this tensor f32, so the two families share one contract.
@@ -145,12 +160,20 @@ def ref_fp32(spec: GdnDecodeSpec, inp) -> Tuple[torch.Tensor, torch.Tensor]:
         q = q * scale
 
     if spec.gate_kind == "kda":
-        # Per-channel gate, bounded in (lower_bound, 0) before the exp.
-        #   log_decay[d] = lower_bound * sigmoid(exp(A_log[h]) * (g[d] + dt_bias[h,d]))
-        inner = torch.exp(inp["A_log"].float())[None, :, None] * (
-            inp["a"][:, 0].float() + inp["dt_bias"].float()
-        )
-        decay = torch.exp(spec.lower_bound * torch.sigmoid(inner))  # [B, HV, DK]
+        if spec.fuse_gate:
+            # Per-channel gate, bounded in (lower_bound, 0) before the exp.
+            #   log_decay[d] = lower_bound * sigmoid(exp(A_log[h]) * (g[d] + dt_bias[h,d]))
+            inner = torch.exp(inp["A_log"].float())[None, :, None] * (
+                inp["a"][:, 0].float() + inp["dt_bias"].float()
+            )
+            decay = torch.exp(spec.lower_bound * torch.sigmoid(inner))  # [B, HV, DK]
+        else:
+            # `a` already carries natural-log-domain decay; only the exp remains.
+            # A_log and dt_bias are unread here -- the caller folded them in.
+            # This mirrors the competitor recurrence-only kernel, which likewise
+            # applies exp(gk) in-kernel and nothing else, which is what makes the
+            # two timeable at one work boundary.
+            decay = torch.exp(inp["a"][:, 0].float())  # [B, HV, DK]
     else:
         # Scalar gate, unbounded below.
         #   log_decay = -exp(A_log[h]) * softplus(a + dt_bias[h])
