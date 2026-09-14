@@ -265,7 +265,14 @@ def _build_simple(spec: GdnDecodeSpec) -> KernelDef:
     )
     Ag = b.param("a", PtrType(io_ty, "global"), noalias=True, readonly=True)
     Bg = b.param("b", PtrType(io_ty, "global"), noalias=True, readonly=True)
-    DTB = b.param("dt_bias", PtrType(io_ty, "global"), noalias=True, readonly=True)
+    # f32 in KDA mode: the per-channel gate is evaluated in f32 and KDA prefill
+    # declares the same tensor f32, so the two families share one contract.
+    DTB = b.param(
+        "dt_bias",
+        PtrType(F32 if spec.gate_kind == "kda" else io_ty, "global"),
+        noalias=True,
+        readonly=True,
+    )
     ALOG = b.param("A_log", PtrType(F32, "global"), noalias=True, readonly=True)
     RIDX = b.param("read_indices", PtrType(I32, "global"), noalias=True, readonly=True)
     WIDX = b.param("write_indices", PtrType(I32, "global"), noalias=True, readonly=True)
@@ -318,20 +325,65 @@ def _build_simple(spec: GdnDecodeSpec) -> KernelDef:
             kn = kv
 
         # ---- gates (per value head) ----
+        # The GDN arm below is the original emission, verbatim and in its
+        # original order -- moved into a branch, not rewritten. Order matters:
+        # these calls append ops to the IR, so hoisting even a shared load out
+        # of the arm would reorder GDN's instructions and move every golden
+        # hash pinned against it. Duplicating two loads across the arms is the
+        # cheap side of that trade.
         a_idx = b.add(b.mul(b_i, b.const_i32(HV)), hv_i)
-        ra = load_scalar_as_f32(b, Ag, a_idx, dtype=spec.dtype)
-        rb = load_scalar_as_f32(b, Bg, a_idx, dtype=spec.dtype)
-        rdt = load_scalar_as_f32(b, DTB, hv_i, dtype=spec.dtype)
-        ral = b.global_load_f32(ALOG, hv_i)  # A_log is fp32
 
-        x = b.fadd(ra, rdt)
-        sp = b.select(
-            b.fcmp("ogt", x, b.const_f32(SOFTPLUS_THRESHOLD)),
-            x,
-            log1p_f32(exp_f32(x)),
-        )
-        decay = exp_f32(b.fneg(b.fmul(exp_f32(ral), sp)))
-        beta = b.rcp_fast(b.fadd(b.const_f32(1.0), exp_f32(b.fneg(rb))))
+        if spec.gate_kind == "gdn":
+            ra = load_scalar_as_f32(b, Ag, a_idx, dtype=spec.dtype)
+            rb = load_scalar_as_f32(b, Bg, a_idx, dtype=spec.dtype)
+            rdt = load_scalar_as_f32(b, DTB, hv_i, dtype=spec.dtype)
+            ral = b.global_load_f32(ALOG, hv_i)  # A_log is fp32
+
+            x = b.fadd(ra, rdt)
+            sp = b.select(
+                b.fcmp("ogt", x, b.const_f32(SOFTPLUS_THRESHOLD)),
+                x,
+                log1p_f32(exp_f32(x)),
+            )
+            decay = exp_f32(b.fneg(b.fmul(exp_f32(ral), sp)))
+            beta = b.rcp_fast(b.fadd(b.const_f32(1.0), exp_f32(b.fneg(rb))))
+        else:
+            # KDA: one decay per K channel.
+            #   log_decay[d] = lower_bound * sigmoid(exp(A_log[h]) * (g[d] + dt_bias[h,d]))
+            # exp(A_log[h]) is per head, so it is hoisted out of the channel loop.
+            # This thread owns a whole state row, so it needs the full DK extent.
+            rb = load_scalar_as_f32(b, Bg, a_idx, dtype=spec.dtype)
+            ral = b.global_load_f32(ALOG, hv_i)  # per head in both gate kinds
+            beta = b.rcp_fast(b.fadd(b.const_f32(1.0), exp_f32(b.fneg(rb))))
+            exp_alog = exp_f32(ral)
+            g_base = b.add(
+                b.mul(b_i, b.const_i32(HV * DK)), b.mul(hv_i, b.const_i32(DK))
+            )
+            dtb_base = b.mul(hv_i, b.const_i32(DK))
+            decay = []
+            for c in range(0, DK, STATE_VEC):
+                gv = load_vec_as_f32(
+                    b, Ag, b.add(g_base, b.const_i32(c)), dtype=spec.dtype, n=STATE_VEC
+                )
+                # dt_bias is f32, so load_vec_as_f32 (a 16-bit ingest helper)
+                # does not apply; global_load_vN lowers STATE_VEC f32 values to
+                # one vector load rather than STATE_VEC scalar ones.
+                dtvec = b.global_load_vN(
+                    DTB, b.add(dtb_base, b.const_i32(c)), F32, STATE_VEC
+                )
+                dtv = [b.vec_extract(dtvec, j) for j in range(STATE_VEC)]
+                for j in range(STATE_VEC):
+                    if spec.fuse_gate:
+                        inner = b.fmul(exp_alog, b.fadd(gv[j], dtv[j]))
+                        sig = b.rcp_fast(
+                            b.fadd(b.const_f32(1.0), exp_f32(b.fneg(inner)))
+                        )
+                        log_decay = b.fmul(b.const_f32(spec.lower_bound), sig)
+                    else:
+                        # `a` already carries natural-log-domain decay; only the
+                        # exponential remains.
+                        log_decay = gv[j]
+                    decay.append(exp_f32(log_decay))
 
         # ---- dot(k_hat, q_hat) (scalar, redundant per thread) ----
         dot_kq = tree_reduce(b, b.fadd, [b.fmul(kn[j], qn[j]) for j in range(DK)])
@@ -348,7 +400,13 @@ def _build_simple(spec: GdnDecodeSpec) -> KernelDef:
         for c in range(0, DK, STATE_VEC):
             off = b.add(rs_base, b.const_i32(c))
             sv += load_vec_as_f32(b, state_r, off, dtype=spec.state_dtype, n=STATE_VEC)
-        sv = [b.fmul(s, decay) for s in sv]  # gated forget
+        # Gated forget. A scalar decay broadcasts over the row; a per-channel
+        # decay zips with it -- `sv` and `decay` are both indexed by K channel,
+        # in the same order, so position i of each is the same channel.
+        if spec.gate_kind == "gdn":
+            sv = [b.fmul(s, decay) for s in sv]
+        else:
+            sv = [b.fmul(s, d) for s, d in zip(sv, decay)]
 
         # ---- S_row . k_hat  and  S_row . q_hat ----
         sum_hk = tree_reduce(b, b.fadd, [b.fmul(sv[j], kn[j]) for j in range(DK)])
@@ -420,7 +478,12 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
     )
     Ag = b.param("a", PtrType(io_ty, "global"), noalias=True, readonly=True)
     Bg = b.param("b", PtrType(io_ty, "global"), noalias=True, readonly=True)
-    DTB = b.param("dt_bias", PtrType(io_ty, "global"), noalias=True, readonly=True)
+    DTB = b.param(
+        "dt_bias",
+        PtrType(F32 if spec.gate_kind == "kda" else io_ty, "global"),
+        noalias=True,
+        readonly=True,
+    )
     ALOG = b.param("A_log", PtrType(F32, "global"), noalias=True, readonly=True)
     RIDX = b.param("read_indices", PtrType(I32, "global"), noalias=True, readonly=True)
     WIDX = b.param("write_indices", PtrType(I32, "global"), noalias=True, readonly=True)
@@ -621,7 +684,7 @@ def gdn_decode_signature(spec: GdnDecodeSpec):
         .ptr("value", spec.dtype)
         .ptr("a", spec.dtype)
         .ptr("b", spec.dtype)
-        .ptr("dt_bias", spec.dtype)
+        .ptr("dt_bias", "f32" if spec.gate_kind == "kda" else spec.dtype)
         .ptr("A_log", "f32")
         .ptr("read_indices", "i32")
         .ptr("write_indices", "i32")
