@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 # Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-"""Re-measure the GDN decode tuning table.
+"""Re-measure the gfx950 GDN/KDA decode tile tables.
 
-The per-batch tile table in ``dispatch/gdn/gfx950.py`` is an empirical claim,
-so the measurement that produced it lives here rather than outside the tree:
-anyone can re-run it, challenge a band, or re-tune after a kernel change.
+The dispatcher owns two empirical tables:
 
-Device time is the metric. Host launch cost is identical across tiles and, at
-small batch, larger than the kernel itself, so wall time would mask exactly the
-differences the table is choosing between.
+* GDN selects its original tile from batch.
+* KDA selects from ``work = batch * num_v_heads`` so tensor-parallel head
+  sharding maps to the same key as an equivalent amount of batch work.
 
-Every configuration is correctness-gated before it is timed. The reference
-depends only on the batch, not the tile, so it is computed once per batch and
-reused across the whole configuration space.
+Anyone can rerun the search, challenge a band, or retune after a kernel,
+compiler, or target change. The script enumerates the validator's legal tile
+space and correctness-gates every configuration before timing it.
 
-Run::
+Device time is the tuning metric. Host launch cost is identical across tiles
+and can hide the kernel differences the table is choosing between.
+
+Run GDN with its default batch anchors::
 
     PYTHONPATH=<rocke>/library:<rocke>/platform/python python3 tune.py
-    PYTHONPATH=... python3 tune.py --batches 1,16 --top 5
+
+Run the KDA work-keying study across several head geometries::
+
+    PYTHONPATH=... python3 tune.py --gate-kind kda \\
+        --geometries 16/32,8/16,4/8 \\
+        --batches 1,2,4,8,16,32,64,128 --top 5
 """
 
 from __future__ import annotations
@@ -217,10 +223,11 @@ def main() -> int:
             "the disagreeing times sit inside run-to-run variation. If they do "
             "not, the table must not be keyed on work."
         )
+    table_name = "_TUNED_TILES_KDA" if args.gate_kind == "kda" else "_TUNED_TILES_GDN"
     print(
-        "\nBand _TUNED_TILES in dispatch/gdn/gfx950.py from the work column, "
-        "record which work values were measured and which band edges are "
-        "interpolated, and re-run the wiring test."
+        f"\nUpdate {table_name} in dispatch/gdn/gfx950.py from the relevant "
+        "selection axis, record which points were measured and which band "
+        "edges are interpolated, then rerun dispatch wiring and numeric tests."
     )
     return 0
 

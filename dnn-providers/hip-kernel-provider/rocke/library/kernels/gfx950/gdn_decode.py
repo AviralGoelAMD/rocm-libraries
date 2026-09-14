@@ -1,32 +1,39 @@
 # Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
 
-"""Gated DeltaNet (GDN) single-token decode kernel instance builder.
+"""GDN/KDA single-token decode kernel instance builder.
 
 For each active sequence and value head, advance one linear-attention decode
 step over a fixed-size recurrent state ``S`` (a ``head_v_dim x head_k_dim``
 key->value matrix), per the gated delta rule:
 
-    q_hat = l2norm(q) * head_k_dim**-0.5      # in-kernel, per key head
+    q_hat = l2norm(q) * head_k_dim**-0.5
     k_hat = l2norm(k)
-    decay = exp(-exp(A_log[vh]) * softplus(a[vh] + dt_bias[vh]))   # per value head
-    beta  = sigmoid(b[vh])
-    S     = decay * S                          # gated forget
-    v_new = (v - S @ k_hat) * beta             # error-correcting delta value
+    log_decay_gdn    = -exp(A_log[h]) * softplus(a[h] + dt_bias[h])
+    log_decay_kda[d] = lower_bound * sigmoid(exp(A_log[h]) * (a[h,d] + dt_bias[h,d]))
+    decay = exp(log_decay)
+    beta  = sigmoid(b[h])
+    S     = S * decay
+    v_new = (v - S @ k_hat) * beta
     out   = S @ q_hat + v_new * dot(k_hat, q_hat)
-    S     = S + outer(v_new, k_hat)            # rank-1 write
+    S     = S + outer(v_new, k_hat)
+
+GDN uses one scalar decay per value head. KDA uses one decay per K channel and
+therefore scales the columns of ``S``. Only gate production and the fade differ;
+the remaining recurrence and serving infrastructure are shared.
 
 Only pages named by ``read_indices`` / ``write_indices`` are touched; negative
-sentinel entries skip the block (continuous-batching padding lanes). Tensors are
-assumed contiguous (row-major), matching the packed linear-attention decode
-contract:
+sentinel entries skip the block. Tensors are contiguous row-major:
 
     query, key   : [B, 1, num_k_heads, head_k_dim]   dtype
     value, out   : [B, 1, num_v_heads, head_v_dim]   dtype
-    a, b         : [B, 1, num_v_heads]               dtype
-    dt_bias      : [num_v_heads]                      dtype
-    A_log        : [num_v_heads]                      f32
-    read/write_indices : [B]                          i32
+    a (GDN)      : [B, 1, num_v_heads]               dtype
+    a (KDA)      : [B, 1, num_v_heads, head_k_dim]   dtype
+    b            : [B, 1, num_v_heads]               dtype
+    dt_bias GDN  : [num_v_heads]                     dtype
+    dt_bias KDA  : [num_v_heads, head_k_dim]         f32
+    A_log        : [num_v_heads]                     f32
+    read/write_indices : [B]                         i32
     state        : [pool, num_v_heads, head_v_dim, head_k_dim]  state_dtype
 
 **v1 mapping (correctness-first):** one workgroup per ``(sequence, value_head)``;
