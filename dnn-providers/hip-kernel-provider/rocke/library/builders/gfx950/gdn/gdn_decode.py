@@ -95,9 +95,23 @@ def make_inputs(spec: GdnDecodeSpec, batch: int, seed: int = 0, device: str = "c
         "query": rnd(batch, 1, hk, dk),
         "key": rnd(batch, 1, hk, dk),
         "value": rnd(batch, 1, hv, dv),
-        "a": rnd(batch, 1, hv),
+        # The KDA gate is per K channel, so `a` carries DK logits per head and
+        # dt_bias gains the same axis. Both stay at this position in the dict so
+        # the GDN draw order -- and therefore every seeded GDN input ever
+        # recorded -- is bit-for-bit unchanged.
+        "a": (
+            rnd(batch, 1, hv, dk, scale=0.5)
+            if spec.gate_kind == "kda"
+            else rnd(batch, 1, hv)
+        ),
         "b": rnd(batch, 1, hv),
-        "dt_bias": rnd(hv),
+        # f32 for KDA: the gate is evaluated in f32 and KDA prefill already
+        # declares this tensor f32, so the two families share one contract.
+        "dt_bias": (
+            torch.randn(hv, dk, device=device, generator=gen, dtype=torch.float32) * 0.1
+            if spec.gate_kind == "kda"
+            else rnd(hv)
+        ),
         "A_log": torch.randn(hv, device=device, generator=gen, dtype=torch.float32),
         "read_indices": torch.arange(batch, device=device, dtype=torch.int32),
         "write_indices": torch.arange(batch, device=device, dtype=torch.int32),
@@ -130,13 +144,27 @@ def ref_fp32(spec: GdnDecodeSpec, inp) -> Tuple[torch.Tensor, torch.Tensor]:
         # l2norm off: the kernel scales q by 1/sqrt(dk) and leaves k raw.
         q = q * scale
 
-    x = inp["a"][:, 0].float() + inp["dt_bias"].float()  # [B, HV]
-    softplus = torch.where(x > 20.0, x, torch.log1p(torch.exp(x)))
-    decay = torch.exp(-torch.exp(inp["A_log"].float()) * softplus)
+    if spec.gate_kind == "kda":
+        # Per-channel gate, bounded in (lower_bound, 0) before the exp.
+        #   log_decay[d] = lower_bound * sigmoid(exp(A_log[h]) * (g[d] + dt_bias[h,d]))
+        inner = torch.exp(inp["A_log"].float())[None, :, None] * (
+            inp["a"][:, 0].float() + inp["dt_bias"].float()
+        )
+        decay = torch.exp(spec.lower_bound * torch.sigmoid(inner))  # [B, HV, DK]
+    else:
+        # Scalar gate, unbounded below.
+        #   log_decay = -exp(A_log[h]) * softplus(a + dt_bias[h])
+        x = inp["a"][:, 0].float() + inp["dt_bias"].float()  # [B, HV]
+        softplus = torch.where(x > 20.0, x, torch.log1p(torch.exp(x)))
+        decay = torch.exp(-torch.exp(inp["A_log"].float()) * softplus)  # [B, HV]
     beta = torch.sigmoid(inp["b"][:, 0].float())
 
     state = inp["state"].float()[inp["read_indices"].long()]  # [B, HV, DV, DK]
-    s = state * decay[..., None, None]
+    # The decay multiplies S from the right, so a per-channel gate scales
+    # columns (the DK axis) and a scalar gate scales the whole matrix.
+    s = state * (
+        decay[..., None, :] if spec.gate_kind == "kda" else decay[..., None, None]
+    )
 
     sk = (s @ k[..., None]).squeeze(-1)  # [B, HV, DV]
     sq = (s @ q[..., None]).squeeze(-1)
