@@ -136,6 +136,16 @@ def sweep_batch(base: GdnDecodeSpec, batch: int, configs):
     return rows
 
 
+def report_missing_cells(missing_cells) -> int:
+    """Report requested cells with no correct timing; return a process status."""
+    if not missing_cells:
+        return 0
+    print("\nincomplete sweep:", file=sys.stderr)
+    for hk, hv, batch in missing_cells:
+        print(f"  Hk={hk} Hv={hv} batch={batch}", file=sys.stderr)
+    return 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -172,6 +182,7 @@ def main() -> int:
     batches = [int(x) for x in args.batches.split(",")]
 
     by_work = {}  # work -> [(us, tile, batch, hv), ...]
+    missing_cells = []
 
     for hk, hv in geometries:
         base = dc.replace(
@@ -186,6 +197,7 @@ def main() -> int:
             rows = sweep_batch(base, batch, configs)
             if not rows:
                 print(f"  batch {batch}: nothing both correct and timeable")
+                missing_cells.append((hk, hv, batch))
                 continue
             work = batch * hv
             print(
@@ -229,7 +241,7 @@ def main() -> int:
         "selection axis, record which points were measured and which band "
         "edges are interpolated, then rerun dispatch wiring and numeric tests."
     )
-    return 0
+    return report_missing_cells(missing_cells)
 
 
 if __name__ == "__main__":
