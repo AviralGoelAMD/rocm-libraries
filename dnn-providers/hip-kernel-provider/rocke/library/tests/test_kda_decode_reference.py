@@ -15,6 +15,7 @@ relation are all device-independent. Only the kernel needs a GPU.
 from __future__ import annotations
 
 import dataclasses as dc
+import math
 import unittest
 
 import pytest
@@ -107,9 +108,83 @@ class TestKdaGateFormula(unittest.TestCase):
             inp["a"][:, 0].float() + inp["dt_bias"].float()
         )
         decay = torch.exp(spec.lower_bound * torch.sigmoid(inner))
-
         spread = decay.amax(dim=-1) - decay.amin(dim=-1)
         self.assertGreater(float(spread.max()), 1e-3)
+
+
+class TestDecayAxis(unittest.TestCase):
+    """Pin WHICH axis the per-channel decay scales.
+
+    The subset test cannot do this. With a channel-constant decay and
+    DV == DK == 128, scaling the DK axis and scaling the DV axis produce
+    identical numbers and neither shape-errors, so that test validates the gate
+    *formula* while leaving the axis resting on ref_fp32 being right by
+    construction. Here the decay genuinely varies per channel and the whole
+    step is rebuilt with einsum, whose explicit index letters name the
+    contraction axis instead of relying on broadcast position.
+    """
+
+    def _longhand(self, spec, inp):
+        eps = 1e-6
+        scale = 1.0 / math.sqrt(spec.head_k_dim)
+        g = spec.v_per_k_head
+        k_of_v = torch.arange(spec.num_v_heads) // g
+        q = inp["query"][:, 0].float()[:, k_of_v]
+        k = inp["key"][:, 0].float()[:, k_of_v]
+        if spec.use_qk_l2norm:
+            q = q * torch.rsqrt((q * q).sum(-1, keepdim=True) + eps) * scale
+            k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + eps)
+        else:
+            q = q * scale
+
+        inner = torch.exp(inp["A_log"].float())[None, :, None] * (
+            inp["a"][:, 0].float() + inp["dt_bias"].float()
+        )
+        decay = torch.exp(spec.lower_bound * torch.sigmoid(inner))  # [B, HV, DK]
+        beta = torch.sigmoid(inp["b"][:, 0].float())
+        state = inp["state"].float()[inp["read_indices"].long()]
+
+        # 'd' is the K channel on BOTH operands: this is the axis claim.
+        s = torch.einsum("bhvd,bhd->bhvd", state, decay)
+        sk = torch.einsum("bhvd,bhd->bhv", s, k)
+        sq = torch.einsum("bhvd,bhd->bhv", s, q)
+        v_new = (inp["value"][:, 0].float() - sk) * beta[..., None]
+        kq = torch.einsum("bhd,bhd->bh", k, q)
+        out = sq + v_new * kq[..., None]
+        s_after = s + torch.einsum("bhv,bhd->bhvd", v_new, k)
+        return out.unsqueeze(1), s_after
+
+    def test_reference_scales_the_dk_axis(self):
+        spec = _kda_spec()
+        inp = make_inputs(spec, batch=2, device="cpu")
+
+        ref_out, ref_state = ref_fp32(spec, inp)
+        long_out, long_state = self._longhand(spec, inp)
+
+        torch.testing.assert_close(ref_out, long_out, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(ref_state, long_state, rtol=1e-5, atol=1e-5)
+
+    def test_the_axis_check_can_fail(self):
+        """A mutation check: scaling the wrong axis must be detectable.
+
+        Without this, the test above could be passing because both sides share
+        a mistake rather than because the axis is right.
+        """
+        spec = _kda_spec()
+        inp = make_inputs(spec, batch=2, device="cpu")
+        _, long_state = self._longhand(spec, inp)
+
+        # Same numbers, decay applied down the V axis instead of the K axis.
+        inner = torch.exp(inp["A_log"].float())[None, :, None] * (
+            inp["a"][:, 0].float() + inp["dt_bias"].float()
+        )
+        decay = torch.exp(spec.lower_bound * torch.sigmoid(inner))
+        state = inp["state"].float()[inp["read_indices"].long()]
+        wrong = torch.einsum("bhvd,bhv->bhvd", state, decay)
+
+        right = torch.einsum("bhvd,bhd->bhvd", state, decay)
+        self.assertFalse(torch.allclose(wrong, right, rtol=1e-3, atol=1e-3))
+        self.assertEqual(tuple(wrong.shape), tuple(long_state.shape))
 
 
 class TestSubsetRelation(unittest.TestCase):
