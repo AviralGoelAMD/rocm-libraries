@@ -91,6 +91,22 @@ class GdnDecodeSpec:
     dtype: DType = "bf16"
     state_dtype: DType = "bf16"
     use_qk_l2norm: bool = True
+    # Forget-gate granularity. "gdn" applies one scalar decay per head; "kda"
+    # applies a per-channel DK-vector decay. GDN is the special case of KDA in
+    # which every channel shares a value, so the general kernel serves both --
+    # but only the general one can express the vector, which is why this is a
+    # kernel field and not a dispatch detail.
+    gate_kind: Literal["gdn", "kda"] = "gdn"
+    # KDA gate lower bound: log-decay = lower_bound * sigmoid(...), so the gate
+    # is bounded in (lower_bound, 0). Unread when gate_kind == "gdn", whose
+    # softplus gate is unbounded below.
+    lower_bound: float = -5.0
+    # True: the kernel computes the decay from raw logits (the shipping path,
+    # one launch). False: `a` carries a precomputed NATURAL-LOG-domain decay and
+    # the kernel only exponentiates and multiplies. The False mode is never
+    # dispatched; it exists so this kernel can be timed against a competitor
+    # recurrence-only kernel at an identical work boundary.
+    fuse_gate: bool = True
     wave_size: int = 64
     # Known-good fallback for direct callers. Production dispatch replaces
     # these values with a batch-tuned tile; callers that construct the spec
@@ -126,6 +142,17 @@ class GdnDecodeSpec:
         )
         if self.state_dtype != self.dtype:
             parts += (f"st{self.state_dtype}",)
+        # Deviation-only, so the KDA gate kind is additive: a default-gate spec
+        # keeps the exact name it had before this field existed, and every
+        # pinned GDN golden hash stays valid. lower_bound is nested because the
+        # GDN gate never reads it -- letting it reach the name there would give
+        # two names to two byte-identical kernels.
+        if self.gate_kind != "gdn":
+            parts += (self.gate_kind,)
+            if self.lower_bound != -5.0:
+                parts += (f"lb{self.lower_bound:g}",)
+        if not self.fuse_gate:
+            parts += ("nofg",)
         if self.wave_size != 64:
             parts += (f"ws{self.wave_size}",)
         return kernel_name_join(
@@ -146,6 +173,16 @@ def is_valid_spec(spec: GdnDecodeSpec, arch: str = "gfx950") -> Tuple[bool, str]
 
     if spec.dtype not in ("f16", "bf16") or spec.state_dtype not in ("f16", "bf16"):
         return False, f"unsupported dtype {spec.dtype}/{spec.state_dtype}"
+    if spec.gate_kind not in ("gdn", "kda"):
+        return False, f"gate_kind must be 'gdn' or 'kda' (got {spec.gate_kind!r})"
+    if spec.gate_kind == "kda" and spec.lower_bound >= 0.0:
+        # log-decay = lower_bound * sigmoid(x) and sigmoid > 0, so a
+        # non-negative bound makes decay >= 1 and the state grows without
+        # bound instead of fading. Checked only for KDA: the GDN gate never
+        # reads the field, so a stale value there is harmless.
+        return False, (
+            f"lower_bound must be negative for the KDA gate, got {spec.lower_bound}"
+        )
     for _field, _value in (
         ("num_k_heads", spec.num_k_heads),
         ("num_v_heads", spec.num_v_heads),
