@@ -23,9 +23,14 @@ with what it does and does not compare:
           identical-boundary comparison available and is the head-to-head
           number.
 ``arm2``  rocKE ``fuse_gate=True`` vs rocKE ``fuse_gate=False``. Same kernel,
-          same shapes, so the difference isolates gate-activation cost -- and
-          therefore tests whether computing the gate in-kernel is the right
-          default at all.
+          same shapes, so the difference isolates the cost of computing the
+          gate INSIDE the kernel. Read it carefully: the raw arm is handed its
+          decay for free -- producing that decay is not counted anywhere in
+          this arm -- so a ratio slightly above 1 does not mean fusing is a net
+          loss. It means the in-kernel gate is cheap. The real alternative to
+          fusing has to produce the decay somewhere, which costs a separate
+          launch at a shape where decode is launch-bound. arm2 on the host
+          clock below prices that, and it is the clock the decision rests on.
 ``arm3``  rocKE ``fuse_gate=True`` vs the fused conv1d+recurrence+RMSNorm
           entry point. NOT a kernel comparison; reported only with the extra
           stages named.
@@ -298,9 +303,12 @@ def main() -> int:
         "\narm1 = rocke_raw / ref_recur: identical work boundary, both take a\n"
         "       precomputed per-channel decay. This is the head-to-head number.\n"
         "       Caveat: rocKE additionally sigmoids beta; the reference does not.\n"
-        "arm2 = rocke_fused / rocke_raw: cost of computing the gate in-kernel.\n"
-        "       >1 means fusing costs time; if that holds at the serving shapes,\n"
-        "       the shipping default is wrong and should change.\n"
+        "arm2 = rocke_fused / rocke_raw: cost of computing the gate in-kernel,\n"
+        "       with the raw arm handed its decay for free. A ratio near 1 means\n"
+        "       the in-kernel gate is cheap, NOT that fusing is a net loss --\n"
+        "       the unfused path still has to produce that decay somewhere.\n"
+        "       The host columns price that: one launch versus two. Decode is\n"
+        "       launch-bound, so the host clock is the one the default rests on.\n"
         "arm3 (not run here) would compare against the conv1d+recurrence+RMSNorm\n"
         "       entry point, which does strictly more work -- never a bare ratio."
     )
