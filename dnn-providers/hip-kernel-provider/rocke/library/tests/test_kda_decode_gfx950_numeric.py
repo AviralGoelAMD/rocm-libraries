@@ -33,6 +33,9 @@ torch = pytest.importorskip("torch", reason="ROCm torch required")
 pytestmark = pytest.mark.gpu
 
 
+from dispatch.gdn.gfx950 import _TUNED_TILES_KDA  # noqa: E402
+
+
 def _device_is_gfx950() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -49,9 +52,21 @@ requires_gfx950 = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def harness():
-    from builders.gfx950.gdn.gdn_decode import TOL, check
+    from builders.gfx950.gdn.gdn_decode import (
+        TOL,
+        check,
+        make_inputs,
+        prepare,
+        ref_fp32,
+    )
 
-    return {"TOL": TOL, "check": check}
+    return {
+        "TOL": TOL,
+        "check": check,
+        "make_inputs": make_inputs,
+        "prepare": prepare,
+        "ref_fp32": ref_fp32,
+    }
 
 
 def _kda(**kw):
@@ -102,15 +117,9 @@ def test_kda_warp_tiled_matches_reference(harness, batch):
 
 
 @requires_gfx950
-@pytest.mark.parametrize("tile", [(4, 16, 8), (2, 8, 2), (1, 8, 1), (8, 16, 1)])
-def test_kda_matches_reference_across_tiles(harness, tile):
-    """Every shipped tile must be correct with the vector gate.
-
-    The tiles differ in how the DK axis is split across lanes (warp_threads_k)
-    and how many state rows each lane carries, so one passing tile says little
-    about the others. A tuning table that can route to a wrong kernel is worse
-    than no tuning at all.
-    """
+@pytest.mark.parametrize("max_work,tile,spec_id", _TUNED_TILES_KDA)
+def test_every_kda_tuned_tile_is_correct(harness, max_work, tile, spec_id):
+    """Every tile in the KDA table agrees with the independent reference."""
     num_warps, warp_threads_k, blocks_per_v_dim = tile
     spec = _kda(
         num_warps=num_warps,
@@ -119,8 +128,70 @@ def test_kda_matches_reference_across_tiles(harness, tile):
     )
     out_err, state_err = harness["check"](spec, batch=16)
 
-    assert out_err <= harness["TOL"], f"KDA tile {tile} output error {out_err:.3e}"
-    assert state_err <= harness["TOL"], f"KDA tile {tile} state error {state_err:.3e}"
+    assert out_err <= harness["TOL"], (
+        f"KDA {spec_id} ({tile}, max_work={max_work}) " f"output error {out_err:.3e}"
+    )
+    assert state_err <= harness["TOL"], (
+        f"KDA {spec_id} ({tile}, max_work={max_work}) " f"state error {state_err:.3e}"
+    )
+
+
+@requires_gfx950
+@pytest.mark.parametrize(
+    "batch,expected_spec_id,expected_tile",
+    [
+        (1, "kda_w128", (4, 16, 4)),
+        (8, "kda_w512", (1, 16, 4)),
+        (32, "kda_w_large", (2, 16, 1)),
+    ],
+)
+def test_kda_dispatch_band_launches_selected_kernel(
+    harness, batch, expected_spec_id, expected_tile
+):
+    """Exercise request → dispatch → selected tile → compile → launch → oracle."""
+    from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode
+    from rocke.helpers.compile import compile_kernel
+    from rocke.runtime.launcher import KernelLauncher, LaunchConfig, no_fence
+
+    result = dispatch_gdn_decode(
+        GdnDecodeRequest(
+            batch=batch,
+            arch=ARCH,
+            gate_kind="kda",
+            num_k_heads=32,
+            num_v_heads=32,
+        )
+    )
+    got_tile = (
+        result.spec.num_warps,
+        result.spec.warp_threads_k,
+        result.spec.blocks_per_v_dim,
+    )
+    assert result.candidate.spec_id == expected_spec_id
+    assert got_tile == expected_tile
+
+    artifact = compile_kernel(result.build(), arch=ARCH)
+    launcher = KernelLauncher(
+        hsaco=artifact.hsaco,
+        kernel_name=artifact.kernel_name,
+        signature=result.signature,
+    )
+
+    inp = harness["make_inputs"](result.spec, batch)
+    ref_out, ref_state = harness["ref_fp32"](result.spec, inp)
+    values, _ = harness["prepare"](result.spec, inp, batch)
+    cfg = LaunchConfig(grid=result.grid, block=result.block, stream=0)
+    with no_fence():
+        launcher(values, config=cfg)
+    torch.cuda.synchronize()
+
+    written = inp["write_indices"].long()
+    out_err = (values["out"].float() - ref_out).abs().max().item()
+    state_err = (values["state"].float()[written] - ref_state).abs().max().item()
+    assert max(out_err, state_err) <= harness["TOL"], (
+        f"dispatch-driven KDA launch disagreed with the reference: "
+        f"out={out_err:.3e} state={state_err:.3e}"
+    )
 
 
 @requires_gfx950

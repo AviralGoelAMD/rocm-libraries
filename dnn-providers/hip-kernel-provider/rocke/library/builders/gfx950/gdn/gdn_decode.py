@@ -214,6 +214,39 @@ def _validate_decode_inputs(
     by ``validate_indices`` (default on; a hot re-prepare loop whose indices are
     already known good may pass ``False``).
     """
+    if spec.gate_kind == "kda":
+        # The emitter indexes these buffers from compile-time B/HV/DK extents:
+        # unlike the scalar GDN ABI, a legacy-sized allocation is too short and
+        # the vector loads would read beyond it. Metadata checks are sync-free,
+        # so they always run even when index-value validation is disabled.
+        a = inp["a"]
+        want_a = (batch, 1, spec.num_v_heads, spec.head_k_dim)
+        if tuple(a.shape) != want_a:
+            raise ValueError(f"KDA a shape {tuple(a.shape)} != {want_a}")
+        want_a_dtype = {"bf16": torch.bfloat16, "f16": torch.float16}[spec.dtype]
+        if a.dtype != want_a_dtype:
+            raise ValueError(f"KDA a dtype {a.dtype} != {want_a_dtype}")
+        if not a.is_contiguous():
+            raise ValueError("KDA a must be contiguous")
+
+        dt_bias = inp["dt_bias"]
+        want_dt_bias = (spec.num_v_heads, spec.head_k_dim)
+        if tuple(dt_bias.shape) != want_dt_bias:
+            raise ValueError(
+                f"KDA dt_bias shape {tuple(dt_bias.shape)} != {want_dt_bias}"
+            )
+        if dt_bias.dtype != torch.float32:
+            raise ValueError(f"KDA dt_bias dtype {dt_bias.dtype} != torch.float32")
+        if not dt_bias.is_contiguous():
+            raise ValueError("KDA dt_bias must be contiguous")
+
+        device = inp["query"].device
+        for name, tensor in (("a", a), ("dt_bias", dt_bias)):
+            if tensor.device != device:
+                raise ValueError(
+                    f"KDA {name} device {tensor.device} != query device {device}"
+                )
+
     state = inp["state"]
     if state.ndim != 4:
         raise ValueError(f"state must be [pool, HV, DV, DK]; got {tuple(state.shape)}")
