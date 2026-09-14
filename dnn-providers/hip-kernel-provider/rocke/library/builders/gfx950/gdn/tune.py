@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 # Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-"""Re-measure the GDN decode tuning table.
+"""Re-measure the gfx950 GDN/KDA decode tile tables.
 
-The per-batch tile table in ``dispatch/gdn/gfx950.py`` is an empirical claim,
-so the measurement that produced it lives here rather than outside the tree:
-anyone can re-run it, challenge a band, or re-tune after a kernel change.
+The dispatcher owns two empirical tables:
 
-Device time is the metric. Host launch cost is identical across tiles and, at
-small batch, larger than the kernel itself, so wall time would mask exactly the
-differences the table is choosing between.
+* GDN selects its original tile from batch.
+* KDA selects from ``work = batch * num_v_heads`` so tensor-parallel head
+  sharding maps to the same key as an equivalent amount of batch work.
 
-Every configuration is correctness-gated before it is timed. The reference
-depends only on the batch, not the tile, so it is computed once per batch and
-reused across the whole configuration space.
+Anyone can rerun the search, challenge a band, or retune after a kernel,
+compiler, or target change. The script enumerates the validator's legal tile
+space and correctness-gates every configuration before timing it.
 
-Run::
+Device time is the tuning metric. Host launch cost is identical across tiles
+and can hide the kernel differences the table is choosing between.
+
+Run GDN with its default batch anchors::
 
     PYTHONPATH=<rocke>/library:<rocke>/platform/python python3 tune.py
-    PYTHONPATH=... python3 tune.py --batches 1,16 --top 5
+
+Run the KDA work-keying study across several head geometries::
+
+    PYTHONPATH=... python3 tune.py --gate-kind kda \\
+        --geometries 16/32,8/16,4/8 \\
+        --batches 1,2,4,8,16,32,64,128 --top 5
 """
 
 from __future__ import annotations
@@ -130,6 +136,16 @@ def sweep_batch(base: GdnDecodeSpec, batch: int, configs):
     return rows
 
 
+def report_missing_cells(missing_cells) -> int:
+    """Report requested cells with no correct timing; return a process status."""
+    if not missing_cells:
+        return 0
+    print("\nincomplete sweep:", file=sys.stderr)
+    for hk, hv, batch in missing_cells:
+        print(f"  Hk={hk} Hv={hv} batch={batch}", file=sys.stderr)
+    return 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -137,39 +153,95 @@ def main() -> int:
         default=",".join(str(b) for b in DEFAULT_BATCHES),
         help="comma-separated decode batch sizes to tune for",
     )
-    ap.add_argument("--top", type=int, default=8, help="rows to print per batch")
+    ap.add_argument(
+        "--gate-kind",
+        default="gdn",
+        choices=("gdn", "kda"),
+        help="forget-gate granularity to tune for",
+    )
+    ap.add_argument(
+        "--geometries",
+        default="16/32",
+        help=(
+            "comma-separated num_k_heads/num_v_heads pairs. More than one turns "
+            "the run into a test of the work-keying hypothesis: cells sharing "
+            "batch * num_v_heads should agree on the best tile."
+        ),
+    )
+    ap.add_argument("--top", type=int, default=8, help="rows to print per cell")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
         print("no HIP device visible", file=sys.stderr)
         return 2
 
-    base = GdnDecodeSpec()
-    configs = legal_configs(base)
-    print(f"legal configurations for this shape: {len(configs)}")
+    geometries = []
+    for item in args.geometries.split(","):
+        hk, hv = item.split("/")
+        geometries.append((int(hk), int(hv)))
+    batches = [int(x) for x in args.batches.split(",")]
 
-    winners = {}
-    for batch in (int(x) for x in args.batches.split(",")):
-        rows = sweep_batch(base, batch, configs)
-        if not rows:
-            print(f"batch {batch}: no configuration was both correct and timeable")
-            return 1
-        print(f"\n=== batch {batch}: top {args.top} of {len(rows)} ===")
-        for micros, tile, err in rows[: args.top]:
+    by_work = {}  # work -> [(us, tile, batch, hv), ...]
+    missing_cells = []
+
+    for hk, hv in geometries:
+        base = dc.replace(
+            GdnDecodeSpec(),
+            gate_kind=args.gate_kind,
+            num_k_heads=hk,
+            num_v_heads=hv,
+        )
+        configs = legal_configs(base)
+        print(f"\n### geometry Hk={hk} Hv={hv}: {len(configs)} legal configurations")
+        for batch in batches:
+            rows = sweep_batch(base, batch, configs)
+            if not rows:
+                print(f"  batch {batch}: nothing both correct and timeable")
+                missing_cells.append((hk, hv, batch))
+                continue
+            work = batch * hv
             print(
-                f"  {micros:9.3f}us  num_warps={tile[0]} warp_threads_k={tile[1]} "
-                f"blocks_per_v_dim={tile[2]}  err={err:.2e}"
+                f"\n=== Hk{hk}/Hv{hv} batch {batch} (work {work}): "
+                f"top {args.top} of {len(rows)} ==="
             )
-        winners[batch] = rows[0]
+            for micros, tile, err in rows[: args.top]:
+                print(
+                    f"  {micros:9.3f}us  num_warps={tile[0]} "
+                    f"warp_threads_k={tile[1]} blocks_per_v_dim={tile[2]}  "
+                    f"err={err:.2e}"
+                )
+            by_work.setdefault(work, []).append((rows[0][0], rows[0][1], batch, hv))
 
-    print("\n=== fastest per batch ===")
-    for batch, (micros, tile, _) in winners.items():
-        print(f"  batch {batch:<6d} {tile}  {micros:.3f}us")
+    # Does the best tile depend only on the product? Cells sharing a work value
+    # but differing in (batch, heads) are the evidence either way. A real
+    # disagreement here invalidates the table's KEY, not just its values.
+    print("\n=== work -> best tile, across geometries ===")
+    print(f"{'work':>7}  {'best tile':16} {'us':>9}  cells (batch x Hv)")
+    disagreements = []
+    for work in sorted(by_work):
+        cells = by_work[work]
+        tiles = {c[1] for c in cells}
+        fastest = min(cells)
+        cellstr = " ".join(f"{b}x{h}" for _, _, b, h in cells)
+        flag = "" if len(tiles) == 1 else "   <-- TILES DISAGREE"
+        if len(tiles) > 1:
+            disagreements.append((work, sorted(tiles)))
+        print(f"{work:>7}  {str(fastest[1]):16} {fastest[0]:9.3f}  {cellstr}{flag}")
+
+    if disagreements:
+        print(
+            f"\nWARNING: work alone did not fix the best tile at "
+            f"{len(disagreements)} work value(s). Before banding, check whether "
+            "the disagreeing times sit inside run-to-run variation. If they do "
+            "not, the table must not be keyed on work."
+        )
+    table_name = "_TUNED_TILES_KDA" if args.gate_kind == "kda" else "_TUNED_TILES_GDN"
     print(
-        "\nUpdate _TUNED_TILES in dispatch/gdn/gfx950.py if these disagree "
-        "with the table, and re-run the wiring test."
+        f"\nUpdate {table_name} in dispatch/gdn/gfx950.py from the relevant "
+        "selection axis, record which points were measured and which band "
+        "edges are interpolated, then rerun dispatch wiring and numeric tests."
     )
-    return 0
+    return report_missing_cells(missing_cells)
 
 
 if __name__ == "__main__":
