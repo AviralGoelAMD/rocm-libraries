@@ -156,10 +156,11 @@ class GdnDecodeSpec:
         # two names to two byte-identical kernels.
         if self.gate_kind != "gdn":
             parts += (self.gate_kind,)
-            if self.lower_bound != -5.0:
-                parts += (f"lb{self.lower_bound:g}",)
-        if not self.fuse_gate:
-            parts += ("nofg",)
+            if self.fuse_gate:
+                if self.lower_bound != -5.0:
+                    parts += (f"lb{self.lower_bound:g}",)
+            else:
+                parts += ("nofg",)
         if self.wave_size != 64:
             parts += (f"ws{self.wave_size}",)
         return kernel_name_join(
@@ -182,13 +183,16 @@ def is_valid_spec(spec: GdnDecodeSpec, arch: str = "gfx950") -> Tuple[bool, str]
         return False, f"unsupported dtype {spec.dtype}/{spec.state_dtype}"
     if spec.gate_kind not in ("gdn", "kda"):
         return False, f"gate_kind must be 'gdn' or 'kda' (got {spec.gate_kind!r})"
-    if spec.gate_kind == "kda" and spec.lower_bound >= 0.0:
-        # log-decay = lower_bound * sigmoid(x) and sigmoid > 0, so a
-        # non-negative bound makes decay >= 1 and the state grows without
-        # bound instead of fading. Checked only for KDA: the GDN gate never
-        # reads the field, so a stale value there is harmless.
+    if spec.gate_kind == "gdn" and not spec.fuse_gate:
+        return False, "gate_kind='gdn' requires fuse_gate=True"
+    if (
+        spec.gate_kind == "kda"
+        and spec.fuse_gate
+        and (not math.isfinite(spec.lower_bound) or spec.lower_bound >= 0.0)
+    ):
         return False, (
-            f"lower_bound must be negative for the KDA gate, got {spec.lower_bound}"
+            "lower_bound must be finite negative for the fused KDA gate, "
+            f"got {spec.lower_bound}"
         )
     for _field, _value in (
         ("num_k_heads", spec.num_k_heads),

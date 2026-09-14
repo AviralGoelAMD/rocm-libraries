@@ -136,7 +136,7 @@ class TestKernelNameIdentity(unittest.TestCase):
             "head_k_dim": dc.replace(base, head_k_dim=64),
             "gate_kind": dc.replace(base, gate_kind="kda"),
             "lower_bound": dc.replace(base, gate_kind="kda", lower_bound=-3.0),
-            "fuse_gate": dc.replace(base, fuse_gate=False),
+            "fuse_gate": dc.replace(base, gate_kind="kda", fuse_gate=False),
         }
         names = {}
         for label, spec in variants.items():
@@ -189,28 +189,56 @@ class TestGateKind(unittest.TestCase):
             dc.replace(base, lower_bound=-3.0).kernel_name(), base.kernel_name()
         )
 
-    def test_lower_bound_reaches_a_kda_name(self):
-        kda = dc.replace(GdnDecodeSpec(), gate_kind="kda")
-        self.assertNotIn("lb", kda.kernel_name())
-        self.assertIn("lb-3", dc.replace(kda, lower_bound=-3.0).kernel_name())
+    def test_lower_bound_reaches_only_a_fused_kda_name(self):
+        fused = dc.replace(GdnDecodeSpec(), gate_kind="kda")
+        self.assertNotIn("lb", fused.kernel_name())
+        self.assertIn("lb-3", dc.replace(fused, lower_bound=-3.0).kernel_name())
+
+        raw = dc.replace(fused, fuse_gate=False)
+        self.assertEqual(
+            dc.replace(raw, lower_bound=-3.0).kernel_name(),
+            dc.replace(raw, lower_bound=0.0).kernel_name(),
+        )
 
     def test_rejects_unknown_gate_kind(self):
         ok, msg = is_valid_spec(dc.replace(GdnDecodeSpec(), gate_kind="mamba"), ARCH)
         self.assertFalse(ok)
         self.assertIn("gate_kind", msg)
 
-    def test_rejects_non_negative_lower_bound_for_kda(self):
-        for bound in (0.0, 1.0):
-            spec = dc.replace(GdnDecodeSpec(), gate_kind="kda", lower_bound=bound)
+    def test_rejects_precomputed_gate_for_gdn(self):
+        spec = dc.replace(GdnDecodeSpec(), gate_kind="gdn", fuse_gate=False)
+        ok, msg = is_valid_spec(spec, ARCH)
+        self.assertFalse(ok)
+        self.assertIn("requires fuse_gate=True", msg)
+
+    def test_fused_kda_requires_finite_negative_lower_bound(self):
+        for bound in (0.0, 1.0, float("nan"), float("inf"), float("-inf")):
+            spec = dc.replace(
+                GdnDecodeSpec(),
+                gate_kind="kda",
+                fuse_gate=True,
+                lower_bound=bound,
+            )
             ok, msg = is_valid_spec(spec, ARCH)
             self.assertFalse(ok, f"lower_bound={bound} must be rejected")
-            self.assertIn("lower_bound", msg)
+            self.assertIn("finite negative", msg)
 
-    def test_gdn_ignores_a_non_negative_lower_bound(self):
-        # The GDN gate never reads lower_bound, so a stale value must not make
-        # an otherwise-valid GDN spec unbuildable.
-        ok, _ = is_valid_spec(dc.replace(GdnDecodeSpec(), lower_bound=0.0), ARCH)
-        self.assertTrue(ok)
+    def test_raw_kda_ignores_lower_bound(self):
+        for bound in (0.0, 1.0, float("nan"), float("inf")):
+            spec = dc.replace(
+                GdnDecodeSpec(),
+                gate_kind="kda",
+                fuse_gate=False,
+                lower_bound=bound,
+            )
+            ok, why = is_valid_spec(spec, ARCH)
+            self.assertTrue(ok, why)
+
+    def test_gdn_ignores_lower_bound(self):
+        ok, why = is_valid_spec(
+            dc.replace(GdnDecodeSpec(), lower_bound=float("nan")), ARCH
+        )
+        self.assertTrue(ok, why)
 
 
 class TestLaunchShape(unittest.TestCase):
