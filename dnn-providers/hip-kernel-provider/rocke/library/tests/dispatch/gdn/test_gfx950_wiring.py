@@ -301,3 +301,47 @@ class TestWorkKeyedTable(unittest.TestCase):
         # No work value may fall through the table.
         for work in (1, 4, 5, 128, 129, 4096, 4097, 10**6):
             self.assertIsNotNone(tile_for_work(work))
+
+
+class TestGdnSelectionIsFrozen(unittest.TestCase):
+    """GDN tile selection at Hv=32 must match the shipped batch-keyed table.
+
+    The tuned table is now keyed on work and split per gate kind. Neither
+    change may move GDN, which is already shipped and frozen: re-keying must
+    be a pure re-expression at Hv=32, and tuning KDA must not reach GDN's
+    table at all.
+
+    This is a perf guard, not a correctness one, which is why it exists.
+    Swapping GDN onto KDA-tuned tiles leaves every numeric test green and
+    every golden hash for the *default* spec untouched -- the kernel stays
+    correct, it just silently gets slower. Nothing else in the suite would
+    notice.
+    """
+
+    # The original table from the shipped GDN decode, keyed on batch.
+    _ORIGINAL = ((4, (4, 16, 8)), (32, (2, 8, 2)), (128, (1, 8, 1)), (None, (8, 16, 1)))
+
+    def _original_tile(self, batch):
+        for max_batch, tile in self._ORIGINAL:
+            if max_batch is None or batch <= max_batch:
+                return tile
+        raise AssertionError("unreachable")
+
+    def test_every_band_edge_selects_the_shipped_tile(self):
+        # Band edges and their +-1 neighbours: an off-by-one in the work
+        # conversion would show up here and nowhere else.
+        for batch in (1, 2, 3, 4, 5, 16, 32, 33, 64, 128, 129, 256, 1024):
+            with self.subTest(batch=batch):
+                spec = dispatch_gdn_decode(_req(batch)).spec
+                self.assertEqual(_TILE(spec), self._original_tile(batch))
+                self.assertEqual(spec.gate_kind, "gdn")
+
+    def test_kda_tuning_cannot_reach_the_gdn_table(self):
+        from dispatch.gdn.gfx950 import _TUNED_TILES_GDN, _TUNED_TILES_KDA
+
+        gdn_tiles = {t for _, t, _ in _TUNED_TILES_GDN}
+        gdn_ids = {sid for _, _, sid in _TUNED_TILES_GDN}
+        kda_ids = {sid for _, _, sid in _TUNED_TILES_KDA}
+
+        self.assertEqual(gdn_tiles, {(4, 16, 8), (2, 8, 2), (1, 8, 1), (8, 16, 1)})
+        self.assertFalse(gdn_ids & kda_ids, "spec ids must not collide")
