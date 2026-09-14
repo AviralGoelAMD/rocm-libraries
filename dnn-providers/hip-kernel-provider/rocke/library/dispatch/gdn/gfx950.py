@@ -42,41 +42,50 @@ from .common import (
 
 ARCH = "gfx950"
 
-# (max_batch, (num_warps, warp_threads_k, blocks_per_v_dim), spec_id)
+# (max_work, (num_warps, warp_threads_k, blocks_per_v_dim), spec_id)
 #
-# Device-time optimum per batch, measured on gfx950 by an exhaustive sweep of
-# all 54 legal tile configurations, correctness-gated against the fp32
-# reference at every point. Only the four batch anchors 1 / 16 / 64 / 256 were
-# measured; the band edges between them are interpolation, chosen to place each
-# anchor comfortably inside its own band rather than at a boundary.
+# Keyed on WORK = batch * num_v_heads, not on batch. The grid is
+# batch * num_v_heads * blocks_per_v_dim and every workgroup does identical
+# work, so batch and head count are interchangeable. This matters because
+# tensor-parallel sharding divides num_v_heads across ranks (32 -> 16 -> 8 ->
+# 4): a batch-keyed table tuned at Hv=32 picks the wrong tile on every
+# multi-GPU deployment, including rungs no sweep ever visited.
 #
-# The bands are deliberately coarse. Adjacent configurations sit within a few
-# percent of each other, which is the same order as run-to-run variation, so a
-# finer table would be encoding noise. The gain this table is actually claiming
-# is against the single universal default, which the sweep ranked around
-# 30th of 54 at the larger batches.
+# !!! PROVISIONAL -- DO NOT SHIP !!!
+# These entries are the previous batch-keyed values re-expressed at Hv=32
+# (batch b -> work 32b). They have NOT been measured against the per-channel
+# KDA gate, which adds loads and registers and can move the optimum, and the
+# work axis itself has not been swept. Task 8 of the implementation plan
+# replaces this table with measured values and rewrites this comment with the
+# usual provenance: what was measured, what is interpolated, and what the
+# table does not claim.
 _TUNED_TILES = (
-    (4, (4, 16, 8), "b4"),
-    (32, (2, 8, 2), "b32"),
-    (128, (1, 8, 1), "b128"),
-    (None, (8, 16, 1), "b_large"),
+    (128, (4, 16, 8), "w128"),
+    (1024, (2, 8, 2), "w1024"),
+    (4096, (1, 8, 1), "w4096"),
+    (None, (8, 16, 1), "w_large"),
 )
 
 # Every tile the table can produce, for tuners and for the sweep space.
 TUNED_SPEC_IDS = tuple(entry[2] for entry in _TUNED_TILES)
 
 
-def tile_for_batch(batch: int) -> Tuple[int, int, int]:
-    """Tuned ``(num_warps, warp_threads_k, blocks_per_v_dim)`` for ``batch``."""
-    for max_batch, tile, _ in _TUNED_TILES:
-        if max_batch is None or batch <= max_batch:
+def work_for(batch: int, num_v_heads: int) -> int:
+    """The quantity the tile table is keyed on."""
+    return int(batch) * int(num_v_heads)
+
+
+def tile_for_work(work: int) -> Tuple[int, int, int]:
+    """Tuned ``(num_warps, warp_threads_k, blocks_per_v_dim)`` for ``work``."""
+    for max_work, tile, _ in _TUNED_TILES:
+        if max_work is None or work <= max_work:
             return tile
     raise AssertionError("unreachable: table has an open-ended final band")
 
 
-def spec_id_for_batch(batch: int) -> str:
-    for max_batch, _, spec_id in _TUNED_TILES:
-        if max_batch is None or batch <= max_batch:
+def spec_id_for_work(work: int) -> str:
+    for max_work, _, spec_id in _TUNED_TILES:
+        if max_work is None or work <= max_work:
             return spec_id
     raise AssertionError("unreachable: table has an open-ended final band")
 
@@ -100,6 +109,7 @@ def make_spec(req: GdnDecodeRequest, tile: Tuple[int, int, int]) -> GdnDecodeSpe
         dtype=normalize_dtype(req.dtype),
         state_dtype=normalize_dtype(req.state_dtype),
         use_qk_l2norm=bool(req.use_qk_l2norm),
+        gate_kind=str(req.gate_kind),
         num_warps=num_warps,
         warp_threads_k=warp_threads_k,
         blocks_per_v_dim=blocks_per_v_dim,
@@ -133,7 +143,7 @@ def _make_candidate(*, tile: Tuple[int, int, int], spec_id: str, priority: int):
         # registration order. An explicit ``spec_id`` pin bypasses this, which
         # is what makes a tuning sweep able to force a non-default tile.
         if req.spec_id.strip().lower() == "auto":
-            wanted = spec_id_for_batch(int(req.batch))
+            wanted = spec_id_for_work(work_for(req.batch, req.num_v_heads))
             # Prefer the tuned tile, but only when it is valid for this geometry.
             # If it is not, fall through so any valid candidate may serve (the
             # registry picks by priority) rather than failing a kernel-supported
@@ -145,7 +155,9 @@ def _make_candidate(*, tile: Tuple[int, int, int], spec_id: str, priority: int):
                 )[0]
             ):
                 return False, (
-                    f"tuned tile for batch {req.batch} is {wanted!r}, not {spec_id!r}"
+                    f"tuned tile for work {work_for(req.batch, req.num_v_heads)} "
+                    f"(batch {req.batch} x {req.num_v_heads} heads) is {wanted!r}, "
+                    f"not {spec_id!r}"
                 )
         # Final authority is the kernel's own validator.
         return is_valid_spec(make_spec(req, tile), arch=req.arch)

@@ -20,8 +20,9 @@ from dispatch.gdn import (
     dispatch_gdn_decode,
     gdn_candidates,
     gdn_sweep_space,
+    request_errors,
 )
-from dispatch.gdn.gfx950 import ARCH, TUNED_SPEC_IDS, tile_for_batch
+from dispatch.gdn.gfx950 import ARCH, TUNED_SPEC_IDS, tile_for_work
 from kernels.gfx950.gdn_decode import (
     gdn_decode_grid,
     gdn_decode_signature,
@@ -69,12 +70,13 @@ class TestTunedSelection(unittest.TestCase):
             with self.subTest(batch=batch):
                 self.assertEqual(_TILE(dispatch_gdn_decode(_req(batch)).spec), expected)
 
-    def test_tile_for_batch_agrees_with_dispatch(self):
+    def test_tile_helper_agrees_with_dispatch(self):
+        # The helper and the dispatcher must agree, or the tuner and production
+        # would disagree about which tile a shape gets.
         for batch in (1, 2, 5, 17, 63, 100, 200, 4096):
             with self.subTest(batch=batch):
-                self.assertEqual(
-                    _TILE(dispatch_gdn_decode(_req(batch)).spec), tile_for_batch(batch)
-                )
+                spec = dispatch_gdn_decode(_req(batch)).spec
+                self.assertEqual(_TILE(spec), tile_for_work(batch * spec.num_v_heads))
 
     def test_selected_spec_is_always_buildable(self):
         for batch in (1, 4, 5, 16, 33, 64, 129, 256, 8192):
@@ -92,7 +94,7 @@ class TestTunedSelection(unittest.TestCase):
         ok, why = is_valid_spec(result.spec, arch=ARCH)
         self.assertTrue(ok, why)
         self.assertEqual(result.spec.head_k_dim, 64)
-        self.assertNotEqual(result.candidate.spec_id, "b4")  # fell off the tuned tile
+        self.assertNotEqual(result.candidate.spec_id, "w128")  # fell off the tuned tile
 
 
 class TestRequestRejection(unittest.TestCase):
@@ -119,8 +121,8 @@ class TestSpecIdPin(unittest.TestCase):
     def test_pin_overrides_the_tuning_table(self):
         # A tuner must be able to force a non-default tile, otherwise the tuned
         # table could never be re-measured or challenged.
-        result = dispatch_gdn_decode(_req(256, spec_id="b4"))
-        self.assertEqual(result.candidate.spec_id, "b4")
+        result = dispatch_gdn_decode(_req(256, spec_id="w128"))
+        self.assertEqual(result.candidate.spec_id, "w128")
         self.assertEqual(_TILE(result.spec), (4, 16, 8))
 
     def test_every_pin_is_reachable_at_any_batch(self):
@@ -219,3 +221,65 @@ class TestDispatchResultContract(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGateKindWiring(unittest.TestCase):
+    """The request carries gate_kind through to the spec, GDN by default."""
+
+    def test_request_defaults_to_the_gdn_gate(self):
+        self.assertEqual(_req(1).gate_kind, "gdn")
+        self.assertEqual(dispatch_gdn_decode(_req(1)).spec.gate_kind, "gdn")
+
+    def test_kda_request_selects_a_kda_spec(self):
+        req = GdnDecodeRequest(batch=4, arch=ARCH, gate_kind="kda")
+        spec = dispatch_gdn_decode(req).spec
+        self.assertEqual(spec.gate_kind, "kda")
+        self.assertIn("kda", spec.kernel_name())
+
+    def test_gate_kind_reaches_the_compile_key(self):
+        # Two requests differing only in gate_kind select different kernels, so
+        # they must not collapse onto one compile-cache entry.
+        gdn = dispatch_gdn_decode(GdnDecodeRequest(batch=4, arch=ARCH))
+        kda = dispatch_gdn_decode(GdnDecodeRequest(batch=4, arch=ARCH, gate_kind="kda"))
+        self.assertNotEqual(gdn.kernel_id.compile_key, kda.kernel_id.compile_key)
+
+    def test_unknown_gate_kind_is_rejected(self):
+        errors = request_errors(GdnDecodeRequest(batch=1, arch=ARCH, gate_kind="mamba"))
+        self.assertTrue(any("gate_kind" in e for e in errors), errors)
+
+
+class TestWorkKeyedTable(unittest.TestCase):
+    """The tile table is keyed on work = batch * num_v_heads, not on batch.
+
+    Tensor-parallel sharding divides num_v_heads across ranks (32 -> 16 -> 8 ->
+    4). Every workgroup does identical work and the grid is their product, so
+    batch and head count are interchangeable; a batch-keyed table tuned at
+    Hv=32 picks the wrong tile on every multi-GPU deployment.
+    """
+
+    def test_equal_work_selects_the_same_tile(self):
+        self.assertEqual(tile_for_work(8 * 32), tile_for_work(32 * 8))
+        self.assertEqual(tile_for_work(1 * 32), tile_for_work(4 * 8))
+
+    def test_dispatch_uses_work_not_batch(self):
+        # Same batch, half the heads -> half the work -> may select a different
+        # tile. A batch-keyed table would return the same one regardless.
+        full = dispatch_gdn_decode(
+            GdnDecodeRequest(batch=4, arch=ARCH, num_k_heads=16, num_v_heads=32)
+        ).spec
+        sharded = dispatch_gdn_decode(
+            GdnDecodeRequest(batch=4, arch=ARCH, num_k_heads=4, num_v_heads=8)
+        ).spec
+        self.assertEqual(_TILE(full), tile_for_work(4 * 32))
+        self.assertEqual(_TILE(sharded), tile_for_work(4 * 8))
+
+    def test_tile_for_work_agrees_with_dispatch(self):
+        for batch in (1, 16, 64, 256):
+            with self.subTest(batch=batch):
+                spec = dispatch_gdn_decode(_req(batch)).spec
+                self.assertEqual(_TILE(spec), tile_for_work(batch * spec.num_v_heads))
+
+    def test_table_is_total_over_work(self):
+        # No work value may fall through the table.
+        for work in (1, 4, 5, 128, 129, 4096, 4097, 10**6):
+            self.assertIsNotNone(tile_for_work(work))
