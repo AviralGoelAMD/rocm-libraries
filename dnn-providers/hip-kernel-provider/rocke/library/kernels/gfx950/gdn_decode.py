@@ -532,17 +532,59 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             return v
 
         # gates (per value head)
+        # As in _build_simple, the GDN arm is the original emission in its
+        # original order; nothing shared is hoisted out of it, because that
+        # would reorder GDN's IR and move its golden hashes.
         a_idx = b.add(b.mul(b_i, b.const_i32(HV)), hv_i)
-        ra = load_scalar_as_f32(b, Ag, a_idx, dtype=spec.dtype)
-        rb = load_scalar_as_f32(b, Bg, a_idx, dtype=spec.dtype)
-        rdt = load_scalar_as_f32(b, DTB, hv_i, dtype=spec.dtype)
-        ral = b.global_load_f32(ALOG, hv_i)
-        x = b.fadd(ra, rdt)
-        sp = b.select(
-            b.fcmp("ogt", x, b.const_f32(SOFTPLUS_THRESHOLD)), x, log1p_f32(exp_f32(x))
-        )
-        decay = exp_f32(b.fneg(b.fmul(exp_f32(ral), sp)))
-        beta = b.rcp_fast(b.fadd(b.const_f32(1.0), exp_f32(b.fneg(rb))))
+
+        if spec.gate_kind == "gdn":
+            ra = load_scalar_as_f32(b, Ag, a_idx, dtype=spec.dtype)
+            rb = load_scalar_as_f32(b, Bg, a_idx, dtype=spec.dtype)
+            rdt = load_scalar_as_f32(b, DTB, hv_i, dtype=spec.dtype)
+            ral = b.global_load_f32(ALOG, hv_i)
+            x = b.fadd(ra, rdt)
+            sp = b.select(
+                b.fcmp("ogt", x, b.const_f32(SOFTPLUS_THRESHOLD)),
+                x,
+                log1p_f32(exp_f32(x)),
+            )
+            decay = exp_f32(b.fneg(b.fmul(exp_f32(ral), sp)))
+            beta = b.rcp_fast(b.fadd(b.const_f32(1.0), exp_f32(b.fneg(rb))))
+        else:
+            # KDA: one decay per K channel, for the slice THIS lane owns.
+            #
+            # The state tile below is keyed (vi, ki) -- V row and K chunk -- but
+            # a channel's decay does not depend on which V row is being faded,
+            # so the decay is keyed by ki alone and reused across all
+            # WTV_ITERS rows. That is what holds the extra register cost to
+            # WTK_ITERS*VPT values instead of multiplying with the state tile.
+            rb = load_scalar_as_f32(b, Bg, a_idx, dtype=spec.dtype)
+            ral = b.global_load_f32(ALOG, hv_i)  # per head in both gate kinds
+            beta = b.rcp_fast(b.fadd(b.const_f32(1.0), exp_f32(b.fneg(rb))))
+            exp_alog = exp_f32(ral)
+            g_row = b.add(
+                b.mul(b_i, b.const_i32(HV * DK)), b.mul(hv_i, b.const_i32(DK))
+            )
+            dtb_row = b.mul(hv_i, b.const_i32(DK))
+            decay = {}
+            for ki in range(WTK_ITERS):
+                # Same lane offset the state load uses, so slot i of this
+                # slice is the same K channel as slot i of the state vector.
+                koff = b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K))
+                gv = load_vec_as_f32(b, Ag, b.add(g_row, koff), dtype=spec.dtype, n=VPT)
+                dtvec = b.global_load_vN(DTB, b.add(dtb_row, koff), F32, VPT)
+                slice_decay = []
+                for i in range(VPT):
+                    if spec.fuse_gate:
+                        inner = b.fmul(exp_alog, b.fadd(gv[i], b.vec_extract(dtvec, i)))
+                        sig = b.rcp_fast(
+                            b.fadd(b.const_f32(1.0), exp_f32(b.fneg(inner)))
+                        )
+                        log_decay = b.fmul(b.const_f32(spec.lower_bound), sig)
+                    else:
+                        log_decay = gv[i]
+                    slice_decay.append(exp_f32(log_decay))
+                decay[ki] = slice_decay
 
         # load this lane's q,k K-chunks -> f32
         qk_base = b.add(b.mul(b_i, b.const_i32(Q_HN)), b.mul(hk_i, b.const_i32(Q_HK)))
@@ -619,7 +661,12 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             for ki in range(WTK_ITERS):
                 off = b.add(rs_row, b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K)))
                 vec = load_vec_as_f32(b, state_r, off, dtype=spec.state_dtype, n=VPT)
-                sv[(vi, ki)] = [b.fmul(s, decay) for s in vec]
+                # decay[ki] covers the same K channels as this state chunk, in
+                # the same order, and is reused across every vi.
+                if spec.gate_kind == "gdn":
+                    sv[(vi, ki)] = [b.fmul(s, decay) for s in vec]
+                else:
+                    sv[(vi, ki)] = [b.fmul(s, d) for s, d in zip(vec, decay[ki])]
 
         state_w = b.global_ptr_add(
             STATE, b.mul(b.sext(write_pool, I64), b.const_i64(S_POOL * ST_BYTES))

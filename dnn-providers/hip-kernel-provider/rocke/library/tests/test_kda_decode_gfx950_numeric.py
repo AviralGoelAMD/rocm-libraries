@@ -84,3 +84,53 @@ def test_gdn_simple_path_still_matches_reference(harness):
     out_err, state_err = harness["check"](GdnDecodeSpec(simple=True), 4)
 
     assert max(out_err, state_err) <= harness["TOL"]
+
+
+@requires_gfx950
+@pytest.mark.parametrize("batch", [1, 3, 16, 64])
+def test_kda_warp_tiled_matches_reference(harness, batch):
+    """The production warp-tiled emitter, with a per-channel gate.
+
+    The simple path above already proves the gate formula, so a failure here
+    is an indexing bug: this emitter splits the DK axis across lanes, and the
+    decay vector has to line up with the state slice each lane owns.
+    """
+    out_err, state_err = harness["check"](_kda(), batch)
+
+    assert out_err <= harness["TOL"], f"KDA warp-tiled output error {out_err:.3e}"
+    assert state_err <= harness["TOL"], f"KDA warp-tiled state error {state_err:.3e}"
+
+
+@requires_gfx950
+@pytest.mark.parametrize("tile", [(4, 16, 8), (2, 8, 2), (1, 8, 1), (8, 16, 1)])
+def test_kda_matches_reference_across_tiles(harness, tile):
+    """Every shipped tile must be correct with the vector gate.
+
+    The tiles differ in how the DK axis is split across lanes (warp_threads_k)
+    and how many state rows each lane carries, so one passing tile says little
+    about the others. A tuning table that can route to a wrong kernel is worse
+    than no tuning at all.
+    """
+    num_warps, warp_threads_k, blocks_per_v_dim = tile
+    spec = _kda(
+        num_warps=num_warps,
+        warp_threads_k=warp_threads_k,
+        blocks_per_v_dim=blocks_per_v_dim,
+    )
+    out_err, state_err = harness["check"](spec, batch=16)
+
+    assert out_err <= harness["TOL"], f"KDA tile {tile} output error {out_err:.3e}"
+    assert state_err <= harness["TOL"], f"KDA tile {tile} state error {state_err:.3e}"
+
+
+@requires_gfx950
+def test_kda_mha_shape_matches_reference(harness):
+    """The shipping MHA shape: Hk == Hv == 32, kv_group 1.
+
+    The GDN shapes are all GQA (Hv > Hk), so this is the first time the gather
+    that maps a value head to its key head runs with no grouping at all.
+    """
+    out_err, state_err = harness["check"](_kda(num_k_heads=32, num_v_heads=32), 8)
+
+    assert out_err <= harness["TOL"], f"KDA MHA output error {out_err:.3e}"
+    assert state_err <= harness["TOL"], f"KDA MHA state error {state_err:.3e}"
