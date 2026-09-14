@@ -115,6 +115,42 @@ class TestRequestRejection(unittest.TestCase):
         with self.assertRaises(ValueError):
             dispatch_gdn_decode(_req(8, dtype="fp8"))
 
+    def test_kda_d128_is_admitted(self):
+        result = dispatch_gdn_decode(
+            _req(
+                1,
+                gate_kind="kda",
+                num_k_heads=32,
+                num_v_heads=32,
+                head_k_dim=128,
+                head_v_dim=128,
+            )
+        )
+        self.assertEqual(result.spec.gate_kind, "kda")
+        self.assertEqual((result.spec.head_k_dim, result.spec.head_v_dim), (128, 128))
+
+    def test_kda_non_d128_is_loudly_scoped_out(self):
+        for head_k_dim, head_v_dim in ((64, 128), (128, 64)):
+            with self.subTest(head_k_dim=head_k_dim, head_v_dim=head_v_dim):
+                with self.assertRaises(ValueError) as ctx:
+                    dispatch_gdn_decode(
+                        _req(
+                            1,
+                            gate_kind="kda",
+                            num_k_heads=32,
+                            num_v_heads=32,
+                            head_k_dim=head_k_dim,
+                            head_v_dim=head_v_dim,
+                        )
+                    )
+                self.assertIn("NOT_YET_IMPLEMENTED", str(ctx.exception))
+                self.assertIn("128", str(ctx.exception))
+
+    def test_gdn_d64_remains_supported(self):
+        result = dispatch_gdn_decode(_req(1, head_k_dim=64))
+        self.assertEqual(result.spec.gate_kind, "gdn")
+        self.assertEqual(result.spec.head_k_dim, 64)
+
 
 class TestSpecIdPin(unittest.TestCase):
     def test_pin_overrides_the_tuning_table(self):

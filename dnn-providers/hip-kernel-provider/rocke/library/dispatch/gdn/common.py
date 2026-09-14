@@ -123,6 +123,11 @@ def request_errors(req: OperatorRequest) -> list:
         errors.append(
             f"unsupported gate_kind {req.gate_kind!r} (expected 'gdn' or 'kda')"
         )
+    if req.gate_kind == "kda" and (req.head_k_dim != 128 or req.head_v_dim != 128):
+        errors.append(
+            "NOT_YET_IMPLEMENTED: KDA decode currently requires "
+            "head_k_dim == head_v_dim == 128"
+        )
     return errors
 
 
