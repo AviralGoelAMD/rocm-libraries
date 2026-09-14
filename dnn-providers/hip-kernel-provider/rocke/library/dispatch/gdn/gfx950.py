@@ -42,29 +42,18 @@ from .common import (
 
 ARCH = "gfx950"
 
-# (max_work, (num_warps, warp_threads_k, blocks_per_v_dim), spec_id)
+# GDN keeps its original batch-keyed table. KDA is keyed on
+# WORK = batch * num_v_heads because that table was measured across head-count
+# geometries. The distinction is deliberate: changing GDN to work-keying
+# reroutes already-supported sharded-head requests without GDN measurements,
+# which is independent performance work and does not belong in this PR.
 #
-# Keyed on WORK = batch * num_v_heads, not on batch. The grid is
-# batch * num_v_heads * blocks_per_v_dim and every workgroup does identical
-# work, so batch and head count are interchangeable. This matters because
-# tensor-parallel sharding divides num_v_heads across ranks (32 -> 16 -> 8 ->
-# 4): a batch-keyed table tuned at Hv=32 picks the wrong tile on every
-# multi-GPU deployment, including rungs no sweep ever visited.
-#
-# ONE TABLE PER GATE KIND. The per-channel KDA gate carries extra loads and
-# registers that the scalar GDN gate does not, so the two do not share an
-# optimum and must not share a table -- overwriting one with the other's
-# values would silently retune a shipped kernel.
-
-# GDN: the shipped tiles, re-expressed on the work axis (batch b at Hv=32 ->
-# work 32b). The tile VALUES are the original batch-keyed measurements; only
-# the key changed, so Hv=32 selection is unchanged and other head counts now
-# land on the tile their work implies rather than on Hv=32's.
+# (max_batch, (num_warps, warp_threads_k, blocks_per_v_dim), spec_id)
 _TUNED_TILES_GDN = (
-    (128, (4, 16, 8), "w128"),
-    (1024, (2, 8, 2), "w1024"),
-    (4096, (1, 8, 1), "w4096"),
-    (None, (8, 16, 1), "w_large"),
+    (4, (4, 16, 8), "b4"),
+    (32, (2, 8, 2), "b32"),
+    (128, (1, 8, 1), "b128"),
+    (None, (8, 16, 1), "b_large"),
 )
 
 # KDA: measured on gfx950 with the per-channel gate. All 54 legal tiles were
@@ -103,6 +92,21 @@ def _tuned_tiles(gate_kind: str):
 
 # Every tile the tables can produce, for tuners and for the sweep space.
 TUNED_SPEC_IDS = tuple(e[2] for e in _TUNED_TILES_GDN + _TUNED_TILES_KDA)
+
+
+def tile_for_batch(batch: int) -> Tuple[int, int, int]:
+    """Original GDN tile selection, keyed on batch."""
+    for max_batch, tile, _ in _TUNED_TILES_GDN:
+        if max_batch is None or batch <= max_batch:
+            return tile
+    raise AssertionError("unreachable: table has an open-ended final band")
+
+
+def spec_id_for_batch(batch: int) -> str:
+    for max_batch, _, spec_id in _TUNED_TILES_GDN:
+        if max_batch is None or batch <= max_batch:
+            return spec_id
+    raise AssertionError("unreachable: table has an open-ended final band")
 
 
 def work_for(batch: int, num_v_heads: int) -> int:
@@ -194,9 +198,10 @@ def _make_candidate(*, tile: Tuple[int, int, int], spec_id: str, priority: int):
         # registration order. An explicit ``spec_id`` pin bypasses this, which
         # is what makes a tuning sweep able to force a non-default tile.
         if req.spec_id.strip().lower() == "auto":
-            wanted = spec_id_for_work(
-                work_for(req.batch, req.num_v_heads), req.gate_kind
-            )
+            if req.gate_kind == "kda":
+                wanted = spec_id_for_work(work_for(req.batch, req.num_v_heads), "kda")
+            else:
+                wanted = spec_id_for_batch(req.batch)
             # Prefer the tuned tile, but only when it is valid for this geometry.
             # If it is not, fall through so any valid candidate may serve (the
             # registry picks by priority) rather than failing a kernel-supported
