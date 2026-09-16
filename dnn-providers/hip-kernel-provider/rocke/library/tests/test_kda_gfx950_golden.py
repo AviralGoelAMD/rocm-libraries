@@ -156,6 +156,20 @@ def _cases() -> dict[str, Callable]:
             build_kda_chunk_scan,
         )
 
+    # The tile prefetch only fits under the LDS budget on a split v slice, and
+    # the tuned GDN geometry is the one it exists for.
+    add(
+        "kda_gfx950/split_c32_scan_vs8_prefetch",
+        KdaChunkScanSpec(
+            tile=KdaTileSpec(block_size=64, scan_atom_m=16),
+            value_splits=8,
+            token_major_io=True,
+            has_initial_state=True,
+            prefetch_tiles=True,
+        ),
+        build_kda_chunk_scan,
+    )
+
     # The tuned fused default is C32/SA16; an untuned C32 tile pins SA32.
     add("kda_gfx950/fused_c32_sa16", KdaChunkFusedSpec(), build_kda_chunk_fused)
     add(

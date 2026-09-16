@@ -318,6 +318,47 @@ class TestScanSpec:
         art = _compile_or_skip(build_kda_chunk_scan(KdaChunkScanSpec()))
         assert art.hsaco_bytes > 0
 
+    def test_prefetch_doubles_exactly_the_staged_tiles(self):
+        """The second buffer covers the six staged tiles and nothing else.
+
+        ``dec`` is in that six even though it is only ``4*DK`` bytes: it is read
+        by the last product in the body, so a single copy would be overwritten
+        by the next chunk's staging while it is still live. The state mirror and
+        ``V~`` are rebuilt from registers every chunk, so they stay single.
+        """
+        tile = KdaTileSpec(chunk=32, block_size=64, scan_atom_m=16)
+        plain = KdaChunkScanSpec(tile=tile, value_splits=8, token_major_io=True)
+        pf = KdaChunkScanSpec(
+            tile=tile, value_splits=8, token_major_io=True, prefetch_tiles=True
+        )
+        C, DK, PDK, PCB = 32, 128, 128 + 8, 32 + 8
+        staged = 2 * (2 * C * PDK) + 2 * (2 * C * PCB) + 2 * DK * PCB + 4 * DK
+        assert plain.lds_bytes() == 38_912
+        assert pf.lds_bytes() == plain.lds_bytes() + staged == 72_192
+        ok, why = is_valid_scan_spec(pf, arch=ARCH)
+        assert ok, why
+
+    def test_prefetch_reaches_the_name_only_when_on(self):
+        assert "pf" not in KdaChunkScanSpec().kernel_name().split("_")
+        assert "pf" in KdaChunkScanSpec(prefetch_tiles=True).kernel_name().split("_")
+
+    def test_prefetch_still_answers_to_the_lds_budget(self):
+        """The default 128-wide v slice cannot afford the second buffer."""
+        ok, why = is_valid_scan_spec(KdaChunkScanSpec(prefetch_tiles=True), arch=ARCH)
+        assert not ok
+        assert "workgroups per CU" in why
+
+    def test_prefetch_builds_and_fits(self):
+        spec = KdaChunkScanSpec(
+            tile=KdaTileSpec(chunk=32, block_size=64, scan_atom_m=16),
+            value_splits=8,
+            token_major_io=True,
+            has_initial_state=True,
+            prefetch_tiles=True,
+        )
+        art = _compile_or_skip(build_kda_chunk_scan(spec))
+        assert art.hsaco_bytes > 0
+
 
 class TestSpecNaming:
     def test_names_are_distinct_and_carry_the_shape(self):

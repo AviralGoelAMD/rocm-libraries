@@ -100,6 +100,19 @@ def _scan_tile(req: GdnPrefillRequest, value_splits: int) -> KdaTileSpec:
 def _scan_spec(req: OperatorRequest) -> KdaChunkScanSpec:
     assert isinstance(req, GdnPrefillRequest)
     value_splits = value_splits_for(req.batch_heads)
+    # Double-buffered per-chunk tile staging. Prefetch doubles the staged tiles
+    # (38,912 -> 72,192 B), halving resident workgroups per CU from 4 to 2, so it
+    # only pays where the scan cannot already hide its HBM latency behind a second
+    # resident workgroup. That is exactly the ``value_splits=8`` band: ``BH <= 64``
+    # caps demand at ``BH * 8 / 256 <= 2`` WGs/CU, which the prefetch footprint
+    # still supplies. Measured on MI355X at chunk=32, scan-only, fp64-gated
+    # (jobs 641/646/648/649): BH=8 (TP=4 production) -12.2%, BH=16 -12.3%,
+    # BH=32 -12.5%, BH=64 (band edge) -8.4%; at NC=256, BH=8 -12.5%, BH=32 -23.6%.
+    # Outside the band the flag is not merely slower but illegal -- at vs=2/vs=1 the
+    # wider state slice pushes prefetch LDS to 89,088/111,616 B, over the 81,920 B
+    # min_occupancy=2 budget, and ``is_valid_scan_spec`` rejects it. Forcing vs=8
+    # onto those shapes measures +5.6% (BH=128) and +9.9% (BH=256): the losses are
+    # real, and unreachable through this selector.
     return KdaChunkScanSpec(
         head_k=int(req.head_k_dim),
         head_v=int(req.head_v_dim),
@@ -109,6 +122,7 @@ def _scan_spec(req: OperatorRequest) -> KdaChunkScanSpec:
         token_major_io=True,
         has_initial_state=bool(req.has_initial_state),
         store_final_state=bool(req.store_final_state),
+        prefetch_tiles=value_splits == 8,
     )
 
 
