@@ -239,7 +239,7 @@ with open(OUT, 'w', newline='') as f:
         else:
             ms, tf, gb = perf[-1]
             status = 'PASS'
-            reason = 'numeric validation unavailable: BSHD -v=2 reference diverged while AITER and CK outputs matched bit-for-bit'
+            reason = 'numeric validation unavailable: native BSHD -v=2 reference is degenerate near 0.5'
 
         w.writerow([
             cid, B, S, Hq, Hkv, f'{Hq//Hkv}:1', ms, tf, gb, status,
@@ -365,7 +365,7 @@ with open(OUT, 'w', newline='') as f:
         else:
             ms, tf, gb = perf[-1]
             status = 'PASS'
-            reason = 'numeric validation unavailable: BSHD -v=2 reference diverged while AITER and CK outputs matched bit-for-bit'
+            reason = 'numeric validation unavailable: native BSHD -v=2 reference is degenerate near 0.5'
 
         w.writerow([
             cid, B, S, Hq, Hkv, f'{Hq//Hkv}:1', ms, tf, gb, status,
