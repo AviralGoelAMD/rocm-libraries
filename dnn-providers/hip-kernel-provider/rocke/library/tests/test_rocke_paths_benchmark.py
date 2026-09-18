@@ -367,7 +367,11 @@ def test_merge_results_keeps_external_unavailable_validation_timing_when_dense_i
 
 
 def _write_minimal_merge_inputs(
-    tmp_path, *, duplicate_dense: bool = False, unified_batch: int = 64
+    tmp_path,
+    *,
+    duplicate_dense: bool = False,
+    unified_batch: int = 64,
+    external_validation_status: str | None = "UNAVAILABLE",
 ) -> None:
     dense_header = (
         "id\tB\tS\tHq\tHkv\tGQA\tms\ttflops\tmax_abs\tstatus\tkernel\tpath"
@@ -381,19 +385,76 @@ def _write_minimal_merge_inputs(
         f"10\t{unified_batch}\t8192\t32\t8\t4:1\t3.5\t1.0\t0.0\tPASS\tunified"
         "\tauto:2d\t\t\n"
     )
-    external_header = (
-        "id\tB\tS\tHq\tHkv\tGQA\tms\ttflops\tgbps\tstatus\tvalidation_status"
-        "\tkernel\treason\n"
-    )
-    aiter_row = "10\t64\t8192\t32\t8\t4:1\t2.0\t1.0\t1.0\tPASS\tUNAVAILABLE\taiter\t\n"
-    ck_row = "10\t64\t8192\t32\t8\t4:1\t2.5\t1.0\t1.0\tPASS\tUNAVAILABLE\tck\t\n"
+    external_columns = [
+        "id",
+        "B",
+        "S",
+        "Hq",
+        "Hkv",
+        "GQA",
+        "ms",
+        "tflops",
+        "gbps",
+        "status",
+    ]
+    if external_validation_status is not None:
+        external_columns.append("validation_status")
+    external_columns.extend(["kernel", "reason"])
+    external_header = "\t".join(external_columns) + "\n"
+
+    def external_row(ms: str, kernel: str) -> str:
+        values = [
+            "10",
+            "64",
+            "8192",
+            "32",
+            "8",
+            "4:1",
+            ms,
+            "1.0",
+            "1.0",
+            "PASS",
+        ]
+        if external_validation_status is not None:
+            values.append(external_validation_status)
+        values.extend([kernel, ""])
+        return "\t".join(values) + "\n"
 
     (tmp_path / "rocke_dense.tsv").write_text(
         dense_header + dense_row * (2 if duplicate_dense else 1)
     )
     (tmp_path / "rocke_unified.tsv").write_text(dense_header + unified_row)
-    (tmp_path / "aiter.tsv").write_text(external_header + aiter_row)
-    (tmp_path / "ck.tsv").write_text(external_header + ck_row)
+    (tmp_path / "aiter.tsv").write_text(external_header + external_row("2.0", "aiter"))
+    (tmp_path / "ck.tsv").write_text(external_header + external_row("2.5", "ck"))
+
+def test_merge_results_rejects_external_timing_without_validation_status(tmp_path) -> None:
+    from benchmarks.gfx942.attention.prefill.rocke_vs_aiter import merge_results
+
+    _write_minimal_merge_inputs(tmp_path, external_validation_status=None)
+
+    [row] = merge_results.merge(tmp_path)
+
+    for arm in ("AITER", "CK"):
+        assert row[f"{arm}_status"] == "FAIL"
+        assert row[f"{arm}_validation_status"] == ""
+        assert row[f"{arm}_reason"] == "validation status not recorded"
+        assert row[f"{arm}_ms"] is None
+    assert row["AITER_vs_best_rocke"] is None
+    assert row["CK_vs_best_rocke"] is None
+
+    with (tmp_path / "results.csv").open(newline="") as handle:
+        [csv_row] = csv.DictReader(handle)
+    assert csv_row["AITER_ms"] == ""
+    assert csv_row["CK_ms"] == ""
+    assert csv_row["AITER_vs_best_rocke"] == ""
+    assert csv_row["CK_vs_best_rocke"] == ""
+
+    markdown = (tmp_path / "benchmark_results.md").read_text()
+    assert (
+        "| 10 | AITER | FAIL | — | aiter | validation status not recorded |"
+    ) in markdown
+    assert "| 10 | CK | FAIL | — | ck | validation status not recorded |" in markdown
+
 
 
 def test_merge_results_rejects_duplicate_ids_in_an_arm(tmp_path) -> None:

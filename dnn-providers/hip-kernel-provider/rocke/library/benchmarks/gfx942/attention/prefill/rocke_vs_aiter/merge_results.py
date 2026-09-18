@@ -84,11 +84,6 @@ _TIMING_ELIGIBLE_VALIDATION_STATUSES = {"PASS", "UNAVAILABLE"}
 def _ms(row: dict[str, str] | None) -> float | None:
     if row is None or row.get("status") != "PASS":
         return None
-    if (
-        "validation_status" in row
-        and row["validation_status"] not in _TIMING_ELIGIBLE_VALIDATION_STATUSES
-    ):
-        return None
     try:
         value = float(row["ms"])
     except (KeyError, TypeError, ValueError):
@@ -116,11 +111,24 @@ def _ratio(base_ms: float | None, comparison_ms: float | None) -> float | None:
 
 
 def _arm(row: dict[str, str] | None, name: str) -> dict[str, Any]:
+    status = "MISSING" if row is None else row.get("status", "MISSING")
+    reason = "row is missing" if row is None else row.get("reason", "")
+    validation_status = "MISSING" if row is None else row.get("validation_status", "")
+
+    if (
+        name in {"AITER", "CK"}
+        and status == "PASS"
+        and validation_status not in _TIMING_ELIGIBLE_VALIDATION_STATUSES
+    ):
+        status = "FAIL"
+        if not reason:
+            reason = f"validation status {validation_status or 'not recorded'}"
+
     result: dict[str, Any] = {
-        f"{name}_ms": _ms(row),
-        f"{name}_status": "MISSING" if row is None else row.get("status", "MISSING"),
+        f"{name}_ms": _ms(row) if status == "PASS" else None,
+        f"{name}_status": status,
         f"{name}_kernel": "" if row is None else row.get("kernel", ""),
-        f"{name}_reason": "row is missing" if row is None else row.get("reason", ""),
+        f"{name}_reason": reason,
     }
     if name in {"dense", "unified"}:
         result.update(
@@ -132,7 +140,6 @@ def _arm(row: dict[str, str] | None, name: str) -> dict[str, Any]:
             }
         )
     if name in {"AITER", "CK"}:
-        validation_status = "MISSING" if row is None else row.get("validation_status", "")
         result.update(
             {
                 f"{name}_tflops": _producer_field(row, "tflops"),
@@ -140,15 +147,6 @@ def _arm(row: dict[str, str] | None, name: str) -> dict[str, Any]:
                 f"{name}_validation_status": validation_status,
             }
         )
-        if (
-            result[f"{name}_status"] == "PASS"
-            and validation_status not in _TIMING_ELIGIBLE_VALIDATION_STATUSES
-        ):
-            result[f"{name}_status"] = "FAIL"
-            if not result[f"{name}_reason"]:
-                result[f"{name}_reason"] = (
-                    f"validation status {validation_status or 'not recorded'}"
-                )
     return result
 
 
