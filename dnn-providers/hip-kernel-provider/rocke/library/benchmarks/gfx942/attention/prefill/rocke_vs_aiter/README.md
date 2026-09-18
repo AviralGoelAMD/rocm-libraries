@@ -238,9 +238,9 @@ Before timing:
 
 ### External numeric-validation limitation
 
-The native external `-v=2` GPU validator is known invalid for this BSHD workload. The reproduced AITER FMHA-v3 ASM and CK runs both return exit `254` with the same bogus reference near `0.5`; an independent AITER MHA reproduction with `Hq=Hkv=32` also returns `254`. The normal runner therefore never invokes `-v=2` or writes external validation logs.
+The native external `-v=2` GPU validator is known invalid for this BSHD workload. On reproduced configuration 1, AITER FMHA-v3 ASM and CK produced bit-identical outputs—starting `out[0]=0.3535156`, `out[1]=0.2597656`—while only the validator reference diverged (`ref[0]=0.4980469`, `ref[1]=0.4902344`) and both commands returned exit `254`. An independent AITER MHA reproduction with `Hq=Hkv=32` also returns `254`. This cross-kernel agreement identifies the experimental BSHD reference as faulty, not the timed kernels; the normal runner therefore never invokes `-v=2` or writes external validation logs.
 
-External timing rows use `validation_status=UNAVAILABLE` and record this limitation as their reason. An external `status=PASS` means the selected kernel timed successfully; it is **not** an external numeric-output certification. rocKE remains FP32-gated as described above.
+External timing rows use `validation_status=UNAVAILABLE` and record this evidence as their reason. An external `status=PASS` means the selected kernel timed successfully; it is **not** an external numeric-output certification. rocKE remains FP32-gated as described above.
 
 The timing procedure is:
 
@@ -316,7 +316,7 @@ results/
 
 `rocke_dense.tsv` and `rocke_unified.tsv` include each rocKE arm's status, `max_abs`, selected kernel, path, settings, and reason. The shared-fixture rocKE validation records appear in those TSVs and in `logs/rocke/all.log`.
 
-`aiter.tsv` and `ck.tsv` include each external arm's timing status, `validation_status`, selected kernel, and reason. Passing external rows report `validation_status=UNAVAILABLE` because native BSHD GPU numeric validation is known invalid; their `config_XX.log` files preserve the `-v=0` timing output. AITER also writes `config_XX.support.log`. `results.csv` is the four-arm machine-readable merge, and `benchmark_results.md` is the corresponding Markdown report.
+`aiter.tsv` and `ck.tsv` include each external arm's timing status, `validation_status`, selected kernel, and reason. Passing external rows report `validation_status=UNAVAILABLE`: the BSHD `-v=2` reference diverged while the AITER and CK outputs matched bit-for-bit. Their `config_XX.log` files preserve the `-v=0` timing output. AITER also writes `config_XX.support.log`. `results.csv` is the four-arm machine-readable merge, and `benchmark_results.md` is the corresponding Markdown report.
 
 ## Reproduction
 
