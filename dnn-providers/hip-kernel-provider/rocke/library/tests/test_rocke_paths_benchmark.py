@@ -308,9 +308,12 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
         csv_rows = list(csv.DictReader(handle))
     assert csv_rows[0]["best_rocke"] == "unified"
     assert csv_rows[0]["AITER_vs_best_rocke"] == "1.5"
-    assert "dense: UNSUPPORTED — Q/O extent exceeds 32-bit" in (
-        tmp_path / "benchmark_results.md"
-    ).read_text()
+    markdown = (tmp_path / "benchmark_results.md").read_text()
+    assert "dense: UNSUPPORTED — Q/O extent exceeds 32-bit" in markdown
+    assert "| 10 | dense | UNSUPPORTED | — | dense | Q/O extent exceeds 32-bit |" in markdown
+    assert "| 10 | unified | PASS | — | unified | — |" in markdown
+    assert "| 10 | AITER | PASS | PASS | aiter-asm | — |" in markdown
+    assert "| 10 | CK | PASS | PASS | ck-tile | — |" in markdown
 
 
 def _gfx942_gpu_ready() -> bool:

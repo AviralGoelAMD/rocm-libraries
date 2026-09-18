@@ -186,6 +186,25 @@ def _write_markdown(path: Path, rows: list[dict[str, Any]]) -> None:
             f"{_format_ratio(row['CK_vs_best_rocke'])} |"
         )
 
+    lines.extend(
+        [
+            "",
+            "## Arm details",
+            "",
+            "| # | arm | status | validation | kernel | reason |",
+            "|---:|:---|:---|:---|:---|:---|",
+        ]
+    )
+    for row in rows:
+        for arm in _ARM_NAMES:
+            validation_status = row.get(f"{arm}_validation_status") or "—"
+            kernel = row[f"{arm}_kernel"] or "—"
+            reason = row[f"{arm}_reason"] or "—"
+            lines.append(
+                f"| {row['id']} | {arm} | {row[f'{arm}_status']} | "
+                f"{validation_status} | {kernel} | {reason} |"
+            )
+
     failures = []
     for row in rows:
         for arm in _ARM_NAMES:
