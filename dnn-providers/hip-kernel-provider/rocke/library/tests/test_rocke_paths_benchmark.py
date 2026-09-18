@@ -81,3 +81,36 @@ def test_identity_paged_kv_rejects_partial_page() -> None:
 
     with pytest.raises(ValueError, match="divisible"):
         rocke_paths.make_identity_paged_kv(k, k)
+
+
+def test_dense_spec_preflight_rejects_config_10_for_32_bit_qo_extent() -> None:
+    from kernels.gfx942.attention_dense import supports_attention_dense
+
+    spec = rocke_paths.dense_spec(rocke_paths.CONFIGS[-1])
+
+    supported, reason = supports_attention_dense(spec, arch="gfx942")
+
+    assert not supported
+    assert "Q/O" in reason
+    assert "32-bit" in reason or "extent" in reason
+
+
+def _gfx942_gpu_ready() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    return "gfx942" in torch.cuda.get_device_properties(0).gcnArchName.lower()
+
+
+@pytest.mark.skipif(
+    not _gfx942_gpu_ready(), reason="needs a gfx942 GPU with ROCm torch"
+)
+@pytest.mark.gpu
+def test_shared_fixture_dense_and_auto_unified_match_fp32_reference() -> None:
+    dense, unified = rocke_paths.run_rocke_pair(
+        rocke_paths.Config(0, 1, 512, 32, 8), warmup=1, iters=1, seed=0
+    )
+
+    assert dense["status"] == "PASS", dense["reason"]
+    assert unified["status"] == "PASS", unified["reason"]
+    assert dense["max_abs"] < rocke_paths.MAX_ABS_TOL
+    assert unified["max_abs"] < rocke_paths.MAX_ABS_TOL
