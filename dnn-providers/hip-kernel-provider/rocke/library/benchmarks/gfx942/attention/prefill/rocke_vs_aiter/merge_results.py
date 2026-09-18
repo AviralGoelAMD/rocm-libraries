@@ -169,8 +169,12 @@ def _merge_row(
     ck: dict[str, str] | None,
 ) -> dict[str, Any]:
     identity = _row_identity(dense, unified, aiter, ck, identifier=identifier)
-    dense_ms = _ms(dense)
-    unified_ms = _ms(unified)
+    dense_arm = _arm(dense, "dense")
+    unified_arm = _arm(unified, "unified")
+    aiter_arm = _arm(aiter, "AITER")
+    ck_arm = _arm(ck, "CK")
+    dense_ms = dense_arm["dense_ms"]
+    unified_ms = unified_arm["unified_ms"]
     rocke_candidates = [
         ("dense", dense_ms),
         ("unified", unified_ms),
@@ -180,17 +184,17 @@ def _merge_row(
         key=lambda item: item[1],
         default=("", None),
     )
-    aiter_ms = _ms(aiter)
-    ck_ms = _ms(ck)
+    aiter_ms = aiter_arm["AITER_ms"]
+    ck_ms = ck_arm["CK_ms"]
 
     return {
         **identity,
-        **_arm(dense, "dense"),
-        **_arm(unified, "unified"),
+        **dense_arm,
+        **unified_arm,
         "best_rocke": best_rocke,
         "best_rocke_ms": best_rocke_ms,
-        **_arm(aiter, "AITER"),
-        **_arm(ck, "CK"),
+        **aiter_arm,
+        **ck_arm,
         "dense_vs_unified": _ratio(dense_ms, unified_ms),
         "AITER_vs_best_rocke": _ratio(best_rocke_ms, aiter_ms),
         "CK_vs_best_rocke": _ratio(best_rocke_ms, ck_ms),

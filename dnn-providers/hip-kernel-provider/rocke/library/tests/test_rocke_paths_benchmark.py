@@ -454,6 +454,10 @@ def test_merge_results_rejects_external_timing_without_validation_status(tmp_pat
         "| 10 | AITER | FAIL | — | aiter | validation status not recorded |"
     ) in markdown
     assert "| 10 | CK | FAIL | — | ck | validation status not recorded |" in markdown
+    assert (
+        "| 10 | 64 | 8192 | 32 | 8 | 4:1 | 3.0000 | 3.5000 | dense (3.0000 ms) | "
+        "— | — | 0.857× | — | — |"
+    ) in markdown
 
 
 
