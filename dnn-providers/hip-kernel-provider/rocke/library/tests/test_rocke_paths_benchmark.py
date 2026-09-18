@@ -427,17 +427,37 @@ def _write_minimal_merge_inputs(
     (tmp_path / "aiter.tsv").write_text(external_header + external_row("2.0", "aiter"))
     (tmp_path / "ck.tsv").write_text(external_header + external_row("2.5", "ck"))
 
-def test_merge_results_rejects_external_timing_without_validation_status(tmp_path) -> None:
+@pytest.mark.parametrize(
+    (
+        "validation_status",
+        "expected_validation_status",
+        "expected_reason",
+        "markdown_validation_status",
+    ),
+    [
+        (None, "", "validation status not recorded", "—"),
+        ("FAIL", "FAIL", "validation status FAIL", "FAIL"),
+    ],
+)
+def test_merge_results_rejects_external_timing_without_eligible_validation_status(
+    tmp_path,
+    validation_status,
+    expected_validation_status,
+    expected_reason,
+    markdown_validation_status,
+) -> None:
     from benchmarks.gfx942.attention.prefill.rocke_vs_aiter import merge_results
 
-    _write_minimal_merge_inputs(tmp_path, external_validation_status=None)
+    _write_minimal_merge_inputs(
+        tmp_path, external_validation_status=validation_status
+    )
 
     [row] = merge_results.merge(tmp_path)
 
     for arm in ("AITER", "CK"):
         assert row[f"{arm}_status"] == "FAIL"
-        assert row[f"{arm}_validation_status"] == ""
-        assert row[f"{arm}_reason"] == "validation status not recorded"
+        assert row[f"{arm}_validation_status"] == expected_validation_status
+        assert row[f"{arm}_reason"] == expected_reason
         assert row[f"{arm}_ms"] is None
     assert row["AITER_vs_best_rocke"] is None
     assert row["CK_vs_best_rocke"] is None
@@ -451,9 +471,13 @@ def test_merge_results_rejects_external_timing_without_validation_status(tmp_pat
 
     markdown = (tmp_path / "benchmark_results.md").read_text()
     assert (
-        "| 10 | AITER | FAIL | — | aiter | validation status not recorded |"
+        f"| 10 | AITER | FAIL | {markdown_validation_status} | aiter | "
+        f"{expected_reason} |"
     ) in markdown
-    assert "| 10 | CK | FAIL | — | ck | validation status not recorded |" in markdown
+    assert (
+        f"| 10 | CK | FAIL | {markdown_validation_status} | ck | "
+        f"{expected_reason} |"
+    ) in markdown
     assert (
         "| 10 | 64 | 8192 | 32 | 8 | 4:1 | 3.0000 | 3.5000 | dense (3.0000 ms) | "
         "— | — | 0.857× | — | — |"
