@@ -40,6 +40,8 @@ def make_identity_paged_kv(
     k: torch.Tensor, v: torch.Tensor, page_size: int = PAGE_SIZE
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pack dense BSHD K/V tensors into identity-ordered page caches."""
+    if k.device != v.device:
+        raise ValueError("k and v must be on the same device")
     if k.shape != v.shape:
         raise ValueError("k and v must have identical [B, S, Hkv, D] shapes")
     if k.ndim != 4:
@@ -53,8 +55,8 @@ def make_identity_paged_kv(
 
     pages_per_sequence = sequence_length // page_size
     cache_shape = (batch * pages_per_sequence, page_size, kv_heads, head_dim)
-    k_cache = k.reshape(cache_shape)
-    v_cache = v.reshape(cache_shape)
+    k_cache = k.contiguous().view(cache_shape)
+    v_cache = v.contiguous().view(cache_shape)
     block_table = torch.arange(
         batch * pages_per_sequence, device=k.device, dtype=torch.int32
     ).reshape(batch, pages_per_sequence)

@@ -42,6 +42,32 @@ def test_identity_paged_kv_preserves_each_cpu_token() -> None:
     assert torch.equal(block_table, torch.tensor([[0, 1], [2, 3]], dtype=torch.int32))
 
 
+def test_identity_paged_kv_materializes_noncontiguous_inputs() -> None:
+    k = torch.arange(2 * 128 * 2 * 8, dtype=torch.float32).reshape(2, 128, 2, 8)[
+        ..., ::2
+    ]
+    v = torch.arange(2 * 128 * 2 * 8, dtype=torch.float32).add_(2 * 128 * 2 * 8).reshape(
+        2, 128, 2, 8
+    )[..., ::2]
+
+    k_cache, v_cache, _ = rocke_paths.make_identity_paged_kv(k, v)
+
+    assert not k.is_contiguous()
+    assert not v.is_contiguous()
+    assert k_cache.is_contiguous()
+    assert v_cache.is_contiguous()
+    assert torch.equal(k_cache.reshape_as(k), k)
+    assert torch.equal(v_cache.reshape_as(v), v)
+
+
+def test_identity_paged_kv_rejects_kv_on_different_devices() -> None:
+    k = torch.empty(2, 128, 2, 4)
+    v = torch.empty(2, 128, 2, 4, device="meta")
+
+    with pytest.raises(ValueError, match="same device"):
+        rocke_paths.make_identity_paged_kv(k, v)
+
+
 def test_identity_paged_kv_rejects_mismatched_shapes() -> None:
     k = torch.empty(2, 128, 2, 4)
     v = torch.empty(2, 128, 2, 5)
