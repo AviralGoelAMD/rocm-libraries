@@ -1,16 +1,17 @@
-# ROCKE vs CK vs AITER Attention Benchmark — MI300X
+# Four-Way rocKE, AITER, and CK Attention Benchmark — MI300X
 
-This benchmark compares forward-attention performance across:
+This benchmark compares four forward-attention paths:
 
-* **ROCKE Dense Attention**
+* **rocKE `attention_dense`**
+* **rocKE auto-unified attention**
+* **AITER FMHA-v3 ASM**
 * **Composable Kernel (CK) Tile FMHA**
-* **AITER FMHA v3 ASM**
 
-The benchmark targets **AMD Instinct MI300X (`gfx942`)** and evaluates BF16 causal attention across different batch sizes, sequence lengths, and GQA configurations.
+The benchmark targets **AMD Instinct MI300X (`gfx942`)** and evaluates BF16 causal grouped-query attention (GQA) across different batch sizes, sequence lengths, and key/value-head counts.
 
 ## Benchmark Environment
 
-The reported results were collected on an AMD Instinct MI300X-class `gfx942` system using the following software stack:
+Each benchmark run records the hardware and software environment used to produce its results. The benchmark is intended for an AMD Instinct MI300X-class `gfx942` system with the following software stack:
 
 ```text
 GPU:                AMD Instinct MI300X
@@ -98,7 +99,7 @@ The resulting workspace is approximately:
 
 ## Benchmark Configuration
 
-The benchmark compares equivalent forward-attention workloads across all three implementations.
+The benchmark compares the same logical forward-attention workload across four independently reported arms.
 
 Common configuration:
 
@@ -110,11 +111,13 @@ Head dimension:   128
 Query heads:      32
 Attention:        Causal
 Sq:               Sk
-Tensor layout:    BSHD
+Logical layout:   contiguous dense BSHD
 Warmup runs:      10
 Measured runs:    50
 Reported latency: Average latency per kernel launch
 ```
+
+The auto-unified arm uses page-backed K/V internally, but it does **not** benchmark a paged-attention workload. It performs one identity-ordered conversion from the contiguous dense BSHD K/V tensors into page caches before timing; that conversion is outside the timed region. The logical operation for every arm remains non-paged dense BSHD causal attention.
 
 The tested configurations vary:
 
@@ -146,11 +149,9 @@ The benchmark evaluates the following 10 shapes:
 
 ## Implementations and Kernels
 
-### ROCKE
+### rocKE `attention_dense`
 
-ROCKE Dense Attention is run directly from the ROCm Libraries checkout containing this benchmark.
-
-The benchmark uses the production ROCKE dispatch path:
+The `attention_dense` arm runs directly from the ROCm Libraries checkout containing this benchmark. It uses the production rocKE dense dispatch path:
 
 ```text
 dense_request
@@ -160,15 +161,15 @@ resolve_dense_spec
 run
 ```
 
-For every configuration, the resolved ROCKE kernel specification is obtained through:
+For every configuration, the benchmark resolves the dense kernel specification with `resolve_dense_spec(...)` and records the selected kernel and settings in `rocke_dense.tsv`.
 
-```text
-describe_dense_spec(...)
-```
+Configuration 10 (`B=64`, `S=8192`, `Hkv=8`) is expected `attention_dense` coverage: its 32-bit extent is reported as `UNSUPPORTED`. This is a result for the dense arm only; the auto-unified, AITER, and CK arms are still executed and reported independently.
 
-and recorded in the generated benchmark TSV/log files.
+### rocKE auto-unified attention
 
-This is important because ROCKE may select a kernel based on the requested workload rather than relying on a single hard-coded kernel name.
+The auto-unified arm runs rocKE's normal automatic route with the identity-paged K/V representation described above. It records its selected path, concrete kernel, and settings in `rocke_unified.tsv`; it does not substitute a paged logical workload for the dense BSHD operation.
+
+The two rocKE arms share one deterministic BF16 Q/K/V fixture for each configuration. Before timing, each arm produces one output and gates its timed record against the same FP32 causal GQA scaled dot-product attention (SDPA) reference. A rocKE row passes only when `max_abs < 4e-2`; a failed or errored row has no passing timing for downstream comparisons.
 
 ### Composable Kernel
 
@@ -227,111 +228,52 @@ The synthetic timing line produced by AITER's `is_v3_check` path is **not** used
 
 ## Benchmark Methodology
 
-Each implementation executes the same logical forward-attention workload for each tested shape.
+Each arm executes the same logical BF16 causal GQA forward-attention operation for each tested shape. The rocKE pair shares a deterministic BF16 Q/K/V fixture. AITER and CK run in their native GPU benchmark environments, so they cannot consume that in-process rocKE fixture.
 
-The default timing procedure is:
+Before timing:
+
+1. rocKE `attention_dense` and auto-unified each run once and compare their output with an FP32 causal GQA SDPA reference. Each requires `max_abs < 4e-2`.
+2. AITER and CK each run their native GPU validation command. A failed native validation prevents that external arm from being timed.
+3. AITER additionally checks FMHA-v3 ASM support and confirms the expected assembly kernel. CK confirms the expected Tile FMHA kernel.
+
+The timing procedure is:
 
 ```text
 Warmup iterations: 10
 Measured iterations: 50
 ```
 
-Reported latency is the average execution time of one forward-attention invocation as reported by the respective benchmark path.
+Reported latency is the average execution time of one forward-attention invocation as reported by the respective benchmark path. Compilation, environment setup, rocKE's one-time identity-paged conversion, and validation are outside the timed latency.
 
-The benchmark does not include compilation or environment setup time in the reported kernel latency.
-
-ROCKE, CK, and AITER are executed separately using their respective benchmark environments.
-
-The benchmark script also saves the raw output for each configuration so that selected kernel names and reported timings can be inspected independently.
+Each arm is recorded independently. A status of `PASS`, `FAIL`, `ERROR`, `UNSUPPORTED`, or a missing row is preserved rather than inferred from another arm.
 
 ## Results
 
-Lower latency is better.
+Lower latency is better. This README intentionally contains no measured performance table: run-specific results belong to the timestamped output directory and must not be generalized across MI300X systems, software revisions, or benchmark runs.
 
-|  # |  B |     S | Hq | Hkv | GQA |    ROCKE ms |   CK ms | AITER ASM ms | CK vs ROCKE | AITER vs ROCKE | AITER vs CK |
-| -: | -: | ----: | -: | --: | --: | ----------: | ------: | -----------: | ----------: | -------------: | ----------: |
-|  1 |  1 |  4096 | 32 |   8 | 4:1 |      0.6490 |  0.3490 |       0.2860 |       1.86× |          2.27× |       1.22× |
-|  2 |  1 |  4096 | 32 |  16 | 2:1 |      0.6471 |  0.3560 |       0.2760 |       1.82× |          2.34× |       1.29× |
-|  3 |  1 |  8192 | 32 |   8 | 4:1 |      2.0028 |  1.1870 |       0.9890 |       1.69× |          2.03× |       1.20× |
-|  4 |  1 |  8192 | 32 |  16 | 2:1 |      2.0040 |  1.1940 |       0.9940 |       1.68× |          2.02× |       1.20× |
-|  5 |  1 | 16384 | 32 |   8 | 4:1 |      7.6924 |  4.5400 |       3.9500 |       1.69× |          1.95× |       1.15× |
-|  6 | 16 |  4096 | 32 |   8 | 4:1 |      7.2652 |  5.1780 |       4.2010 |       1.40× |          1.73× |       1.23× |
-|  7 | 16 |  8192 | 32 |   8 | 4:1 |     28.0588 | 19.2430 |      15.5580 |       1.46× |          1.80× |       1.24× |
-|  8 | 16 |  4096 | 32 |  16 | 2:1 |      7.7335 |  5.6500 |       4.2320 |       1.37× |          1.83× |       1.34× |
-|  9 | 64 |  4096 | 32 |   8 | 4:1 |     31.0322 | 20.9060 |      16.8720 |       1.48× |          1.84× |       1.24× |
-| 10 | 64 |  8192 | 32 |   8 | 4:1 | unsupported | 78.4520 |      63.4220 |           — |              — |       1.24× |
+`results.csv` and `benchmark_results.md` merge the four independently recorded arms:
 
-## Speedup Calculation
+* rocKE `attention_dense`
+* rocKE auto-unified attention
+* AITER FMHA-v3 ASM
+* CK Tile FMHA
 
-Speedups are calculated from measured latency:
+For each configuration, the report first selects the fastest **passing** rocKE path between `attention_dense` and auto-unified. Only then does it calculate external ratios against AITER and CK. A ratio is emitted only when both of its input timings are finite, positive, and passed their arm's validation. The report also includes each arm's status, validation status where available, selected kernel, and recorded reason, so it does not imply that every row passes.
+
+The rocKE-internal comparison is:
 
 ```text
-CK vs ROCKE       = ROCKE latency / CK latency
-AITER vs ROCKE    = ROCKE latency / AITER latency
-AITER vs CK       = CK latency / AITER latency
+dense vs unified = attention_dense latency / auto-unified latency
 ```
 
-For example:
+The external comparisons use the selected passing rocKE latency:
 
 ```text
-B   = 1
-S   = 4096
-Hq  = 32
-Hkv = 8
+AITER vs best rocKE = best passing rocKE latency / AITER latency
+CK vs best rocKE    = best passing rocKE latency / CK latency
 ```
 
-Measured latency:
-
-```text
-ROCKE:     0.649 ms
-CK:        0.349 ms
-AITER ASM: 0.286 ms
-```
-
-Therefore:
-
-```text
-CK vs ROCKE:
-0.649 / 0.349 = 1.86x
-
-AITER vs ROCKE:
-0.649 / 0.286 = 2.27x
-
-AITER vs CK:
-0.349 / 0.286 = 1.22x
-```
-
-## Observations
-
-Across the tested configurations, both CK and AITER have lower measured latency than the current ROCKE Dense Attention implementation.
-
-AITER FMHA v3 ASM has the lowest measured latency for every supported configuration in this benchmark.
-
-Across the tested shapes:
-
-```text
-CK vs ROCKE:
-1.37x – 1.86x
-
-AITER vs ROCKE:
-1.73x – 2.34x
-
-AITER vs CK:
-1.15x – 1.34x
-```
-
-The relative latency difference between ROCKE and the optimized implementations generally becomes smaller at larger batch sizes.
-
-For:
-
-```text
-B=64
-S=8192
-Hq=32
-Hkv=8
-```
-
-the ROCKE implementation reports the workload as unsupported, while the tested CK and AITER implementations execute successfully.
+For configuration 10 (`B=64`, `S=8192`, `Hkv=8`), `attention_dense` is expected to appear as the 32-bit-extent `UNSUPPORTED` coverage result. The report retains that dense status while independently preserving the auto-unified, AITER, and CK outcomes; it does not fabricate a dense timing or a ratio that requires one.
 
 ## Benchmark Outputs
 
@@ -341,29 +283,33 @@ Each benchmark run creates a timestamped results directory under:
 ~/gpu-bench/results/
 ```
 
-The output contains the environment metadata, raw measurements, generated comparison table, and per-implementation logs.
-
-Conceptually:
+The output contains environment metadata, the four arm TSVs, merged machine- and human-readable reports, and per-arm logs:
 
 ```text
 results/
 └── attention_<timestamp>/
     ├── environment.txt
     ├── configs.tsv
-    ├── rocke.tsv
-    ├── ck.tsv
+    ├── rocke_dense.tsv
+    ├── rocke_unified.tsv
     ├── aiter.tsv
+    ├── ck.tsv
+    ├── results.csv
+    ├── benchmark_results.md
     └── logs/
         ├── rocke/
-        ├── ck/
-        └── aiter/
+        │   └── all.log
+        ├── aiter/
+        │   ├── all.log
+        │   └── config_XX.validation.log
+        └── ck/
+            ├── all.log
+            └── config_XX.validation.log
 ```
 
-`environment.txt` records the hardware/software environment and exact repository revisions used for the run.
+`rocke_dense.tsv` and `rocke_unified.tsv` include each rocKE arm's status, `max_abs`, selected kernel, path, settings, and reason. The shared-fixture rocKE validation records appear in those TSVs and in `logs/rocke/all.log`.
 
-The TSV files record per-shape measurements, status, and selected kernel information.
-
-The log directories contain the raw benchmark output and commands for inspection.
+`aiter.tsv` and `ck.tsv` include each external arm's benchmark status, native validation status, selected kernel, and reason. Their `config_XX.validation.log` files preserve the native GPU validation output. `results.csv` is the four-arm machine-readable merge, and `benchmark_results.md` is the corresponding Markdown report.
 
 ## Reproduction
 
@@ -397,12 +343,12 @@ The setup script:
 The benchmark script then:
 
 1. Records the runtime environment.
-2. Runs the 10 ROCKE configurations.
-3. Runs the same 10 configurations through AITER FMHA-v3 ASM.
-4. Runs the same 10 configurations through CK Tile FMHA.
+2. Runs both rocKE arms from a shared deterministic fixture for each of the 10 configurations.
+3. Runs the same 10 configurations through AITER FMHA-v3 ASM with native GPU validation.
+4. Runs the same 10 configurations through CK Tile FMHA with native GPU validation.
 5. Verifies the expected CK/AITER kernel paths.
-6. Saves raw per-implementation results and logs.
-7. Produces the three-way latency comparison.
+6. Saves the four raw per-arm result TSVs and validation logs.
+7. Produces the four-arm CSV and Markdown reports, selecting the fastest passing rocKE path before external ratios.
 
 ## Benchmark Files
 
@@ -415,4 +361,4 @@ rocke_vs_aiter/
 
 `setup_mi300x_attention_bench.sh` prepares the environments, dependencies, and kernel builds required by the benchmark.
 
-`run_mi300x_attention_bench_updated.sh` executes ROCKE, CK, and AITER across the same 10 attention workloads and records the environment, selected kernels, raw measurements, and comparison results.
+`run_mi300x_attention_bench_updated.sh` executes rocKE `attention_dense`, rocKE auto-unified, CK, and AITER across the same 10 logical dense BSHD attention workloads and records the environment, selected kernels, validation evidence, raw measurements, and four-arm comparison results.
