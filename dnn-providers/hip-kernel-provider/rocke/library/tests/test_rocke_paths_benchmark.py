@@ -210,7 +210,7 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
             "status": "UNSUPPORTED",
             "kernel": "dense\\kernel|selected",
             "path": "attention_dense",
-            "settings": "",
+            "settings": "dense settings",
             "reason": "Q/O extent | newline\nand slash \\",
         },
     )
@@ -225,7 +225,7 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
             "status": "PASS",
             "kernel": "unified",
             "path": "auto:2d",
-            "settings": "",
+            "settings": "unified settings",
             "reason": "",
         },
     )
@@ -280,9 +280,17 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
         {
             **common,
             "dense_ms": None,
+            "dense_tflops": None,
+            "dense_max_abs": None,
             "dense_status": "UNSUPPORTED",
             "dense_kernel": "dense\\kernel|selected",
+            "dense_path": "attention_dense",
+            "dense_settings": "dense settings",
             "dense_reason": "Q/O extent | newline\nand slash \\",
+            "unified_tflops": 1.0,
+            "unified_max_abs": 0.0,
+            "unified_path": "auto:2d",
+            "unified_settings": "unified settings",
             "unified_ms": 3.0,
             "unified_status": "PASS",
             "unified_kernel": "unified",
@@ -290,11 +298,15 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
             "best_rocke": "unified",
             "best_rocke_ms": 3.0,
             "AITER_ms": 2.0,
+            "AITER_tflops": 1.5,
+            "AITER_gbps": 2.5,
             "AITER_status": "PASS",
             "AITER_validation_status": "PASS",
             "AITER_kernel": "aiter-asm",
             "AITER_reason": "",
             "CK_ms": 2.5,
+            "CK_tflops": 1.25,
+            "CK_gbps": 2.0,
             "CK_status": "PASS",
             "CK_validation_status": "PASS",
             "CK_kernel": "ck-tile",
@@ -306,6 +318,11 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
     ]
     with (tmp_path / "results.csv").open(newline="") as handle:
         csv_rows = list(csv.DictReader(handle))
+    assert csv_rows[0]["unified_max_abs"] == "0.0"
+    assert csv_rows[0]["unified_path"] == "auto:2d"
+    assert csv_rows[0]["unified_settings"] == "unified settings"
+    assert csv_rows[0]["AITER_tflops"] == "1.5"
+    assert csv_rows[0]["AITER_gbps"] == "2.5"
     assert csv_rows[0]["best_rocke"] == "unified"
     assert csv_rows[0]["AITER_vs_best_rocke"] == "1.5"
     markdown = (tmp_path / "benchmark_results.md").read_text()
@@ -317,6 +334,7 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
     assert "| 10 | unified | PASS | — | unified | — |" in markdown
     assert "| 10 | AITER | PASS | PASS | aiter-asm | — |" in markdown
     assert "| 10 | CK | PASS | PASS | ck-tile | — |" in markdown
+    assert "| 10 | unified | 1.0000 | — | 0.000000 | auto:2d | unified settings |" in markdown
 
 
 def _write_minimal_merge_inputs(

@@ -28,21 +28,33 @@ _RESULT_FIELDS = (
     "Hkv",
     "GQA",
     "dense_ms",
+    "dense_tflops",
+    "dense_max_abs",
     "dense_status",
     "dense_kernel",
+    "dense_path",
+    "dense_settings",
     "dense_reason",
     "unified_ms",
+    "unified_tflops",
+    "unified_max_abs",
     "unified_status",
     "unified_kernel",
+    "unified_path",
+    "unified_settings",
     "unified_reason",
     "best_rocke",
     "best_rocke_ms",
     "AITER_ms",
+    "AITER_tflops",
+    "AITER_gbps",
     "AITER_status",
     "AITER_validation_status",
     "AITER_kernel",
     "AITER_reason",
     "CK_ms",
+    "CK_tflops",
+    "CK_gbps",
     "CK_status",
     "CK_validation_status",
     "CK_kernel",
@@ -78,6 +90,19 @@ def _ms(row: dict[str, str] | None) -> float | None:
     return value if math.isfinite(value) and value > 0 else None
 
 
+def _producer_field(row: dict[str, str] | None, field: str) -> float | str | None:
+    """Preserve one producer metric while making ordinary numeric values numeric."""
+    if row is None:
+        return None
+    value = row.get(field, "")
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
 def _ratio(base_ms: float | None, comparison_ms: float | None) -> float | None:
     if base_ms is None or comparison_ms is None:
         return None
@@ -85,35 +110,36 @@ def _ratio(base_ms: float | None, comparison_ms: float | None) -> float | None:
 
 
 def _arm(row: dict[str, str] | None, name: str) -> dict[str, Any]:
-    if row is None:
-        result: dict[str, Any] = {
-            f"{name}_ms": None,
-            f"{name}_status": "MISSING",
-            f"{name}_kernel": "",
-            f"{name}_reason": "row is missing",
-        }
-        if name in {"AITER", "CK"}:
-            result[f"{name}_validation_status"] = "MISSING"
-        return result
-
-    status = row.get("status", "MISSING")
-    reason = row.get("reason", "")
-    result = {
+    result: dict[str, Any] = {
         f"{name}_ms": _ms(row),
-        f"{name}_status": status,
-        f"{name}_kernel": row.get("kernel", ""),
-        f"{name}_reason": reason,
+        f"{name}_status": "MISSING" if row is None else row.get("status", "MISSING"),
+        f"{name}_kernel": "" if row is None else row.get("kernel", ""),
+        f"{name}_reason": "row is missing" if row is None else row.get("reason", ""),
     }
+    if name in {"dense", "unified"}:
+        result.update(
+            {
+                f"{name}_tflops": _producer_field(row, "tflops"),
+                f"{name}_max_abs": _producer_field(row, "max_abs"),
+                f"{name}_path": "" if row is None else row.get("path", ""),
+                f"{name}_settings": "" if row is None else row.get("settings", ""),
+            }
+        )
     if name in {"AITER", "CK"}:
-        validation_status = row.get("validation_status", "")
-        result[f"{name}_validation_status"] = validation_status
-        if status == "PASS" and validation_status != "PASS":
+        validation_status = "MISSING" if row is None else row.get("validation_status", "")
+        result.update(
+            {
+                f"{name}_tflops": _producer_field(row, "tflops"),
+                f"{name}_gbps": _producer_field(row, "gbps"),
+                f"{name}_validation_status": validation_status,
+            }
+        )
+        if result[f"{name}_status"] == "PASS" and validation_status != "PASS":
             result[f"{name}_status"] = "FAIL"
-            if not reason:
+            if not result[f"{name}_reason"]:
                 result[f"{name}_reason"] = (
                     f"validation status {validation_status or 'not recorded'}"
                 )
-
     return result
 
 
@@ -170,6 +196,14 @@ def _format_ms(value: float | None) -> str:
 
 def _format_ratio(value: float | None) -> str:
     return "—" if value is None else f"{value:.3f}×"
+
+
+def _format_metric(value: float | str | None, digits: int) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, float):
+        return f"{value:.{digits}f}"
+    return value
 
 
 def _markdown_cell(value: Any) -> str:
@@ -229,6 +263,26 @@ def _write_markdown(path: Path, rows: list[dict[str, Any]]) -> None:
                 f"{_markdown_cell(row[f'{arm}_status'])} | "
                 f"{_markdown_cell(validation_status)} | {_markdown_cell(kernel)} | "
                 f"{_markdown_cell(reason)} |"
+            )
+
+    lines.extend(
+        [
+            "",
+            "## Throughput and rocKE metadata",
+            "",
+            "| # | arm | TFLOPS | GB/s | max abs | path | settings |",
+            "|---:|:---|---:|---:|---:|:---|:---|",
+        ]
+    )
+    for row in rows:
+        for arm in _ARM_NAMES:
+            lines.append(
+                f"| {_markdown_cell(row['id'])} | {_markdown_cell(arm)} | "
+                f"{_markdown_cell(_format_metric(row.get(f'{arm}_tflops'), 4))} | "
+                f"{_markdown_cell(_format_metric(row.get(f'{arm}_gbps'), 4))} | "
+                f"{_markdown_cell(_format_metric(row.get(f'{arm}_max_abs'), 6))} | "
+                f"{_markdown_cell(row.get(f'{arm}_path') or '—')} | "
+                f"{_markdown_cell(row.get(f'{arm}_settings') or '—')} |"
             )
 
     failures = []
