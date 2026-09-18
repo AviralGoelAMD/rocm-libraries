@@ -208,10 +208,10 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
             "tflops": "",
             "max_abs": "",
             "status": "UNSUPPORTED",
-            "kernel": "dense",
+            "kernel": "dense\\kernel|selected",
             "path": "attention_dense",
             "settings": "",
-            "reason": "Q/O extent exceeds 32-bit",
+            "reason": "Q/O extent | newline\nand slash \\",
         },
     )
     write_tsv(
@@ -281,8 +281,8 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
             **common,
             "dense_ms": None,
             "dense_status": "UNSUPPORTED",
-            "dense_kernel": "dense",
-            "dense_reason": "Q/O extent exceeds 32-bit",
+            "dense_kernel": "dense\\kernel|selected",
+            "dense_reason": "Q/O extent | newline\nand slash \\",
             "unified_ms": 3.0,
             "unified_status": "PASS",
             "unified_kernel": "unified",
@@ -309,11 +309,62 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
     assert csv_rows[0]["best_rocke"] == "unified"
     assert csv_rows[0]["AITER_vs_best_rocke"] == "1.5"
     markdown = (tmp_path / "benchmark_results.md").read_text()
-    assert "dense: UNSUPPORTED — Q/O extent exceeds 32-bit" in markdown
-    assert "| 10 | dense | UNSUPPORTED | — | dense | Q/O extent exceeds 32-bit |" in markdown
+    assert "dense: `UNSUPPORTED` — Q/O extent \\| newline<br>and slash \\\\" in markdown
+    assert (
+        "| 10 | dense | UNSUPPORTED | — | dense\\\\kernel\\|selected | "
+        "Q/O extent \\| newline<br>and slash \\\\ |"
+    ) in markdown
     assert "| 10 | unified | PASS | — | unified | — |" in markdown
     assert "| 10 | AITER | PASS | PASS | aiter-asm | — |" in markdown
     assert "| 10 | CK | PASS | PASS | ck-tile | — |" in markdown
+
+
+def _write_minimal_merge_inputs(
+    tmp_path, *, duplicate_dense: bool = False, unified_batch: int = 64
+) -> None:
+    dense_header = (
+        "id\tB\tS\tHq\tHkv\tGQA\tms\ttflops\tmax_abs\tstatus\tkernel\tpath"
+        "\tsettings\treason\n"
+    )
+    dense_row = (
+        "10\t64\t8192\t32\t8\t4:1\t3.0\t1.0\t0.0\tPASS\tdense"
+        "\tattention_dense\t\t\n"
+    )
+    unified_row = (
+        f"10\t{unified_batch}\t8192\t32\t8\t4:1\t3.5\t1.0\t0.0\tPASS\tunified"
+        "\tauto:2d\t\t\n"
+    )
+    external_header = (
+        "id\tB\tS\tHq\tHkv\tGQA\tms\ttflops\tgbps\tstatus\tvalidation_status"
+        "\tkernel\treason\n"
+    )
+    aiter_row = "10\t64\t8192\t32\t8\t4:1\t2.0\t1.0\t1.0\tPASS\tPASS\taiter\t\n"
+    ck_row = "10\t64\t8192\t32\t8\t4:1\t2.5\t1.0\t1.0\tPASS\tPASS\tck\t\n"
+
+    (tmp_path / "rocke_dense.tsv").write_text(
+        dense_header + dense_row * (2 if duplicate_dense else 1)
+    )
+    (tmp_path / "rocke_unified.tsv").write_text(dense_header + unified_row)
+    (tmp_path / "aiter.tsv").write_text(external_header + aiter_row)
+    (tmp_path / "ck.tsv").write_text(external_header + ck_row)
+
+
+def test_merge_results_rejects_duplicate_ids_in_an_arm(tmp_path) -> None:
+    from benchmarks.gfx942.attention.prefill.rocke_vs_aiter import merge_results
+
+    _write_minimal_merge_inputs(tmp_path, duplicate_dense=True)
+
+    with pytest.raises(ValueError, match=r"rocke_dense\.tsv: duplicate id 10"):
+        merge_results.merge(tmp_path)
+
+
+def test_merge_results_rejects_cross_arm_identity_drift(tmp_path) -> None:
+    from benchmarks.gfx942.attention.prefill.rocke_vs_aiter import merge_results
+
+    _write_minimal_merge_inputs(tmp_path, unified_batch=1)
+
+    with pytest.raises(ValueError, match=r"id 10: B differs"):
+        merge_results.merge(tmp_path)
 
 
 def _gfx942_gpu_ready() -> bool:

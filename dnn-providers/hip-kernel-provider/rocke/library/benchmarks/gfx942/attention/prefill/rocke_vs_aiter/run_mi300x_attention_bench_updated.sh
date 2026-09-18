@@ -101,7 +101,7 @@ log "0. RECORD ENVIRONMENT"
     echo "ck_commit=$(git -C "$CK" rev-parse HEAD 2>/dev/null || echo unavailable)"
     echo "system_rocm_version=$(cat /opt/rocm/.info/version 2>/dev/null || echo unavailable)"
     echo "ck_compiler=$(/opt/rocm/llvm/bin/clang++ --version 2>/dev/null | head -n 1 || echo unavailable)"
-    bash -lc "source '$AITER_ENV'; python - <<'PY'
+    AITER_ENV_PATH="$AITER_ENV" bash -c 'source "$AITER_ENV_PATH"; exec python -' <<'PY'
 import importlib.metadata as im, torch
 print('torch=' + torch.__version__)
 print('torch_hip=' + str(torch.version.hip))
@@ -109,13 +109,18 @@ print('triton=' + im.version('triton'))
 print('gpu=' + torch.cuda.get_device_name(0))
 print('arch=' + torch.cuda.get_device_properties(0).gcnArchName)
 print('cus=' + str(torch.cuda.get_device_properties(0).multi_processor_count))
-PY"
+PY
 } | tee "$OUT/environment.txt"
 
 log "1. ROCKE DENSE AND AUTO-UNIFIED"
-BENCH_WARMUP="$WARMUP" \
-BENCH_REPEAT="$REPEAT" \
-bash -lc "source '$ROCKE_ENV'; cd '$ROCM_LIBS/dnn-providers/hip-kernel-provider'; python '$SCRIPT_DIR/rocke_paths.py' --out-dense '$OUT/rocke_dense.tsv' --out-unified '$OUT/rocke_unified.tsv' --warmup '$WARMUP' --iters '$REPEAT'" \
+ROCKE_ENV_PATH="$ROCKE_ENV" \
+ROCKE_WORKDIR="$ROCM_LIBS/dnn-providers/hip-kernel-provider" \
+ROCKE_RUNNER="$SCRIPT_DIR/rocke_paths.py" \
+ROCKE_OUT_DENSE="$OUT/rocke_dense.tsv" \
+ROCKE_OUT_UNIFIED="$OUT/rocke_unified.tsv" \
+ROCKE_WARMUP="$WARMUP" \
+ROCKE_REPEAT="$REPEAT" \
+bash -c 'source "$ROCKE_ENV_PATH"; cd "$ROCKE_WORKDIR"; exec python "$ROCKE_RUNNER" --out-dense "$ROCKE_OUT_DENSE" --out-unified "$ROCKE_OUT_UNIFIED" --warmup "$ROCKE_WARMUP" --iters "$ROCKE_REPEAT"' \
     2>&1 | tee "$OUT/logs/rocke/all.log"
 
 log "2. AITER FMHA-v3 ASM"
@@ -254,12 +259,15 @@ with open(OUT, 'w', newline='') as f:
 print('wrote', OUT)
 PY
 
+AITER_ENV_PATH="$AITER_ENV" \
+AITER_WORKDIR="$AITER/op_tests/cpp/mha" \
+AITER_RUNNER="$OUT/aiter_runner.py" \
 AITER_EXE="$AITER_EXE" \
 OUT_TSV="$OUT/aiter.tsv" \
 LOG_DIR="$OUT/logs/aiter" \
 BENCH_WARMUP="$WARMUP" \
 BENCH_REPEAT="$REPEAT" \
-bash -lc "source '$AITER_ENV'; cd '$AITER/op_tests/cpp/mha'; python '$OUT/aiter_runner.py'" \
+bash -c 'source "$AITER_ENV_PATH"; cd "$AITER_WORKDIR"; exec python "$AITER_RUNNER"' \
     2>&1 | tee "$OUT/logs/aiter/all.log"
 
 log "3. COMPOSABLE KERNEL CK TILE FMHA"
@@ -390,13 +398,15 @@ with open(OUT, 'w', newline='') as f:
 print('wrote', OUT)
 PY
 
+CK_ENV_PATH="$CK_ENV" \
+CK_RUNNER="$OUT/ck_runner.py" \
 CK_EXE="$CK_EXE" \
 OUT_TSV="$OUT/ck.tsv" \
 LOG_DIR="$OUT/logs/ck" \
 BENCH_WARMUP="$WARMUP" \
 BENCH_REPEAT="$REPEAT" \
 CK_EXPECTED_KERNEL="$CK_EXPECTED_KERNEL" \
-bash -lc "source '$CK_ENV'; python3 '$OUT/ck_runner.py'" \
+bash -c 'source "$CK_ENV_PATH"; exec python3 "$CK_RUNNER"' \
     2>&1 | tee "$OUT/logs/ck/all.log"
 
 log "4. GENERATE FOUR-WAY TABLE"

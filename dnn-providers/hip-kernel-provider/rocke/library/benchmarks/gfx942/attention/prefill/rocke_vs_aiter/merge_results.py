@@ -18,6 +18,8 @@ _INPUTS = {
     "CK": "ck.tsv",
 }
 _ARM_NAMES = ("dense", "unified", "AITER", "CK")
+
+_IDENTITY_FIELDS = ("B", "S", "Hq", "Hkv", "GQA")
 _RESULT_FIELDS = (
     "id",
     "B",
@@ -52,8 +54,16 @@ _RESULT_FIELDS = (
 
 
 def _read_tsv(path: Path) -> dict[str, dict[str, str]]:
+    rows: dict[str, dict[str, str]] = {}
     with path.open(newline="") as handle:
-        return {row["id"]: row for row in csv.DictReader(handle, delimiter="\t")}
+        for row in csv.DictReader(handle, delimiter="\t"):
+            identifier = row.get("id")
+            if not identifier:
+                raise ValueError(f"{path.name}: row is missing id")
+            if identifier in rows:
+                raise ValueError(f"{path.name}: duplicate id {identifier}")
+            rows[identifier] = row
+    return rows
 
 
 def _ms(row: dict[str, str] | None) -> float | None:
@@ -108,17 +118,14 @@ def _arm(row: dict[str, str] | None, name: str) -> dict[str, Any]:
 
 
 def _row_identity(*arms: dict[str, str] | None, identifier: str) -> dict[str, str]:
-    for arm in arms:
-        if arm is not None:
-            return {
-                "id": identifier,
-                "B": arm.get("B", ""),
-                "S": arm.get("S", ""),
-                "Hq": arm.get("Hq", ""),
-                "Hkv": arm.get("Hkv", ""),
-                "GQA": arm.get("GQA", ""),
-            }
-    raise AssertionError("at least one arm must exist")
+    source = next(arm for arm in arms if arm is not None)
+    identity = {"id": identifier}
+    for field in _IDENTITY_FIELDS:
+        identity[field] = source.get(field, "")
+        for arm in arms:
+            if arm is not None and arm.get(field, "") != identity[field]:
+                raise ValueError(f"id {identifier}: {field} differs between arms")
+    return identity
 
 
 def _merge_row(
@@ -128,6 +135,7 @@ def _merge_row(
     aiter: dict[str, str] | None,
     ck: dict[str, str] | None,
 ) -> dict[str, Any]:
+    identity = _row_identity(dense, unified, aiter, ck, identifier=identifier)
     dense_ms = _ms(dense)
     unified_ms = _ms(unified)
     rocke_candidates = [
@@ -143,7 +151,7 @@ def _merge_row(
     ck_ms = _ms(ck)
 
     return {
-        **_row_identity(dense, unified, aiter, ck, identifier=identifier),
+        **identity,
         **_arm(dense, "dense"),
         **_arm(unified, "unified"),
         "best_rocke": best_rocke,
@@ -164,6 +172,18 @@ def _format_ratio(value: float | None) -> str:
     return "—" if value is None else f"{value:.3f}×"
 
 
+def _markdown_cell(value: Any) -> str:
+    """Render a TSV-derived value as one safe Markdown table cell."""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\n", "<br>")
+    )
+
+
 def _write_markdown(path: Path, rows: list[dict[str, Any]]) -> None:
     lines = [
         "# MI300X/gfx942 BF16 causal attention benchmark",
@@ -178,12 +198,16 @@ def _write_markdown(path: Path, rows: list[dict[str, Any]]) -> None:
         if row["best_rocke_ms"] is not None:
             best = f"{best} ({_format_ms(row['best_rocke_ms'])} ms)"
         lines.append(
-            f"| {row['id']} | {row['B']} | {row['S']} | {row['Hq']} | {row['Hkv']} | {row['GQA']} | "
-            f"{_format_ms(row['dense_ms'])} | {_format_ms(row['unified_ms'])} | {best} | "
-            f"{_format_ms(row['AITER_ms'])} | {_format_ms(row['CK_ms'])} | "
-            f"{_format_ratio(row['dense_vs_unified'])} | "
-            f"{_format_ratio(row['AITER_vs_best_rocke'])} | "
-            f"{_format_ratio(row['CK_vs_best_rocke'])} |"
+            f"| {_markdown_cell(row['id'])} | {_markdown_cell(row['B'])} | "
+            f"{_markdown_cell(row['S'])} | {_markdown_cell(row['Hq'])} | "
+            f"{_markdown_cell(row['Hkv'])} | {_markdown_cell(row['GQA'])} | "
+            f"{_markdown_cell(_format_ms(row['dense_ms']))} | "
+            f"{_markdown_cell(_format_ms(row['unified_ms']))} | "
+            f"{_markdown_cell(best)} | {_markdown_cell(_format_ms(row['AITER_ms']))} | "
+            f"{_markdown_cell(_format_ms(row['CK_ms']))} | "
+            f"{_markdown_cell(_format_ratio(row['dense_vs_unified']))} | "
+            f"{_markdown_cell(_format_ratio(row['AITER_vs_best_rocke']))} | "
+            f"{_markdown_cell(_format_ratio(row['CK_vs_best_rocke']))} |"
         )
 
     lines.extend(
@@ -201,8 +225,10 @@ def _write_markdown(path: Path, rows: list[dict[str, Any]]) -> None:
             kernel = row[f"{arm}_kernel"] or "—"
             reason = row[f"{arm}_reason"] or "—"
             lines.append(
-                f"| {row['id']} | {arm} | {row[f'{arm}_status']} | "
-                f"{validation_status} | {kernel} | {reason} |"
+                f"| {_markdown_cell(row['id'])} | {_markdown_cell(arm)} | "
+                f"{_markdown_cell(row[f'{arm}_status'])} | "
+                f"{_markdown_cell(validation_status)} | {_markdown_cell(kernel)} | "
+                f"{_markdown_cell(reason)} |"
             )
 
     failures = []
@@ -211,8 +237,9 @@ def _write_markdown(path: Path, rows: list[dict[str, Any]]) -> None:
             status = row[f"{arm}_status"]
             if status != "PASS":
                 failures.append(
-                    f"- Config {row['id']} {arm}: {status} — "
-                    f"{row[f'{arm}_reason'] or 'no reason recorded'}"
+                    f"- Config {_markdown_cell(row['id'])} {_markdown_cell(arm)}: "
+                    f"`{_markdown_cell(status)}` — "
+                    f"{_markdown_cell(row[f'{arm}_reason'] or 'no reason recorded')}"
                 )
     if failures:
         lines.extend(["", "## Nonpassing arms", "", *failures])
