@@ -78,10 +78,16 @@ def _read_tsv(path: Path) -> dict[str, dict[str, str]]:
     return rows
 
 
+_TIMING_ELIGIBLE_VALIDATION_STATUSES = {"PASS", "UNAVAILABLE"}
+
+
 def _ms(row: dict[str, str] | None) -> float | None:
     if row is None or row.get("status") != "PASS":
         return None
-    if "validation_status" in row and row["validation_status"] != "PASS":
+    if (
+        "validation_status" in row
+        and row["validation_status"] not in _TIMING_ELIGIBLE_VALIDATION_STATUSES
+    ):
         return None
     try:
         value = float(row["ms"])
@@ -134,7 +140,10 @@ def _arm(row: dict[str, str] | None, name: str) -> dict[str, Any]:
                 f"{name}_validation_status": validation_status,
             }
         )
-        if result[f"{name}_status"] == "PASS" and validation_status != "PASS":
+        if (
+            result[f"{name}_status"] == "PASS"
+            and validation_status not in _TIMING_ELIGIBLE_VALIDATION_STATUSES
+        ):
             result[f"{name}_status"] = "FAIL"
             if not result[f"{name}_reason"]:
                 result[f"{name}_reason"] = (

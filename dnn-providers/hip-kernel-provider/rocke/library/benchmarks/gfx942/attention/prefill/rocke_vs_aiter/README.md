@@ -233,8 +233,14 @@ Each arm executes the same logical BF16 causal GQA forward-attention operation f
 Before timing:
 
 1. rocKE `attention_dense` and auto-unified each run once and compare their output with an FP32 causal GQA SDPA reference. Each requires `max_abs < 4e-2`.
-2. AITER and CK each run their native GPU validation command. A failed native validation prevents that external arm from being timed.
-3. AITER additionally checks FMHA-v3 ASM support and confirms the expected assembly kernel. CK confirms the expected Tile FMHA kernel.
+2. AITER checks FMHA-v3 ASM support and confirms the expected assembly kernel. CK confirms the expected Tile FMHA kernel.
+3. AITER and CK run their original native GPU timer commands with `-v=0`.
+
+### External numeric-validation limitation
+
+The native external `-v=2` GPU validator is known invalid for this BSHD workload. The reproduced AITER FMHA-v3 ASM and CK runs both return exit `254` with the same bogus reference near `0.5`; an independent AITER MHA reproduction with `Hq=Hkv=32` also returns `254`. The normal runner therefore never invokes `-v=2` or writes external validation logs.
+
+External timing rows use `validation_status=UNAVAILABLE` and record this limitation as their reason. An external `status=PASS` means the selected kernel timed successfully; it is **not** an external numeric-output certification. rocKE remains FP32-gated as described above.
 
 The timing procedure is:
 
@@ -243,7 +249,7 @@ Warmup iterations: 10
 Measured iterations: 50
 ```
 
-Reported latency is the average execution time of one forward-attention invocation as reported by the respective benchmark path. Compilation, environment setup, rocKE's one-time identity-paged conversion, and validation are outside the timed latency.
+Reported latency is the average execution time of one forward-attention invocation as reported by the respective benchmark path. Compilation, environment setup, rocKE's one-time identity-paged conversion, and AITER's support check are outside the timed latency.
 
 Each arm is recorded independently. A status of `PASS`, `FAIL`, `ERROR`, `UNSUPPORTED`, or a missing row is preserved rather than inferred from another arm.
 
@@ -258,7 +264,7 @@ Lower latency is better. This README intentionally contains no measured performa
 * AITER FMHA-v3 ASM
 * CK Tile FMHA
 
-For each configuration, the report first selects the fastest **passing** rocKE path between `attention_dense` and auto-unified. Only then does it calculate external ratios against AITER and CK. A ratio is emitted only when both of its input timings are finite, positive, and passed their arm's validation. The report also includes each arm's status, validation status where available, selected kernel, and recorded reason, so it does not imply that every row passes.
+For each configuration, the report first selects the fastest **passing** rocKE path between `attention_dense` and auto-unified. Only then does it calculate external ratios against AITER and CK. A ratio is emitted only when both input timings are finite, positive, and have `status=PASS`; `validation_status=UNAVAILABLE` permits external timing rows but remains visible in the report with its reason. The report includes each arm's status, validation status where available, selected kernel, and recorded reason, so it does not imply numeric certification for external rows.
 
 The rocKE-internal comparison is:
 
@@ -301,15 +307,16 @@ results/
         │   └── all.log
         ├── aiter/
         │   ├── all.log
-        │   └── config_XX.validation.log
+        │   ├── config_XX.support.log
+        │   └── config_XX.log
         └── ck/
             ├── all.log
-            └── config_XX.validation.log
+            └── config_XX.log
 ```
 
 `rocke_dense.tsv` and `rocke_unified.tsv` include each rocKE arm's status, `max_abs`, selected kernel, path, settings, and reason. The shared-fixture rocKE validation records appear in those TSVs and in `logs/rocke/all.log`.
 
-`aiter.tsv` and `ck.tsv` include each external arm's benchmark status, native validation status, selected kernel, and reason. Their `config_XX.validation.log` files preserve the native GPU validation output. `results.csv` is the four-arm machine-readable merge, and `benchmark_results.md` is the corresponding Markdown report.
+`aiter.tsv` and `ck.tsv` include each external arm's timing status, `validation_status`, selected kernel, and reason. Passing external rows report `validation_status=UNAVAILABLE` because native BSHD GPU numeric validation is known invalid; their `config_XX.log` files preserve the `-v=0` timing output. AITER also writes `config_XX.support.log`. `results.csv` is the four-arm machine-readable merge, and `benchmark_results.md` is the corresponding Markdown report.
 
 ## Reproduction
 
@@ -344,11 +351,10 @@ The benchmark script then:
 
 1. Records the runtime environment.
 2. Runs both rocKE arms from a shared deterministic fixture for each of the 10 configurations.
-3. Runs the same 10 configurations through AITER FMHA-v3 ASM with native GPU validation.
-4. Runs the same 10 configurations through CK Tile FMHA with native GPU validation.
-5. Verifies the expected CK/AITER kernel paths.
-6. Saves the four raw per-arm result TSVs and validation logs.
-7. Produces the four-arm CSV and Markdown reports, selecting the fastest passing rocKE path before external ratios.
+3. Runs the same 10 configurations through AITER FMHA-v3 ASM with its `-v=0` GPU timer, then verifies ASM support and the expected assembly kernel.
+4. Runs the same 10 configurations through CK Tile FMHA with its `-v=0` GPU timer and verifies the expected CK kernel.
+5. Saves the four raw per-arm result TSVs and timing/support logs.
+6. Produces the four-arm CSV and Markdown reports, selecting the fastest passing rocKE path before external ratios.
 
 ## Benchmark Files
 
@@ -361,4 +367,4 @@ rocke_vs_aiter/
 
 `setup_mi300x_attention_bench.sh` prepares the environments, dependencies, and kernel builds required by the benchmark.
 
-`run_mi300x_attention_bench_updated.sh` executes rocKE `attention_dense`, rocKE auto-unified, CK, and AITER across the same 10 logical dense BSHD attention workloads and records the environment, selected kernels, validation evidence, raw measurements, and four-arm comparison results.
+`run_mi300x_attention_bench_updated.sh` executes rocKE `attention_dense`, rocKE auto-unified, CK, and AITER across the same 10 logical dense BSHD attention workloads and records the environment, selected kernels, rocKE FP32 validation evidence, external numeric-validation availability, raw measurements, and four-arm comparison results.

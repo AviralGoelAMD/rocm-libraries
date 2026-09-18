@@ -163,7 +163,7 @@ def test_main_writes_stable_ordered_dense_and_unified_tsvs(tmp_path, monkeypatch
 
 
 
-def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
+def test_merge_results_keeps_external_unavailable_validation_timing_when_dense_is_unsupported(
     tmp_path,
 ) -> None:
     from benchmarks.gfx942.attention.prefill.rocke_vs_aiter import merge_results
@@ -254,9 +254,12 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
             "tflops": "1.5",
             "gbps": "2.5",
             "status": "PASS",
-            "validation_status": "PASS",
+            "validation_status": "UNAVAILABLE",
             "kernel": "aiter-asm",
-            "reason": "",
+            "reason": (
+                "numeric validation unavailable: native BSHD GPU validator is known "
+                "invalid for this workload"
+            ),
         },
     )
     write_tsv(
@@ -268,9 +271,12 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
             "tflops": "1.25",
             "gbps": "2.0",
             "status": "PASS",
-            "validation_status": "PASS",
+            "validation_status": "UNAVAILABLE",
             "kernel": "ck-tile",
-            "reason": "",
+            "reason": (
+                "numeric validation unavailable: native BSHD GPU validator is known "
+                "invalid for this workload"
+            ),
         },
     )
 
@@ -301,16 +307,22 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
             "AITER_tflops": 1.5,
             "AITER_gbps": 2.5,
             "AITER_status": "PASS",
-            "AITER_validation_status": "PASS",
+            "AITER_validation_status": "UNAVAILABLE",
             "AITER_kernel": "aiter-asm",
-            "AITER_reason": "",
+            "AITER_reason": (
+                "numeric validation unavailable: native BSHD GPU validator is known "
+                "invalid for this workload"
+            ),
             "CK_ms": 2.5,
             "CK_tflops": 1.25,
             "CK_gbps": 2.0,
             "CK_status": "PASS",
-            "CK_validation_status": "PASS",
+            "CK_validation_status": "UNAVAILABLE",
             "CK_kernel": "ck-tile",
-            "CK_reason": "",
+            "CK_reason": (
+                "numeric validation unavailable: native BSHD GPU validator is known "
+                "invalid for this workload"
+            ),
             "dense_vs_unified": None,
             "AITER_vs_best_rocke": 1.5,
             "CK_vs_best_rocke": 1.2,
@@ -340,8 +352,14 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
         "Q/O extent \\| newline<br>and slash \\\\ |"
     ) in markdown
     assert "| 10 | unified | PASS | — | unified | — |" in markdown
-    assert "| 10 | AITER | PASS | PASS | aiter-asm | — |" in markdown
-    assert "| 10 | CK | PASS | PASS | ck-tile | — |" in markdown
+    assert (
+        "| 10 | AITER | PASS | UNAVAILABLE | aiter-asm | numeric validation unavailable: "
+        "native BSHD GPU validator is known invalid for this workload |"
+    ) in markdown
+    assert (
+        "| 10 | CK | PASS | UNAVAILABLE | ck-tile | numeric validation unavailable: "
+        "native BSHD GPU validator is known invalid for this workload |"
+    ) in markdown
     assert "| 10 | unified | 1.0000 | — | 0.000000 | auto:2d | unified settings |" in markdown
     assert "| 10 | dense | 0.7500 | — | 0.010000 | attention_dense | dense settings |" in markdown
     assert "| 10 | AITER | 1.5000 | 2.5000 | — | — | — |" in markdown
@@ -367,8 +385,8 @@ def _write_minimal_merge_inputs(
         "id\tB\tS\tHq\tHkv\tGQA\tms\ttflops\tgbps\tstatus\tvalidation_status"
         "\tkernel\treason\n"
     )
-    aiter_row = "10\t64\t8192\t32\t8\t4:1\t2.0\t1.0\t1.0\tPASS\tPASS\taiter\t\n"
-    ck_row = "10\t64\t8192\t32\t8\t4:1\t2.5\t1.0\t1.0\tPASS\tPASS\tck\t\n"
+    aiter_row = "10\t64\t8192\t32\t8\t4:1\t2.0\t1.0\t1.0\tPASS\tUNAVAILABLE\taiter\t\n"
+    ck_row = "10\t64\t8192\t32\t8\t4:1\t2.5\t1.0\t1.0\tPASS\tUNAVAILABLE\tck\t\n"
 
     (tmp_path / "rocke_dense.tsv").write_text(
         dense_header + dense_row * (2 if duplicate_dense else 1)
