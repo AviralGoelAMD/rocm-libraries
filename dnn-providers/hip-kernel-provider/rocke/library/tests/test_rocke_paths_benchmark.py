@@ -162,6 +162,157 @@ def test_main_writes_stable_ordered_dense_and_unified_tsvs(tmp_path, monkeypatch
         assert all(row["path"] == expected_path for row in rows)
 
 
+
+def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
+    tmp_path,
+) -> None:
+    from benchmarks.gfx942.attention.prefill.rocke_vs_aiter import merge_results
+
+    common = {
+        "id": "10",
+        "B": "64",
+        "S": "8192",
+        "Hq": "32",
+        "Hkv": "8",
+        "GQA": "4:1",
+    }
+
+    def write_tsv(name: str, fields: list[str], row: dict[str, str]) -> None:
+        with (tmp_path / name).open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t")
+            writer.writeheader()
+            writer.writerow(row)
+
+    rocke_fields = [
+        "id",
+        "B",
+        "S",
+        "Hq",
+        "Hkv",
+        "GQA",
+        "ms",
+        "tflops",
+        "max_abs",
+        "status",
+        "kernel",
+        "path",
+        "settings",
+        "reason",
+    ]
+    write_tsv(
+        "rocke_dense.tsv",
+        rocke_fields,
+        {
+            **common,
+            "ms": "",
+            "tflops": "",
+            "max_abs": "",
+            "status": "UNSUPPORTED",
+            "kernel": "dense",
+            "path": "attention_dense",
+            "settings": "",
+            "reason": "Q/O extent exceeds 32-bit",
+        },
+    )
+    write_tsv(
+        "rocke_unified.tsv",
+        rocke_fields,
+        {
+            **common,
+            "ms": "3.0",
+            "tflops": "1.0",
+            "max_abs": "0.0",
+            "status": "PASS",
+            "kernel": "unified",
+            "path": "auto:2d",
+            "settings": "",
+            "reason": "",
+        },
+    )
+
+    external_fields = [
+        "id",
+        "B",
+        "S",
+        "Hq",
+        "Hkv",
+        "GQA",
+        "ms",
+        "tflops",
+        "gbps",
+        "status",
+        "validation_status",
+        "kernel",
+        "reason",
+    ]
+    write_tsv(
+        "aiter.tsv",
+        external_fields,
+        {
+            **common,
+            "ms": "2.0",
+            "tflops": "1.5",
+            "gbps": "2.5",
+            "status": "PASS",
+            "validation_status": "PASS",
+            "kernel": "aiter-asm",
+            "reason": "",
+        },
+    )
+    write_tsv(
+        "ck.tsv",
+        external_fields,
+        {
+            **common,
+            "ms": "2.5",
+            "tflops": "1.25",
+            "gbps": "2.0",
+            "status": "PASS",
+            "validation_status": "PASS",
+            "kernel": "ck-tile",
+            "reason": "",
+        },
+    )
+
+    rows = merge_results.merge(tmp_path)
+
+    assert rows == [
+        {
+            **common,
+            "dense_ms": None,
+            "dense_status": "UNSUPPORTED",
+            "dense_kernel": "dense",
+            "dense_reason": "Q/O extent exceeds 32-bit",
+            "unified_ms": 3.0,
+            "unified_status": "PASS",
+            "unified_kernel": "unified",
+            "unified_reason": "",
+            "best_rocke": "unified",
+            "best_rocke_ms": 3.0,
+            "AITER_ms": 2.0,
+            "AITER_status": "PASS",
+            "AITER_validation_status": "PASS",
+            "AITER_kernel": "aiter-asm",
+            "AITER_reason": "",
+            "CK_ms": 2.5,
+            "CK_status": "PASS",
+            "CK_validation_status": "PASS",
+            "CK_kernel": "ck-tile",
+            "CK_reason": "",
+            "dense_vs_unified": None,
+            "AITER_vs_best_rocke": 1.5,
+            "CK_vs_best_rocke": 1.2,
+        }
+    ]
+    with (tmp_path / "results.csv").open(newline="") as handle:
+        csv_rows = list(csv.DictReader(handle))
+    assert csv_rows[0]["best_rocke"] == "unified"
+    assert csv_rows[0]["AITER_vs_best_rocke"] == "1.5"
+    assert "dense: UNSUPPORTED — Q/O extent exceeds 32-bit" in (
+        tmp_path / "benchmark_results.md"
+    ).read_text()
+
+
 def _gfx942_gpu_ready() -> bool:
     if not torch.cuda.is_available():
         return False

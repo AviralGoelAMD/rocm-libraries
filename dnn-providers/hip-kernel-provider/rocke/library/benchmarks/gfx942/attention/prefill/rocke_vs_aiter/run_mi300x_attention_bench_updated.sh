@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Exact three-way attention benchmark from this chat:
-#   ROCKE dense attention vs AITER FMHA-v3 ASM vs CK Tile FMHA.
+# Exact four-way attention benchmark:
+#   rocKE dense and auto-unified attention vs AITER FMHA-v3 ASM vs CK Tile FMHA.
 #
 # Common workload semantics:
 #   BF16, D=128, Hq=32
@@ -19,8 +19,7 @@ set -Eeuo pipefail
 #   standalone CK Tile tile_example_fmha_fwd
 #   num_splits=1, BF16, causal, BSHD, row-major V
 #
-# ROCKE:
-#   production dispatch via dense_request -> resolve_dense_spec -> run
+#   checked-in shared-fixture dense and auto-unified runner
 
 command -v git >/dev/null 2>&1 || { echo "ERROR: git not found" >&2; exit 1; }
 
@@ -113,123 +112,10 @@ print('cus=' + str(torch.cuda.get_device_properties(0).multi_processor_count))
 PY"
 } | tee "$OUT/environment.txt"
 
-log "1. ROCKE"
-cat > "$OUT/rocke_runner.py" <<'PY'
-import argparse
-import csv
-import os
-import traceback
-import torch
-
-from builders.gfx942.attention.prefill.attention_dense_prefill import (
-    dense_request,
-    resolve_dense_spec,
-    describe_dense_spec,
-    run,
-)
-from kernels.gfx942.attention_dense import supports_attention_dense
-
-CONFIGS = [
-    (1, 1, 4096, 32, 8),
-    (2, 1, 4096, 32, 16),
-    (3, 1, 8192, 32, 8),
-    (4, 1, 8192, 32, 16),
-    (5, 1, 16384, 32, 8),
-    (6, 16, 4096, 32, 8),
-    (7, 16, 8192, 32, 8),
-    (8, 16, 4096, 32, 16),
-    (9, 64, 4096, 32, 8),
-    (10, 64, 8192, 32, 8),
-]
-
-warmup = int(os.environ['BENCH_WARMUP'])
-iters = int(os.environ['BENCH_REPEAT'])
-out_path = os.environ['OUT_TSV']
-
-args = argparse.Namespace(
-    persistent=None,
-    num_persistent=None,
-    persist_decode=None,
-    block_n=None,
-    waves_per_eu=None,
-    interleave=None,
-    lds_k_group_pad=None,
-    sliding_window=None,
-)
-
-with open(out_path, 'w', newline='') as f:
-    w = csv.writer(f, delimiter='\t')
-    w.writerow(['id','B','S','Hq','Hkv','GQA','ms','tflops','status','kernel','reason'])
-
-    for cid, B, S, Hq, Hkv in CONFIGS:
-        print('\n' + '=' * 110)
-        print(f'ROCKE CONFIG {cid}: B={B} S={S} Hq={Hq} Hkv={Hkv} GQA={Hq//Hkv}:1')
-        print('=' * 110)
-
-        ms = tf = None
-        kernel = ''
-        status = 'PASS'
-        reason = ''
-
-        try:
-            req = dense_request(
-                args,
-                batch=B,
-                seqlen_q=S,
-                seqlen_kv=S,
-                num_query_heads=Hq,
-                num_kv_heads=Hkv,
-                head_size=128,
-                causal=True,
-                dtype='bf16',
-            )
-            spec = resolve_dense_spec(req, {})
-            kernel = describe_dense_spec(spec)
-
-            # Check support before allocating the large Q/K/V/O tensors. This is
-            # important for the B=64,S=8192 case that can hit the 32-bit extent limit.
-            ok, why = supports_attention_dense(spec, arch='gfx942')
-            if not ok:
-                status = 'UNSUPPORTED'
-                reason = str(why)
-                print('UNSUPPORTED:', reason)
-            else:
-                print('kernel:', kernel)
-                # Timing only. Numerical correctness is a separate validation pass.
-                ms, tf, _ = run(
-                    spec,
-                    warmup=warmup,
-                    iters=iters,
-                    check=False,
-                    overrides={},
-                )
-        except Exception as e:
-            text = f'{type(e).__name__}: {e}'
-            if 'unsupported' in text.lower() or '32-bit' in text.lower() or 'extent' in text.lower():
-                status = 'UNSUPPORTED'
-            else:
-                status = 'ERROR'
-                traceback.print_exc()
-            reason = text
-            print(status + ':', reason)
-        finally:
-            torch.cuda.empty_cache()
-
-        w.writerow([
-            cid, B, S, Hq, Hkv, f'{Hq//Hkv}:1',
-            '' if ms is None else f'{ms:.9f}',
-            '' if tf is None else f'{tf:.9f}',
-            status, kernel, reason,
-        ])
-        f.flush()
-
-print('wrote', out_path)
-PY
-
+log "1. ROCKE DENSE AND AUTO-UNIFIED"
 BENCH_WARMUP="$WARMUP" \
 BENCH_REPEAT="$REPEAT" \
-OUT_TSV="$OUT/rocke.tsv" \
-bash -lc "source '$ROCKE_ENV'; cd '$ROCM_LIBS/dnn-providers/hip-kernel-provider'; python '$OUT/rocke_runner.py'" \
+bash -lc "source '$ROCKE_ENV'; cd '$ROCM_LIBS/dnn-providers/hip-kernel-provider'; python '$SCRIPT_DIR/rocke_paths.py' --out-dense '$OUT/rocke_dense.tsv' --out-unified '$OUT/rocke_unified.tsv' --warmup '$WARMUP' --iters '$REPEAT'" \
     2>&1 | tee "$OUT/logs/rocke/all.log"
 
 log "2. AITER FMHA-v3 ASM"
@@ -285,50 +171,69 @@ def base_cmd(B, S, Hq, Hkv):
         '-fwd_v3=1',            # force v3 ASM path
         '-v3_bf16_cvt=2',       # RTZ on gfx942
         '-mode=0',
-        '-timer=gpu',
         '-kname=1',
-        '-v=0',
     ]
 
 with open(OUT, 'w', newline='') as f:
     w = csv.writer(f, delimiter='\t')
-    w.writerow(['id','B','S','Hq','Hkv','GQA','ms','tflops','gbps','status','kernel','reason'])
+    w.writerow([
+        'id', 'B', 'S', 'Hq', 'Hkv', 'GQA', 'ms', 'tflops', 'gbps', 'status',
+        'validation_status', 'kernel', 'reason',
+    ])
 
     for cid, B, S, Hq, Hkv in CONFIGS:
         print('\n' + '=' * 110)
         print(f'AITER ASM CONFIG {cid}: B={B} S={S} Hq={Hq} Hkv={Hkv} GQA={Hq//Hkv}:1')
         print('=' * 110)
 
+        validation_cmd = base_cmd(B,S,Hq,Hkv) + ['-v=2', '-warmup=0', '-repeat=1']
+        validation = subprocess.run(
+            validation_cmd, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, env=os.environ.copy()
+        )
         # -is_v3_check prints a synthetic 1.000-ms line. Keep this output separate
         # and NEVER parse it as benchmark performance.
-        support_cmd = base_cmd(B,S,Hq,Hkv) + ['-warmup=0','-repeat=1','-is_v3_check=1']
+        support_cmd = base_cmd(B,S,Hq,Hkv) + [
+            '-v=0', '-warmup=0', '-repeat=1', '-is_v3_check=1',
+        ]
         support = subprocess.run(
             support_cmd, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, env=os.environ.copy()
         )
+        proc = None
+        text = ''
+        if validation.returncode == 0 and support.returncode == 0:
+            bench_cmd = base_cmd(B,S,Hq,Hkv) + [
+                '-timer=gpu', '-v=0', f'-warmup={WARMUP}', f'-repeat={REPEAT}',
+            ]
+            proc = subprocess.run(
+                bench_cmd, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, env=os.environ.copy()
+            )
+            text = proc.stdout
+            print(text, end='')
 
-        bench_cmd = base_cmd(B,S,Hq,Hkv) + [f'-warmup={WARMUP}', f'-repeat={REPEAT}']
-        proc = subprocess.run(
-            bench_cmd, text=True, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, env=os.environ.copy()
-        )
-        text = proc.stdout
-        print(text, end='')
-
+        with open(os.path.join(LOG_DIR, f'config_{cid:02d}.validation.log'), 'w') as lf:
+            lf.write('COMMAND: ' + ' '.join(validation_cmd) + '\n\n' + validation.stdout)
         with open(os.path.join(LOG_DIR, f'config_{cid:02d}.support.log'), 'w') as lf:
             lf.write('COMMAND: ' + ' '.join(support_cmd) + '\n\n' + support.stdout)
-        with open(os.path.join(LOG_DIR, f'config_{cid:02d}.log'), 'w') as lf:
-            lf.write('COMMAND: ' + ' '.join(bench_cmd) + '\n\n' + text)
+        if proc is not None:
+            with open(os.path.join(LOG_DIR, f'config_{cid:02d}.log'), 'w') as lf:
+                lf.write('COMMAND: ' + ' '.join(bench_cmd) + '\n\n' + text)
 
         perf = perf_re.findall(text)
         km = load_re.findall(text)
         kernel = km[-1] if km else ''
+        validation_status = 'PASS' if validation.returncode == 0 else 'FAIL'
 
-        if support.returncode != 0:
+        if validation.returncode != 0:
+            status, reason = 'FAIL', f'validation exit={validation.returncode}'
+            ms = tf = gb = ''
+        elif support.returncode != 0:
             status, reason = 'UNSUPPORTED', f'ASM support check exit={support.returncode}'
             ms = tf = gb = ''
-        elif proc.returncode != 0:
-            status, reason = 'ERROR', f'benchmark exit={proc.returncode}'
+        elif proc is None or proc.returncode != 0:
+            status, reason = 'ERROR', f'benchmark exit={proc.returncode if proc else "not run"}'
             ms = tf = gb = ''
         elif not perf:
             status, reason = 'ERROR', 'could not parse benchmark timing line'
@@ -340,7 +245,10 @@ with open(OUT, 'w', newline='') as f:
             ms, tf, gb = perf[-1]
             status, reason = 'PASS', ''
 
-        w.writerow([cid,B,S,Hq,Hkv,f'{Hq//Hkv}:1',ms,tf,gb,status,kernel,reason])
+        w.writerow([
+            cid, B, S, Hq, Hkv, f'{Hq//Hkv}:1', ms, tf, gb, status,
+            validation_status, kernel, reason,
+        ])
         f.flush()
 
 print('wrote', OUT)
@@ -389,10 +297,9 @@ perf_re = re.compile(rf'({num})\s*ms,\s*({num})\s*TFlops,\s*({num})\s*GB/s')
 kernel_re = re.compile(r'\b(fmha_fwd_[^,\s]+)')
 
 
-def cmd_for(B, S, Hq, Hkv):
+def base_cmd(B, S, Hq, Hkv):
     return [
         EXE,
-        '-v=0',
         '-mode=0',
         f'-b={B}',
         f'-h={Hq}',
@@ -411,37 +318,55 @@ def cmd_for(B, S, Hq, Hkv):
         '-lse=0',
         '-kname=1',
         '-num_splits=1',         # do not let a heuristic alter the algorithm
-        f'-warmup={WARMUP}',
-        f'-repeat={REPEAT}',
     ]
 
 with open(OUT, 'w', newline='') as f:
     w = csv.writer(f, delimiter='\t')
-    w.writerow(['id','B','S','Hq','Hkv','GQA','ms','tflops','gbps','status','kernel','reason'])
+    w.writerow([
+        'id', 'B', 'S', 'Hq', 'Hkv', 'GQA', 'ms', 'tflops', 'gbps', 'status',
+        'validation_status', 'kernel', 'reason',
+    ])
 
     for cid, B, S, Hq, Hkv in CONFIGS:
-        cmd = cmd_for(B,S,Hq,Hkv)
+        validation_cmd = base_cmd(B,S,Hq,Hkv) + ['-v=2', '-warmup=0', '-repeat=1']
+        bench_cmd = base_cmd(B,S,Hq,Hkv) + [
+            '-timer=gpu', '-v=0', f'-warmup={WARMUP}', f'-repeat={REPEAT}',
+        ]
         print('\n' + '=' * 110)
         print(f'CK CONFIG {cid}: B={B} S={S} Hq={Hq} Hkv={Hkv} GQA={Hq//Hkv}:1')
-        print('COMMAND:', ' '.join(cmd))
+        print('COMMAND:', ' '.join(bench_cmd))
         print('=' * 110)
 
-        proc = subprocess.run(
-            cmd, text=True, stdout=subprocess.PIPE,
+        validation = subprocess.run(
+            validation_cmd, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, env=os.environ.copy()
         )
-        text = proc.stdout
-        print(text, end='')
+        proc = None
+        text = ''
+        if validation.returncode == 0:
+            proc = subprocess.run(
+                bench_cmd, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, env=os.environ.copy()
+            )
+            text = proc.stdout
+            print(text, end='')
 
-        with open(os.path.join(LOG_DIR, f'config_{cid:02d}.log'), 'w') as lf:
-            lf.write('COMMAND: ' + ' '.join(cmd) + '\n\n' + text)
+        with open(os.path.join(LOG_DIR, f'config_{cid:02d}.validation.log'), 'w') as lf:
+            lf.write('COMMAND: ' + ' '.join(validation_cmd) + '\n\n' + validation.stdout)
+        if proc is not None:
+            with open(os.path.join(LOG_DIR, f'config_{cid:02d}.log'), 'w') as lf:
+                lf.write('COMMAND: ' + ' '.join(bench_cmd) + '\n\n' + text)
 
         perf = perf_re.findall(text)
         kernels = kernel_re.findall(text)
         kernel = kernels[-1] if kernels else ''
+        validation_status = 'PASS' if validation.returncode == 0 else 'FAIL'
 
-        if proc.returncode != 0:
-            status, reason = 'ERROR', f'benchmark exit={proc.returncode}'
+        if validation.returncode != 0:
+            status, reason = 'FAIL', f'validation exit={validation.returncode}'
+            ms = tf = gb = ''
+        elif proc is None or proc.returncode != 0:
+            status, reason = 'ERROR', f'benchmark exit={proc.returncode if proc else "not run"}'
             ms = tf = gb = ''
         elif not perf:
             status, reason = 'ERROR', 'could not parse benchmark timing line'
@@ -456,7 +381,10 @@ with open(OUT, 'w', newline='') as f:
             ms, tf, gb = perf[-1]
             status, reason = 'PASS', ''
 
-        w.writerow([cid,B,S,Hq,Hkv,f'{Hq//Hkv}:1',ms,tf,gb,status,kernel,reason])
+        w.writerow([
+            cid, B, S, Hq, Hkv, f'{Hq//Hkv}:1', ms, tf, gb, status,
+            validation_status, kernel, reason,
+        ])
         f.flush()
 
 print('wrote', OUT)
@@ -471,186 +399,8 @@ CK_EXPECTED_KERNEL="$CK_EXPECTED_KERNEL" \
 bash -lc "source '$CK_ENV'; python3 '$OUT/ck_runner.py'" \
     2>&1 | tee "$OUT/logs/ck/all.log"
 
-log "4. GENERATE THREE-WAY TABLE"
-OUT="$OUT" WARMUP="$WARMUP" REPEAT="$REPEAT" python3 - <<'PY'
-import csv
-import math
-import os
-from pathlib import Path
-
-out = Path(os.environ['OUT'])
-
-
-def read_tsv(path):
-    with open(path, newline='') as f:
-        return {int(r['id']): r for r in csv.DictReader(f, delimiter='\t')}
-
-
-def val(r, key):
-    try:
-        return float(r[key]) if r and r.get(key, '') else None
-    except ValueError:
-        return None
-
-
-def fmt(x, n=4):
-    return '—' if x is None else f'{x:.{n}f}'
-
-
-def ratio(base_ms, faster_ms):
-    return None if base_ms is None or faster_ms is None or faster_ms == 0 else base_ms / faster_ms
-
-
-def sfmt(x):
-    return '—' if x is None else f'{x:.2f}×'
-
-
-def geomean(vals):
-    vals = [x for x in vals if x is not None and x > 0]
-    return math.exp(sum(math.log(x) for x in vals) / len(vals)) if vals else None
-
-
-def status_display(row, ms):
-    if row['status'] == 'PASS':
-        return fmt(ms)
-    if row['status'] == 'UNSUPPORTED':
-        return 'unsupported'
-    return row['status'].lower()
-
-
-rocke = read_tsv(out / 'rocke.tsv')
-ck = read_tsv(out / 'ck.tsv')
-aiter = read_tsv(out / 'aiter.tsv')
-rows = []
-
-for cid in range(1, 11):
-    r, c, a = rocke[cid], ck[cid], aiter[cid]
-    B, S, Hq, Hkv = map(int, [r['B'], r['S'], r['Hq'], r['Hkv']])
-
-    rms = val(r,'ms') if r['status'] == 'PASS' else None
-    cms = val(c,'ms') if c['status'] == 'PASS' else None
-    ams = val(a,'ms') if a['status'] == 'PASS' else None
-
-    rows.append({
-        'id': cid,
-        'B': B,
-        'S': S,
-        'Hq': Hq,
-        'Hkv': Hkv,
-        'GQA': f'{Hq//Hkv}:1',
-        'ROCKE_ms': rms,
-        'CK_ms': cms,
-        'AITER_ms': ams,
-        'CK_vs_ROCKE': ratio(rms, cms),
-        'AITER_vs_ROCKE': ratio(rms, ams),
-        'AITER_vs_CK': ratio(cms, ams),
-        'ROCKE_TFLOPS': val(r,'tflops') if r['status']=='PASS' else None,
-        'CK_TFLOPS': val(c,'tflops') if c['status']=='PASS' else None,
-        'AITER_TFLOPS': val(a,'tflops') if a['status']=='PASS' else None,
-        'CK_GBps': val(c,'gbps') if c['status']=='PASS' else None,
-        'AITER_GBps': val(a,'gbps') if a['status']=='PASS' else None,
-        'ROCKE_status': r['status'],
-        'CK_status': c['status'],
-        'AITER_status': a['status'],
-        'ROCKE_kernel': r.get('kernel',''),
-        'CK_kernel': c.get('kernel',''),
-        'AITER_kernel': a.get('kernel',''),
-        'ROCKE_reason': r.get('reason',''),
-        'CK_reason': c.get('reason',''),
-        'AITER_reason': a.get('reason',''),
-    })
-
-with open(out / 'results.csv', 'w', newline='') as f:
-    w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-    w.writeheader()
-    w.writerows(rows)
-
-ck_r_vals = [r['CK_vs_ROCKE'] for r in rows]
-a_r_vals = [r['AITER_vs_ROCKE'] for r in rows]
-a_c_vals = [r['AITER_vs_CK'] for r in rows]
-ck_r_gm = geomean(ck_r_vals)
-a_r_gm = geomean(a_r_vals)
-a_c_gm = geomean(a_c_vals)
-
-lines = [
-    '# MI300X/gfx942 BF16 causal attention benchmark',
-    '',
-    f'Common methodology: **BF16**, `D=128`, `Hq=32`, causal, `Sq=Sk`, BSHD, **{os.environ["WARMUP"]} warmups + {os.environ["REPEAT"]} measured launches**.',
-    '',
-    'Reported `ms` is the **average time for one kernel launch**, not the total for all measured launches.',
-    '',
-    'Implementations:',
-    '- **ROCKE**: production dense-attention dispatch (`dense_request -> resolve_dense_spec -> run`).',
-    '- **AITER**: `fwd_v3=1`, gfx942 BF16 **RTZ** (`v3_bf16_cvt=2`) ASM; the runner checks for `fmha_fwd_hd128_bf16_causal_rtz`.',
-    '- **CK**: standalone `tile_example_fmha_fwd`, BF16, causal, BSHD, row-major V, `num_splits=1`; setup compiles one exact CK kernel instance and this runner verifies that instance is selected.',
-    '',
-    '| # | B | S | Hq | Hkv | GQA | ROCKE ms | CK ms | AITER ASM ms | CK vs ROCKE | AITER vs ROCKE | AITER vs CK |',
-    '|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|',
-]
-
-for r in rows:
-    rr, cc, aa = rocke[r['id']], ck[r['id']], aiter[r['id']]
-    lines.append(
-        f"| {r['id']} | {r['B']} | {r['S']} | {r['Hq']} | {r['Hkv']} | {r['GQA']} | "
-        f"{status_display(rr, r['ROCKE_ms'])} | {status_display(cc, r['CK_ms'])} | {status_display(aa, r['AITER_ms'])} | "
-        f"{sfmt(r['CK_vs_ROCKE'])} | {sfmt(r['AITER_vs_ROCKE'])} | {sfmt(r['AITER_vs_CK'])} |"
-    )
-
-lines += [
-    '',
-    '## Throughput',
-    '',
-    '| # | ROCKE TFLOPS | CK TFLOPS | AITER TFLOPS | CK GB/s | AITER GB/s |',
-    '|---:|---:|---:|---:|---:|---:|',
-]
-for r in rows:
-    lines.append(
-        f"| {r['id']} | {fmt(r['ROCKE_TFLOPS'],1)} | {fmt(r['CK_TFLOPS'],2)} | "
-        f"{fmt(r['AITER_TFLOPS'],2)} | {fmt(r['CK_GBps'],2)} | {fmt(r['AITER_GBps'],2)} |"
-    )
-
-lines += ['', '## Summary', '']
-if ck_r_gm is not None:
-    n = sum(x is not None and x > 0 for x in ck_r_vals)
-    lines.append(f'- Geometric-mean CK latency speedup over ROCKE across {n} common supported configs: **{ck_r_gm:.3f}×**.')
-if a_r_gm is not None:
-    n = sum(x is not None and x > 0 for x in a_r_vals)
-    lines.append(f'- Geometric-mean AITER ASM latency speedup over ROCKE across {n} common supported configs: **{a_r_gm:.3f}×**.')
-if a_c_gm is not None:
-    n = sum(x is not None and x > 0 for x in a_c_vals)
-    lines.append(f'- Geometric-mean AITER ASM latency speedup over CK across {n} common supported configs: **{a_c_gm:.3f}×**.')
-
-bad = [r for r in rows if r['ROCKE_status'] != 'PASS' or r['CK_status'] != 'PASS' or r['AITER_status'] != 'PASS']
-if bad:
-    lines += ['', '## Unsupported / errors', '']
-    for r in bad:
-        if r['ROCKE_status'] != 'PASS':
-            lines.append(f"- Config {r['id']} ROCKE: `{r['ROCKE_status']}` — {r['ROCKE_reason'] or 'no reason recorded'}")
-        if r['CK_status'] != 'PASS':
-            lines.append(f"- Config {r['id']} CK: `{r['CK_status']}` — {r['CK_reason'] or 'no reason recorded'}")
-        if r['AITER_status'] != 'PASS':
-            lines.append(f"- Config {r['id']} AITER: `{r['AITER_status']}` — {r['AITER_reason'] or 'no reason recorded'}")
-
-lines += [
-    '',
-    '## Reproduction artifacts',
-    '',
-    '- `environment.txt` — GPU, ROCm/Torch/Triton, git commits, CK compiler, warmup/repeat',
-    '- `rocke.tsv` — raw parsed ROCKE measurements',
-    '- `ck.tsv` — raw parsed CK measurements and selected kernel names',
-    '- `aiter.tsv` — raw parsed AITER ASM measurements and loaded kernel names',
-    '- `results.csv` — merged machine-readable comparison',
-    '- `logs/rocke/all.log` — complete ROCKE output',
-    '- `logs/ck/config_*.log` — exact CK commands and raw output',
-    '- `logs/aiter/config_*.log` — exact AITER benchmark commands and raw output',
-    '- `logs/aiter/config_*.support.log` — separate AITER ASM support checks',
-    '',
-    'Note: the GB/s values printed by the CK/AITER benchmark programs are benchmark-derived traffic metrics; they are not rocprofiler-measured HBM traffic.',
-]
-
-(out / 'benchmark_results.md').write_text('\n'.join(lines) + '\n')
-print('\n'.join(lines))
-PY
+log "4. GENERATE FOUR-WAY TABLE"
+python3 "$SCRIPT_DIR/merge_results.py" "$OUT"
 
 log "DONE"
 echo "Results: $OUT"
