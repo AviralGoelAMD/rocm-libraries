@@ -205,8 +205,8 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
         {
             **common,
             "ms": "",
-            "tflops": "",
-            "max_abs": "",
+            "tflops": "0.75",
+            "max_abs": "0.01",
             "status": "UNSUPPORTED",
             "kernel": "dense\\kernel|selected",
             "path": "attention_dense",
@@ -280,8 +280,8 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
         {
             **common,
             "dense_ms": None,
-            "dense_tflops": None,
-            "dense_max_abs": None,
+            "dense_tflops": 0.75,
+            "dense_max_abs": 0.01,
             "dense_status": "UNSUPPORTED",
             "dense_kernel": "dense\\kernel|selected",
             "dense_path": "attention_dense",
@@ -318,13 +318,21 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
     ]
     with (tmp_path / "results.csv").open(newline="") as handle:
         csv_rows = list(csv.DictReader(handle))
-    assert csv_rows[0]["unified_max_abs"] == "0.0"
-    assert csv_rows[0]["unified_path"] == "auto:2d"
-    assert csv_rows[0]["unified_settings"] == "unified settings"
-    assert csv_rows[0]["AITER_tflops"] == "1.5"
-    assert csv_rows[0]["AITER_gbps"] == "2.5"
-    assert csv_rows[0]["best_rocke"] == "unified"
-    assert csv_rows[0]["AITER_vs_best_rocke"] == "1.5"
+    csv_row = csv_rows[0]
+    assert csv_row["dense_tflops"] == "0.75"
+    assert csv_row["dense_max_abs"] == "0.01"
+    assert csv_row["dense_path"] == "attention_dense"
+    assert csv_row["dense_settings"] == "dense settings"
+    assert csv_row["unified_tflops"] == "1.0"
+    assert csv_row["unified_max_abs"] == "0.0"
+    assert csv_row["unified_path"] == "auto:2d"
+    assert csv_row["unified_settings"] == "unified settings"
+    assert csv_row["AITER_tflops"] == "1.5"
+    assert csv_row["AITER_gbps"] == "2.5"
+    assert csv_row["CK_tflops"] == "1.25"
+    assert csv_row["CK_gbps"] == "2.0"
+    assert csv_row["best_rocke"] == "unified"
+    assert csv_row["AITER_vs_best_rocke"] == "1.5"
     markdown = (tmp_path / "benchmark_results.md").read_text()
     assert "dense: `UNSUPPORTED` — Q/O extent \\| newline<br>and slash \\\\" in markdown
     assert (
@@ -335,6 +343,9 @@ def test_merge_results_keeps_passing_unified_config_when_dense_is_unsupported(
     assert "| 10 | AITER | PASS | PASS | aiter-asm | — |" in markdown
     assert "| 10 | CK | PASS | PASS | ck-tile | — |" in markdown
     assert "| 10 | unified | 1.0000 | — | 0.000000 | auto:2d | unified settings |" in markdown
+    assert "| 10 | dense | 0.7500 | — | 0.010000 | attention_dense | dense settings |" in markdown
+    assert "| 10 | AITER | 1.5000 | 2.5000 | — | — | — |" in markdown
+    assert "| 10 | CK | 1.2500 | 2.0000 | — | — | — |" in markdown
 
 
 def _write_minimal_merge_inputs(
