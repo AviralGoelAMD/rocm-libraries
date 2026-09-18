@@ -139,6 +139,40 @@ def _row(config: Config, *, path: str) -> dict[str, Any]:
     }
 
 
+def _preflight_dense(config: Config) -> tuple[dict[str, Any], Any | None, bool]:
+    """Resolve and check dense support without allocating any CUDA tensors."""
+    from kernels.gfx942.attention_dense import (
+        gfx942_kernel_name,
+        supports_attention_dense,
+    )
+
+    row = _row(config, path="attention_dense")
+    try:
+        spec = dense_spec(config)
+        row["kernel"] = gfx942_kernel_name(spec)
+        row["settings"] = repr(spec)
+        supported, reason = supports_attention_dense(spec, arch="gfx942")
+    except Exception as error:  # dispatch failure is a real runner error
+        row["reason"] = _error_text(error)
+        return row, None, False
+    if not supported:
+        row["status"] = "UNSUPPORTED"
+        row["reason"] = str(reason)
+    return row, spec, supported
+
+
+def preflight_dense_row(config: Config) -> dict[str, Any]:
+    """Return the structured dense support result without touching CUDA memory."""
+    row, _, _ = _preflight_dense(config)
+    return row
+
+
+def preflight_rocke_rows(config: Config) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Create independent dense and auto-unified rows before CUDA allocation."""
+    dense, _, _ = _preflight_dense(config)
+    return dense, _row(config, path="auto")
+
+
 def _error_text(error: Exception) -> str:
     return f"{type(error).__name__}: {error}"
 
@@ -204,27 +238,10 @@ def run_rocke_pair(
     config: Config, *, warmup: int, iters: int, seed: int
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run dense and normal auto-unified attention from one BF16 Q/K/V fixture."""
-    from kernels.gfx942.attention_dense import (
-        gfx942_kernel_name,
-        run_attention_dense_torch,
-        supports_attention_dense,
-    )
+    from kernels.gfx942.attention_dense import run_attention_dense_torch
 
-    dense = _row(config, path="attention_dense")
+    dense, spec, dense_launchable = _preflight_dense(config)
     unified = _row(config, path="auto")
-    preflight_succeeded = False
-    supported = False
-    try:
-        spec = dense_spec(config)
-        dense["kernel"] = gfx942_kernel_name(spec)
-        dense["settings"] = repr(spec)
-        supported, reason = supports_attention_dense(spec, arch="gfx942")
-        preflight_succeeded = True
-    except Exception as error:  # dispatch failure is a real runner error
-        dense["reason"] = _error_text(error)
-    if preflight_succeeded and not supported:
-        dense["status"] = "UNSUPPORTED"
-        dense["reason"] = str(reason)
 
     if not torch.cuda.is_available():
         message = "CUDA is unavailable"
@@ -234,7 +251,8 @@ def run_rocke_pair(
         return dense, unified
 
     try:
-        device = torch.device("cuda")
+        device_index = torch.cuda.current_device()
+        device = torch.device("cuda", device_index)
         generator = torch.Generator(device=device).manual_seed(seed)
         q = torch.randn(
             config.B, config.S, config.Hq, _HEAD_SIZE,
@@ -278,12 +296,14 @@ def run_rocke_pair(
             max_seqlen_k=config.S,
             dtype="bf16",
             q_dtype="bf16",
-            num_cus=torch.cuda.get_device_properties(0).multi_processor_count,
+            num_cus=torch.cuda.get_device_properties(
+                device_index
+            ).multi_processor_count,
         )
         unified["path"], unified["kernel"], unified["settings"] = _unified_identity(
             problem
         )
-        stream = int(torch.cuda.current_stream().cuda_stream)
+        stream = int(torch.cuda.current_stream(device_index).cuda_stream)
     except Exception as error:
         message = _error_text(error)
         if dense["status"] != "UNSUPPORTED":
@@ -293,7 +313,6 @@ def run_rocke_pair(
 
     from rocke.runtime import synchronize_and_release, time_launches
 
-    dense_launchable = preflight_succeeded and supported
 
     if dense_launchable:
         try:

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import csv
+
 import pytest
 import torch
 
@@ -95,10 +97,76 @@ def test_dense_spec_preflight_rejects_config_10_for_32_bit_qo_extent() -> None:
     assert "32-bit" in reason or "extent" in reason
 
 
+def test_dense_preflight_rows_keep_config_10_unsupported_without_cuda_allocation() -> None:
+    dense, unified = rocke_paths.preflight_rocke_rows(rocke_paths.CONFIGS[-1])
+
+    assert dense["status"] == "UNSUPPORTED"
+    assert dense["ms"] is None
+    assert dense["reason"]
+    assert "Q/O" in dense["reason"]
+    assert unified is not dense
+    assert unified["path"] == "auto"
+    assert unified["status"] == "ERROR"
+    assert unified["reason"] == ""
+
+def test_main_writes_stable_ordered_dense_and_unified_tsvs(tmp_path, monkeypatch) -> None:
+    def stub_pair(config, *, warmup, iters, seed):
+        dense = {
+            **rocke_paths._row(config, path="attention_dense"),
+            "ms": 1.25,
+            "tflops": 2.5,
+            "max_abs": 0.0,
+            "status": "PASS",
+        }
+        unified = {
+            **rocke_paths._row(config, path="auto:2d"),
+            "ms": 1.5,
+            "tflops": 2.0,
+            "max_abs": 0.0,
+            "status": "PASS",
+        }
+        return dense, unified
+
+    monkeypatch.setattr(rocke_paths, "run_rocke_pair", stub_pair)
+    dense_path = tmp_path / "dense.tsv"
+    unified_path = tmp_path / "unified.tsv"
+
+    assert rocke_paths.main(
+        [
+            "--out-dense",
+            str(dense_path),
+            "--out-unified",
+            str(unified_path),
+            "--warmup",
+            "0",
+            "--iters",
+            "1",
+            "--seed",
+            "7",
+        ]
+    ) == 0
+
+    expected_fields = [
+        "id", "B", "S", "Hq", "Hkv", "GQA", "ms", "tflops", "max_abs",
+        "status", "kernel", "path", "settings", "reason",
+    ]
+    for path, expected_path in (
+        (dense_path, "attention_dense"),
+        (unified_path, "auto:2d"),
+    ):
+        with path.open(newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            rows = list(reader)
+        assert reader.fieldnames == expected_fields
+        assert [int(row["id"]) for row in rows] == list(range(1, 11))
+        assert all(row["path"] == expected_path for row in rows)
+
+
 def _gfx942_gpu_ready() -> bool:
     if not torch.cuda.is_available():
         return False
-    return "gfx942" in torch.cuda.get_device_properties(0).gcnArchName.lower()
+    device_index = torch.cuda.current_device()
+    return "gfx942" in torch.cuda.get_device_properties(device_index).gcnArchName.lower()
 
 
 @pytest.mark.skipif(
