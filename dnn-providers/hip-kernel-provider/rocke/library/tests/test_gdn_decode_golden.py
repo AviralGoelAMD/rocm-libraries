@@ -171,6 +171,39 @@ def test_every_shipped_configuration_is_recorded(arch):
     assert not missing, f"configurations without a SHA-256: {missing}"
 
 
+@pytest.mark.parametrize("arch", _ARCHES)
+def test_gdn_decode_ir_cpp_python_byte_identity(arch, monkeypatch):
+    """The C++ engine lowers every golden case to the same bytes as Python.
+
+    The fixtures above pin the *Python* lowering; production defaults to the C++
+    engine, so this is the other half over the same case set. There is no
+    ``gdn_decode_emit.c`` mirror, so the comparison starts from the Python-built
+    kernel's serialized IR. ``ROCKE_CPP_STRICT=1`` disables the silent Python
+    fallback, so an absent or stale engine cannot pass. Failure handling follows
+    ``test_attention_ir_cpp_parity.py``: an undeclared engine is a whole-run
+    skip, an arch in ``CPP_UNPORTED_ARCHES`` a counted skip, anything else red.
+    """
+    from rocke.core.backend import BackendCoverageGap, BackendError
+    from rocke.helpers.compile import _lower_llvm_via_backend
+
+    monkeypatch.setenv("ROCKE_CPP_STRICT", "1")
+    mismatched = []
+    for cid, build in _cases(arch).items():
+        kernel = build()
+        py = _lower_llvm_via_backend(kernel, arch=arch, backend="python", spec=None)
+        try:
+            cpp = _lower_llvm_via_backend(kernel, arch=arch, backend="cpp", spec=None)
+        except BackendCoverageGap as e:  # subclass of BackendError: catch first
+            pytest.skip(f"{arch} is a declared C++ engine gap: {str(e)[:200]}")
+        except BackendError as e:
+            pytest.skip(f"C++ engine not importable: {str(e)[:200]}")
+        if py != cpp:
+            mismatched.append(cid)
+    assert (
+        not mismatched
+    ), f"gdn_decode {arch} cpp/python IR byte-mismatch:\n  " + "\n  ".join(mismatched)
+
+
 def _synthetic_fixture(monkeypatch, tmp_path):
     """Point the gfx950 golden at a fixture whose only case failed to lower."""
     monkeypatch.setattr(
