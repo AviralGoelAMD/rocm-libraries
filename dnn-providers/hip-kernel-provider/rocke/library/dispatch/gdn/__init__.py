@@ -44,6 +44,13 @@ from .prefill_common import (
 
 _ARCH_MODULES = (gfx942, gfx950)
 
+# Arches that register GDN decode, and the subset that also serves the KDA gate.
+# Tools and tests read these instead of restating the arch lists.
+GDN_DECODE_ARCHES = tuple(module.ARCH for module in _ARCH_MODULES)
+KDA_DECODE_ARCHES = tuple(
+    module.ARCH for module in _ARCH_MODULES if "kda" in module.GATE_KINDS
+)
+
 GDN_REGISTRY = CandidateRegistry(
     FAMILY, dim_vocabulary=GDN_DIM_VOCABULARY, require_build=True
 )
@@ -163,6 +170,8 @@ __all__ = [
     "dispatch_gdn_decode",
     "dispatch_gdn_decode_all",
     "gdn_candidates",
+    "GDN_DECODE_ARCHES",
+    "KDA_DECODE_ARCHES",
     "gdn_sweep_space",
     "normalize_dtype",
     "FAMILY_PREFILL",

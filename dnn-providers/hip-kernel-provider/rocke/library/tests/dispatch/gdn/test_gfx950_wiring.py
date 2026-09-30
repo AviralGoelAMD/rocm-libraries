@@ -45,8 +45,14 @@ def _req(batch: int, **kw) -> GdnDecodeRequest:
 
 class TestRegistration(unittest.TestCase):
     def test_every_configured_tile_is_registered(self):
+        # Filter by candidate NAME, not spec_id: gfx942 registers the same
+        # spec_ids, so an arch-blind set would let a missing gfx950 candidate
+        # be answered by its gfx942 twin.
         names = {
-            c.spec_id for c in gdn_candidates() if not c.spec_id.startswith("kda_")
+            c.spec_id
+            for c in gdn_candidates()
+            if c.name.startswith(f"gdn_decode_{ARCH}_")
+            and not c.spec_id.startswith("kda_")
         }
         expected = {f"nw{nw}_wtk{wtk}_bpv{bpv}" for nw, wtk, bpv in CONFIGURED_TILES}
         self.assertEqual(names, expected)

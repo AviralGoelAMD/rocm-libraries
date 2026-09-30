@@ -15,7 +15,8 @@ from dispatch.gdn import (
     dispatch_gdn_decode_all,
     gdn_candidates,
 )
-from dispatch.gdn.gfx942 import ARCH, CONFIGURED_TILES, DEFAULT_TILE, make_spec
+from dispatch.gdn.common import make_spec
+from dispatch.gdn.gfx942 import ARCH, CONFIGURED_TILES, DEFAULT_TILE
 from kernels.common.gdn_decode import is_valid_spec
 from rocke.dispatch.core import stable_json_hash
 
@@ -71,11 +72,13 @@ def test_compile_keys_differ_from_gfx950_for_the_same_tile():
     """Same spec, different arch: the cache must never hand one arch's code to the other.
 
     The spec itself is arch-neutral, so its hash is shared; the arch must enter
-    the compile key, or the two arches would collide on one cache entry.
+    the compile key, or the two arches would collide on one cache entry. The
+    tile is pinned so that a change of either arch's default cannot move it.
     """
-    gfx942 = dispatch_gdn_decode(_req())
-    gfx950 = dispatch_gdn_decode(replace(_req(), arch="gfx950"))
-    assert _tile(gfx942.spec) == _tile(gfx950.spec)
+    pinned = _req(algorithm="warp_tiled", spec_id="nw4_wtk16_bpv8")
+    gfx942 = dispatch_gdn_decode(pinned)
+    gfx950 = dispatch_gdn_decode(replace(pinned, arch="gfx950"))
+    assert _tile(gfx942.spec) == _tile(gfx950.spec) == (4, 16, 8)
     assert gfx942.kernel_id.spec_hash == gfx950.kernel_id.spec_hash
     assert gfx942.kernel_id.compile_key != gfx950.kernel_id.compile_key
     assert gfx942.candidate.name != gfx950.candidate.name
@@ -106,13 +109,58 @@ def test_auto_is_static_default_independent_of_batch():
         assert _tile(result.spec) == DEFAULT_TILE
 
 
+def test_auto_admits_only_the_default_when_it_is_legal():
+    """``auto`` is decided by admission, not by registry order.
+
+    Asking each candidate directly takes priority order out of the picture:
+    with a legal default, every other legal tile must refuse ``auto`` and
+    still accept its own pin.
+    """
+    auto = _req()
+    for result in dispatch_gdn_decode_all(auto):
+        candidate = result.candidate
+        admitted, why = candidate.admits(auto)
+        if _tile(result.spec) == DEFAULT_TILE:
+            assert admitted, why
+            continue
+        assert not admitted and "static GDN auto tile" in why, (candidate.name, why)
+        pin = replace(auto, algorithm=candidate.algorithm, spec_id=candidate.spec_id)
+        assert candidate.admits(pin)[0], candidate.name
+
+
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("use_qk_l2norm", "False"),
+        ("head_k_dim", 128.9),
+        ("batch", 16.7),
+        ("num_v_heads", True),
+        ("gate_kind", None),
+    ],
+)
+def test_malformed_request_field_is_rejected_not_coerced(arch, field, value):
+    """``bool("False")`` is ``True`` and ``int(128.9)`` is ``128``: a cast would
+    serve a different kernel than the caller described, so dispatch refuses."""
+    req = replace(_req(), arch=arch, **{field: value})
+    with pytest.raises(ValueError, match=field):
+        dispatch_gdn_decode(req)
+    with pytest.raises(TypeError, match=field):
+        make_spec(req, DEFAULT_TILE)
+
+
 def test_d64_auto_falls_back_to_a_validator_approved_candidate():
     result = dispatch_gdn_decode(_req(head_k_dim=64))
     assert is_valid_spec(result.spec, arch=ARCH)[0]
     assert _tile(result.spec) != DEFAULT_TILE
 
 
-def test_kda_gate_is_not_served_on_gfx942():
-    assert dispatch_gdn_decode_all(_req(gate_kind="kda")) == ()
-    with pytest.raises(ValueError):
-        dispatch_gdn_decode(_req(gate_kind="kda"))
+def test_kda_gate_is_not_yet_implemented_on_gfx942():
+    """A scope-out, not a hardware limit: the validator accepts a KDA spec on
+    gfx942, so dispatch must say ``NOT_YET_IMPLEMENTED`` rather than imply the
+    arch cannot run it."""
+    kda = _req(gate_kind="kda")
+    assert is_valid_spec(make_spec(kda, DEFAULT_TILE), arch=ARCH)[0]
+    assert dispatch_gdn_decode_all(kda) == ()
+    with pytest.raises(ValueError, match="NOT_YET_IMPLEMENTED"):
+        dispatch_gdn_decode(kda)

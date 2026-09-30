@@ -15,7 +15,8 @@ from dispatch.gdn import (
     dispatch_gdn_decode_all,
     gdn_candidates,
 )
-from dispatch.gdn.gfx950 import ARCH, CONFIGURED_TILES, DEFAULT_TILE, make_spec
+from dispatch.gdn.common import make_spec
+from dispatch.gdn.gfx950 import ARCH, CONFIGURED_TILES, DEFAULT_TILE
 from kernels.common.gdn_decode import is_valid_spec
 from rocke.dispatch.core import stable_json_hash
 

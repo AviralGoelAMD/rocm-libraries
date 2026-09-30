@@ -22,8 +22,8 @@ the same change so the diff states it out loud::
     python3 library/tests/test_gdn_decode_golden.py --write
 
 Each arch that registers GDN decode has its own fixture, covering that arch's
-legal registered tiles. KDA decode is gfx950-only, so only the gfx950 fixture
-carries KDA cases.
+legal registered tiles. Only arches that register KDA decode (gfx950 today) carry
+KDA cases.
 
 Lowering needs no GPU and no comgr, so this runs anywhere.
 """
@@ -38,7 +38,15 @@ from pathlib import Path
 
 import pytest
 
-_ARCHES = ("gfx942", "gfx950")
+# Pin the library root ahead of everything on sys.path so that running this file
+# directly does not let tests/dispatch/ shadow the real library/dispatch package.
+_LIB_ROOT = str(Path(__file__).resolve().parent.parent)
+if sys.path and sys.path[0] != _LIB_ROOT:
+    sys.path.insert(0, _LIB_ROOT)
+
+from dispatch.gdn import GDN_DECODE_ARCHES, KDA_DECODE_ARCHES  # noqa: E402
+
+_ARCHES = GDN_DECODE_ARCHES
 _GOLDENS = {
     arch: Path(__file__).resolve().parent
     / "golden"
@@ -46,12 +54,6 @@ _GOLDENS = {
     for arch in _ARCHES
 }
 _FLAVORS = ("llvm20", "llvm22", "llvm23")
-
-# Pin the library root ahead of everything on sys.path so that running this file
-# directly does not let tests/dispatch/ shadow the real library/dispatch package.
-_LIB_ROOT = str(Path(__file__).resolve().parent.parent)
-if sys.path and sys.path[0] != _LIB_ROOT:
-    sys.path.insert(0, _LIB_ROOT)
 
 
 def _cases(arch):
@@ -73,7 +75,7 @@ def _cases(arch):
         "simple": build(simple=True),
         "no_l2norm": build(use_qk_l2norm=False),
     }
-    if arch == "gfx950":
+    if arch in KDA_DECODE_ARCHES:
         # KDA gate kind. Pinned for the same reason the GDN cases are: the
         # per-channel gate is emitted code, and a refactor that changed it
         # without breaking it would pass every other test in the tree.
@@ -85,7 +87,7 @@ def _cases(arch):
         cases[f"registered_{result.candidate.spec_id}"] = (
             lambda spec=result.spec: build_gdn_decode(spec, arch=arch)
         )
-    if arch == "gfx950":
+    if arch in KDA_DECODE_ARCHES:
         for _, tile, spec_id in _TUNED_TILES_KDA:
             cases[f"tuned_{spec_id}"] = build(
                 gate_kind="kda",
@@ -179,9 +181,10 @@ def test_gdn_decode_ir_cpp_python_byte_identity(arch, monkeypatch):
     engine, so this is the other half over the same case set. There is no
     ``gdn_decode_emit.c`` mirror, so the comparison starts from the Python-built
     kernel's serialized IR. ``ROCKE_CPP_STRICT=1`` disables the silent Python
-    fallback, so an absent or stale engine cannot pass. Failure handling follows
-    ``test_attention_ir_cpp_parity.py``: an undeclared engine is a whole-run
-    skip, an arch in ``CPP_UNPORTED_ARCHES`` a counted skip, anything else red.
+    fallback, so an absent or stale engine cannot pass. An engine that cannot
+    be imported, or that declares this arch unported (``BackendCoverageGap``),
+    skips this arch's case with the reason in the skip message; any lowering
+    that runs and differs is red.
     """
     from rocke.core.backend import BackendCoverageGap, BackendError
     from rocke.helpers.compile import _lower_llvm_via_backend

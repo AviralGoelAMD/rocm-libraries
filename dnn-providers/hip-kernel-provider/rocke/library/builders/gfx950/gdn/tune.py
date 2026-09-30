@@ -31,7 +31,7 @@ import sys
 
 
 from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode, dispatch_gdn_decode_all
-from dispatch.gdn.gfx950 import BLOCKS_PER_V_DIM, NUM_WARPS, WARP_THREADS_K
+from dispatch.gdn.common import BLOCKS_PER_V_DIM, NUM_WARPS, WARP_THREADS_K
 from kernels.common.gdn_decode import GdnDecodeSpec, is_valid_spec
 
 ARCH = "gfx950"
