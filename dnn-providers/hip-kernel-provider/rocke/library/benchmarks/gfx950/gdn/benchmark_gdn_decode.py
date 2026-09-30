@@ -19,7 +19,7 @@ from dispatch.gdn import (
     dispatch_gdn_decode,
     dispatch_gdn_decode_all,
 )
-from kernels.gfx950.gdn_decode import GdnDecodeSpec
+from kernels.common.gdn_decode import GdnDecodeSpec
 
 ARCH = "gfx950"
 

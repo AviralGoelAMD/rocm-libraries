@@ -107,7 +107,7 @@ fused kernel and keeps the split halves opt-in.
 
 | File | Spec | Doc |
 |-----------------------------------|-------------------------------------------------------------------|------------------------------|
-| `gfx950/gdn_decode.py` | `GdnDecodeSpec` (gated delta rule; single-token decode over a paged recurrent state) | `instances/gdn.md` |
+| `common/gdn_decode.py` | `GdnDecodeSpec` (gated delta rule; single-token decode over a paged recurrent state) | `instances/gdn.md` |
 
 Runtime entry points: `dispatch_gdn_decode(GdnDecodeRequest(...))` (single-token decode) and `dispatch_gdn_prefill(GdnPrefillRequest(...))` (split chunkwise prefill — the shared KDA chunkwise kernels run in `gate_kind="gdn"` mode; there is no fused single-kernel GDN prefill, so the caller pins `chunk_prep` then `chunk_scan`).
 

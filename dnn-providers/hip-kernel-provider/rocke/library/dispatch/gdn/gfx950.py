@@ -15,7 +15,7 @@ import dataclasses as dc
 from itertools import product
 from typing import Tuple
 
-from kernels.gfx950.gdn_decode import (
+from kernels.common.gdn_decode import (
     GDN_DTYPES,
     GdnDecodeSpec,
     build_gdn_decode,

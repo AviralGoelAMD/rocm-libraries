@@ -1,8 +1,8 @@
 # GDN/KDA Host Tools: Driver, Benchmark, and Tuning
 
-This directory contains the host-side tools for the shared gfx950 GDN/KDA
-single-token decode emitter. The device-code emitter lives at
-[`library/kernels/gfx950/gdn_decode.py`](../../../kernels/gfx950/gdn_decode.py).
+This directory contains the host-side tools for the shared GDN/KDA single-token
+decode emitter (GDN on gfx942 and gfx950, KDA on gfx950). The device-code emitter lives at
+[`library/kernels/common/gdn_decode.py`](../../../kernels/common/gdn_decode.py).
 
 **GDN prefill** is driven from
 [`library/builders/gfx950/kda/gdn_prefill.py`](../../kda/gdn_prefill.py) and runs

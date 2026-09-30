@@ -22,7 +22,7 @@ One token per sequence, for a batch of sequences generated concurrently. GDN
 uses one scalar decay per head; KDA uses one decay per K channel. Kernel and
 drivers live under `library/` (`library -> platform` one-way):
 
-- `library/kernels/gfx950/gdn_decode.py` -- shared spec, validator and emitter
+- `library/kernels/common/gdn_decode.py` -- shared spec, validator and emitter (gfx942 and gfx950)
 - `library/builders/gfx950/gdn/gdn_decode.py` -- host driver and independent fp32 reference
 - `library/builders/gfx950/gdn/tune.py` -- exhaustive GDN/KDA tile sweep
 - `library/benchmarks/gfx950/gdn/benchmark_gdn_decode.py` -- GDN benchmark

@@ -62,7 +62,7 @@ def _cases(arch):
     """
     from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode_all
     from dispatch.gdn.gfx950 import _TUNED_TILES_KDA
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec, build_gdn_decode
+    from kernels.common.gdn_decode import GdnDecodeSpec, build_gdn_decode
 
     def build(**overrides):
         spec = dc.replace(GdnDecodeSpec(), **overrides)
@@ -225,7 +225,7 @@ def test_gate_kind_actually_moves_the_ir():
     and the kernel name -- otherwise the KDA cases above are pinning nothing and
     two different kernels would share one compile-cache entry.
     """
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec, build_gdn_decode
+    from kernels.common.gdn_decode import GdnDecodeSpec, build_gdn_decode
 
     flavor = _current_flavor()
     gdn = GdnDecodeSpec()
@@ -254,7 +254,7 @@ def test_gdn_cases_carry_no_kda_marker():
     which inherits its gate kind from the spec id in the KDA table) -- so the
     split is on containment, not prefix.
     """
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     assert GdnDecodeSpec().gate_kind == "gdn"
     ids = list(_cases("gfx950"))

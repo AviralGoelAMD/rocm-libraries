@@ -51,7 +51,7 @@ from builders.gfx950.gdn.gdn_decode import (
 )
 from builders.gfx950.gdn.tune import legal_configs, sweep_batch
 from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode
-from kernels.gfx950.gdn_decode import GdnDecodeSpec, gdn_decode_grid
+from kernels.common.gdn_decode import GdnDecodeSpec, gdn_decode_grid
 from rocke.runtime.hip_module import get_device_arch
 
 ARCH = "gfx950"

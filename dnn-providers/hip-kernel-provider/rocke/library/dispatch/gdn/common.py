@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-from kernels.gfx950.gdn_decode import (
+from kernels.common.gdn_decode import (
     # Re-exported, never redeclared. The kernel owns what it covers; dispatch's
     # job is to state that coverage, not to restate it -- a copy drifts in the
     # direction that fails silently, rejecting a shape the kernel has since

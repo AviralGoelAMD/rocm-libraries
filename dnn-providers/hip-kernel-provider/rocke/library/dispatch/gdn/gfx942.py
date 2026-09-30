@@ -3,7 +3,7 @@
 
 """gfx942 candidate registration for GDN decode.
 
-Same arch-neutral emitter as gfx950 (``kernels/gfx950/gdn_decode.py``),
+Same arch-neutral emitter as gfx950 (``kernels/common/gdn_decode.py``),
 validated and compiled for gfx942. The registry owns the configured tile
 space; the kernel validator is the only authority on which configured tiles
 are legal for a request. Production ``auto`` uses one static tile and never
@@ -17,7 +17,7 @@ import dataclasses as dc
 from itertools import product
 from typing import Tuple
 
-from kernels.gfx950.gdn_decode import (
+from kernels.common.gdn_decode import (
     GDN_DTYPES,
     GdnDecodeSpec,
     build_gdn_decode,

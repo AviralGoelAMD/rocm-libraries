@@ -23,7 +23,7 @@ import pytest
 torch = pytest.importorskip("torch", reason="torch required (CPU is enough)")
 
 from builders.gfx950.gdn.gdn_decode import make_inputs, ref_fp32  # noqa: E402
-from kernels.gfx950.gdn_decode import GdnDecodeSpec  # noqa: E402
+from kernels.common.gdn_decode import GdnDecodeSpec  # noqa: E402
 
 
 def _kda_spec(**kw):

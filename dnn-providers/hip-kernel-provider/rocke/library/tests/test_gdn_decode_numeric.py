@@ -88,7 +88,7 @@ def test_the_tolerance_gate_can_actually_fail(harness):
     """
     import torch
 
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     spec = GdnDecodeSpec()
     batch = 4
@@ -123,7 +123,7 @@ def test_the_tolerance_gate_can_actually_fail(harness):
 @pytest.mark.parametrize("batch", [1, 3, 16, 64])
 def test_matches_fp32_reference(harness, batch):
     """Output and updated state both agree with the reference."""
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     out_err, state_err = harness["check"](GdnDecodeSpec(), batch)
     assert out_err <= harness["TOL"], f"output error {out_err:.3e}"
@@ -133,7 +133,7 @@ def test_matches_fp32_reference(harness, batch):
 @requires_device
 def test_simple_reference_path_matches(harness):
     """The one-thread-per-row path is a correctness baseline; keep it working."""
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     out_err, state_err = harness["check"](GdnDecodeSpec(simple=True), 4)
     assert max(out_err, state_err) <= harness["TOL"]
@@ -258,7 +258,7 @@ def test_padding_lanes_are_skipped_and_leave_state_untouched(harness):
     This is the continuous-batching contract: idle slots in a ragged request
     cost nothing and must come back bit-identical.
     """
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     spec = GdnDecodeSpec()
     batch = 8
@@ -281,7 +281,7 @@ def test_padding_lanes_are_skipped_and_leave_state_untouched(harness):
 @requires_device
 def test_mismatched_skip_index_leaves_write_page_untouched(harness):
     """A lane with ``read=-1`` must not write its otherwise-valid target page."""
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     spec = GdnDecodeSpec()
     batch = 8
@@ -311,7 +311,7 @@ def test_large_pool_crosses_the_i32_offset_boundary(harness):
     in the intended slot rather than a wrapped-around one. A read-only fix would
     pass ``out`` yet corrupt a different slot, so the state write is checked too.
     """
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     spec = GdnDecodeSpec()
     hv, dv, dk = spec.num_v_heads, spec.head_v_dim, spec.head_k_dim
@@ -353,7 +353,7 @@ def test_large_pool_crosses_the_i32_offset_boundary(harness):
 @requires_device
 def test_results_are_deterministic(harness):
     """Same inputs, same answer -- no dependence on scheduling or leftovers."""
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     spec = GdnDecodeSpec()
     first = harness["check"](spec, 16)
@@ -364,7 +364,7 @@ def test_results_are_deterministic(harness):
 @requires_device
 def test_state_dtype_variant_is_correct(harness):
     """An f16 recurrent state is a distinct kernel; it must be checked too."""
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec, is_valid_spec
+    from kernels.common.gdn_decode import GdnDecodeSpec, is_valid_spec
 
     spec = dc.replace(GdnDecodeSpec(), state_dtype="f16")
     ok, why = is_valid_spec(spec, arch=ARCH)
@@ -378,7 +378,7 @@ def test_f16_io_variant_is_correct(harness):
     """f16 I/O is an advertised dtype -- ``is_valid_spec`` admits it -- so a
     config the validator says yes to must be numerically checked on device, not
     just assumed. (The default path is bf16 I/O.)"""
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec, is_valid_spec
+    from kernels.common.gdn_decode import GdnDecodeSpec, is_valid_spec
 
     spec = dc.replace(GdnDecodeSpec(), dtype="f16", state_dtype="f16")
     ok, why = is_valid_spec(spec, arch=ARCH)
@@ -389,7 +389,7 @@ def test_f16_io_variant_is_correct(harness):
 
 @requires_device
 def test_f16_io_bf16_state_is_correct(harness):
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     spec = dc.replace(GdnDecodeSpec(), dtype="f16", state_dtype="bf16")
     batch = 8
@@ -419,7 +419,7 @@ def test_use_qk_l2norm_off_matches_reference(harness):
     ~3e-2 rather than the normalized ~1e-2 -- still orders below the O(1) error
     an unbranched (wrong-oracle) reference would produce, so it still catches a
     ref that ignores the flag."""
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     spec = dc.replace(GdnDecodeSpec(), use_qk_l2norm=False)
     out_err, state_err = harness["check"](spec, 8)
@@ -482,7 +482,7 @@ def test_end_to_end_through_the_dispatch_result(harness):
 
 @requires_device
 def test_mismatched_write_skip_leaves_state_untouched(harness):
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     spec, batch, lane = GdnDecodeSpec(), 8, 2
     inp = harness["make_inputs"](spec, batch)
@@ -502,7 +502,7 @@ def test_mismatched_write_skip_leaves_state_untouched(harness):
 
 @requires_device
 def test_paged_reorder_matches_reference(harness):
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     spec, batch = GdnDecodeSpec(), 16
     inp = harness["make_inputs"](spec, batch)
@@ -525,7 +525,7 @@ def test_paged_reorder_matches_reference(harness):
 
 @requires_device
 def test_two_step_continuation(harness):
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     spec, batch = GdnDecodeSpec(), 16
     inp = harness["make_inputs"](spec, batch)
@@ -552,7 +552,7 @@ def test_two_step_continuation(harness):
 
 @requires_device
 def test_state_reset_is_bit_exact(harness):
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     spec, batch = GdnDecodeSpec(), 16
     inp = harness["make_inputs"](spec, batch)

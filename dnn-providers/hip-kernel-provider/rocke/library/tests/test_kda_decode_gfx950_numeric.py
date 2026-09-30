@@ -70,7 +70,7 @@ def harness():
 
 
 def _kda(**kw):
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     return dc.replace(GdnDecodeSpec(), gate_kind="kda", **kw)
 
@@ -94,7 +94,7 @@ def test_kda_simple_path_matches_reference(harness, batch):
 @requires_gfx950
 def test_gdn_simple_path_still_matches_reference(harness):
     """The GDN gate must be untouched by the KDA branch living beside it."""
-    from kernels.gfx950.gdn_decode import GdnDecodeSpec
+    from kernels.common.gdn_decode import GdnDecodeSpec
 
     out_err, state_err = harness["check"](GdnDecodeSpec(simple=True), 4)
 

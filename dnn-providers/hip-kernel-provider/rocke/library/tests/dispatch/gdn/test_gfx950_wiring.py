@@ -29,7 +29,7 @@ from dispatch.gdn.gfx950 import (
     TUNED_SPEC_IDS,
     tile_for_work,
 )
-from kernels.gfx950.gdn_decode import (
+from kernels.common.gdn_decode import (
     gdn_decode_grid,
     gdn_decode_signature,
     is_valid_spec,
@@ -214,7 +214,7 @@ class TestDtypeCoverage(unittest.TestCase):
         tuple would otherwise silently shrink coverage -- every test still
         passes, there are just fewer of them -- which is the quiet direction
         the re-export was meant to prevent."""
-        from kernels.gfx950.gdn_decode import GDN_DTYPES
+        from kernels.common.gdn_decode import GDN_DTYPES
 
         self.assertEqual(set(GDN_DTYPES), {"bf16", "f16"})
         for candidate in gdn_candidates():

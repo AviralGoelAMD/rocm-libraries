@@ -53,8 +53,9 @@ linear-attention decode contract:
 ``blocks_per_v_dim`` workgroups per ``(sequence, value_head)``. Each warp splits
 the ``head_k_dim`` reduction across ``warp_threads_k`` lanes and recombines with
 an XOR butterfly (``quad_perm`` at offsets 1-2, ``ds_swizzle`` wider), so no LDS
-is allocated. Dispatch selects this tile from the gfx950 GDN registry: `auto`
-uses a deterministic static priority, while an explicit `spec_id` pins a tile.
+is allocated. Dispatch selects this tile from the per-arch GDN registry
+(``dispatch/gdn/gfx942.py``, ``dispatch/gdn/gfx950.py``): `auto` uses a
+deterministic static priority, while an explicit `spec_id` pins a tile.
 
 ``simple=True`` is the v1 reference: one workgroup per ``(sequence, value_head)``,
 ``head_v_dim`` threads, thread ``t`` owning state row ``t`` (the full
@@ -65,10 +66,12 @@ VGPR-heavy by construction. It is **not reachable through dispatch**; it exists
 as the correctness baseline the warp-tiled path is validated against, and is
 selected only by naming the spec directly (see ``ALGORITHM.md`` section 4.7).
 
-Built for gfx950 (wave64) and placed alongside the KDA chunkwise kernel in
-``kernels/gfx950/``; the ``arch`` argument is a validation/target hook, not a
-portability claim -- a new arch adds its own tuned specs here rather than
-importing across folders.
+Shared by gfx942 and gfx950, hence ``kernels/common/``. The emitter uses no
+arch-specific instructions (no MFMA; VALU, DPP/``ds_swizzle`` and ``exp2``
+only), so both arches emit identical IR; ``arch`` enters as the validation
+target in :func:`is_valid_spec` (wave size, max threads per block) and later
+as the compile target. An arch whose hardware needs a different emission gets
+its own emitter rather than a branch here.
 """
 
 from __future__ import annotations

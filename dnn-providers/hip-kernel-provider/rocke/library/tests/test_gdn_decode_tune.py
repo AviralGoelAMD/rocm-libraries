@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 from builders.gfx950.gdn import tune
 from dispatch.gdn.gfx950 import BLOCKS_PER_V_DIM, NUM_WARPS, WARP_THREADS_K
-from kernels.gfx950.gdn_decode import GdnDecodeSpec, is_valid_spec
+from kernels.common.gdn_decode import GdnDecodeSpec, is_valid_spec
 
 
 def test_legal_configs_reuses_registry_tile_space():
