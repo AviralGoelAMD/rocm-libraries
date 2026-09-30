@@ -41,7 +41,10 @@ ARCH = "gfx942"
 NUM_WARPS = (1, 2, 4, 8, 16)
 WARP_THREADS_K = (1, 2, 4, 8, 16, 32)
 BLOCKS_PER_V_DIM = (1, 2, 4, 8, 16, 32)
-# Provisional: the gfx950 default, legal on gfx942 but not yet measured here.
+# Measured on MI300X with ``tune.py --arch gfx942`` over (Hk, Hv) in
+# {(16, 32), (8, 16), (4, 8)} x batch {1, 16, 64, 256}: the best single tile by
+# geomean against each cell's fastest legal tile, stable across repeat runs.
+# Re-measure after any emitter, compiler or tile-space change.
 DEFAULT_TILE = (2, 16, 8)
 
 _LEXICOGRAPHIC_TILES = tuple(product(NUM_WARPS, WARP_THREADS_K, BLOCKS_PER_V_DIM))

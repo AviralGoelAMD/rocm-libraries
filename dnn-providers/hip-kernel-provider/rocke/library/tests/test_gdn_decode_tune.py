@@ -111,6 +111,42 @@ def test_main_reports_dispatcher_default_outside_top_rows(monkeypatch, capsys):
     assert "consider DEFAULT_TILE = (4, 16, 8)" in output
 
 
+def test_main_targets_the_requested_arch(monkeypatch, capsys):
+    requested = []
+    monkeypatch.setattr(tune, "device_is_visible", lambda: True)
+
+    def fake_results(request):
+        requested.append(request.arch)
+        return (object(),)
+
+    monkeypatch.setattr(tune, "dispatch_gdn_decode_all", fake_results)
+    monkeypatch.setattr(
+        tune,
+        "sweep_registry_batch",
+        lambda batch, results: [(5.0, (2, 16, 8), "default", 0.0)],
+    )
+    monkeypatch.setattr(
+        tune,
+        "dispatch_gdn_decode",
+        lambda request: SimpleNamespace(candidate=SimpleNamespace(spec_id="default")),
+    )
+    monkeypatch.setattr("sys.argv", ["tune.py", "--batches", "1", "--arch", "gfx942"])
+
+    assert tune.main() == 0
+    assert requested == ["gfx942"]
+
+
+def test_main_rejects_kda_off_gfx950(monkeypatch):
+    import pytest
+
+    monkeypatch.setattr(
+        "sys.argv", ["tune.py", "--gate-kind", "kda", "--arch", "gfx942"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        tune.main()
+    assert exc.value.code == 2
+
+
 def test_report_gdn_dispatcher_default_keeps_fastest_default(capsys):
     tune.report_gdn_dispatcher_default([(5.0, (2, 16, 8), "default", 0.0)], "default")
 

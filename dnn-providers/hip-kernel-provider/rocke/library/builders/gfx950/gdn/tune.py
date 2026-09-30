@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-"""Measure gfx950 GDN registry candidates and KDA tile-table alternatives.
+"""Measure GDN registry candidates (gfx942/gfx950) and KDA tile-table alternatives.
 
 GDN dispatch has a static registry priority. Its sweep measures every legal
 registered candidate but does not change dispatcher-default selection. KDA keeps
@@ -11,9 +11,10 @@ tile to challenge the selected work band.
 Every candidate is correctness-gated before device timing. Host launch cost can
 hide kernel differences at small batch, so device time is the comparison metric.
 
-Run GDN with its default batch anchors::
+Run GDN with its default batch anchors (``--arch gfx942`` on an MI300-class
+device; the arch must match the device the kernels load on)::
 
-    PYTHONPATH=<rocke>/library:<rocke>/platform/python python3 tune.py
+    PYTHONPATH=<rocke>/library:<rocke>/platform/python python3 tune.py [--arch gfx942]
 
 Run the KDA work-keying study across several head geometries::
 
@@ -34,6 +35,7 @@ from dispatch.gdn.gfx950 import BLOCKS_PER_V_DIM, NUM_WARPS, WARP_THREADS_K
 from kernels.gfx950.gdn_decode import GdnDecodeSpec, is_valid_spec
 
 ARCH = "gfx950"
+GDN_ARCHES = ("gfx942", "gfx950")
 DEFAULT_BATCHES = (1, 16, 64, 256)
 
 # KDA's study deliberately searches the registry's configured tile space. GDN
@@ -130,7 +132,7 @@ def sweep_registry_batch(batch: int, results):
         spec = result.spec
         tile = (spec.num_warps, spec.warp_threads_k, spec.blocks_per_v_dim)
         try:
-            launcher = launcher_for(spec, arch=ARCH)
+            launcher = launcher_for(spec, arch=result.request.arch)
         except Exception as exc:
             print(
                 f"  {result.candidate.spec_id} compile failed: {type(exc).__name__}",
@@ -254,7 +256,15 @@ def main() -> int:
         help="comma-separated num_k_heads/num_v_heads pairs",
     )
     parser.add_argument("--top", type=int, default=8, help="rows to print per cell")
+    parser.add_argument(
+        "--arch",
+        default=ARCH,
+        choices=GDN_ARCHES,
+        help="target arch; must match the visible device (KDA is gfx950-only)",
+    )
     args = parser.parse_args()
+    if args.gate_kind == "kda" and args.arch != ARCH:
+        parser.error(f"KDA decode is registered on {ARCH} only")
 
     if not device_is_visible():
         print("no HIP device visible", file=sys.stderr)
@@ -270,7 +280,7 @@ def main() -> int:
         for batch in batches:
             request = GdnDecodeRequest(
                 batch=batch,
-                arch=ARCH,
+                arch=args.arch,
                 gate_kind=args.gate_kind,
                 num_k_heads=num_k_heads,
                 num_v_heads=num_v_heads,

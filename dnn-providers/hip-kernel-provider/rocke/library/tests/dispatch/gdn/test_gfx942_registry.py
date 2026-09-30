@@ -68,11 +68,17 @@ def test_legal_compile_identities_are_unique():
 
 
 def test_compile_keys_differ_from_gfx950_for_the_same_tile():
-    """Same spec, different arch: the cache must never hand one arch's code to the other."""
+    """Same spec, different arch: the cache must never hand one arch's code to the other.
+
+    The spec itself is arch-neutral, so its hash is shared; the arch must enter
+    the compile key, or the two arches would collide on one cache entry.
+    """
     gfx942 = dispatch_gdn_decode(_req())
     gfx950 = dispatch_gdn_decode(replace(_req(), arch="gfx950"))
     assert _tile(gfx942.spec) == _tile(gfx950.spec)
+    assert gfx942.kernel_id.spec_hash == gfx950.kernel_id.spec_hash
     assert gfx942.kernel_id.compile_key != gfx950.kernel_id.compile_key
+    assert gfx942.candidate.name != gfx950.candidate.name
 
 
 def test_every_legal_pin_round_trips_and_illegal_pin_fails_loudly():
