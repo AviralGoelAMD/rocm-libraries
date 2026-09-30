@@ -17,10 +17,102 @@ import pytest
 
 torch = pytest.importorskip("torch", reason="torch required (CPU build is fine)")
 
-from builders.gfx950.gdn.gdn_decode import make_inputs, prepare
+from builders.gfx950.gdn.gdn_decode import (
+    TOL,
+    compare_to_reference,
+    make_inputs,
+    prepare,
+    ref_fp32,
+)
 from kernels.common.gdn_decode import GdnDecodeSpec
 
 DEVICE = "cpu"
+
+
+@pytest.mark.parametrize(
+    "name,mutate,match",
+    [
+        ("read_indices", lambda t: t.to(torch.int64), "read_indices must be int32"),
+        ("write_indices", lambda t: t.to(torch.int64), "write_indices must be int32"),
+        (
+            "read_indices",
+            lambda t: t[:-1].contiguous(),
+            r"read_indices must be \[batch",
+        ),
+        (
+            "write_indices",
+            lambda t: t[:-1].contiguous(),
+            r"write_indices must be \[batch",
+        ),
+        ("state", lambda t: t[0].contiguous(), r"state must be \[pool"),
+    ],
+)
+def test_index_and_state_layout_guards_reject(name, mutate, match):
+    """The sync-free layout guards, each fed the input it exists to refuse.
+
+    An int64 index read as int32 yields page ids built from half-words -- an
+    arbitrary address, not a clean error -- and an index vector shorter than
+    the batch lets the tail workgroups read past it. A 3-D state has no pool
+    axis for an index to select. The value-range flag is off so only the
+    layout guard can fire.
+    """
+    spec = GdnDecodeSpec()
+    batch = 8
+    inp = make_inputs(spec, batch, device=DEVICE)
+    inp[name] = mutate(inp[name])
+    with pytest.raises(ValueError, match=match):
+        prepare(spec, inp, batch, validate_indices=False)
+
+
+def _correct_launch(spec, batch):
+    """Inputs plus the result a correct kernel would leave behind."""
+    inp = make_inputs(spec, batch, device=DEVICE)
+    ref_out, ref_state = ref_fp32(spec, inp)
+    before = inp["state"].clone()
+    written = inp["write_indices"].long()
+    state = before.clone()
+    state[written] = ref_state.to(state.dtype)
+    out = ref_out.to(inp["query"].dtype)
+    return inp, before, out, state, ref_out, ref_state
+
+
+def test_correctness_gate_passes_a_correct_result():
+    """False-positive probe: a correct result, rounded to the kernel's bf16
+    storage, clears the gate that every numeric lane applies."""
+    spec = GdnDecodeSpec()
+    inp, before, out, state, ref_out, ref_state = _correct_launch(spec, batch=4)
+    errs = compare_to_reference(
+        out, state, before, inp["write_indices"], ref_out, ref_state
+    )
+    assert max(errs) <= TOL, errs
+
+
+@pytest.mark.parametrize("fault", ["output", "written_state", "stray_write"])
+def test_correctness_gate_rejects_each_fault_it_names(fault):
+    """The gate ``check()`` and the tuner use must say no to each failure.
+
+    ``stray_write`` changes one element of a page the kernel was never told to
+    touch by less than ``TOL``. A tolerance comparison cannot see a change that
+    small; the bit-exact untouched-page rule must.
+    """
+    spec = GdnDecodeSpec()
+    inp, before, out, state, ref_out, ref_state = _correct_launch(spec, batch=4)
+    written = inp["write_indices"].long()
+    if fault == "output":
+        out[0, 0, 0, 0] += 1.0
+    elif fault == "written_state":
+        state[written[0], 0, 0, 0] += 1.0
+    else:
+        untouched = sorted(set(range(state.shape[0])) - set(written.tolist()))
+        assert untouched, "make_inputs must leave spare pool pages"
+        page = untouched[0]
+        state[page, 0, 0, 0] += TOL / 2
+        change = (state[page].float() - before[page].float()).abs().max().item()
+        assert 0 < change < TOL, change
+    out_err, state_err = compare_to_reference(
+        out, state, before, inp["write_indices"], ref_out, ref_state
+    )
+    assert max(out_err, state_err) > TOL, (fault, out_err, state_err)
 
 
 def test_out_of_range_index_is_rejected():

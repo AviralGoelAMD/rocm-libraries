@@ -22,6 +22,10 @@ Run::
 
     PYTHONPATH=<rocke>/library:<rocke>/platform/python \\
         python3 gdn_decode.py --batches 1,16 --variant tiled
+
+Kernels compile for the visible device's arch (gfx942 or gfx950) unless
+``--arch`` names it explicitly; a mismatch is refused, because a code object
+built for another arch cannot load.
 """
 
 from __future__ import annotations
@@ -44,7 +48,12 @@ from kernels.common.gdn_decode import (
     is_valid_spec,
 )
 from rocke.helpers.compile import compile_kernel
-from rocke.runtime.launcher import KernelLauncher, LaunchConfig, no_fence
+from rocke.runtime.launcher import (
+    KernelLauncher,
+    LaunchConfig,
+    no_fence,
+    synchronize_and_release,
+)
 
 # bf16 inputs against an fp32 reference. Observed error grows with batch (more
 # state rows accumulate into one output), so the bound is set well above the
@@ -52,7 +61,6 @@ from rocke.runtime.launcher import KernelLauncher, LaunchConfig, no_fence
 # magnitude of a real indexing or reduction bug.
 TOL = 1e-2
 
-_ARCH = "gfx950"
 _LAUNCHER_CACHE: Dict[Tuple, KernelLauncher] = {}
 
 # Spec dtype name -> the torch dtype the kernel is compiled against. The kernel
@@ -61,13 +69,26 @@ _LAUNCHER_CACHE: Dict[Tuple, KernelLauncher] = {}
 _TORCH_DT = {"bf16": torch.bfloat16, "f16": torch.float16}
 
 
-def launcher_for(spec: GdnDecodeSpec, arch: str = _ARCH) -> KernelLauncher:
-    """Compile ``spec`` and wrap it in a launcher, memoised per spec.
+def device_arch() -> str:
+    """The visible device's gfx target, e.g. ``"gfx942"``.
+
+    rocke's own query (``hipDeviceGetAttribute``), which already strips feature
+    flags such as ``:sramecc+:xnack-``.
+    """
+    from rocke.runtime.hip_module import get_device_arch
+
+    return get_device_arch()
+
+
+def launcher_for(spec: GdnDecodeSpec, arch: str | None = None) -> KernelLauncher:
+    """Compile ``spec`` for ``arch`` (default: the visible device) and wrap it
+    in a launcher, memoised per (spec, arch).
 
     Keyed on ``kernel_name()`` because that string is what the compiled code
     object is identified by; every field that changes emitted code is encoded
     in it, so two specs cannot collide on one cache entry.
     """
+    arch = arch or device_arch()
     key = (spec.kernel_name(), arch)
     cached = _LAUNCHER_CACHE.get(key)
     if cached is not None:
@@ -421,36 +442,123 @@ def run(spec: GdnDecodeSpec, inp, launcher: KernelLauncher, batch: int):
     return values["out"], values["state"]
 
 
-def check(
-    spec: GdnDecodeSpec, batch: int, seed: int = 0, arch: str = _ARCH
+def compare_to_reference(
+    out: torch.Tensor,
+    state: torch.Tensor,
+    before: torch.Tensor,
+    write_indices: torch.Tensor,
+    ref_out: torch.Tensor,
+    ref_state: torch.Tensor,
 ) -> Tuple[float, float]:
-    """Run and compare against the reference. Returns ``(out_err, state_err)``.
+    """The correctness gate: ``(out_err, state_err)`` to compare with ``TOL``.
 
     ``state_err`` covers the WHOLE pool, not only the written pages: the pages
     the kernel was not told to touch are compared against their pre-launch
-    contents. Comparing written pages alone cannot see a write that landed in
-    the wrong slot -- the slot written checks out and the slot damaged is never
-    looked at -- and a misplaced write is the failure mode a paged state pool
-    invites.
+    contents (``before``). Comparing written pages alone cannot see a write
+    that landed in the wrong slot -- the slot written checks out and the slot
+    damaged is never looked at -- and a misplaced write is the failure mode a
+    paged state pool invites. An untouched page must come back bit-identical:
+    a misplaced write of real state values can be smaller than ``TOL``, so any
+    change there reports ``inf`` rather than its size.
     """
+    out_err = (out.float() - ref_out).abs().max().item()
+    written = write_indices.long()
+    state_err = (state.float()[written] - ref_state).abs().max().item()
+    untouched = torch.ones(state.shape[0], dtype=torch.bool, device=state.device)
+    untouched[written] = False
+    if untouched.any() and not torch.equal(state[untouched], before[untouched]):
+        state_err = float("inf")
+    return out_err, state_err
+
+
+def check(
+    spec: GdnDecodeSpec, batch: int, seed: int = 0, arch: str | None = None
+) -> Tuple[float, float]:
+    """Run once on ``arch`` (default: the visible device) and apply
+    :func:`compare_to_reference`. Returns ``(out_err, state_err)``."""
     inp = make_inputs(spec, batch, seed=seed)
     ref_out, ref_state = ref_fp32(spec, inp)
     before = inp["state"].clone()
     out, state = run(spec, inp, launcher_for(spec, arch=arch), batch)
-    out_err = (out.float() - ref_out).abs().max().item()
-    written = inp["write_indices"].long()
-    state_err = (state.float()[written] - ref_state).abs().max().item()
-    untouched = torch.ones(state.shape[0], dtype=torch.bool, device=state.device)
-    untouched[written] = False
-    if untouched.any():
-        spill = (state[untouched].float() - before[untouched].float()).abs().max()
-        state_err = max(state_err, spill.item())
-    return out_err, state_err
+    return compare_to_reference(
+        out, state, before, inp["write_indices"], ref_out, ref_state
+    )
 
 
-def bench(spec: GdnDecodeSpec, batch: int, reps: int = 200) -> float:
+def rotation_input_sets(inp, batch: int, rotate_bytes: int):
+    """Input sets to cycle through so one cycle touches ``>= rotate_bytes``.
+
+    ``rotate_bytes=0`` returns ``[inp]``: every launch re-reads the same
+    buffers, which then sit in the last-level cache (warm; debugging only). A
+    positive value clones the read-only inputs K times so each launch reads
+    fresh memory, as a decode step in a real model does (cold). The state pool
+    is shared here because :func:`prepare` clones it per set.
+    """
+    if rotate_bytes <= 0:
+        return [inp]
+    state = inp["state"]
+    touched = 2 * batch * state[0].nbytes + sum(
+        t.nbytes for name, t in inp.items() if name != "state"
+    )
+    copies = max(2, math.ceil(rotate_bytes / touched))
+    return [
+        {**{n: t.clone() for n, t in inp.items() if n != "state"}, "state": state}
+        for _ in range(copies)
+    ]
+
+
+def graph_device_us(launcher: KernelLauncher, prepared, reps: int = 32):
+    """Per-launch device time from a replayed HIP graph, or None if capture fails.
+
+    ``prepared`` is a list of ``(values, cfg)`` from :func:`prepare`; the graph
+    cycles through them, so a list built from :func:`rotation_input_sets`
+    times cold memory. The reported time is the minimum over 20 replays.
+
+    Unfenced launches keep their argument tensors alive in the runtime until a
+    release; this drains and releases on return, or a sweep over many tiles
+    would hold every rotated state pool it ever timed.
+    """
+    try:
+        return _graph_device_us(launcher, prepared, reps)
+    finally:
+        synchronize_and_release()
+
+
+def _graph_device_us(launcher: KernelLauncher, prepared, reps: int):
+    for i in range(max(10, len(prepared))):
+        launch(launcher, *prepared[i % len(prepared)])
+    torch.cuda.synchronize()
+    length = len(prepared) * math.ceil(reps / len(prepared))
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for i in range(length):
+                launch(launcher, *prepared[i % len(prepared)])
+    except Exception:
+        # A failed capture leaves the stream invalidated; resynchronise so the
+        # next caller does not inherit it.
+        torch.cuda.synchronize()
+        return None
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    best = float("inf")
+    for _ in range(20):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        torch.cuda.synchronize()
+        best = min(best, start.elapsed_time(end) * 1e3 / length)
+    return best
+
+
+def bench(
+    spec: GdnDecodeSpec, batch: int, reps: int = 200, arch: str | None = None
+) -> float:
     """Median host-observed launch latency in microseconds."""
-    launcher = launcher_for(spec)
+    launcher = launcher_for(spec, arch=arch)
     values, cfg = prepare(spec, make_inputs(spec, batch), batch)
     for _ in range(50):
         launch(launcher, values, cfg)
@@ -476,30 +584,47 @@ def main() -> int:
     ap.add_argument("--bench", action="store_true", help="also report per-launch time")
     ap.add_argument("--no-check", action="store_true", help="skip the correctness gate")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--arch",
+        default=None,
+        help="target arch (default: the visible device); must match the device",
+    )
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
         print("no HIP device visible", file=sys.stderr)
         return 2
+    from dispatch.gdn import GDN_DECODE_ARCHES
+
+    arch = device_arch()
+    if arch not in GDN_DECODE_ARCHES:
+        print(
+            f"GDN decode supports {GDN_DECODE_ARCHES}; device is {arch}",
+            file=sys.stderr,
+        )
+        return 2
+    if args.arch is not None and args.arch != arch:
+        print(f"--arch {args.arch} does not match the device ({arch})", file=sys.stderr)
+        return 2
 
     spec = GdnDecodeSpec(simple=(args.variant == "simple"))
-    ok, why = is_valid_spec(spec, arch=_ARCH)
+    ok, why = is_valid_spec(spec, arch=arch)
     if not ok:
         print(f"spec rejected: {why}", file=sys.stderr)
         return 2
-    print(f"kernel: {spec.kernel_name()}  block={spec.block_size}")
+    print(f"arch: {arch}  kernel: {spec.kernel_name()}  block={spec.block_size}")
 
     worst = 0.0
     for batch in (int(x) for x in args.batches.split(",")):
         grid = gdn_decode_grid(batch, spec)
         line = f"B={batch:<5d} grid={grid[0]:<7d}"
         if not args.no_check:
-            out_err, state_err = check(spec, batch, seed=args.seed)
+            out_err, state_err = check(spec, batch, seed=args.seed, arch=arch)
             worst = max(worst, out_err, state_err)
             verdict = "OK" if max(out_err, state_err) <= TOL else "FAIL"
             line += f" out_err={out_err:.3e} state_err={state_err:.3e} {verdict}"
         if args.bench:
-            line += f" {bench(spec, batch):8.2f}us"
+            line += f" {bench(spec, batch, arch=arch):8.2f}us"
         print(line)
 
     if args.no_check:

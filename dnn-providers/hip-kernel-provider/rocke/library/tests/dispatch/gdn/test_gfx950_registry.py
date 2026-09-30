@@ -174,6 +174,9 @@ def test_benchmark_reports_missing_candidates_before_selecting_auto(
 
     from benchmarks.gfx950.gdn import benchmark_gdn_decode
 
+    monkeypatch.setattr(
+        benchmark_gdn_decode, "resolve_target", lambda requested: (ARCH, "test device")
+    )
     monkeypatch.setattr(benchmark_gdn_decode, "registered_results", lambda request: ())
     monkeypatch.setattr(
         benchmark_gdn_decode,

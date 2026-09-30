@@ -30,7 +30,7 @@ torch = pytest.importorskip("torch", reason="ROCm torch required")
 
 pytestmark = pytest.mark.gpu
 
-SUPPORTED_ARCHES = ("gfx942", "gfx950")
+from dispatch.gdn import GDN_DECODE_ARCHES as SUPPORTED_ARCHES  # noqa: E402
 
 
 def _device_arch() -> str | None:
@@ -73,50 +73,6 @@ def harness():
         "prepare": prepare,
         "ref_fp32": ref_fp32,
     }
-
-
-@requires_device
-def test_the_tolerance_gate_can_actually_fail(harness):
-    """Prove the comparison fires, by handing it a deliberately wrong result.
-
-    Every other lane in this file asserts ``err <= TOL``. None of them shows
-    that the comparison can say no -- so a gate that compared the wrong tensor,
-    or carried a tolerance nothing could exceed, would look exactly like a
-    passing suite. This arm perturbs a real result and asserts both halves of
-    the gate reject it: the output error AND the state error, since the state
-    is the half a decode step can get wrong for every token that follows.
-    """
-    import torch
-
-    from kernels.common.gdn_decode import GdnDecodeSpec
-
-    spec = GdnDecodeSpec()
-    batch = 4
-    inp = harness["make_inputs"](spec, batch)
-    ref_out, ref_state = harness["ref_fp32"](spec, inp)
-
-    # A perturbation far above TOL, applied to one element of each tensor.
-    bad_out = ref_out.clone()
-    bad_out[0, 0, 0, 0] += 1.0
-    bad_state = ref_state.clone()
-    bad_state[0, 0, 0] += 1.0
-
-    out_err = (bad_out.float() - ref_out).abs().max().item()
-    state_err = (bad_state.float() - ref_state).abs().max().item()
-    assert out_err > harness["TOL"], "a wrong output slipped under the tolerance"
-    assert state_err > harness["TOL"], "a wrong state slipped under the tolerance"
-
-    # And the untouched-page half of check(): scribbling on a page the kernel
-    # was never told to write must register, or a misplaced write is invisible.
-    written = inp["write_indices"].long()
-    untouched = torch.ones(
-        inp["state"].shape[0], dtype=torch.bool, device=inp["state"].device
-    )
-    untouched[written] = False
-    assert untouched.any(), (
-        "make_inputs must leave spare pool pages, or the misplaced-write "
-        "detector in check() has nothing to compare"
-    )
 
 
 @requires_device
@@ -213,6 +169,43 @@ def test_all_d64_registry_candidates_are_correct(harness):
     assert len(results) == 20
     for result in results:
         _assert_dispatch_result_matches_fp32(harness, result, batch=1)
+
+
+@requires_device
+@pytest.mark.parametrize(
+    "head_k_dim,head_v_dim",
+    [
+        (256, 256),
+        (192, 192),
+        (96, 96),
+        (32, 32),
+        (128, 256),
+        (256, 128),
+        (64, 128),
+        (128, 64),
+        (128, 8),
+    ],
+)
+def test_other_served_head_geometries_are_correct(harness, head_k_dim, head_v_dim):
+    """Dispatch serves every head geometry the validator admits, not only the
+    D128 and D64 lanes above; each one it serves must be proven on device.
+    Covers ``auto`` plus the first and last legal pins of each geometry."""
+    from dispatch.gdn import (
+        GdnDecodeRequest,
+        dispatch_gdn_decode,
+        dispatch_gdn_decode_all,
+    )
+
+    request = GdnDecodeRequest(
+        batch=4, arch=ARCH, head_k_dim=head_k_dim, head_v_dim=head_v_dim
+    )
+    results = dispatch_gdn_decode_all(request)
+    assert results, "geometry is expected to be served"
+    chosen = {}
+    for result in (dispatch_gdn_decode(request), results[0], results[-1]):
+        chosen.setdefault(result.candidate.spec_id, result)
+    for result in chosen.values():
+        _assert_dispatch_result_matches_fp32(harness, result, batch=4)
 
 
 @requires_device
