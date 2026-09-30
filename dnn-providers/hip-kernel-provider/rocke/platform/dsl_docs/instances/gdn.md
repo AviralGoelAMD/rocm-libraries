@@ -8,7 +8,7 @@ so cost per token does not grow with sequence length.
 
 One page per family, as with [`kda.md`](kda.md) and
 [`attention.md`](attention.md). The **Decode** section documents the shared
-gfx950 GDN/KDA emitter; the **Prefill** section documents GDN mode on the shared
+GDN/KDA decode emitter (GDN on gfx942 and gfx950, KDA on gfx950); the **Prefill** section documents GDN mode on the shared
 KDA chunkwise pair.
 
 For the equation and GPU-mapping walkthrough, see
@@ -119,11 +119,14 @@ GDN declares 180 stable tile identities per arch (gfx942 and gfx950).
 `is_valid_spec()` filters that configured space per request; the default D128
 request admits 54 on either arch. Production `auto` deterministically prefers
 the arch's static `DEFAULT_TILE` whenever it is legal -- `(num_warps=2,
-warp_threads_k=16, blocks_per_v_dim=8)` on both arches, each measured on its
-own hardware. It never measures at runtime and does not select by batch. An
+warp_threads_k=16, blocks_per_v_dim=8)` on both arches. gfx942's was chosen by
+the `tune.py` static-tile summary on MI300X (cold cache, D128, bf16); gfx950's
+is the emitter's default tile, not re-chosen by a registry-wide sweep. Each
+module's comment states its basis. `auto` never measures at runtime and does
+not select by batch. An
 explicit `spec_id`, such as `nw4_wtk16_bpv8`, selects an exact legal GDN
 candidate for benchmarking or replay; the same `spec_id` names the same tile on
-either arch. Re-measure a default with `tune.py --arch <gfx942|gfx950>`.
+either arch. Re-measure a default by running `tune.py` on a device of that arch.
 
 KDA keeps its separately measured table keyed by
 `work = batch * num_v_heads`, so tensor-parallel head sharding maps to the same
@@ -145,7 +148,8 @@ An explicit `spec_id` selects one legal candidate of the requested gate kind.
 Candidate admission ends in `is_valid_spec()`, so dispatch cannot offer a tile
 that the kernel rejects.
 
-GDN decode runs on gfx942 and gfx950; the KDA gate is gfx950-only. `bf16` and
+GDN decode runs on gfx942 and gfx950. The KDA gate runs on gfx950; on gfx942 it
+is not yet validated, and dispatch refuses it as `NOT_YET_IMPLEMENTED`. `bf16` and
 `f16` activation/state dtypes are supported and need
 not match. Head geometry is constrained by the validator. KDA's production
 fused mode and benchmark-only precomputed-log-decay mode are both numerically

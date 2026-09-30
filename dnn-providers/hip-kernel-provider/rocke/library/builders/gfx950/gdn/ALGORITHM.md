@@ -634,10 +634,14 @@ Widening the range needs nested chunking or per-token rescaling.
 **Follow-ups.**
 
 1. A fused-path GDN prefill kernel (§5.4).
-2. gfx942 support; KDA work bands are arch-specific and need re-sweeping.
+2. KDA decode on gfx942. The emitter and validator already accept it; it needs on-device
+   validation and a gfx942 sweep of the arch-specific KDA work bands. Until then gfx942 dispatch
+   refuses the KDA gate as `NOT_YET_IMPLEMENTED`.
 3. Extending the supported decay range.
 4. Scan-side parallelism beyond the current `value_splits` cap, or a shorter serial chain — the scan
    is the critical path at small `BH` (§5.4).
 5. Host-struct consolidation of the GDN and KDA request lineage.
-6. Machine-checked byte-identity for the cross-engine surfaces this family touches — currently
-   reasoned and Python-verified.
+6. Machine-checked byte-identity for the prefill surfaces this family touches — currently
+   reasoned and Python-verified. Decode has it: `test_gdn_decode_golden.py` lowers every golden
+   case through both engines and requires identical LLVM IR (skipped when `rocke_engine` is not
+   built).
