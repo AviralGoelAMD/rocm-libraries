@@ -106,7 +106,7 @@ as described in the notes.
 
 | Instance | gfx942 | gfx950 | gfx1151 | Notes |
 |---|:--:|:--:|:--:|---|
-| `gdn_decode` | ❌ | ✅ | ❌ | gated delta rule, single-token decode over a paged recurrent state; no softmax |
+| `gdn_decode` | ✅ | ✅ | ❌ | gated delta rule, single-token decode over a paged recurrent state; no softmax. gfx942 serves the scalar GDN gate only; the per-channel KDA gate is gfx950-only |
 | `gdn_prefill` | ❌ | ✅ | ❌ | gated delta rule, chunkwise prefill, **bf16 only**; the KDA chunkwise pair in `gate_kind="gdn"` mode, two launches (`chunk_prep` then `chunk_scan`), no fused default |
 ---
 
@@ -169,12 +169,14 @@ as described in the notes.
 - gfx942/gfx950 cells use a portable f16 16x16x16 config; an instance marked ❌
   for a CDNA arch lacks the specific atom that config selects (e.g. `mfma_gemm`
   and `direct_conv_16c` need the CDNA4 16x16x32 atom absent on gfx942).
-- **`gdn_decode` dispatch is gfx950-only by registration and a wave64 target
-  match.** Its candidates are registered only for gfx950 and create a default
-  `GdnDecodeSpec` with `wave_size=64`. `is_valid_spec` requires that value to
-  match the target's hardware wave size, rejecting wave32 targets before it
-  considers the thread-block limit. The lane mapping and XOR butterfly depend
-  on this match. Adding an arch requires a new module under
-  `library/dispatch/gdn/` plus a tuning run. This instance is GPU-numeric-verified on
-  gfx950 against an fp32 reference, covering both the output and the in-place
-  recurrent-state update.
+- **`gdn_decode` dispatch is registered for gfx942 and gfx950 and requires a
+  wave64 target.** One arch-neutral emitter (`library/kernels/common/gdn_decode.py`)
+  serves both; each arch has its own registry module under
+  `library/dispatch/gdn/` with its own measured static default. Candidates
+  create a default `GdnDecodeSpec` with `wave_size=64`; `is_valid_spec` requires
+  that value to match the target's hardware wave size, rejecting wave32 targets
+  before it considers the thread-block limit. The lane mapping and XOR butterfly
+  depend on this match. Adding an arch requires a new module under
+  `library/dispatch/gdn/` plus a tuning run. This instance is GPU-numeric-verified
+  on gfx942 and gfx950 against an fp32 reference, covering both the output and
+  the in-place recurrent-state update.

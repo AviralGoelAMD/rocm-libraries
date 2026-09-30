@@ -32,17 +32,19 @@ retune either decode mode or the GDN prefill path.
 | File | Purpose |
 |---|---|
 | [`gdn_decode.py`](gdn_decode.py) | Compile a spec, build inputs, launch the shared decode emitter, and compare with the independent fp32 reference |
-| [`tune.py`](tune.py) | Measure legal GDN registry candidates or KDA work-keyed candidates |
+| [`tune.py`](tune.py) | Measure legal GDN registry candidates (`--arch gfx942\|gfx950`) or KDA work-keyed candidates |
 | [`ALGORITHM.md`](ALGORITHM.md) | Explain the gated delta rule, gate kinds, and GPU mapping |
 | [`library/benchmarks/gfx950/gdn/benchmark_gdn_decode.py`](../../../benchmarks/gfx950/gdn/benchmark_gdn_decode.py) | Benchmark every legal GDN registry candidate and the static dispatcher default |
 | [`library/benchmarks/gfx950/gdn/benchmark_kda_decode.py`](../../../benchmarks/gfx950/gdn/benchmark_kda_decode.py) | Benchmark KDA fused/precomputed/simple variants from the dispatcher; optionally sweep all legal tiles |
-| [`library/dispatch/gdn/gfx950.py`](../../../dispatch/gdn/gfx950.py) | Declare the GDN registry/static default and KDA work-keyed table |
-| [`library/tests/dispatch/gdn/test_gfx950_registry.py`](../../../tests/dispatch/gdn/test_gfx950_registry.py) | CPU GDN registry count, identity, legality, and selection coverage |
+| [`library/dispatch/gdn/gfx950.py`](../../../dispatch/gdn/gfx950.py) | Declare the gfx950 GDN registry/static default and KDA work-keyed table |
+| [`library/dispatch/gdn/gfx942.py`](../../../dispatch/gdn/gfx942.py) | Declare the gfx942 GDN registry/static default (GDN gate only) |
+| [`library/tests/dispatch/gdn/test_gfx950_registry.py`](../../../tests/dispatch/gdn/test_gfx950_registry.py) | CPU gfx950 GDN registry count, identity, legality, and selection coverage |
+| [`library/tests/dispatch/gdn/test_gfx942_registry.py`](../../../tests/dispatch/gdn/test_gfx942_registry.py) | CPU gfx942 GDN registry count, identity, legality, selection, and cross-arch cache-key coverage |
 | [`library/tests/test_gdn_decode_spec.py`](../../../tests/test_gdn_decode_spec.py) | CPU validator and IR-emission coverage |
 | [`library/tests/test_gdn_decode_prepare.py`](../../../tests/test_gdn_decode_prepare.py) | Host-side input validation: shapes, dtypes, contiguity, pool-index range |
 | [`library/tests/test_gdn_decode_numeric.py`](../../../tests/test_gdn_decode_numeric.py) | On-device GDN output and state correctness (gfx942 or gfx950, whichever the device is) |
 | [`library/tests/test_kda_decode_gfx950_numeric.py`](../../../tests/test_kda_decode_gfx950_numeric.py) | On-device KDA output/state correctness and dispatch-to-launch coverage |
-| [`library/tests/test_gdn_decode_golden.py`](../../../tests/test_gdn_decode_golden.py) | Detect unexpected LLVM-IR changes in both gate kinds |
+| [`library/tests/test_gdn_decode_golden.py`](../../../tests/test_gdn_decode_golden.py) | Per-arch LLVM-IR golden hashes and C++/Python engine byte-identity |
 | [`library/builders/gfx950/kda/gdn_prefill.py`](../../kda/gdn_prefill.py) | Drive chunkwise prefill (the KDA chunkwise kernels in `gate_kind="gdn"` mode) and hold its fp64 oracle |
 | [`library/benchmarks/gfx950/gdn/sweep_prefill_value_splits.py`](../../../benchmarks/gfx950/gdn/sweep_prefill_value_splits.py) | Sweep `value_splits` for prefill at a given `batch_heads` |
 | [`library/tests/dispatch/gdn/test_gfx950_prefill_wiring.py`](../../../tests/dispatch/gdn/test_gfx950_prefill_wiring.py) | Prefill dispatch: candidate selection, the two-launch guard, launch geometry |
@@ -60,7 +62,7 @@ export PYTHONPATH="$PWD/library:$PWD/platform/python${PYTHONPATH:+:$PYTHONPATH}"
 
 The driver, benchmark, tuning sweep, and numeric tests require:
 
-- ROCm torch with a visible gfx950 GPU;
+- ROCm torch with a visible gfx942 or gfx950 GPU (KDA: gfx950 only);
 - a working ROCm comgr library for compiling the emitted LLVM IR;
 - the rocKE Python package from `platform/python`.
 
@@ -145,8 +147,13 @@ them fastest first:
 
 ```bash
 python3 library/builders/gfx950/gdn/tune.py \
-  --gate-kind gdn --batches 1,16,64,256 --top 5
+  --gate-kind gdn --batches 1,16,64,256 --top 5 [--arch gfx942]
 ```
+
+`--arch` (default `gfx950`) must match the visible device. To choose an arch's
+static default, run every legal tile over several head geometries
+(`--geometries 16/32,8/16,4/8 --top 60`) and pick the tile with the best geomean
+against each cell's fastest legal tile.
 
 For every GDN cell, it also reports the static dispatcher default, the fastest
 legal candidate, the default's rank and time ratio, and a manual
@@ -172,6 +179,7 @@ python3 -m pytest \
   library/tests/test_gdn_decode_spec.py \
   library/tests/test_gdn_decode_golden.py \
   library/tests/dispatch/gdn/test_gfx950_registry.py \
+  library/tests/dispatch/gdn/test_gfx942_registry.py \
   library/tests/dispatch/gdn/test_gfx950_wiring.py \
   library/tests/test_gdn_decode_tune.py \
   -m "not gpu"
@@ -185,6 +193,11 @@ python3 -m pytest \
   library/tests/test_kda_decode_gfx950_numeric.py \
   -m gpu
 ```
+
+The golden test also lowers every case through the C++ engine and requires
+byte-identical IR. It skips when `rocke_engine` is not importable; build it from
+`platform/cpp/bindings/` (see its README) and put the build directory on
+`PYTHONPATH` to exercise it.
 
 Re-record the golden LLVM-IR hashes **only when an emitted-code change is
 intentional and reviewed**:

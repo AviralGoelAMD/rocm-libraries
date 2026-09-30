@@ -1,8 +1,8 @@
 # GDN/KDA gated-delta decode and prefill — algorithm and design
 
-> **Scope.** The shared gated-delta family on gfx950: a single-token **decode**
-> emitter that serves GDN and KDA, plus chunkwise **prefill** kernels where GDN
-> ships as a mode of the existing KDA implementation.
+> **Scope.** The shared gated-delta family: a single-token **decode** emitter
+> that serves GDN (gfx942 and gfx950) and KDA (gfx950), plus gfx950 chunkwise
+> **prefill** kernels where GDN ships as a mode of the existing KDA implementation.
 > This document specifies *what* the kernels compute and *why they are shaped the way they are*.
 > It is a specification, not a tuning history, and it carries **no measurements** — latency is
 > recorded in the internal perf repository per repository compliance.
@@ -78,7 +78,7 @@ creates explicit control flow. The path from a request to a running kernel is
 
 ```
 request → dispatch picks a spec → builder emits KernelDef → rocKE lowers to LLVM IR
-        → comgr compiles a gfx950 code object → launcher packs kernargs and launches
+        → comgr compiles a code object for the target arch → launcher packs kernargs and launches
 ```
 
 so a spec is the unit that dispatch selects, that the golden test pins, and that the validators

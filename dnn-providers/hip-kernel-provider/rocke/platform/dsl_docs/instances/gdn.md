@@ -115,12 +115,15 @@ only the first lane of each group stores the output scalar.
 `blocks_per_v_dim` splits one head's value dimension across workgroups to
 manufacture parallelism when the natural grid is small.
 
-GDN declares 180 stable tile identities. `is_valid_spec()` filters that
-configured space per request; the default D128 request admits 54. Production
-`auto` deterministically prefers `(num_warps=2, warp_threads_k=16,
-blocks_per_v_dim=8)` whenever it is legal. It never measures at runtime and
-does not select by batch. An explicit `spec_id`, such as `nw4_wtk16_bpv8`,
-selects an exact legal GDN candidate for benchmarking or replay.
+GDN declares 180 stable tile identities per arch (gfx942 and gfx950).
+`is_valid_spec()` filters that configured space per request; the default D128
+request admits 54 on either arch. Production `auto` deterministically prefers
+the arch's static `DEFAULT_TILE` whenever it is legal -- `(num_warps=2,
+warp_threads_k=16, blocks_per_v_dim=8)` on both arches, each measured on its
+own hardware. It never measures at runtime and does not select by batch. An
+explicit `spec_id`, such as `nw4_wtk16_bpv8`, selects an exact legal GDN
+candidate for benchmarking or replay; the same `spec_id` names the same tile on
+either arch. Re-measure a default with `tune.py --arch <gfx942|gfx950>`.
 
 KDA keeps its separately measured table keyed by
 `work = batch * num_v_heads`, so tensor-parallel head sharding maps to the same
@@ -142,7 +145,8 @@ An explicit `spec_id` selects one legal candidate of the requested gate kind.
 Candidate admission ends in `is_valid_spec()`, so dispatch cannot offer a tile
 that the kernel rejects.
 
-gfx950 only. `bf16` and `f16` activation/state dtypes are supported and need
+GDN decode runs on gfx942 and gfx950; the KDA gate is gfx950-only. `bf16` and
+`f16` activation/state dtypes are supported and need
 not match. Head geometry is constrained by the validator. KDA's production
 fused mode and benchmark-only precomputed-log-decay mode are both numerically
 covered.
@@ -154,7 +158,8 @@ PYTHONPATH=library:platform/python python3 -m pytest \
   library/tests/test_gdn_decode_spec.py \
   library/tests/test_gdn_decode_golden.py \
   library/tests/dispatch/gdn/test_gfx950_wiring.py \
-  library/tests/dispatch/gdn/test_gfx950_registry.py
+  library/tests/dispatch/gdn/test_gfx950_registry.py \
+  library/tests/dispatch/gdn/test_gfx942_registry.py
 ```
 
 The on-device output and recurrent-state checks are in
