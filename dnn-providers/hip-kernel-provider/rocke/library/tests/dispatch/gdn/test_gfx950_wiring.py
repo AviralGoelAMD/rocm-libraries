@@ -83,10 +83,10 @@ class TestStaticSelection(unittest.TestCase):
 
 
 class TestRequestRejection(unittest.TestCase):
-    def test_other_arch_is_rejected(self):
+    def test_unregistered_arch_is_rejected(self):
         with self.assertRaises(ValueError) as ctx:
-            dispatch_gdn_decode(_req(8, arch="gfx942"))
-        self.assertIn("gfx942", str(ctx.exception))
+            dispatch_gdn_decode(_req(8, arch="gfx90a"))
+        self.assertIn("gfx90a", str(ctx.exception))
 
     def test_head_ratio_must_divide(self):
         with self.assertRaises(ValueError) as ctx:

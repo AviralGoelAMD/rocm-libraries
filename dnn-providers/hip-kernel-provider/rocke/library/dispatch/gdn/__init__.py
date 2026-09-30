@@ -24,6 +24,7 @@ from rocke.dispatch.core import (
     stable_json_hash,
 )
 
+from . import gfx942
 from . import gfx950
 from . import prefill_gfx950
 from .common import (
@@ -41,7 +42,7 @@ from .prefill_common import (
     GdnPrefillRequest,
 )
 
-_ARCH_MODULES = (gfx950,)
+_ARCH_MODULES = (gfx942, gfx950)
 
 GDN_REGISTRY = CandidateRegistry(
     FAMILY, dim_vocabulary=GDN_DIM_VOCABULARY, require_build=True
