@@ -21,6 +21,10 @@ the same change so the diff states it out loud::
 
     python3 library/tests/test_gdn_decode_golden.py --write
 
+Each arch that registers GDN decode has its own fixture, covering that arch's
+legal registered tiles. KDA decode is gfx950-only, so only the gfx950 fixture
+carries KDA cases.
+
 Lowering needs no GPU and no comgr, so this runs anywhere.
 """
 
@@ -32,11 +36,16 @@ import json
 import sys
 from pathlib import Path
 
-_GOLDEN = (
-    Path(__file__).resolve().parent / "golden" / "gdn_decode_gfx950_ir_sha256.json"
-)
+import pytest
+
+_ARCHES = ("gfx942", "gfx950")
+_GOLDENS = {
+    arch: Path(__file__).resolve().parent
+    / "golden"
+    / f"gdn_decode_{arch}_ir_sha256.json"
+    for arch in _ARCHES
+}
 _FLAVORS = ("llvm20", "llvm22", "llvm23")
-_ARCH = "gfx950"
 
 # Pin the library root ahead of everything on sys.path so that running this file
 # directly does not let tests/dispatch/ shadow the real library/dispatch package.
@@ -45,7 +54,7 @@ if sys.path and sys.path[0] != _LIB_ROOT:
     sys.path.insert(0, _LIB_ROOT)
 
 
-def _cases():
+def _cases(arch):
     """case id -> zero-arg builder returning a KernelDef.
 
     Covers the default spec, the reference path, and every legal registered
@@ -57,31 +66,33 @@ def _cases():
 
     def build(**overrides):
         spec = dc.replace(GdnDecodeSpec(), **overrides)
-        return lambda: build_gdn_decode(spec, arch=_ARCH)
+        return lambda: build_gdn_decode(spec, arch=arch)
 
     cases = {
         "default": build(),
         "simple": build(simple=True),
         "no_l2norm": build(use_qk_l2norm=False),
+    }
+    if arch == "gfx950":
         # KDA gate kind. Pinned for the same reason the GDN cases are: the
         # per-channel gate is emitted code, and a refactor that changed it
         # without breaking it would pass every other test in the tree.
-        "kda_default": build(gate_kind="kda"),
-        "kda_simple": build(gate_kind="kda", simple=True),
-        "kda_raw_gate": build(gate_kind="kda", fuse_gate=False),
-    }
-    request = GdnDecodeRequest(batch=16, arch=_ARCH)
+        cases["kda_default"] = build(gate_kind="kda")
+        cases["kda_simple"] = build(gate_kind="kda", simple=True)
+        cases["kda_raw_gate"] = build(gate_kind="kda", fuse_gate=False)
+    request = GdnDecodeRequest(batch=16, arch=arch)
     for result in dispatch_gdn_decode_all(request):
         cases[f"registered_{result.candidate.spec_id}"] = (
-            lambda spec=result.spec: build_gdn_decode(spec, arch=_ARCH)
+            lambda spec=result.spec: build_gdn_decode(spec, arch=arch)
         )
-    for _, tile, spec_id in _TUNED_TILES_KDA:
-        cases[f"tuned_{spec_id}"] = build(
-            gate_kind="kda",
-            num_warps=tile[0],
-            warp_threads_k=tile[1],
-            blocks_per_v_dim=tile[2],
-        )
+    if arch == "gfx950":
+        for _, tile, spec_id in _TUNED_TILES_KDA:
+            cases[f"tuned_{spec_id}"] = build(
+                gate_kind="kda",
+                num_warps=tile[0],
+                warp_threads_k=tile[1],
+                blocks_per_v_dim=tile[2],
+            )
     return cases
 
 
@@ -91,22 +102,22 @@ def _current_flavor():
     return _resolve_llvm_flavor()
 
 
-def _sha_for(build, flavor):
+def _sha_for(build, flavor, arch):
     from rocke.core.lower_llvm import _lower_kernel_to_llvm_python
 
-    llvm = _lower_kernel_to_llvm_python(build(), arch=_ARCH, llvm_flavor=flavor)
+    llvm = _lower_kernel_to_llvm_python(build(), arch=arch, llvm_flavor=flavor)
     data = llvm.encode("utf-8")
     return hashlib.sha256(data).hexdigest(), len(data)
 
 
-def _build_doc():
-    doc = {"schema": "gdn_decode_gfx950.ir_golden_sha256/v1", "flavors": {}}
+def _build_doc(arch):
+    doc = {"schema": f"gdn_decode_{arch}.ir_golden_sha256/v1", "flavors": {}}
     failures = []
     for flavor in _FLAVORS:
         cases = {}
-        for cid, build in _cases().items():
+        for cid, build in _cases(arch).items():
             try:
-                sha, nbytes = _sha_for(build, flavor)
+                sha, nbytes = _sha_for(build, flavor, arch)
             except Exception as exc:  # pragma: no cover - diagnostic only
                 failures.append(f"{flavor}/{cid}: {exc}")
                 continue
@@ -120,103 +131,82 @@ def _build_doc():
     return doc
 
 
-def test_gdn_decode_ir_matches_golden():
-    import pytest
-
-    if not _GOLDEN.exists():
-        pytest.skip("gdn_decode golden fixture missing; generate with --write")
-    golden = json.loads(_GOLDEN.read_text())
+def _recorded(arch):
+    golden = _GOLDENS[arch]
+    if not golden.exists():
+        pytest.skip(f"gdn_decode {arch} golden fixture missing; generate with --write")
     flavor = _current_flavor()
-    recorded = golden.get("flavors", {}).get(flavor)
+    recorded = json.loads(golden.read_text()).get("flavors", {}).get(flavor)
     if not recorded:
-        pytest.skip(f"no gdn_decode golden recorded for llvm flavor {flavor!r}")
+        pytest.skip(f"no gdn_decode {arch} golden recorded for llvm flavor {flavor!r}")
+    return flavor, recorded
+
+
+@pytest.mark.parametrize("arch", _ARCHES)
+def test_gdn_decode_ir_matches_golden(arch):
+    flavor, recorded = _recorded(arch)
     drift = []
-    for cid, build in _cases().items():
+    for cid, build in _cases(arch).items():
         entry = recorded["cases"].get(cid, {})
         want = entry.get("sha256")
         if not want:
             drift.append(f"{cid}: no sha256 recorded ({entry})")
             continue
-        got, _ = _sha_for(build, flavor)
+        got, _ = _sha_for(build, flavor, arch)
         if got != want:
             drift.append(f"{cid}: {want} -> {got}")
     assert not drift, (
-        "gdn_decode IR drift vs golden (re-record with --write if intended):\n  "
-        + "\n  ".join(drift)
+        f"gdn_decode {arch} IR drift vs golden (re-record with --write if "
+        "intended):\n  " + "\n  ".join(drift)
     )
 
 
-def test_every_shipped_configuration_is_recorded():
+@pytest.mark.parametrize("arch", _ARCHES)
+def test_every_shipped_configuration_is_recorded(arch):
     """A new tuned tile must arrive with a golden entry, not silently uncovered."""
-    import pytest
-
-    if not _GOLDEN.exists():
-        pytest.skip("gdn_decode golden fixture missing; generate with --write")
-    golden = json.loads(_GOLDEN.read_text())
-    flavor = _current_flavor()
-    recorded = golden.get("flavors", {}).get(flavor)
-    if not recorded:
-        pytest.skip(f"no gdn_decode golden recorded for llvm flavor {flavor!r}")
+    _, recorded = _recorded(arch)
     missing = sorted(
-        cid for cid in _cases() if not recorded["cases"].get(cid, {}).get("sha256")
+        cid for cid in _cases(arch) if not recorded["cases"].get(cid, {}).get("sha256")
     )
     assert not missing, f"configurations without a SHA-256: {missing}"
 
 
-def test_golden_ir_check_rejects_entry_without_sha256(monkeypatch, tmp_path):
-    import pytest
-
-    monkeypatch.setattr(sys.modules[__name__], "_cases", lambda: {"default": object()})
+def _synthetic_fixture(monkeypatch, tmp_path):
+    """Point the gfx950 golden at a fixture whose only case failed to lower."""
+    monkeypatch.setattr(
+        sys.modules[__name__], "_cases", lambda arch: {"default": object()}
+    )
     fixture = tmp_path / "gdn_decode_gfx950_ir_sha256.json"
     fixture.write_text(
         json.dumps(
             {
                 "flavors": {
                     _current_flavor(): {
-                        "cases": {
-                            cid: {"error": "synthetic lowering failure"}
-                            for cid in _cases()
-                        }
+                        "cases": {"default": {"error": "synthetic lowering failure"}}
                     }
                 }
             }
         )
     )
-    monkeypatch.setattr(sys.modules[__name__], "_GOLDEN", fixture)
+    monkeypatch.setitem(_GOLDENS, "gfx950", fixture)
 
+
+def test_golden_ir_check_rejects_entry_without_sha256(monkeypatch, tmp_path):
+    _synthetic_fixture(monkeypatch, tmp_path)
     with pytest.raises(AssertionError, match="no sha256 recorded"):
-        test_gdn_decode_ir_matches_golden()
+        test_gdn_decode_ir_matches_golden("gfx950")
 
 
 def test_config_coverage_rejects_entry_without_sha256(monkeypatch, tmp_path):
-    import pytest
-
-    monkeypatch.setattr(sys.modules[__name__], "_cases", lambda: {"default": object()})
-    fixture = tmp_path / "gdn_decode_gfx950_ir_sha256.json"
-    fixture.write_text(
-        json.dumps(
-            {
-                "flavors": {
-                    _current_flavor(): {
-                        "cases": {
-                            cid: {"error": "synthetic lowering failure"}
-                            for cid in _cases()
-                        }
-                    }
-                }
-            }
-        )
-    )
-    monkeypatch.setattr(sys.modules[__name__], "_GOLDEN", fixture)
-
+    _synthetic_fixture(monkeypatch, tmp_path)
     with pytest.raises(AssertionError, match="without a SHA-256"):
-        test_every_shipped_configuration_is_recorded()
+        test_every_shipped_configuration_is_recorded("gfx950")
 
 
 def test_build_doc_refuses_lowering_failure(monkeypatch):
-    import pytest
-
-    monkeypatch.setattr(sys.modules[__name__], "_cases", lambda: {"default": object()})
+    monkeypatch.setattr(
+        sys.modules[__name__], "_cases", lambda arch: {"default": object()}
+    )
 
     def fail_lowering(*_):
         raise RuntimeError("synthetic lowering failure")
@@ -224,7 +214,7 @@ def test_build_doc_refuses_lowering_failure(monkeypatch):
     monkeypatch.setattr(sys.modules[__name__], "_sha_for", fail_lowering)
 
     with pytest.raises(RuntimeError, match="refusing to write"):
-        _build_doc()
+        _build_doc("gfx950")
 
 
 def test_gate_kind_actually_moves_the_ir():
@@ -235,16 +225,18 @@ def test_gate_kind_actually_moves_the_ir():
     and the kernel name -- otherwise the KDA cases above are pinning nothing and
     two different kernels would share one compile-cache entry.
     """
-    import dataclasses as _dc
-
     from kernels.gfx950.gdn_decode import GdnDecodeSpec, build_gdn_decode
 
     flavor = _current_flavor()
     gdn = GdnDecodeSpec()
-    kda = _dc.replace(gdn, gate_kind="kda")
+    kda = dc.replace(gdn, gate_kind="kda")
 
-    gdn_sha, _ = _sha_for(lambda: build_gdn_decode(gdn, arch=_ARCH), flavor)
-    kda_sha, _ = _sha_for(lambda: build_gdn_decode(kda, arch=_ARCH), flavor)
+    gdn_sha, _ = _sha_for(
+        lambda: build_gdn_decode(gdn, arch="gfx950"), flavor, "gfx950"
+    )
+    kda_sha, _ = _sha_for(
+        lambda: build_gdn_decode(kda, arch="gfx950"), flavor, "gfx950"
+    )
 
     assert gdn_sha != kda_sha, "gate_kind did not change the emitted IR"
     assert gdn.kernel_name() != kda.kernel_name(), "gate_kind did not change the name"
@@ -265,7 +257,7 @@ def test_gdn_cases_carry_no_kda_marker():
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
 
     assert GdnDecodeSpec().gate_kind == "gdn"
-    ids = list(_cases())
+    ids = list(_cases("gfx950"))
     gdn_ids = [cid for cid in ids if "kda" not in cid]
     kda_ids = [cid for cid in ids if "kda" in cid]
 
@@ -273,13 +265,20 @@ def test_gdn_cases_carry_no_kda_marker():
     assert len(gdn_ids) >= 7, f"expected the original GDN case set, got {gdn_ids}"
     assert kda_ids, "the KDA gate kind is unpinned"
     assert not set(gdn_ids) & set(kda_ids)
+    assert not [
+        cid for cid in _cases("gfx942") if "kda" in cid
+    ], "gfx942 serves the GDN gate only; a KDA case there pins nothing shipped"
 
 
 if __name__ == "__main__":
     if "--write" in sys.argv:
-        _GOLDEN.parent.mkdir(parents=True, exist_ok=True)
-        _GOLDEN.write_text(json.dumps(_build_doc(), indent=2, sort_keys=True) + "\n")
-        print(f"wrote {_GOLDEN}")
+        for arch in _ARCHES:
+            _GOLDENS[arch].parent.mkdir(parents=True, exist_ok=True)
+            _GOLDENS[arch].write_text(
+                json.dumps(_build_doc(arch), indent=2, sort_keys=True) + "\n"
+            )
+            print(f"wrote {_GOLDENS[arch]}")
     else:
-        test_gdn_decode_ir_matches_golden()
-        test_every_shipped_configuration_is_recorded()
+        for arch in _ARCHES:
+            test_gdn_decode_ir_matches_golden(arch)
+            test_every_shipped_configuration_is_recorded(arch)

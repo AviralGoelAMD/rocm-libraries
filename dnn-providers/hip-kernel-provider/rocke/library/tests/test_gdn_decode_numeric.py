@@ -1,7 +1,7 @@
 # Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
 
-"""On-device numeric checks for the GDN decode kernel (gfx950).
+"""On-device numeric checks for the GDN decode kernel (gfx942 and gfx950).
 
 Compares the kernel against a whole-tensor fp32 reference that shares no
 algebra with it -- no tiling, no warp structure, no cross-lane reductions -- so
@@ -13,41 +13,49 @@ recurrent state in place; checking only the output would let a corrupted state
 write ship silently, because nothing reads the state back until the next decode
 step.
 
-These lanes need a real gfx950 and ROCm torch, so they are marked ``gpu`` and
-skipped elsewhere. The spec rules, emission and dispatch selection are covered
-by CPU-only tests so this family still contributes coverage without a device.
+These lanes need a real gfx942 or gfx950 and ROCm torch, so they are marked
+``gpu`` and skipped elsewhere; they run against whichever supported arch the
+device reports. The spec rules, emission and dispatch selection are covered by
+CPU-only tests so this family still contributes coverage without a device.
 """
 
 from __future__ import annotations
 
 import dataclasses as dc
+import functools
 
 import pytest
-
-ARCH = "gfx950"
 
 torch = pytest.importorskip("torch", reason="ROCm torch required")
 
 pytestmark = pytest.mark.gpu
 
+SUPPORTED_ARCHES = ("gfx942", "gfx950")
 
-def _device_is_gfx950() -> bool:
+
+def _device_arch() -> str | None:
     # rocke's own query, not torch's: `hip_module.get_device_arch` goes through
     # hipDeviceGetAttribute and already strips the feature flags, returning
     # "gfx950" rather than "gfx950:sramecc+:xnack-". Asking torch would mean a
     # substring test against torch's formatting of the same string.
     if not torch.cuda.is_available():
-        return False
+        return None
     try:
         from rocke.runtime.hip_module import get_device_arch
 
-        return get_device_arch() == ARCH
+        return get_device_arch()
     except Exception:
-        return False
+        return None
 
 
-requires_gfx950 = pytest.mark.skipif(
-    not _device_is_gfx950(), reason=f"needs a {ARCH} device"
+_DEVICE_ARCH = _device_arch()
+# Every lane targets the device's own arch; off-device the lanes skip, and
+# ARCH only has to be a registered arch for module-level code to import.
+ARCH = _DEVICE_ARCH if _DEVICE_ARCH in SUPPORTED_ARCHES else "gfx950"
+
+requires_device = pytest.mark.skipif(
+    _DEVICE_ARCH not in SUPPORTED_ARCHES,
+    reason=f"needs a device in {SUPPORTED_ARCHES}",
 )
 
 
@@ -58,16 +66,16 @@ def harness():
 
     return {
         "TOL": TOL,
-        "check": check,
+        "check": functools.partial(check, arch=ARCH),
         "launch": launch,
-        "launcher_for": launcher_for,
+        "launcher_for": functools.partial(launcher_for, arch=ARCH),
         "make_inputs": make_inputs,
         "prepare": prepare,
         "ref_fp32": ref_fp32,
     }
 
 
-@requires_gfx950
+@requires_device
 def test_the_tolerance_gate_can_actually_fail(harness):
     """Prove the comparison fires, by handing it a deliberately wrong result.
 
@@ -111,7 +119,7 @@ def test_the_tolerance_gate_can_actually_fail(harness):
     )
 
 
-@requires_gfx950
+@requires_device
 @pytest.mark.parametrize("batch", [1, 3, 16, 64])
 def test_matches_fp32_reference(harness, batch):
     """Output and updated state both agree with the reference."""
@@ -122,7 +130,7 @@ def test_matches_fp32_reference(harness, batch):
     assert state_err <= harness["TOL"], f"state error {state_err:.3e}"
 
 
-@requires_gfx950
+@requires_device
 def test_simple_reference_path_matches(harness):
     """The one-thread-per-row path is a correctness baseline; keep it working."""
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
@@ -170,7 +178,7 @@ def _assert_dispatch_result_matches_fp32(harness, result, batch):
     )
 
 
-@requires_gfx950
+@requires_device
 def test_all_registry_candidates_are_correct(harness, request):
     """Every legal default-D128 registry candidate matches the FP32 oracle."""
     from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode_all
@@ -194,7 +202,7 @@ def test_all_registry_candidates_are_correct(harness, request):
             _assert_dispatch_result_matches_fp32(harness, result, batch)
 
 
-@requires_gfx950
+@requires_device
 def test_all_d64_registry_candidates_are_correct(harness):
     """Every explicitly selectable D64 tile is proven on device, not only auto."""
     from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode_all
@@ -207,7 +215,7 @@ def test_all_d64_registry_candidates_are_correct(harness):
         _assert_dispatch_result_matches_fp32(harness, result, batch=1)
 
 
-@requires_gfx950
+@requires_device
 def test_dispatcher_auto_smoke(harness):
     """Compile and launch only through the dispatcher-auto DispatchResult."""
     from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode
@@ -243,7 +251,7 @@ def test_dispatcher_auto_smoke(harness):
     assert torch.equal(values["state"][untouched], before[untouched])
 
 
-@requires_gfx950
+@requires_device
 def test_padding_lanes_are_skipped_and_leave_state_untouched(harness):
     """A negative index means 'skip', and must not disturb that state slot.
 
@@ -270,7 +278,7 @@ def test_padding_lanes_are_skipped_and_leave_state_untouched(harness):
     ), "state of an inactive (negative-index) sequence was modified"
 
 
-@requires_gfx950
+@requires_device
 def test_mismatched_skip_index_leaves_write_page_untouched(harness):
     """A lane with ``read=-1`` must not write its otherwise-valid target page."""
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
@@ -292,7 +300,7 @@ def test_mismatched_skip_index_leaves_write_page_untouched(harness):
     ), "a mismatched skip lane modified its write page"
 
 
-@requires_gfx950
+@requires_device
 def test_large_pool_crosses_the_i32_offset_boundary(harness):
     """A pool deep enough that ``slot * S_POOL`` overflows a signed i32 must
     still address the right slot.
@@ -342,7 +350,7 @@ def test_large_pool_crosses_the_i32_offset_boundary(harness):
     ), f"i32 offset overflow at slot {slot}: out={out_err:.3e} state={state_err:.3e}"
 
 
-@requires_gfx950
+@requires_device
 def test_results_are_deterministic(harness):
     """Same inputs, same answer -- no dependence on scheduling or leftovers."""
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
@@ -353,7 +361,7 @@ def test_results_are_deterministic(harness):
     assert first == second
 
 
-@requires_gfx950
+@requires_device
 def test_state_dtype_variant_is_correct(harness):
     """An f16 recurrent state is a distinct kernel; it must be checked too."""
     from kernels.gfx950.gdn_decode import GdnDecodeSpec, is_valid_spec
@@ -365,7 +373,7 @@ def test_state_dtype_variant_is_correct(harness):
     assert max(out_err, state_err) <= harness["TOL"]
 
 
-@requires_gfx950
+@requires_device
 def test_f16_io_variant_is_correct(harness):
     """f16 I/O is an advertised dtype -- ``is_valid_spec`` admits it -- so a
     config the validator says yes to must be numerically checked on device, not
@@ -379,7 +387,7 @@ def test_f16_io_variant_is_correct(harness):
     assert max(out_err, state_err) <= harness["TOL"]
 
 
-@requires_gfx950
+@requires_device
 def test_f16_io_bf16_state_is_correct(harness):
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
 
@@ -403,7 +411,7 @@ def test_f16_io_bf16_state_is_correct(harness):
     assert torch.equal(values["state"][untouched], before[untouched])
 
 
-@requires_gfx950
+@requires_device
 def test_use_qk_l2norm_off_matches_reference(harness):
     """With l2norm disabled the kernel scales q by 1/sqrt(dk) and leaves k raw;
     the reference must branch the same way. Raw (unnormalized) k gives the state
@@ -418,7 +426,7 @@ def test_use_qk_l2norm_off_matches_reference(harness):
     assert max(out_err, state_err) <= 3.5e-2
 
 
-@requires_gfx950
+@requires_device
 def test_fallback_head_dim_geometry_is_numerically_correct(harness):
     """The head_k=64 geometry the dispatcher serves via tile fallback (#1) must
     be numerically correct on device, not merely dispatch-valid -- a served-but-
@@ -431,7 +439,7 @@ def test_fallback_head_dim_geometry_is_numerically_correct(harness):
     assert max(out_err, state_err) <= harness["TOL"]
 
 
-@requires_gfx950
+@requires_device
 def test_end_to_end_through_the_dispatch_result(harness):
     """Drive a launch from the dispatch result alone, as a caller would.
 
@@ -472,7 +480,7 @@ def test_end_to_end_through_the_dispatch_result(harness):
     )
 
 
-@requires_gfx950
+@requires_device
 def test_mismatched_write_skip_leaves_state_untouched(harness):
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
 
@@ -492,7 +500,7 @@ def test_mismatched_write_skip_leaves_state_untouched(harness):
     assert torch.equal(values["out"][lane], torch.zeros_like(values["out"][lane]))
 
 
-@requires_gfx950
+@requires_device
 def test_paged_reorder_matches_reference(harness):
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
 
@@ -515,7 +523,7 @@ def test_paged_reorder_matches_reference(harness):
     assert torch.equal(values["state"][untouched], before[untouched])
 
 
-@requires_gfx950
+@requires_device
 def test_two_step_continuation(harness):
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
 
@@ -542,7 +550,7 @@ def test_two_step_continuation(harness):
         inp = dict(inp, state=values["state"].clone())
 
 
-@requires_gfx950
+@requires_device
 def test_state_reset_is_bit_exact(harness):
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
 

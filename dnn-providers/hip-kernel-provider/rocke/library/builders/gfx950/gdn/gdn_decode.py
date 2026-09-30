@@ -421,7 +421,9 @@ def run(spec: GdnDecodeSpec, inp, launcher: KernelLauncher, batch: int):
     return values["out"], values["state"]
 
 
-def check(spec: GdnDecodeSpec, batch: int, seed: int = 0) -> Tuple[float, float]:
+def check(
+    spec: GdnDecodeSpec, batch: int, seed: int = 0, arch: str = _ARCH
+) -> Tuple[float, float]:
     """Run and compare against the reference. Returns ``(out_err, state_err)``.
 
     ``state_err`` covers the WHOLE pool, not only the written pages: the pages
@@ -434,7 +436,7 @@ def check(spec: GdnDecodeSpec, batch: int, seed: int = 0) -> Tuple[float, float]
     inp = make_inputs(spec, batch, seed=seed)
     ref_out, ref_state = ref_fp32(spec, inp)
     before = inp["state"].clone()
-    out, state = run(spec, inp, launcher_for(spec), batch)
+    out, state = run(spec, inp, launcher_for(spec, arch=arch), batch)
     out_err = (out.float() - ref_out).abs().max().item()
     written = inp["write_indices"].long()
     state_err = (state.float()[written] - ref_state).abs().max().item()

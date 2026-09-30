@@ -40,7 +40,7 @@ retune either decode mode or the GDN prefill path.
 | [`library/tests/dispatch/gdn/test_gfx950_registry.py`](../../../tests/dispatch/gdn/test_gfx950_registry.py) | CPU GDN registry count, identity, legality, and selection coverage |
 | [`library/tests/test_gdn_decode_spec.py`](../../../tests/test_gdn_decode_spec.py) | CPU validator and IR-emission coverage |
 | [`library/tests/test_gdn_decode_prepare.py`](../../../tests/test_gdn_decode_prepare.py) | Host-side input validation: shapes, dtypes, contiguity, pool-index range |
-| [`library/tests/test_gdn_decode_gfx950_numeric.py`](../../../tests/test_gdn_decode_gfx950_numeric.py) | On-device GDN output and state correctness |
+| [`library/tests/test_gdn_decode_numeric.py`](../../../tests/test_gdn_decode_numeric.py) | On-device GDN output and state correctness (gfx942 or gfx950, whichever the device is) |
 | [`library/tests/test_kda_decode_gfx950_numeric.py`](../../../tests/test_kda_decode_gfx950_numeric.py) | On-device KDA output/state correctness and dispatch-to-launch coverage |
 | [`library/tests/test_gdn_decode_golden.py`](../../../tests/test_gdn_decode_golden.py) | Detect unexpected LLVM-IR changes in both gate kinds |
 | [`library/builders/gfx950/kda/gdn_prefill.py`](../../kda/gdn_prefill.py) | Drive chunkwise prefill (the KDA chunkwise kernels in `gate_kind="gdn"` mode) and hold its fp64 oracle |
@@ -181,7 +181,7 @@ On-device numeric coverage:
 
 ```bash
 python3 -m pytest \
-  library/tests/test_gdn_decode_gfx950_numeric.py \
+  library/tests/test_gdn_decode_numeric.py \
   library/tests/test_kda_decode_gfx950_numeric.py \
   -m gpu
 ```

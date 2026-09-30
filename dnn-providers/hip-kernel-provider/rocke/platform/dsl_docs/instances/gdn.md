@@ -158,12 +158,12 @@ PYTHONPATH=library:platform/python python3 -m pytest \
 ```
 
 The on-device output and recurrent-state checks are in
-`library/tests/test_gdn_decode_gfx950_numeric.py`.
+`library/tests/test_gdn_decode_numeric.py`; it runs on gfx942 or gfx950.
 
 - **Spec rejected at dispatch.** The message names the failing rule; most often
   a head dim or `blocks_per_v_dim` that does not divide.
-- **Wrong arch.** Candidates declare gfx950; another arch is rejected by the
-  capability prefilter before a spec is built.
+- **Wrong arch.** GDN decode candidates declare gfx942 or gfx950; any other arch
+  is rejected by the capability prefilter before a spec is built.
 - **Malformed KDA gate buffers.** `prepare()` requires per-channel `a` and f32
   `dt_bias` with exact contiguous shapes and the same device as `query`.
 - **State appears corrupted on the following step.** The kernel writes `out` and
