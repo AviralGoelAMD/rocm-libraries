@@ -464,7 +464,9 @@ def _build_simple(spec: GdnDecodeSpec) -> KernelDef:
         sv = []
         for c in range(0, DK, STATE_VEC):
             off = b.add(rs_base, b.const_i32(c))
-            sv += load_vec_as_f32(b, state_r, off, dtype=spec.state_dtype, n=STATE_VEC)
+            sv += load_vec_as_f32(
+                b, state_r, off, dtype=spec.state_dtype, n=STATE_VEC, nontemporal=True
+            )
         # Gated forget. A scalar decay broadcasts over the row; a per-channel
         # decay zips with it -- `sv` and `decay` are both indexed by K channel,
         # in the same order, so position i of each is the same channel.
@@ -494,7 +496,9 @@ def _build_simple(spec: GdnDecodeSpec) -> KernelDef:
         new_s = [b.fma(kn[j], v_new, sv[j]) for j in range(DK)]
         for c in range(0, DK, STATE_VEC):
             vec = pack_f32_to(b, new_s[c : c + STATE_VEC], dtype=spec.state_dtype)
-            store_vec(b, state_w, b.add(ws_base, b.const_i32(c)), vec, n=STATE_VEC)
+            store_vec(
+                b, state_w, b.add(ws_base, b.const_i32(c)), vec, n=STATE_VEC, nontemporal=True
+            )
 
     return b.kernel
 
@@ -739,7 +743,9 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             )
             for ki in range(WTK_ITERS):
                 off = b.add(rs_row, b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K)))
-                vec = load_vec_as_f32(b, state_r, off, dtype=spec.state_dtype, n=VPT)
+                vec = load_vec_as_f32(
+                    b, state_r, off, dtype=spec.state_dtype, n=VPT, nontemporal=True
+                )
                 # decay[ki] covers the same K channels as this state chunk, in
                 # the same order, and is reused across every vi.
                 if spec.gate_kind == "gdn":
@@ -791,7 +797,7 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
                 new = [b.fma(kn[ki][i], v_new, sv[(vi, ki)][i]) for i in range(VPT)]
                 vec = pack_f32_to(b, new, dtype=spec.state_dtype)
                 off = b.add(ws_row, b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K)))
-                store_vec(b, state_w, off, vec, n=VPT)
+                store_vec(b, state_w, off, vec, n=VPT, nontemporal=True)
 
     return b.kernel
 
