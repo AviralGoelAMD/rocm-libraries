@@ -661,6 +661,9 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             b.add(tile_v_start, b.add(gv_start, b.const_i32(vi * WGROUP_V)))
             for vi in range(WTV_ITERS)
         ]
+        # The recurrent state is read once and written once per launch, so its
+        # loads/stores are marked non-temporal (streaming). q/k/v, the gates and
+        # the output keep the default cache policy.
         s_raw = {}
         for vi, v_row in enumerate(v_rows):
             rs_row = b.add(
@@ -669,7 +672,7 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             for ki in range(WTK_ITERS):
                 off = b.add(rs_row, b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K)))
                 s_raw[(vi, ki)] = load_vec_as_f32(
-                    b, state_r, off, dtype=spec.state_dtype, n=VPT
+                    b, state_r, off, dtype=spec.state_dtype, n=VPT, nontemporal=True
                 )
 
         # this lane's v, one per V row
@@ -817,7 +820,7 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
                 new = [b.fma(kn[ki][i], v_new, sv[(vi, ki)][i]) for i in range(VPT)]
                 vec = pack_f32_to(b, new, dtype=spec.state_dtype)
                 off = b.add(ws_row, b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K)))
-                store_vec(b, state_w, off, vec, n=VPT)
+                store_vec(b, state_w, off, vec, n=VPT, nontemporal=True)
 
     return b.kernel
 
