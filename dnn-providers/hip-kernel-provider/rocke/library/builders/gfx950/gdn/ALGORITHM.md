@@ -329,18 +329,33 @@ is retired at large batch, where the grid is already ample.
 
 ### 4.3 Dataflow and pipeline
 
-One workgroup, one decode step, in emission order:
+One workgroup, one decode step, in emission order (warp-tiled path):
 
 1. decode `bidx` and `tid` into `(sequence, value head, v-sub-block)` and `(wave, k-lane, v-lane)`;
 2. load `read_indices` / `write_indices` and form the `active` predicate — **outside** the guard, so
    a padded lane costs two `i32` loads and exits;
-3. under `scf_if(active)`: evaluate `decay` and `β`;
-4. load the lane's `q` and `k` slices as 16-byte vectors, promoted to `f32`;
+3. under `scf_if(active)`, issue **every** global load before any math: the gate inputs (GDN: the
+   `a`, `b`, `dt_bias` and `A_log` scalars; KDA: `b` and `A_log` plus the lane's per-channel gate and
+   `dt_bias` vectors), the lane's `q` and `k` slices as 16-byte vectors, the raw lane tile of the
+   state, and one `v` per owned V row — all promoted to `f32`;
+4. evaluate `decay` and `β`;
 5. reduce the two L2 norms (two cross-lane reductions, §4.4);
 6. reduce `dot(k̂, q̂)` (one more);
-7. form the state read pointer, load the whole lane tile, applying `decay` as it lands;
+7. apply `decay` to the raw state tile;
 8. per owned V row: reduce `s·k̂` and `s·q̂`, form `v_new = β (v − s·k̂)`, then emit the output and
    the rank-1 state update.
+
+Why loads first: the AMDGPU scheduler does not hoist a load above earlier math or across the
+`k_lane == 0` output-store branch, so emission order bounds how many separate load batches (each
+ended by a `vmcnt` wait) a wave exposes. Loads first gives the default and small tiles a single
+batch; larger tiles still split into two or three. The floating-point arithmetic is the same and in
+the same order as an interleaved emission. The simple path (`spec.simple`) keeps the interleaved
+order: q/k, norms, gates, dot, then the state row.
+
+Cache policy: the state is read once and written once per call, so the state loads (step 3) and
+stores (step 8) are **nontemporal** (`nontemporal=True` → LLVM `!nontemporal` → the `nt` bit on
+gfx950) in both paths. This is always on, not a spec field or kernel-name tag. `q`, `k`, `v`, the
+gates and `out` keep the default cache policy.
 
 Two consequences of the identity in §1.2 item 3: the output store and the state write in step 8 are
 **independent** — neither reads the other's result — and the output is broadcast across the k-lane
