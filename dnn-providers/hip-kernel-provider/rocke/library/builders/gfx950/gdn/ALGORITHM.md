@@ -409,13 +409,22 @@ grid size, not GDN tile selection. A caller may pin an exact candidate with
 `nw<num_warps>_wtk<warp_threads_k>_bpv<blocks_per_v_dim>`.
 
 
-KDA remains keyed on `work = batch × num_v_heads`. Tensor-parallel sharding
-changes `num_v_heads` per rank, so two launches with the same batch can expose
-different amounts of GPU work:
+KDA `auto` is also one static tile: it prefers `(4, 16, 4)` whenever legal, and
+batch and `num_v_heads` change grid size, not the tile. If that tile is illegal
+for a request, dispatch falls back to the first legal KDA candidate below. The
+default replaced a work-keyed auto selection; on gfx950 MI355X with cold memory,
+over 56 shapes (`Hk = Hv ∈ {4, 8, 12, 16, 24, 32, 48, 96}` × batch
+`{1, 8, 16, 32, 64, 128, 256}`), it had the lowest geomean
+(1.05×) and worst-case (1.11×) slowdown against each shape's fastest
+shortlisted single tile, and ran 1.8% slower than the work table on average.
 
-| Band | Work | `(num_warps, warp_threads_k, blocks_per_v_dim)` |
+The measured work table stays registered. Its rows are named candidates that a
+caller or benchmark can pin by `spec_id`; `work = batch × num_v_heads` is the
+key they were measured against, not an `auto` input:
+
+| `spec_id` | Measured for work | `(num_warps, warp_threads_k, blocks_per_v_dim)` |
 | --- | --- | --- |
-| `kda_w128` | `≤ 128` | `(4, 16, 4)` |
+| `kda_w128` (the `auto` default) | `≤ 128` | `(4, 16, 4)` |
 | `kda_w512` | `≤ 512` | `(1, 16, 4)` |
 | `kda_w_large` | larger | `(2, 16, 1)` |
 

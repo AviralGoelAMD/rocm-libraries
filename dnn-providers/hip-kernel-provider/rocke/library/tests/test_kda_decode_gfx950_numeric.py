@@ -138,15 +138,20 @@ def test_every_kda_tuned_tile_is_correct(harness, max_work, tile, spec_id):
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "batch,expected_spec_id,expected_tile",
+    "batch,spec_id,expected_spec_id,expected_tile",
     [
-        (1, "kda_w128", (4, 16, 4)),
-        (8, "kda_w512", (1, 16, 4)),
-        (32, "kda_w_large", (2, 16, 1)),
+        # auto is the static KDA default at every batch.
+        (1, "auto", "kda_w128", (4, 16, 4)),
+        (8, "auto", "kda_w128", (4, 16, 4)),
+        (32, "auto", "kda_w128", (4, 16, 4)),
+        # Each pinnable work-table tile, at the batch it was measured for.
+        (1, "kda_w128", "kda_w128", (4, 16, 4)),
+        (8, "kda_w512", "kda_w512", (1, 16, 4)),
+        (32, "kda_w_large", "kda_w_large", (2, 16, 1)),
     ],
 )
 def test_kda_dispatch_band_launches_selected_kernel(
-    harness, batch, expected_spec_id, expected_tile
+    harness, batch, spec_id, expected_spec_id, expected_tile
 ):
     """Exercise request → dispatch → selected tile → compile → launch → oracle."""
     from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode
@@ -158,6 +163,7 @@ def test_kda_dispatch_band_launches_selected_kernel(
             batch=batch,
             arch=ARCH,
             gate_kind="kda",
+            spec_id=spec_id,
             num_k_heads=32,
             num_v_heads=32,
         )

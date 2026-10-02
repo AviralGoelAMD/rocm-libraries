@@ -122,9 +122,10 @@ blocks_per_v_dim=8)` whenever it is legal. It never measures at runtime and
 does not select by batch. An explicit `spec_id`, such as `nw4_wtk16_bpv8`,
 selects an exact legal GDN candidate for benchmarking or replay.
 
-KDA keeps its separately measured table keyed by
-`work = batch * num_v_heads`, so tensor-parallel head sharding maps to the same
-key as an equivalent amount of batch work. Re-measure KDA with
+KDA `auto` is also one static tile, `(4, 16, 4)`, whenever it is legal; batch
+and head count change only the grid. KDA's separately measured work table
+(`work = batch * num_v_heads`) stays registered as pinnable candidates
+`kda_w128`, `kda_w512` and `kda_w_large`. Re-measure KDA with
 `library/builders/gfx950/gdn/tune.py`; exact measurements live outside the
 public source tree.
 

@@ -26,6 +26,7 @@ from dispatch.gdn.gfx950 import (
     ARCH,
     CONFIGURED_TILES,
     DEFAULT_TILE,
+    KDA_DEFAULT_TILE,
     TUNED_SPEC_IDS,
     tile_for_work,
 )
@@ -371,55 +372,92 @@ class TestGateKindWiring(unittest.TestCase):
         self.assertTrue(any("gate_kind" in e for e in errors), errors)
 
 
-class TestWorkKeyedTable(unittest.TestCase):
-    """The new KDA table is keyed on work = batch * num_v_heads."""
+class TestKdaStaticSelection(unittest.TestCase):
+    """KDA auto must use one static default rather than the work table.
 
-    def test_equal_work_selects_the_same_kda_tile(self):
+    The shipped tile is pinned as a literal, not as ``KDA_DEFAULT_TILE``: a
+    test that follows the constant cannot notice the default moving. Changing
+    it changes what every gfx950 KDA ``auto`` user runs, so it needs KDA
+    measurements (``tune.py --gate-kind kda``) in the same change.
+    """
+
+    _SHIPPED_TILE = (4, 16, 4)
+
+    def test_default_tile_is_the_shipped_tile(self):
+        self.assertEqual(KDA_DEFAULT_TILE, self._SHIPPED_TILE)
+
+    def test_selection_is_frozen_across_head_counts_and_batches(self):
+        # Tensor-parallel sharding changes the local head count, and the old
+        # work-keyed selection moved with it; the static default must not.
+        for num_k_heads, num_v_heads in (
+            (4, 4),
+            (8, 8),
+            (16, 16),
+            (32, 32),
+            (8, 32),
+            (4, 8),
+        ):
+            for batch in (1, 4, 5, 8, 32, 33, 64, 128, 129, 256, 4096):
+                with self.subTest(hk=num_k_heads, hv=num_v_heads, batch=batch):
+                    result = dispatch_gdn_decode(
+                        GdnDecodeRequest(
+                            batch=batch,
+                            arch=ARCH,
+                            gate_kind="kda",
+                            num_k_heads=num_k_heads,
+                            num_v_heads=num_v_heads,
+                        )
+                    )
+                    self.assertEqual(_TILE(result.spec), self._SHIPPED_TILE)
+                    self.assertEqual(result.spec.gate_kind, "kda")
+
+
+class TestKdaWorkTable(unittest.TestCase):
+    """The measured KDA work table stays pinnable; auto no longer reads it."""
+
+    _TABLE = {
+        "kda_w128": (4, 16, 4),
+        "kda_w512": (1, 16, 4),
+        "kda_w_large": (2, 16, 1),
+    }
+
+    def test_pinned_spec_id_selects_its_table_tile_at_any_batch(self):
+        self.assertEqual(set(TUNED_SPEC_IDS), set(self._TABLE))
+        for spec_id, tile in self._TABLE.items():
+            for batch in (1, 8, 32, 256):
+                with self.subTest(spec_id=spec_id, batch=batch):
+                    result = dispatch_gdn_decode(
+                        GdnDecodeRequest(
+                            batch=batch,
+                            arch=ARCH,
+                            gate_kind="kda",
+                            spec_id=spec_id,
+                            num_k_heads=16,
+                            num_v_heads=16,
+                        )
+                    )
+                    self.assertEqual(result.candidate.spec_id, spec_id)
+                    self.assertEqual(_TILE(result.spec), tile)
+
+    def test_equal_work_maps_to_the_same_table_tile(self):
         self.assertEqual(tile_for_work(8 * 32, "kda"), tile_for_work(32 * 8, "kda"))
         self.assertEqual(tile_for_work(1 * 32, "kda"), tile_for_work(4 * 8, "kda"))
 
-    def test_kda_dispatch_uses_work_not_batch(self):
-        full = dispatch_gdn_decode(
-            GdnDecodeRequest(
-                batch=4,
-                arch=ARCH,
-                gate_kind="kda",
-                num_k_heads=32,
-                num_v_heads=32,
-            )
-        ).spec
-        sharded = dispatch_gdn_decode(
-            GdnDecodeRequest(
-                batch=4,
-                arch=ARCH,
-                gate_kind="kda",
-                num_k_heads=8,
-                num_v_heads=8,
-            )
-        ).spec
-        self.assertEqual(_TILE(full), tile_for_work(4 * 32, "kda"))
-        self.assertEqual(_TILE(sharded), tile_for_work(4 * 8, "kda"))
+    def test_table_band_edges(self):
+        for work, tile in (
+            (1, (4, 16, 4)),
+            (128, (4, 16, 4)),
+            (129, (1, 16, 4)),
+            (512, (1, 16, 4)),
+            (513, (2, 16, 1)),
+            (10**6, (2, 16, 1)),
+        ):
+            with self.subTest(work=work):
+                self.assertEqual(tile_for_work(work, "kda"), tile)
 
-    def test_tile_for_work_agrees_with_kda_dispatch(self):
-        for batch in (1, 8, 32, 128):
-            with self.subTest(batch=batch):
-                spec = dispatch_gdn_decode(
-                    GdnDecodeRequest(
-                        batch=batch,
-                        arch=ARCH,
-                        gate_kind="kda",
-                        num_k_heads=32,
-                        num_v_heads=32,
-                    )
-                ).spec
-                self.assertEqual(
-                    _TILE(spec),
-                    tile_for_work(batch * spec.num_v_heads, "kda"),
-                )
-
-    def test_kda_table_is_total_over_work(self):
-        for work in (1, 4, 5, 128, 129, 4096, 4097, 10**6):
-            self.assertIsNotNone(tile_for_work(work, "kda"))
+    def test_table_has_no_gdn_rows(self):
+        with self.assertRaises(ValueError):
+            tile_for_work(128, "gdn")
 
 
 class TestGdnAndKdaTileNamespaces(unittest.TestCase):

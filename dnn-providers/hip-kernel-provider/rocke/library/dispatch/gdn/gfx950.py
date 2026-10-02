@@ -36,8 +36,11 @@ from .common import (
 
 ARCH = "gfx950"
 
-# KDA keeps its measured work-keyed table. GDN candidate registration below
-# owns the full configured tile space and has no GDN batch-winner table.
+# KDA's measured work-keyed table (work = batch * num_v_heads). KDA ``auto``
+# does not consult it any more (see KDA_DEFAULT_TILE); the rows stay registered
+# as named candidates so a caller or benchmark can pin one by ``spec_id``.
+# GDN candidate registration below owns the full configured tile space and has
+# no GDN batch-winner table.
 #
 # (max_work, (num_warps, warp_threads_k, blocks_per_v_dim), spec_id)
 _TUNED_TILES_KDA = (
@@ -45,6 +48,21 @@ _TUNED_TILES_KDA = (
     (512, (1, 16, 4), "kda_w512"),
     (None, (2, 16, 1), "kda_w_large"),
 )
+
+# KDA ``auto`` is one static tile on purpose; batch and heads only change the
+# grid. This replaced the work-keyed auto selection above. Measured on gfx950
+# MI355X with cold memory (>= 1 GiB input rotation) over 56 shapes (Hk=Hv in
+# {4,8,12,16,24,32,48,96} x batch {1,8,16,32,64,128,256}) with the PR #29 kernel
+# (load-first + streaming state): among the shortlisted single tiles, (4,16,4)
+# has the lowest geomean (1.05x) and worst-case (1.11x) slowdown against each
+# shape's fastest tile. It is 1.8% slower than the work table on average, worst
+# at batch 128-256 (~4-5%). It is the table's ``kda_w128`` tile, so auto reuses
+# that candidate instead of registering a duplicate. To revisit, run
+# ``tune.py --gate-kind kda``.
+KDA_DEFAULT_TILE = (4, 16, 4)
+assert any(
+    tile == KDA_DEFAULT_TILE for _, tile, _ in _TUNED_TILES_KDA
+), "KDA_DEFAULT_TILE must be one of the registered _TUNED_TILES_KDA tiles"
 
 NUM_WARPS = (1, 2, 4, 8, 16)
 WARP_THREADS_K = (1, 2, 4, 8, 16, 32)
@@ -70,11 +88,12 @@ CONFIGURED_TILES = (DEFAULT_TILE,) + tuple(
     tile for tile in _LEXICOGRAPHIC_TILES if tile != DEFAULT_TILE
 )
 
+# The measured KDA work table's spec ids, pinnable by callers and benchmarks.
 TUNED_SPEC_IDS = tuple(entry[2] for entry in _TUNED_TILES_KDA)
 
 
 def work_for(batch: int, num_v_heads: int) -> int:
-    """KDA's measured selection quantity."""
+    """Work quantity that keys the pinnable KDA table (not used by ``auto``)."""
     return int(batch) * int(num_v_heads)
 
 
@@ -94,11 +113,12 @@ def spec_id_for_work(work: int) -> str:
     raise AssertionError("unreachable: KDA table has an open-ended final band")
 
 
-def _tile_for_kda_spec_id(spec_id: str) -> Tuple[int, int, int]:
-    for _, tile, candidate_spec_id in _TUNED_TILES_KDA:
-        if candidate_spec_id == spec_id:
-            return tile
-    raise KeyError(spec_id)
+def kda_default_spec_id() -> str:
+    """Spec id of the registered KDA candidate that carries KDA_DEFAULT_TILE."""
+    for _, tile, spec_id in _TUNED_TILES_KDA:
+        if tile == KDA_DEFAULT_TILE:
+            return spec_id
+    raise AssertionError("unreachable: KDA_DEFAULT_TILE is asserted registered")
 
 
 def _gate_kind_for_spec_id(spec_id: str) -> str:
@@ -173,16 +193,12 @@ def _make_candidate(
                     f"static GDN auto tile is {DEFAULT_TILE!r}, not {tile!r}"
                 )
         if req.spec_id.strip().lower() == "auto" and req.gate_kind == "kda":
-            wanted = spec_id_for_work(work_for(req.batch, req.num_v_heads))
-            if (
-                wanted != spec_id
-                and is_valid_spec(
-                    make_spec(req, _tile_for_kda_spec_id(wanted)), arch=req.arch
-                )[0]
-            ):
+            default_is_legal = is_valid_spec(
+                make_spec(req, KDA_DEFAULT_TILE), arch=req.arch
+            )[0]
+            if default_is_legal and tile != KDA_DEFAULT_TILE:
                 return False, (
-                    f"tuned KDA tile for work {work_for(req.batch, req.num_v_heads)} "
-                    f"is {wanted!r}, not {spec_id!r}"
+                    f"static KDA auto tile is {KDA_DEFAULT_TILE!r}, not {tile!r}"
                 )
         # Final authority is the kernel's own validator.
         return is_valid_spec(make_spec(req, tile), arch=req.arch)

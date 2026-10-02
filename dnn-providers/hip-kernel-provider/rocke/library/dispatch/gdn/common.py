@@ -57,8 +57,10 @@ class GdnDecodeRequest(OperatorRequest):
     it is legal; otherwise dispatch chooses a validator-admitted fallback.
     Neither ``batch`` nor ``num_v_heads`` chooses GDN's auto tile.
 
-    For ``gate_kind="kda"``, ``auto`` is keyed on ``batch * num_v_heads`` -- the
-    "work" -- so tensor parallelism selects the tile for heads local to a rank.
+    For ``gate_kind="kda"``, ``auto`` likewise uses the static
+    ``KDA_DEFAULT_TILE`` whenever it is legal, with a validator-admitted
+    fallback otherwise; ``batch`` and ``num_v_heads`` only change the grid. The
+    measured work-keyed KDA tiles stay pinnable by ``spec_id``.
 
     ``gate_kind`` selects the forget-gate granularity: ``"gdn"`` (one scalar
     decay per head) or ``"kda"`` (a per-channel decay). It reaches the spec and

@@ -3,10 +3,11 @@
 # SPDX-License-Identifier: MIT
 """Measure gfx950 GDN registry candidates and KDA tile-table alternatives.
 
-GDN dispatch has a static registry priority. Its sweep measures every legal
-registered candidate but does not change dispatcher-default selection. KDA keeps
-its separate work-keyed table, so its sweep enumerates every validator-admitted
-tile to challenge the selected work band.
+Both GDN and KDA dispatch use one static ``auto`` tile (``DEFAULT_TILE`` and
+``KDA_DEFAULT_TILE``). The GDN sweep measures every legal registered candidate;
+the KDA sweep enumerates every validator-admitted tile to challenge the static
+default and the pinnable work-keyed KDA table. Neither sweep changes
+dispatcher-default selection.
 
 Every candidate is correctness-gated before device timing. Host launch cost can
 hide kernel differences at small batch, so device time is the comparison metric.
@@ -15,7 +16,8 @@ Run GDN with its default batch anchors::
 
     PYTHONPATH=<rocke>/library:<rocke>/platform/python python3 tune.py
 
-Run the KDA work-keying study across several head geometries::
+Run the KDA study (static default plus work-keying of the pinnable table)
+across several head geometries::
 
     PYTHONPATH=<rocke>/library:<rocke>/platform/python python3 tune.py --gate-kind kda \
         --geometries 16/32,8/16,4/8 \
@@ -251,9 +253,10 @@ def report_gdn_dispatcher_default(rows, auto_id: str) -> bool:
 def report_kda_work_keying(by_work) -> None:
     """Check that cells sharing ``batch * num_v_heads`` pick the same best tile.
 
-    ``_TUNED_TILES_KDA`` is keyed on work alone. Cells with equal work but a
-    different (batch, num_v_heads) split are the evidence for or against that
-    key: a disagreement invalidates the table's key, not just one value.
+    ``_TUNED_TILES_KDA`` (pinnable by ``spec_id``; not used by ``auto``) is
+    keyed on work alone. Cells with equal work but a different
+    (batch, num_v_heads) split are the evidence for or against that key: a
+    disagreement invalidates the table's key, not just one value.
     """
     print("\n=== KDA work -> best tile, across geometries ===")
     print(f"{'work':>7}  {'best tile':16} {'us':>9}  cells (batch x Hv)")
@@ -317,9 +320,9 @@ def main() -> int:
                 num_v_heads=num_v_heads,
             )
             if args.gate_kind == "kda":
-                # KDA's measured table is work-keyed, but the study must test
-                # every validator-admitted tile rather than the current band's
-                # dispatcher result.
+                # KDA auto is the static KDA_DEFAULT_TILE; the study tests
+                # every validator-admitted tile against it, not only the
+                # registered candidates.
                 auto = dispatch_gdn_decode(request)
                 base = auto.spec
                 configs = legal_configs(base)
