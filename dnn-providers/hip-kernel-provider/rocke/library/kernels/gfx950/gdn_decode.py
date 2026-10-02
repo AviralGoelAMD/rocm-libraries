@@ -78,7 +78,7 @@ from dataclasses import dataclass
 from typing import Literal, Tuple, get_args
 
 from rocke.helpers.activations import LN2, LOG2E, SOFTPLUS_THRESHOLD
-from rocke.core.ir import F32, I32, I64, IRBuilder, KernelDef, PtrType
+from rocke.core.ir import F32, I32, I64, IRBuilder, KernelDef, PtrType, TemporalHint
 from rocke.helpers.io import (
     io_ir_type,
     load_scalar_as_f32,
@@ -469,7 +469,12 @@ def _build_simple(spec: GdnDecodeSpec) -> KernelDef:
         for c in range(0, DK, STATE_VEC):
             off = b.add(rs_base, b.const_i32(c))
             sv += load_vec_as_f32(
-                b, state_r, off, dtype=spec.state_dtype, n=STATE_VEC, nontemporal=True
+                b,
+                state_r,
+                off,
+                dtype=spec.state_dtype,
+                n=STATE_VEC,
+                temporal_hint=TemporalHint.STREAMING,
             )
         # Gated forget. A scalar decay broadcasts over the row; a per-channel
         # decay zips with it -- `sv` and `decay` are both indexed by K channel,
@@ -506,7 +511,7 @@ def _build_simple(spec: GdnDecodeSpec) -> KernelDef:
                 b.add(ws_base, b.const_i32(c)),
                 vec,
                 n=STATE_VEC,
-                nontemporal=True,
+                temporal_hint=TemporalHint.STREAMING,
             )
 
     return b.kernel
@@ -686,7 +691,12 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             for ki in range(WTK_ITERS):
                 off = b.add(rs_row, b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K)))
                 s_raw[(vi, ki)] = load_vec_as_f32(
-                    b, state_r, off, dtype=spec.state_dtype, n=VPT, nontemporal=True
+                    b,
+                    state_r,
+                    off,
+                    dtype=spec.state_dtype,
+                    n=VPT,
+                    temporal_hint=TemporalHint.STREAMING,
                 )
 
         # this lane's v, one per V row
@@ -834,7 +844,9 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
                 new = [b.fma(kn[ki][i], v_new, sv[(vi, ki)][i]) for i in range(VPT)]
                 vec = pack_f32_to(b, new, dtype=spec.state_dtype)
                 off = b.add(ws_row, b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K)))
-                store_vec(b, state_w, off, vec, n=VPT, nontemporal=True)
+                store_vec(
+                    b, state_w, off, vec, n=VPT, temporal_hint=TemporalHint.STREAMING
+                )
 
     return b.kernel
 
