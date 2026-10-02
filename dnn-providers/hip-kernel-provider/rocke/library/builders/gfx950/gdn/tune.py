@@ -286,6 +286,12 @@ def main() -> int:
         default="16/32",
         help="comma-separated num_k_heads/num_v_heads pairs",
     )
+    parser.add_argument(
+        "--state-dtype",
+        default="bf16",
+        choices=("bf16", "f16", "f32"),
+        help="recurrent-state dtype; tiles tuned for one width need not suit another",
+    )
     parser.add_argument("--top", type=int, default=8, help="rows to print per cell")
     args = parser.parse_args()
 
@@ -306,6 +312,7 @@ def main() -> int:
                 batch=batch,
                 arch=ARCH,
                 gate_kind=args.gate_kind,
+                state_dtype=args.state_dtype,
                 num_k_heads=num_k_heads,
                 num_v_heads=num_v_heads,
             )

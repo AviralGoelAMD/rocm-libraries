@@ -33,7 +33,12 @@ torch = pytest.importorskip("torch", reason="ROCm torch required")
 pytestmark = pytest.mark.gpu
 
 
-from dispatch.gdn.gfx950 import _TUNED_TILES_KDA  # noqa: E402
+from dispatch.gdn.gfx950 import _TUNED_TILES_KDA, _TUNED_TILES_KDA_F32  # noqa: E402
+
+# Each shipped table with the state width it was measured for.
+_SHIPPED_KDA_TILES = [(*row, "bf16") for row in _TUNED_TILES_KDA] + [
+    (*row, "f32") for row in _TUNED_TILES_KDA_F32
+]
 
 
 def _device_is_gfx950() -> bool:
@@ -119,11 +124,10 @@ def test_kda_warp_tiled_matches_reference(harness, batch):
 
 
 @requires_gfx950
-@pytest.mark.parametrize("state_dtype", ["bf16", "f32"])
-@pytest.mark.parametrize("max_work,tile,spec_id", _TUNED_TILES_KDA)
+@pytest.mark.parametrize("max_work,tile,spec_id,state_dtype", _SHIPPED_KDA_TILES)
 def test_every_kda_tuned_tile_is_correct(harness, max_work, tile, spec_id, state_dtype):
-    """Every tile in the KDA table agrees with the independent reference,
-    with the state stored in bf16 or in f32. f32 doubles the state bytes each
+    """Every tile in each KDA table agrees with the independent reference,
+    with the state width that table serves. f32 doubles the state bytes each
     lane moves, so it exercises a different load/store split."""
     num_warps, warp_threads_k, blocks_per_v_dim = tile
     spec = _kda(
@@ -146,15 +150,18 @@ def test_every_kda_tuned_tile_is_correct(harness, max_work, tile, spec_id, state
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "batch,expected_spec_id,expected_tile",
+    "batch,state_dtype,expected_spec_id,expected_tile",
     [
-        (1, "kda_w128", (4, 16, 4)),
-        (8, "kda_w512", (1, 16, 4)),
-        (32, "kda_w_large", (2, 16, 1)),
+        (1, "bf16", "kda_w128", (4, 16, 4)),
+        (8, "bf16", "kda_w512", (1, 16, 4)),
+        (32, "bf16", "kda_w_large", (2, 16, 1)),
+        (1, "f32", "kda_f32_w128", (4, 16, 8)),
+        (8, "f32", "kda_f32_w_large", (8, 16, 4)),
+        (32, "f32", "kda_f32_w_large", (8, 16, 4)),
     ],
 )
 def test_kda_dispatch_band_launches_selected_kernel(
-    harness, batch, expected_spec_id, expected_tile
+    harness, batch, state_dtype, expected_spec_id, expected_tile
 ):
     """Exercise request → dispatch → selected tile → compile → launch → oracle."""
     from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode
@@ -168,6 +175,7 @@ def test_kda_dispatch_band_launches_selected_kernel(
             gate_kind="kda",
             num_k_heads=32,
             num_v_heads=32,
+            state_dtype=state_dtype,
         )
     )
     got_tile = (

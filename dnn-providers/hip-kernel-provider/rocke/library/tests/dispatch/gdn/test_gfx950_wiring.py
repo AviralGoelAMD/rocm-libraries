@@ -390,25 +390,60 @@ class TestWorkKeyedTable(unittest.TestCase):
         self.assertEqual(_TILE(sharded), tile_for_work(4 * 8, "kda"))
 
     def test_tile_for_work_agrees_with_kda_dispatch(self):
-        for batch in (1, 8, 32, 128):
-            with self.subTest(batch=batch):
-                spec = dispatch_gdn_decode(
-                    GdnDecodeRequest(
-                        batch=batch,
-                        arch=ARCH,
-                        gate_kind="kda",
-                        num_k_heads=32,
-                        num_v_heads=32,
+        for state_dtype in ("bf16", "f16", "f32"):
+            for batch in (1, 4, 8, 32, 128):
+                with self.subTest(state_dtype=state_dtype, batch=batch):
+                    spec = dispatch_gdn_decode(
+                        GdnDecodeRequest(
+                            batch=batch,
+                            arch=ARCH,
+                            gate_kind="kda",
+                            num_k_heads=32,
+                            num_v_heads=32,
+                            state_dtype=state_dtype,
+                        )
+                    ).spec
+                    self.assertEqual(spec.state_dtype, state_dtype)
+                    self.assertEqual(
+                        _TILE(spec),
+                        tile_for_work(batch * spec.num_v_heads, "kda", state_dtype),
                     )
-                ).spec
-                self.assertEqual(
-                    _TILE(spec),
-                    tile_for_work(batch * spec.num_v_heads, "kda"),
+
+    def test_state_width_picks_the_table(self):
+        """bf16 and f16 share the 2-byte table; f32 auto never lands on a
+        2-byte row, and the two tables disagree where it was measured to matter
+        (large work), so a mix-up changes the tile a caller gets."""
+        from dispatch.gdn.gfx950 import _TUNED_TILES_KDA, _TUNED_TILES_KDA_F32
+
+        two_byte = {sid for _, _, sid in _TUNED_TILES_KDA}
+        f32_ids = {sid for _, _, sid in _TUNED_TILES_KDA_F32}
+        for batch in (1, 4, 8, 16, 64, 256):
+            with self.subTest(batch=batch):
+                req = dict(
+                    batch=batch,
+                    arch=ARCH,
+                    gate_kind="kda",
+                    num_k_heads=32,
+                    num_v_heads=32,
                 )
+                bf16 = dispatch_gdn_decode(GdnDecodeRequest(**req)).candidate.spec_id
+                f16 = dispatch_gdn_decode(
+                    GdnDecodeRequest(**req, state_dtype="f16")
+                ).candidate.spec_id
+                f32 = dispatch_gdn_decode(
+                    GdnDecodeRequest(**req, state_dtype="fp32")
+                ).candidate.spec_id
+                self.assertEqual(bf16, f16)
+                self.assertIn(bf16, two_byte)
+                self.assertIn(f32, f32_ids)
+        self.assertNotEqual(
+            tile_for_work(10**6, "kda", "bf16"), tile_for_work(10**6, "kda", "f32")
+        )
 
     def test_kda_table_is_total_over_work(self):
-        for work in (1, 4, 5, 128, 129, 4096, 4097, 10**6):
-            self.assertIsNotNone(tile_for_work(work, "kda"))
+        for state_dtype in ("bf16", "f32"):
+            for work in (1, 4, 5, 128, 129, 4096, 4097, 10**6):
+                self.assertIsNotNone(tile_for_work(work, "kda", state_dtype))
 
 
 class TestGdnAndKdaTileNamespaces(unittest.TestCase):

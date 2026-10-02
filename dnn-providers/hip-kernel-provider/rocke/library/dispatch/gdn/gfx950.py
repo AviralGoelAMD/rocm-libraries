@@ -40,11 +40,19 @@ ARCH = "gfx950"
 # owns the full configured tile space and has no GDN batch-winner table.
 #
 # (max_work, (num_warps, warp_threads_k, blocks_per_v_dim), spec_id)
+# Measured with a bf16 state; also serves f16 (same 2-byte state width).
 _TUNED_TILES_KDA = (
     (128, (4, 16, 4), "kda_w128"),
     (512, (1, 16, 4), "kda_w512"),
     (None, (2, 16, 1), "kda_w_large"),
 )
+# Measured with an f32 state. Twice the state bytes per lane favour more warps
+# per head: the 2-byte table's large-work tile is ~1.5x off the f32 best there.
+_TUNED_TILES_KDA_F32 = (
+    (128, (4, 16, 8), "kda_f32_w128"),
+    (None, (8, 16, 4), "kda_f32_w_large"),
+)
+_ALL_KDA_TILES = _TUNED_TILES_KDA + _TUNED_TILES_KDA_F32
 
 NUM_WARPS = (1, 2, 4, 8, 16)
 WARP_THREADS_K = (1, 2, 4, 8, 16, 32)
@@ -56,7 +64,7 @@ CONFIGURED_TILES = (DEFAULT_TILE,) + tuple(
     tile for tile in _LEXICOGRAPHIC_TILES if tile != DEFAULT_TILE
 )
 
-TUNED_SPEC_IDS = tuple(entry[2] for entry in _TUNED_TILES_KDA)
+TUNED_SPEC_IDS = tuple(entry[2] for entry in _ALL_KDA_TILES)
 
 
 def work_for(batch: int, num_v_heads: int) -> int:
@@ -64,24 +72,35 @@ def work_for(batch: int, num_v_heads: int) -> int:
     return int(batch) * int(num_v_heads)
 
 
-def tile_for_work(work: int, gate_kind: str = "kda") -> Tuple[int, int, int]:
+def _kda_table(state_dtype: str):
+    """The work-keyed KDA table measured for this state width."""
+    return (
+        _TUNED_TILES_KDA_F32
+        if normalize_dtype(state_dtype) == "f32"
+        else _TUNED_TILES_KDA
+    )
+
+
+def tile_for_work(
+    work: int, gate_kind: str = "kda", state_dtype: str = "bf16"
+) -> Tuple[int, int, int]:
     if gate_kind != "kda":
         raise ValueError(f"no work-keyed table for gate kind {gate_kind!r}")
-    for max_work, tile, _ in _TUNED_TILES_KDA:
+    for max_work, tile, _ in _kda_table(state_dtype):
         if max_work is None or work <= max_work:
             return tile
     raise AssertionError("unreachable: KDA table has an open-ended final band")
 
 
-def spec_id_for_work(work: int) -> str:
-    for max_work, _, spec_id in _TUNED_TILES_KDA:
+def spec_id_for_work(work: int, state_dtype: str = "bf16") -> str:
+    for max_work, _, spec_id in _kda_table(state_dtype):
         if max_work is None or work <= max_work:
             return spec_id
     raise AssertionError("unreachable: KDA table has an open-ended final band")
 
 
 def _tile_for_kda_spec_id(spec_id: str) -> Tuple[int, int, int]:
-    for _, tile, candidate_spec_id in _TUNED_TILES_KDA:
+    for _, tile, candidate_spec_id in _ALL_KDA_TILES:
         if candidate_spec_id == spec_id:
             return tile
     raise KeyError(spec_id)
@@ -89,7 +108,7 @@ def _tile_for_kda_spec_id(spec_id: str) -> Tuple[int, int, int]:
 
 def _gate_kind_for_spec_id(spec_id: str) -> str:
     """Which gate kind's table a spec id belongs to."""
-    if any(sid == spec_id for _, _, sid in _TUNED_TILES_KDA):
+    if any(sid == spec_id for _, _, sid in _ALL_KDA_TILES):
         return "kda"
     return "gdn"
 
@@ -159,7 +178,9 @@ def _make_candidate(
                     f"static GDN auto tile is {DEFAULT_TILE!r}, not {tile!r}"
                 )
         if req.spec_id.strip().lower() == "auto" and req.gate_kind == "kda":
-            wanted = spec_id_for_work(work_for(req.batch, req.num_v_heads))
+            wanted = spec_id_for_work(
+                work_for(req.batch, req.num_v_heads), req.state_dtype
+            )
             if (
                 wanted != spec_id
                 and is_valid_spec(
@@ -219,7 +240,7 @@ def candidates() -> Tuple[KernelCandidate, ...]:
             priority=10 + len(gdn) + i,
             spec_id=spec_id,
         )
-        for i, (_, tile, spec_id) in enumerate(_TUNED_TILES_KDA)
+        for i, (_, tile, spec_id) in enumerate(_ALL_KDA_TILES)
     )
     return gdn + kda
 

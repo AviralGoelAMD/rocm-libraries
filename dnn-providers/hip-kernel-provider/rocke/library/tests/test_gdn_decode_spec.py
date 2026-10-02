@@ -352,12 +352,13 @@ class TestEmission(unittest.TestCase):
                 self.assertEqual(_compiled_scratch_bytes(self, result.spec), 0)
 
     def test_every_kda_tuned_tile_compiles(self):
-        from dispatch.gdn.gfx950 import _TUNED_TILES_KDA
+        from dispatch.gdn.gfx950 import _ALL_KDA_TILES
 
-        # f32 doubles the state registers each lane loads, so it is the state
-        # dtype most likely to spill.
+        # Every tuned tile is reachable with either state width (auto picks one
+        # table; a spec_id pin can pair any tile with any width). f32 doubles
+        # the state registers each lane loads, so it is the most likely to spill.
         for state_dtype in ("bf16", "f32"):
-            for _, tile, spec_id in _TUNED_TILES_KDA:
+            for _, tile, spec_id in _ALL_KDA_TILES:
                 with self.subTest(spec_id=spec_id, state_dtype=state_dtype):
                     spec = dc.replace(
                         GdnDecodeSpec(),

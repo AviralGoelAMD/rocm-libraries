@@ -52,7 +52,7 @@ def _cases():
     tile, so a change to any selectable configuration is visible.
     """
     from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode_all
-    from dispatch.gdn.gfx950 import _TUNED_TILES_KDA
+    from dispatch.gdn.gfx950 import _TUNED_TILES_KDA, _TUNED_TILES_KDA_F32
     from kernels.gfx950.gdn_decode import GdnDecodeSpec, build_gdn_decode
 
     def build(**overrides):
@@ -78,6 +78,14 @@ def _cases():
     for _, tile, spec_id in _TUNED_TILES_KDA:
         cases[f"tuned_{spec_id}"] = build(
             gate_kind="kda",
+            num_warps=tile[0],
+            warp_threads_k=tile[1],
+            blocks_per_v_dim=tile[2],
+        )
+    for _, tile, spec_id in _TUNED_TILES_KDA_F32:
+        cases[f"tuned_{spec_id}"] = build(
+            gate_kind="kda",
+            state_dtype="f32",
             num_warps=tile[0],
             warp_threads_k=tile[1],
             blocks_per_v_dim=tile[2],

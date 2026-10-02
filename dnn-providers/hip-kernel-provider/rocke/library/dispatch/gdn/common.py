@@ -63,6 +63,8 @@ class GdnDecodeRequest(OperatorRequest):
 
     For ``gate_kind="kda"``, ``auto`` is keyed on ``batch * num_v_heads`` -- the
     "work" -- so tensor parallelism selects the tile for heads local to a rank.
+    The work bands come from a table measured for the state width: one for
+    2-byte states (bf16/f16) and one for f32.
 
     ``gate_kind`` selects the forget-gate granularity: ``"gdn"`` (one scalar
     decay per head) or ``"kda"`` (a per-channel decay). It reaches the spec and

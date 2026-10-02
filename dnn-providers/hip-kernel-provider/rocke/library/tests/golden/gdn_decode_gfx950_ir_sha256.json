@@ -242,6 +242,14 @@
           "bytes": 155146,
           "sha256": "8bd3d1b4a079412986b2932d2e4c6824de17ab66ec65285b8172f09b319b4e96"
         },
+        "tuned_kda_f32_w128": {
+          "bytes": 26225,
+          "sha256": "ac67eb85fb8e5200344968097015b3082ea90b24482d77f163c282bbdb37f513"
+        },
+        "tuned_kda_f32_w_large": {
+          "bytes": 26225,
+          "sha256": "afdb8b60c6c116f2fc5dfa4122d04ebda4e1953e0748f4be4f0b6f6a9f61bef5"
+        },
         "tuned_kda_w128": {
           "bytes": 34241,
           "sha256": "c7a29fbb2740c0103b69866e341ee53a1b78f555f29c281be65126ea3eeef000"
@@ -498,6 +506,14 @@
           "bytes": 155153,
           "sha256": "2904dde3953da5b6973dcf25648de71523701a8b84984460b79a9b45375109dc"
         },
+        "tuned_kda_f32_w128": {
+          "bytes": 26232,
+          "sha256": "b0686d08a83808fe89311ebfdb2fde5d26a5a4877ae7d0bf9fcdabfc73cb02ab"
+        },
+        "tuned_kda_f32_w_large": {
+          "bytes": 26232,
+          "sha256": "e686f4108bd338984e7e99f7f7b2b183fcd3a2c601bcf8539e4f3a9765f5e8b2"
+        },
         "tuned_kda_w128": {
           "bytes": 34248,
           "sha256": "62843ce2877f7840f45ae469413877a50d75b71a8cca7373c83ec39c7a522d03"
@@ -753,6 +769,14 @@
         "simple": {
           "bytes": 155157,
           "sha256": "72254a6f6d93118a83153e814ddfee6c67b467a76d2c15c53c9e3e9b22bae435"
+        },
+        "tuned_kda_f32_w128": {
+          "bytes": 26236,
+          "sha256": "5b75ee104e8078579d3d1ea58150410d0085468f67dfd0e480b812f52c7fb4b2"
+        },
+        "tuned_kda_f32_w_large": {
+          "bytes": 26236,
+          "sha256": "5db718333e9f81736fd737e0529f3800a2d02447117a4deca181dde7a2935ce0"
         },
         "tuned_kda_w128": {
           "bytes": 34252,

@@ -14,9 +14,11 @@ from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode
 
 ARCH = "gfx950"
 CASES = (
-    (1, "kda_w128", (4, 16, 4)),
-    (8, "kda_w512", (1, 16, 4)),
-    (32, "kda_w_large", (2, 16, 1)),
+    (1, "bf16", "kda_w128", (4, 16, 4)),
+    (8, "bf16", "kda_w512", (1, 16, 4)),
+    (32, "bf16", "kda_w_large", (2, 16, 1)),
+    (1, "f32", "kda_f32_w128", (4, 16, 8)),
+    (32, "f32", "kda_f32_w_large", (8, 16, 4)),
 )
 
 
@@ -60,8 +62,10 @@ def test_scratch_gate_rejects_nonzero_metadata():
         )
 
 
-@pytest.mark.parametrize("batch,expected_spec_id,expected_tile", CASES)
-def test_dispatched_kda_tile_is_scratch_free(batch, expected_spec_id, expected_tile):
+@pytest.mark.parametrize("batch,state_dtype,expected_spec_id,expected_tile", CASES)
+def test_dispatched_kda_tile_is_scratch_free(
+    batch, state_dtype, expected_spec_id, expected_tile
+):
     """Compile each production candidate and reject register spills."""
     result = dispatch_gdn_decode(
         GdnDecodeRequest(
@@ -72,6 +76,7 @@ def test_dispatched_kda_tile_is_scratch_free(batch, expected_spec_id, expected_t
             num_v_heads=32,
             head_k_dim=128,
             head_v_dim=128,
+            state_dtype=state_dtype,
         )
     )
     tile = (
