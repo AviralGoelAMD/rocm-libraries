@@ -298,6 +298,10 @@ of the gate inputs, not the recurrent-state layout or the rest of the ABI:
 | `read_indices`, `write_indices` | `[B]`, `i32` | same | in |
 | `state` | `[pool, num_v_heads, head_v_dim, head_k_dim]`, `state_dtype` | same | in-place |
 
+`state_dtype` is `bf16`, `f16` or `f32`; the I/O `dtype` is `bf16` or `f16`. The kernel
+updates the state in f32 registers either way, so `f32` only widens the state loads and
+stores (two 16-byte accesses per 8 elements instead of one).
+
 The launch also passes a trailing `batch_size` `i32` scalar (not a tensor).
 `prepare()` validates the gate-kind-dependent shapes, dtypes, devices and
 contiguity before launch, in addition to the state-pool checks in §4.5.

@@ -76,8 +76,9 @@ def _kda(**kw):
 
 
 @requires_gfx950
+@pytest.mark.parametrize("state_dtype", ["bf16", "f32"])
 @pytest.mark.parametrize("batch", [1, 3, 16, 64])
-def test_kda_simple_path_matches_reference(harness, batch):
+def test_kda_simple_path_matches_reference(harness, batch, state_dtype):
     """The one-thread-per-row reference emitter, with a per-channel gate.
 
     This path owns a whole state row per thread, so the gate vector maps onto
@@ -85,7 +86,8 @@ def test_kda_simple_path_matches_reference(harness, batch):
     here first means a later warp-tiled failure is an indexing bug and not a
     gate-formula bug.
     """
-    out_err, state_err = harness["check"](_kda(simple=True), batch)
+    spec = _kda(simple=True, state_dtype=state_dtype)
+    out_err, state_err = harness["check"](spec, batch)
 
     assert out_err <= harness["TOL"], f"KDA simple output error {out_err:.3e}"
     assert state_err <= harness["TOL"], f"KDA simple state error {state_err:.3e}"
@@ -117,22 +119,28 @@ def test_kda_warp_tiled_matches_reference(harness, batch):
 
 
 @requires_gfx950
+@pytest.mark.parametrize("state_dtype", ["bf16", "f32"])
 @pytest.mark.parametrize("max_work,tile,spec_id", _TUNED_TILES_KDA)
-def test_every_kda_tuned_tile_is_correct(harness, max_work, tile, spec_id):
-    """Every tile in the KDA table agrees with the independent reference."""
+def test_every_kda_tuned_tile_is_correct(harness, max_work, tile, spec_id, state_dtype):
+    """Every tile in the KDA table agrees with the independent reference,
+    with the state stored in bf16 or in f32. f32 doubles the state bytes each
+    lane moves, so it exercises a different load/store split."""
     num_warps, warp_threads_k, blocks_per_v_dim = tile
     spec = _kda(
         num_warps=num_warps,
         warp_threads_k=warp_threads_k,
         blocks_per_v_dim=blocks_per_v_dim,
+        state_dtype=state_dtype,
     )
     out_err, state_err = harness["check"](spec, batch=16)
 
     assert out_err <= harness["TOL"], (
-        f"KDA {spec_id} ({tile}, max_work={max_work}) " f"output error {out_err:.3e}"
+        f"KDA {spec_id} ({tile}, max_work={max_work}, state {state_dtype}) "
+        f"output error {out_err:.3e}"
     )
     assert state_err <= harness["TOL"], (
-        f"KDA {spec_id} ({tile}, max_work={max_work}) " f"state error {state_err:.3e}"
+        f"KDA {spec_id} ({tile}, max_work={max_work}, state {state_dtype}) "
+        f"state error {state_err:.3e}"
     )
 
 

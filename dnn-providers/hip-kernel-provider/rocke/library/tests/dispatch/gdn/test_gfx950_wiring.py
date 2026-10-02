@@ -225,6 +225,24 @@ class TestDtypeCoverage(unittest.TestCase):
                 got = dispatch_gdn_decode(_req(16, dtype=dtype))
                 self.assertEqual(got.spec.dtype, dtype)
 
+    def test_f32_reaches_the_state_but_not_the_io(self):
+        """f32 is a state dtype only. Every spelling of it must reach the
+        compiled spec for both gate kinds (the kernel name, and so the cache
+        key, carries it), and the I/O dtype must still refuse it."""
+        from kernels.gfx950.gdn_decode import STATE_DTYPES
+
+        self.assertEqual(set(STATE_DTYPES), {"bf16", "f16", "f32"})
+        for gate_kind in ("gdn", "kda"):
+            for spelling in ("f32", "fp32", "float32"):
+                with self.subTest(gate_kind=gate_kind, spelling=spelling):
+                    got = dispatch_gdn_decode(
+                        _req(16, gate_kind=gate_kind, state_dtype=spelling)
+                    )
+                    self.assertEqual(got.spec.state_dtype, "f32")
+                    self.assertIn("stf32", got.spec.kernel_name())
+        with self.assertRaises(ValueError):
+            dispatch_gdn_decode(_req(16, dtype="float32"))
+
 
 class TestLaunchGeometry(unittest.TestCase):
     def test_grid_and_block_track_the_selected_spec(self):

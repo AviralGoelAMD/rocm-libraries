@@ -44,7 +44,7 @@ linear-attention decode contract:
     dt_bias KDA  : [num_v_heads, head_k_dim]         f32
     A_log        : [num_v_heads]                     f32
     read/write_indices : [B]                         i32
-    state        : [pool, num_v_heads, head_v_dim, head_k_dim]  state_dtype
+    state        : [pool, num_v_heads, head_v_dim, head_k_dim]  state_dtype (f16/bf16/f32)
 
 **Two emitters, one contract**, selected by ``GdnDecodeSpec.simple``.
 
@@ -97,6 +97,7 @@ __all__ = [
     "gdn_decode_grid",
     "gdn_decode_signature",
     "GDN_DTYPES",
+    "STATE_DTYPES",
 ]
 
 DType = Literal["f16", "bf16"]
@@ -105,12 +106,50 @@ DType = Literal["f16", "bf16"]
 # fails silently -- a prefilter rejecting a shape the kernel has since learned
 # to run, or admitting one it cannot.
 GDN_DTYPES = get_args(DType)
+# The recurrent state may also be f32: production KDA/GDN decode keeps the
+# state in f32, and prefill hands it over in f32. Only the state widens; q/k/v,
+# the gates and the output stay in ``dtype``. The kernel already does every
+# state update in f32 registers, so f32 changes only the state loads/stores.
+StateDType = Literal["f16", "bf16", "f32"]
+STATE_DTYPES = get_args(StateDType)
 
 NORM_EPS = 1e-6
 EXP2_CLAMP = 126.0  # f32 exp2 argument range; keeps exp2_fast inside its contract
-STATE_VEC = 8  # 16B bf16 vector load/store width
+# State elements per vector access: 16 B in f16/bf16, 32 B in f32 (the backend
+# splits that into two 16 B accesses).
+STATE_VEC = 8
 # State element size in bytes; is_valid_spec bars any state dtype but these.
-_STATE_BYTES = {dt: 2 for dt in GDN_DTYPES}
+_STATE_BYTES = {"f16": 2, "bf16": 2, "f32": 4}
+# The ``state`` param promises 16 B alignment (one pool row starts at a
+# multiple of 16 B); an f32 access must not claim its 32 B payload size.
+_STATE_ALIGN = 16
+
+
+def _state_ir_type(state_dtype: str):
+    return F32 if state_dtype == "f32" else io_ir_type(state_dtype)
+
+
+def _load_state_f32(b: IRBuilder, ptr, idx, *, state_dtype: str, n: int):
+    """Streamed (nontemporal) load of ``n`` state elements as f32 values."""
+    if state_dtype == "f32":
+        v = b.global_load_vN(ptr, idx, F32, n, align=_STATE_ALIGN, nontemporal=True)
+        return [b.vec_extract(v, i) for i in range(n)]
+    return load_vec_as_f32(b, ptr, idx, dtype=state_dtype, n=n, nontemporal=True)
+
+
+def _pack_state(b: IRBuilder, values, *, state_dtype: str):
+    """Pack f32 ``values`` into a state-dtype vector (no conversion for f32)."""
+    if state_dtype == "f32":
+        return b.vec_pack(values, F32)
+    return pack_f32_to(b, values, dtype=state_dtype)
+
+
+def _store_state(b: IRBuilder, ptr, idx, vec, *, state_dtype: str, n: int) -> None:
+    """Streamed (nontemporal) store of a packed state vector."""
+    if state_dtype == "f32":
+        b.global_store_vN(ptr, idx, vec, n, align=_STATE_ALIGN, nontemporal=True)
+        return
+    store_vec(b, ptr, idx, vec, n=n, nontemporal=True)
 
 
 @dataclass(frozen=True)
@@ -122,7 +161,7 @@ class GdnDecodeSpec:
     head_k_dim: int = 128
     head_v_dim: int = 128
     dtype: DType = "bf16"
-    state_dtype: DType = "bf16"
+    state_dtype: StateDType = "bf16"
     use_qk_l2norm: bool = True
     # Forget-gate granularity. "gdn" applies one scalar decay per head; "kda"
     # applies a per-channel DK-vector decay. GDN is the special case of KDA in
@@ -216,7 +255,7 @@ def is_valid_spec(spec: GdnDecodeSpec, arch: str = "gfx950") -> Tuple[bool, str]
             f"spec.wave_size {spec.wave_size} != {arch} wave size "
             f"{target.wave_size}",
         )
-    if spec.dtype not in GDN_DTYPES or spec.state_dtype not in GDN_DTYPES:
+    if spec.dtype not in GDN_DTYPES or spec.state_dtype not in STATE_DTYPES:
         return False, f"unsupported dtype {spec.dtype}/{spec.state_dtype}"
     if spec.gate_kind not in ("gdn", "kda"):
         return False, f"gate_kind must be 'gdn' or 'kda' (got {spec.gate_kind!r})"
@@ -299,7 +338,7 @@ def _build_simple(spec: GdnDecodeSpec) -> KernelDef:
     ST_BYTES = _STATE_BYTES[spec.state_dtype]
 
     io_ty = io_ir_type(spec.dtype)
-    st_ty = io_ir_type(spec.state_dtype)
+    st_ty = _state_ir_type(spec.state_dtype)
 
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = BS
@@ -468,8 +507,8 @@ def _build_simple(spec: GdnDecodeSpec) -> KernelDef:
         sv = []
         for c in range(0, DK, STATE_VEC):
             off = b.add(rs_base, b.const_i32(c))
-            sv += load_vec_as_f32(
-                b, state_r, off, dtype=spec.state_dtype, n=STATE_VEC, nontemporal=True
+            sv += _load_state_f32(
+                b, state_r, off, state_dtype=spec.state_dtype, n=STATE_VEC
             )
         # Gated forget. A scalar decay broadcasts over the row; a per-channel
         # decay zips with it -- `sv` and `decay` are both indexed by K channel,
@@ -499,14 +538,14 @@ def _build_simple(spec: GdnDecodeSpec) -> KernelDef:
         ws_base = b.add(b.mul(hv_i, b.const_i32(S_HV)), b.mul(tid, b.const_i32(S_VR)))
         new_s = [b.fma(kn[j], v_new, sv[j]) for j in range(DK)]
         for c in range(0, DK, STATE_VEC):
-            vec = pack_f32_to(b, new_s[c : c + STATE_VEC], dtype=spec.state_dtype)
-            store_vec(
+            vec = _pack_state(b, new_s[c : c + STATE_VEC], state_dtype=spec.state_dtype)
+            _store_state(
                 b,
                 state_w,
                 b.add(ws_base, b.const_i32(c)),
                 vec,
+                state_dtype=spec.state_dtype,
                 n=STATE_VEC,
-                nontemporal=True,
             )
 
     return b.kernel
@@ -543,7 +582,7 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
     ST_BYTES = _STATE_BYTES[spec.state_dtype]
 
     io_ty = io_ir_type(spec.dtype)
-    st_ty = io_ir_type(spec.state_dtype)
+    st_ty = _state_ir_type(spec.state_dtype)
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = BS
 
@@ -685,8 +724,8 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             )
             for ki in range(WTK_ITERS):
                 off = b.add(rs_row, b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K)))
-                s_raw[(vi, ki)] = load_vec_as_f32(
-                    b, state_r, off, dtype=spec.state_dtype, n=VPT, nontemporal=True
+                s_raw[(vi, ki)] = _load_state_f32(
+                    b, state_r, off, state_dtype=spec.state_dtype, n=VPT
                 )
 
         # this lane's v, one per V row
@@ -832,9 +871,9 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             )
             for ki in range(WTK_ITERS):
                 new = [b.fma(kn[ki][i], v_new, sv[(vi, ki)][i]) for i in range(VPT)]
-                vec = pack_f32_to(b, new, dtype=spec.state_dtype)
+                vec = _pack_state(b, new, state_dtype=spec.state_dtype)
                 off = b.add(ws_row, b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K)))
-                store_vec(b, state_w, off, vec, n=VPT, nontemporal=True)
+                _store_state(b, state_w, off, vec, state_dtype=spec.state_dtype, n=VPT)
 
     return b.kernel
 

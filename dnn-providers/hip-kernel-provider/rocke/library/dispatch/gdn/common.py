@@ -20,6 +20,7 @@ from kernels.gfx950.gdn_decode import (
     # direction that fails silently, rejecting a shape the kernel has since
     # learned to run.
     GDN_DTYPES,
+    STATE_DTYPES,
 )
 from rocke.dispatch.core import (
     OperatorRequest,
@@ -38,6 +39,9 @@ _DTYPE_ALIASES = {
     "f16": "f16",
     "fp16": "f16",
     "float16": "f16",
+    "f32": "f32",
+    "fp32": "f32",
+    "float32": "f32",
 }
 
 
@@ -126,7 +130,7 @@ def request_errors(req: OperatorRequest) -> list:
         errors.append("head dims must be positive")
     if normalize_dtype(req.dtype) not in GDN_DTYPES:
         errors.append(f"unsupported dtype {req.dtype!r}")
-    if normalize_dtype(req.state_dtype) not in GDN_DTYPES:
+    if normalize_dtype(req.state_dtype) not in STATE_DTYPES:
         errors.append(f"unsupported state_dtype {req.state_dtype!r}")
     if req.gate_kind not in ("gdn", "kda"):
         errors.append(
