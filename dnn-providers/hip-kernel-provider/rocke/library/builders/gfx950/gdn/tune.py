@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-"""Measure gfx950 GDN registry candidates and KDA tile-table alternatives.
+"""Measure gfx950 GDN/KDA decode registry candidates against the static default.
 
-GDN dispatch has a static registry priority. Its sweep measures every legal
-registered candidate but does not change dispatcher-default selection. KDA keeps
-its separate work-keyed table, so its sweep enumerates every validator-admitted
-tile to challenge the selected work band.
+GDN and KDA dispatch register the same configured tile space and each uses one
+static ``auto`` tile: ``DEFAULT_TILE`` for GDN, ``KDA_DEFAULT_TILE`` for a KDA
+bf16/f16 state and ``KDA_DEFAULT_TILE_F32`` for a KDA f32 state. For each cell
+the sweep asks the dispatcher for every legal registered candidate of the gate
+kind, times each one, and reports the default's rank and its ratio to the
+fastest. It never changes dispatcher-default selection.
 
 Every candidate is correctness-gated before device timing. Host launch cost can
 hide kernel differences at small batch, so device time is the comparison metric.
@@ -15,30 +17,29 @@ Run GDN with its default batch anchors::
 
     PYTHONPATH=<rocke>/library:<rocke>/platform/python python3 tune.py
 
-Run the KDA work-keying study across several head geometries::
+Run KDA across several head geometries, for a 2-byte or an f32 state::
 
     PYTHONPATH=<rocke>/library:<rocke>/platform/python python3 tune.py --gate-kind kda \
         --geometries 16/32,8/16,4/8 \
-        --batches 1,2,4,8,16,32,64,128 --top 5
+        --batches 1,2,4,8,16,32,64,128 --top 5 [--state-dtype f32]
 """
 
 from __future__ import annotations
 
 import argparse
-import dataclasses as dc
 import sys
 
-
 from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode, dispatch_gdn_decode_all
-from dispatch.gdn.gfx950 import BLOCKS_PER_V_DIM, NUM_WARPS, WARP_THREADS_K, work_for
-from kernels.gfx950.gdn_decode import GdnDecodeSpec, is_valid_spec
 
 ARCH = "gfx950"
 DEFAULT_BATCHES = (1, 16, 64, 256)
 
-# KDA's study deliberately searches the registry's configured tile space. GDN
-# dispatcher auto uses the registry instead, so its sweep only receives registry
-# dispatch results.
+
+def default_tile_name(gate_kind: str, state_dtype: str) -> str:
+    """Name of the dispatch constant that holds ``auto``'s tile for this cell."""
+    if gate_kind != "kda":
+        return "DEFAULT_TILE"
+    return "KDA_DEFAULT_TILE_F32" if state_dtype == "f32" else "KDA_DEFAULT_TILE"
 
 
 def device_is_visible() -> bool:
@@ -59,23 +60,6 @@ def device_is_visible() -> bool:
         return False
     torch = torch_module
     return torch.cuda.is_available()
-
-
-def legal_configs(base: GdnDecodeSpec):
-    """Every validator-admitted tile for KDA's exhaustive tuning study."""
-    out = []
-    for num_warps in NUM_WARPS:
-        for warp_threads_k in WARP_THREADS_K:
-            for blocks_per_v_dim in BLOCKS_PER_V_DIM:
-                spec = dc.replace(
-                    base,
-                    num_warps=num_warps,
-                    warp_threads_k=warp_threads_k,
-                    blocks_per_v_dim=blocks_per_v_dim,
-                )
-                if is_valid_spec(spec, arch=ARCH)[0]:
-                    out.append((num_warps, warp_threads_k, blocks_per_v_dim))
-    return out
 
 
 def device_us(values, cfg, launcher, reps: int = 32):
@@ -122,7 +106,7 @@ def _untouched_damage(state, before, untouched) -> float:
 
 
 def sweep_registry_batch(batch: int, results):
-    """Return correct, timed GDN registry candidates for one batch, fastest first."""
+    """Return correct, timed registry candidates for one batch, fastest first."""
     if not results:
         return []
 
@@ -176,51 +160,10 @@ def sweep_registry_batch(batch: int, results):
     return rows
 
 
-def sweep_batch(base: GdnDecodeSpec, batch: int, configs):
-    """Return correct, timed KDA configurations for one batch, fastest first."""
-    inp = make_inputs(base, batch)
-    ref_out, ref_state = ref_fp32(base, inp)
-    before = inp["state"].clone()  # see sweep_registry_batch
-    written = inp["write_indices"].long()
-    untouched = torch.ones(
-        inp["state"].shape[0], dtype=torch.bool, device=inp["state"].device
-    )
-    untouched[written] = False
+def report_dispatcher_default(rows, auto_id: str, default_name: str) -> bool:
+    """Print the shipped default against the fastest measured candidate.
 
-    rows = []
-    for tile in configs:
-        spec = dc.replace(
-            base,
-            num_warps=tile[0],
-            warp_threads_k=tile[1],
-            blocks_per_v_dim=tile[2],
-        )
-        try:
-            launcher = launcher_for(spec, arch=ARCH)
-        except Exception as exc:
-            print(f"  {tile} compile failed: {type(exc).__name__}", file=sys.stderr)
-            continue
-        values, cfg = prepare(spec, inp, batch)
-        launch(launcher, values, cfg)
-        drain()
-        err = max(
-            (values["out"].float() - ref_out).abs().max().item(),
-            (values["state"].float()[written] - ref_state).abs().max().item(),
-        )
-        err = max(err, _untouched_damage(values["state"], before, untouched))
-        if err > TOL:
-            print(f"  {tile} INCORRECT err={err:.3e}", file=sys.stderr)
-            continue
-        micros = device_us(values, cfg, launcher)
-        if micros is not None:
-            rows.append((micros, tile, err))
-    rows.sort()
-    return rows
-
-
-def report_gdn_dispatcher_default(rows, auto_id: str) -> bool:
-    """Print the shipped GDN default against the fastest measured candidate.
-
+    ``default_name`` is the dispatch constant that holds the default tile.
     Return False when the default is not among the correct, timed rows.
     """
     best_micros, best_tile, best_id, _ = rows[0]
@@ -237,42 +180,15 @@ def report_gdn_dispatcher_default(rows, auto_id: str) -> bool:
         )
         print(f"  default / fastest = {micros / best_micros:.3f}x")
         if spec_id == best_id:
-            print("  manual review: retain DEFAULT_TILE")
+            print(f"  manual review: retain {default_name}")
         else:
-            print(f"  manual review: consider DEFAULT_TILE = {best_tile}")
+            print(f"  manual review: consider {default_name} = {best_tile}")
         return True
     print(
         f"  dispatcher default {auto_id!r} is NOT in the correct-and-timeable "
         "set for this cell"
     )
     return False
-
-
-def report_kda_work_keying(by_work) -> None:
-    """Check that cells sharing ``batch * num_v_heads`` pick the same best tile.
-
-    ``_TUNED_TILES_KDA`` is keyed on work alone. Cells with equal work but a
-    different (batch, num_v_heads) split are the evidence for or against that
-    key: a disagreement invalidates the table's key, not just one value.
-    """
-    print("\n=== KDA work -> best tile, across geometries ===")
-    print(f"{'work':>7}  {'best tile':16} {'us':>9}  cells (batch x Hv)")
-    disagreements = 0
-    for work in sorted(by_work):
-        cells = by_work[work]
-        tiles = {cell[1] for cell in cells}
-        fastest = min(cells)
-        cell_text = " ".join(f"{batch}x{hv}" for _, _, batch, hv in cells)
-        flag = "" if len(tiles) == 1 else "   <-- TILES DISAGREE"
-        disagreements += len(tiles) > 1
-        print(f"{work:>7}  {str(fastest[1]):16} {fastest[0]:9.3f}  {cell_text}{flag}")
-    if disagreements:
-        print(
-            f"\nWARNING: work alone did not fix the best tile at {disagreements} "
-            "work value(s). Check whether the disagreeing times sit inside "
-            "run-to-run variation; if they do not, _TUNED_TILES_KDA must not be "
-            "keyed on work."
-        )
 
 
 def main() -> int:
@@ -293,6 +209,12 @@ def main() -> int:
         default="16/32",
         help="comma-separated num_k_heads/num_v_heads pairs",
     )
+    parser.add_argument(
+        "--state-dtype",
+        default="bf16",
+        choices=("bf16", "f16", "f32"),
+        help="recurrent-state dtype; tiles tuned for one width need not suit another",
+    )
     parser.add_argument("--top", type=int, default=8, help="rows to print per cell")
     args = parser.parse_args()
 
@@ -306,51 +228,17 @@ def main() -> int:
         for item in args.geometries.split(",")
     ]
     failed = False
-    by_work = {}  # KDA work -> [(us, best tile, batch, num_v_heads), ...]
+    default_name = default_tile_name(args.gate_kind, args.state_dtype)
     for num_k_heads, num_v_heads in geometries:
         for batch in batches:
             request = GdnDecodeRequest(
                 batch=batch,
                 arch=ARCH,
                 gate_kind=args.gate_kind,
+                state_dtype=args.state_dtype,
                 num_k_heads=num_k_heads,
                 num_v_heads=num_v_heads,
             )
-            if args.gate_kind == "kda":
-                # KDA's measured table is work-keyed, but the study must test
-                # every validator-admitted tile rather than the current band's
-                # dispatcher result.
-                auto = dispatch_gdn_decode(request)
-                base = auto.spec
-                configs = legal_configs(base)
-                print(f"legal KDA configurations for batch {batch}: {len(configs)}")
-                rows = sweep_batch(base, batch, configs)
-                if not rows:
-                    print(f"batch {batch}: no candidate was both correct and timeable")
-                    failed = True
-                    continue
-                auto_tile = (
-                    base.num_warps,
-                    base.warp_threads_k,
-                    base.blocks_per_v_dim,
-                )
-                print(
-                    f"\n=== Hk{num_k_heads}/Hv{num_v_heads} batch {batch}: "
-                    f"top {args.top} ==="
-                )
-                for micros, tile, err in rows[: args.top]:
-                    mark = " <- dispatcher default" if tile == auto_tile else ""
-                    print(f"  {micros:9.3f}us tile={tile} err={err:.2e}{mark}")
-                if all(tile != auto_tile for _, tile, _ in rows):
-                    print(
-                        f"  dispatcher default {auto_tile} is NOT in the "
-                        "correct-and-timeable set for this cell"
-                    )
-                by_work.setdefault(work_for(batch, num_v_heads), []).append(
-                    (rows[0][0], rows[0][1], batch, num_v_heads)
-                )
-                continue
-
             results = dispatch_gdn_decode_all(request)
             print(f"legal registry candidates for batch {batch}: {len(results)}")
             rows = sweep_registry_batch(batch, results)
@@ -367,11 +255,9 @@ def main() -> int:
             for micros, tile, spec_id, err in rows[: args.top]:
                 mark = " <- dispatcher default" if spec_id == auto_id else ""
                 print(f"  {micros:9.3f}us  {spec_id} tile={tile} err={err:.2e}{mark}")
-            if not report_gdn_dispatcher_default(rows, auto_id):
+            if not report_dispatcher_default(rows, auto_id, default_name):
                 failed = True
 
-    if by_work:
-        report_kda_work_keying(by_work)
     print(
         "\nDispatcher default is deterministic; measurements do not change selection."
     )

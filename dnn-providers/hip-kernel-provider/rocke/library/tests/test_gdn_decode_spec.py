@@ -174,6 +174,7 @@ class TestKernelNameIdentity(unittest.TestCase):
         variants = {
             "base": base,
             "state_dtype": dc.replace(base, state_dtype="f16"),
+            "state_dtype_f32": dc.replace(base, state_dtype="f32"),
             "dtype": dc.replace(base, dtype="f16"),
             "wave_size": dc.replace(base, wave_size=32),
             "num_warps": dc.replace(base, num_warps=4),
@@ -358,19 +359,29 @@ class TestEmission(unittest.TestCase):
                 if result.candidate.spec_id not in spills:
                     self.assertEqual(scratch, 0)
 
-    def test_every_kda_tuned_tile_compiles(self):
-        from dispatch.gdn.gfx950 import _TUNED_TILES_KDA
+    def test_registered_kda_tiles_compile(self):
+        from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode_all
 
-        for _, tile, spec_id in _TUNED_TILES_KDA:
-            with self.subTest(spec_id=spec_id):
-                spec = dc.replace(
-                    GdnDecodeSpec(),
-                    gate_kind="kda",
-                    num_warps=tile[0],
-                    warp_threads_k=tile[1],
-                    blocks_per_v_dim=tile[2],
+        # KDA registers GDN's tile space, so the same register-heavy tile
+        # spills for the same reason (see test_registered_gdn_tiles_compile).
+        # f32 doubles the state registers each lane loads, so both widths run.
+        spills = {"kda_nw1_wtk1_bpv1"}
+        for state_dtype in ("bf16", "f32"):
+            results = dispatch_gdn_decode_all(
+                GdnDecodeRequest(
+                    batch=16, arch="gfx950", gate_kind="kda", state_dtype=state_dtype
                 )
-                self.assertEqual(_compiled_scratch_bytes(self, spec), 0)
+            )
+            for result in results:
+                spec_id = result.candidate.spec_id
+                with self.subTest(spec_id=spec_id, state_dtype=state_dtype):
+                    scratch = _compiled_scratch_bytes(self, result.spec)
+                    if spec_id not in spills:
+                        self.assertEqual(scratch, 0)
+
+    def test_default_gdn_tile_compiles_with_an_f32_state(self):
+        spec = dc.replace(GdnDecodeSpec(), state_dtype="f32")
+        self.assertEqual(_compiled_scratch_bytes(self, spec), 0)
 
     def test_distinct_tiles_emit_distinct_code(self):
         # If two tiles produced identical IR the tuning table would be choosing

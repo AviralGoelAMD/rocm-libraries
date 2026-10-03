@@ -298,6 +298,10 @@ of the gate inputs, not the recurrent-state layout or the rest of the ABI:
 | `read_indices`, `write_indices` | `[B]`, `i32` | same | in |
 | `state` | `[pool, num_v_heads, head_v_dim, head_k_dim]`, `state_dtype` | same | in-place |
 
+`state_dtype` is `bf16`, `f16` or `f32`; the I/O `dtype` is `bf16` or `f16`. The kernel
+updates the state in f32 registers either way, so `f32` only widens the state loads and
+stores (two 16-byte accesses per 8 elements instead of one).
+
 The launch also passes a trailing `batch_size` `i32` scalar (not a tensor).
 `prepare()` validates the gate-kind-dependent shapes, dtypes, devices and
 contiguity before launch, in addition to the state-pool checks in §4.5.
@@ -329,18 +333,33 @@ is retired at large batch, where the grid is already ample.
 
 ### 4.3 Dataflow and pipeline
 
-One workgroup, one decode step, in emission order:
+One workgroup, one decode step, in emission order (warp-tiled path):
 
 1. decode `bidx` and `tid` into `(sequence, value head, v-sub-block)` and `(wave, k-lane, v-lane)`;
 2. load `read_indices` / `write_indices` and form the `active` predicate — **outside** the guard, so
    a padded lane costs two `i32` loads and exits;
-3. under `scf_if(active)`: evaluate `decay` and `β`;
-4. load the lane's `q` and `k` slices as 16-byte vectors, promoted to `f32`;
+3. under `scf_if(active)`, issue **every** global load before any math: the gate inputs (GDN: the
+   `a`, `b`, `dt_bias` and `A_log` scalars; KDA: `b` and `A_log` plus the lane's per-channel gate and
+   `dt_bias` vectors), the lane's `q` and `k` slices as 16-byte vectors, the raw lane tile of the
+   state, and one `v` per owned V row — all promoted to `f32`;
+4. evaluate `decay` and `β`;
 5. reduce the two L2 norms (two cross-lane reductions, §4.4);
 6. reduce `dot(k̂, q̂)` (one more);
-7. form the state read pointer, load the whole lane tile, applying `decay` as it lands;
+7. apply `decay` to the raw state tile;
 8. per owned V row: reduce `s·k̂` and `s·q̂`, form `v_new = β (v − s·k̂)`, then emit the output and
    the rank-1 state update.
+
+Why loads first: the AMDGPU scheduler does not hoist a load above earlier math or across the
+`k_lane == 0` output-store branch, so emission order bounds how many separate load batches (each
+ended by a `vmcnt` wait) a wave exposes. Loads first gives the default and small tiles a single
+batch; larger tiles still split into two or three. The floating-point arithmetic is the same and in
+the same order as an interleaved emission. The simple path (`spec.simple`) keeps the interleaved
+order: q/k, norms, gates, dot, then the state row.
+
+Cache policy: the state is read once and written once per call, so the state loads (step 3) and
+stores (step 8) are **nontemporal** (`temporal_hint=TemporalHint.STREAMING` → LLVM `!nontemporal`
+→ the `nt` bit on gfx950) in both paths and for every state dtype. This is always on, not a spec
+field or kernel-name tag. `q`, `k`, `v`, the gates and `out` keep the default cache policy.
 
 Two consequences of the identity in §1.2 item 3: the output store and the state write in step 8 are
 **independent** — neither reads the other's result — and the output is broadcast across the k-lane
@@ -381,33 +400,47 @@ before launch.
 
 ### 4.6 Registry and tile selection
 
-GDN exposes the Cartesian product of:
+GDN and KDA each register the Cartesian product of:
 
 - `num_warps ∈ {1, 2, 4, 8, 16}`;
 - `warp_threads_k ∈ {1, 2, 4, 8, 16, 32}`;
 - `blocks_per_v_dim ∈ {1, 2, 4, 8, 16, 32}`.
 
-This produces 180 stable identities. `is_valid_spec()` is the only legality
-authority and admits 54 GDN candidates for the default D128 shape. Production
-`auto` deterministically prefers `(2, 16, 8)` whenever legal; batch changes
-grid size, not GDN tile selection. A caller may pin an exact candidate with
-`nw<num_warps>_wtk<warp_threads_k>_bpv<blocks_per_v_dim>`.
+This produces 180 stable identities per gate kind. `is_valid_spec()` is the
+only legality authority and admits 54 candidates of each gate kind for the
+default D128 shape (for KDA, with either state width). A caller may pin an
+exact candidate with `nw<num_warps>_wtk<warp_threads_k>_bpv<blocks_per_v_dim>`
+(GDN) or the same id prefixed with `kda_` (KDA); a candidate never serves the
+other gate kind.
 
+Production `auto` is one static tile, and batch and `num_v_heads` change grid
+size, not the tile:
 
-KDA remains keyed on `work = batch × num_v_heads`. Tensor-parallel sharding
-changes `num_v_heads` per rank, so two launches with the same batch can expose
-different amounts of GPU work:
+| Gate kind | State dtype | `auto` tile | Constant |
+| --- | --- | --- | --- |
+| GDN | any | `(2, 16, 8)` | `DEFAULT_TILE` |
+| KDA | `bf16`, `f16` | `(4, 16, 4)` | `KDA_DEFAULT_TILE` |
+| KDA | `f32` | `(8, 16, 4)` | `KDA_DEFAULT_TILE_F32` |
 
-| Band | Work | `(num_warps, warp_threads_k, blocks_per_v_dim)` |
-| --- | --- | --- |
-| `kda_w128` | `≤ 128` | `(4, 16, 4)` |
-| `kda_w512` | `≤ 512` | `(1, 16, 4)` |
-| `kda_w_large` | larger | `(2, 16, 1)` |
+If the default is illegal for a request, dispatch falls back to the first legal
+candidate of that gate kind in registration order (`DEFAULT_TILE`, then product
+order), for both gate kinds.
 
-`BPV` manufactures workgroups when the natural grid is too small. KDA's table
-comes from exhaustive legal-tile sweeps with every candidate correctness-gated
-before timing. Its band edges interpolate measured anchors; exact measurements
-live in the protected performance record.
+The KDA defaults replaced work-keyed tables (`work = batch × num_v_heads`). On
+gfx950 MI355X with cold memory, over 56 shapes (`Hk = Hv ∈ {4, 8, 12, 16, 24,
+32, 48, 96}` × batch `{1, 8, 16, 32, 64, 128, 256}`), every candidate
+correctness-gated before timing:
+
+- 2-byte state: `(4, 16, 4)` had the lowest geomean (1.05×) and worst-case
+  (1.11×) slowdown against each shape's fastest shortlisted single tile, and ran
+  1.8% slower than the bf16 work table on average.
+- f32 state: `(8, 16, 4)` had a 1.015× geomean and 1.112× worst-case slowdown
+  against each shape's fastest tile, ran 0.3% slower than the f32 work table on
+  average (worst at batch 1, up to 9%), and spills nothing.
+
+`BPV` manufactures workgroups when the natural grid is too small. Re-measure
+either gate kind with `tune.py`; exact measurements live in the protected
+performance record.
 
 ### 4.7 The reference path
 

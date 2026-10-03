@@ -59,7 +59,8 @@ _LAUNCHER_CACHE: Dict[Tuple, KernelLauncher] = {}
 # Spec dtype name -> the torch dtype the kernel is compiled against. The kernel
 # receives a raw pointer, so this mapping is the only thing tying a caller's
 # tensor to the element type frozen into the machine code.
-_TORCH_DT = {"bf16": torch.bfloat16, "f16": torch.float16}
+# f32 is a state dtype only; is_valid_spec rejects it as the I/O dtype.
+_TORCH_DT = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
 
 
 def launcher_for(spec: GdnDecodeSpec, arch: str = _ARCH) -> KernelLauncher:
