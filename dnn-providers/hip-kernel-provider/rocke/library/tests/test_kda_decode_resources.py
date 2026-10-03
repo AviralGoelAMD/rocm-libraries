@@ -90,3 +90,31 @@ def test_dispatched_kda_tile_is_scratch_free(
 
     resources = _resources_for(result.build())
     _assert_scratch_free(resources, spec_id=expected_spec_id, tile=tile)
+
+
+@pytest.mark.parametrize("gate_kind", ["gdn", "kda"])
+@pytest.mark.parametrize("state_dtype", ["bf16", "f32"])
+def test_dispatched_fused_default_is_scratch_free(gate_kind, state_dtype):
+    """The static fused (conv + out-norm) ``auto`` tile compiles without spills."""
+    from dispatch.gdn.gfx950 import FUSED_DEFAULT_TILES
+
+    result = dispatch_gdn_decode(
+        GdnDecodeRequest(
+            batch=8,
+            arch=ARCH,
+            gate_kind=gate_kind,
+            num_k_heads=32,
+            num_v_heads=32,
+            state_dtype=state_dtype,
+            fuse_conv=True,
+            fuse_out_norm=True,
+        )
+    )
+    tile = (
+        result.spec.num_warps,
+        result.spec.warp_threads_k,
+        result.spec.blocks_per_v_dim,
+    )
+    assert tile == FUSED_DEFAULT_TILES[(gate_kind, state_dtype)]
+    resources = _resources_for(result.build())
+    _assert_scratch_free(resources, spec_id=result.candidate.spec_id, tile=tile)

@@ -85,6 +85,24 @@ def _cases():
             cases[f"registered_{result.candidate.spec_id}{suffix}"] = (
                 lambda spec=result.spec: build_gdn_decode(spec, arch=_ARCH)
             )
+    # Fused conv1d / gated-RMSNorm modes, each flag alone and both, per gate
+    # kind and state width. Pinned at an explicit BPV=1 tile (not ``auto``) so
+    # retuning the fused defaults does not move these hashes.
+    for gate in ("gdn", "kda"):
+        for state_dtype in ("bf16", "f32"):
+            for conv, norm in ((True, False), (False, True), (True, True)):
+                tag = ("_cv" if conv else "") + ("_rn" if norm else "")
+                cases[f"fused_{gate}_st{state_dtype}{tag}"] = build(
+                    num_k_heads=16,
+                    num_v_heads=16,
+                    gate_kind=gate,
+                    state_dtype=state_dtype,
+                    num_warps=4,
+                    warp_threads_k=16,
+                    blocks_per_v_dim=1,
+                    fuse_conv=conv,
+                    fuse_out_norm=norm,
+                )
     return cases
 
 

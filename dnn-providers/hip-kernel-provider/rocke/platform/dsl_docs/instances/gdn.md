@@ -131,6 +131,13 @@ grid. An illegal default falls back the same way GDN's does. Re-measure either
 gate kind with `library/builders/gfx950/gdn/tune.py`; exact measurements live
 outside the public source tree.
 
+Requests with `fuse_conv` (width-4 conv1d + SiLU on the packed q/k/v row) or
+`fuse_out_norm` (sigmoid-gated RMSNorm on the output) admit only
+`blocks_per_v_dim == 1` tiles, and `fuse_conv` also needs `num_k_heads ==
+num_v_heads`. Their `auto` is `FUSED_DEFAULT_TILES[(gate_kind, state_width)]`,
+currently `(4, 16, 1)` for both gate kinds and state widths. Both flags off
+select and emit exactly the unfused kernel.
+
 ## Dispatch
 
 `dispatch_gdn_decode(GdnDecodeRequest(...))` returns the selected candidate,

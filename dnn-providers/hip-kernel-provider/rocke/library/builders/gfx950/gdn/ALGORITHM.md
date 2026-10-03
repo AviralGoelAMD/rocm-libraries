@@ -37,6 +37,7 @@
   - [4.6 Registry and tile selection](#46-registry-and-tile-selection)
   - [4.7 The reference path](#47-the-reference-path)
   - [4.8 Spec validation](#48-spec-validation)
+  - [4.9 Optional fusions: conv1d and gated RMSNorm](#49-optional-fusions-conv1d-and-gated-rmsnorm)
 - [5. Prefill kernel](#5-prefill-kernel)
   - [5.1 Chunkwise factorization](#51-chunkwise-factorization)
   - [5.2 The triangular solve](#52-the-triangular-solve)
@@ -325,7 +326,8 @@ three ways:
 | across k-lanes | `WTK` | `WTK` lanes cover a row, `VPT = 8` contiguous channels each, repeated `WTK_ITERS = DK / (WTK × VPT)` times |
 
 Live state per lane is `WTV_ITERS × WTK_ITERS × VPT` values, held **in registers**. The design is
-deliberately register-resident: the kernel allocates **no LDS and issues no barriers**.
+deliberately register-resident: in the unfused mode the kernel allocates **no LDS and issues no
+barriers** (the fused-norm mode of §4.9 adds one `num_warps`-float LDS reduction and a barrier).
 
 `BPV` is a parallelism-manufacturing knob, not a work-reducing one — each of the `BPV` workgroups
 re-loads `q` and `k` and re-runs the normalisation reductions. It buys occupancy at small batch and
@@ -381,7 +383,7 @@ XOR is chosen over a shift-down tree deliberately: the pattern is symmetric, so 
 holding the full sum**. That is what each lane needs — it must scale its own channels — so no
 broadcast step is required afterwards. Offsets 1 and 2 lower to `quad_perm`, a lane-read modifier
 on the arithmetic instruction itself; wider offsets use `ds_swizzle`. Neither allocates shared
-memory, which is why the kernel has no LDS and no `lgkmcnt` barrier stalls on the narrow steps.
+memory, which is why the unfused kernel has no LDS and no `lgkmcnt` barrier stalls on the narrow steps.
 
 ### 4.5 State pool addressing
 
@@ -460,6 +462,45 @@ across the workgroup's value lanes.
 
 The dispatcher's support check ends by calling this same validator, so "the spec the kernel can
 emit" and "the spec dispatch may select" are one rule rather than two copies that can drift.
+
+### 4.9 Optional fusions: conv1d and gated RMSNorm
+
+A hybrid model runs two neighbours around this decode step: a width-4 causal conv1d + SiLU on the
+packed `[q | k | v]` row before it, and a sigmoid-gated RMSNorm on its output after it. Two spec
+flags fuse them into the kernel, independently:
+
+| Flag | Computes | Extra arguments |
+| --- | --- | --- |
+| `fuse_conv` | per channel `x' = silu(h0·w0 + h1·w1 + h2·w2 + x·w3)`; taps shift in place to `(h1, h2, x)` | `mixed_qkv [B, 2·Hk·K + Hv·V]` (replaces `query`/`key`/`value`) + `qkv_stride`; `conv_state [slot, C, 3]` (I/O dtype, same read/write slots as the recurrent state); `conv_weight [C, 4]` f32 |
+| `fuse_out_norm` | `o · rsqrt(mean(o²) + eps) · norm_weight · sigmoid(out_gate)` over the head's `DV` outputs | `out_gate [B, Hv·V]` + `og_stride`; `norm_weight [V]` f32; runtime `norm_eps` |
+
+Both flags off emit exactly the unfused kernel: the name gains `_cv` / `_rn` only when a flag is
+on, and every pre-existing golden IR hash is unchanged.
+
+**One workgroup per head.** Both flags require `blocks_per_v_dim == 1`. The norm needs all `DV`
+outputs of a head in one workgroup, and with `BPV > 1` several workgroups would read the q/k conv
+taps while one shifts them in place. `fuse_conv` also requires `Hk == Hv`: with `Hv > Hk` the
+`Hv/Hk` workgroups of one k-head share the q/k conv channels and the in-place shift would race
+across workgroups, which no barrier can order. GQA GDN models (e.g. Hk/Hv 16/32) therefore fuse
+the norm only and keep a separate conv kernel; KDA models (Hk == Hv) can fuse both.
+
+**Dataflow.** The conv taps and weights join the load-first batch; conv + SiLU run before the L2
+norms; the recurrence is unchanged. With the norm on, each wave reduces its `Σo²` (k-lane 0 only,
+since every k-lane holds the row's output), writes one float to LDS, and a workgroup barrier
+precedes the gated store. That barrier also guarantees every wave has read its taps before any
+tap is overwritten; with conv on and the norm off, a barrier is emitted for that alone when
+`num_warps > 1`. Each conv channel is written once: q/k channels by wave 0 v-lane 0, a V row's
+channel by its k-lane-0 owner. The norm runs on the fp32 output (a reference implementation that
+rounds `o` to bf16 first differs by up to one bf16 step).
+
+**Defaults and cost.** `FUSED_DEFAULT_TILES` holds one static BPV=1 tile per gate kind and state
+width; `(4, 16, 1)` won all four warm sweeps over 56 shapes (geomean 1.000–1.053× vs per-shape
+best; runners-up ≥ 10% slower) and the KDA f32 pick held under a cold re-time. `fuse_conv` with a
+single wave spills (that wave owns all `DV` rows plus their taps) and is exempt from the zero-scratch
+gate, like the unfused `(1,1,1)`. The fused mode is an enablement path, not yet a fast path: on
+MI355X (cold) the fused KDA kernel is slower than the unfused kernel plus separate conv and norm
+kernels, because one workgroup per head with conv taps held in registers roughly halves occupancy.
+See §8.
 
 ---
 
@@ -667,10 +708,14 @@ Widening the range needs nested chunking or per-token rescaling.
 **Follow-ups.**
 
 1. A fused-path GDN prefill kernel (§5.4).
-2. gfx942 support; KDA work bands are arch-specific and need re-sweeping.
+2. gfx942 support; the static decode tile defaults are arch-specific and need re-sweeping.
 3. Extending the supported decay range.
 4. Scan-side parallelism beyond the current `value_splits` cap, or a shorter serial chain — the scan
    is the critical path at small `BH` (§5.4).
 5. Host-struct consolidation of the GDN and KDA request lineage.
 6. Machine-checked byte-identity for the cross-engine surfaces this family touches — currently
    reasoned and Python-verified.
+7. A fast fused decode path (§4.9). The BPV=1 fused kernel holds the whole head's tile plus conv
+   taps in registers; streaming the state in row chunks with a few chunks in flight (as AITER's
+   Gluon packed KDA decode does) would cut live registers, or `BPV > 1` with an out-of-place conv
+   state and a cross-workgroup norm would restore small-batch parallelism.

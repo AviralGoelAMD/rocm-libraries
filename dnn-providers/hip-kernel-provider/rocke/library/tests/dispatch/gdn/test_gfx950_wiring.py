@@ -504,3 +504,81 @@ class TestGdnAndKdaTileNamespaces(unittest.TestCase):
             len({c.spec_id for c in candidates}), 2 * len(CONFIGURED_TILES)
         )
         self.assertEqual(len({c.name for c in candidates}), 2 * len(CONFIGURED_TILES))
+
+
+class TestFusedDispatch(unittest.TestCase):
+    """fuse_conv / fuse_out_norm requests: BPV=1 tiles only, static fused
+    defaults, Hk == Hv for conv, and no change to unfused selection."""
+
+    @staticmethod
+    def req(**kw):
+        base = dict(
+            batch=8,
+            arch=ARCH,
+            num_k_heads=16,
+            num_v_heads=16,
+            gate_kind="kda",
+            fuse_conv=True,
+            fuse_out_norm=True,
+        )
+        base.update(kw)
+        return GdnDecodeRequest(**base)
+
+    @staticmethod
+    def tile(spec):
+        return (spec.num_warps, spec.warp_threads_k, spec.blocks_per_v_dim)
+
+    def test_auto_is_fused_default(self):
+        from dispatch.gdn.gfx950 import FUSED_DEFAULT_TILES
+
+        for gate in ("gdn", "kda"):
+            for st in ("bf16", "f32"):
+                for batch in (1, 8, 128, 4096):
+                    with self.subTest(gate=gate, st=st, batch=batch):
+                        s = dispatch_gdn_decode(
+                            self.req(gate_kind=gate, state_dtype=st, batch=batch)
+                        ).spec
+                        self.assertEqual(self.tile(s), FUSED_DEFAULT_TILES[(gate, st)])
+                        self.assertTrue(s.fuse_conv and s.fuse_out_norm)
+
+    def test_fused_defaults_are_bpv1_and_configured(self):
+        from dispatch.gdn.gfx950 import FUSED_DEFAULT_TILES
+
+        for key, t in FUSED_DEFAULT_TILES.items():
+            with self.subTest(key=key):
+                self.assertIn(t, CONFIGURED_TILES)
+                self.assertEqual(t[2], 1)
+
+    def test_bpv_gt1_pin_rejected(self):
+        with self.assertRaises(ValueError):
+            dispatch_gdn_decode(self.req(spec_id="kda_nw4_wtk16_bpv4"))
+
+    def test_bpv1_pin_accepted(self):
+        s = dispatch_gdn_decode(self.req(spec_id="kda_nw2_wtk16_bpv1")).spec
+        self.assertEqual(self.tile(s), (2, 16, 1))
+
+    def test_conv_gqa_rejected(self):
+        r = self.req(
+            gate_kind="gdn", num_k_heads=8, num_v_heads=16, fuse_out_norm=False
+        )
+        self.assertTrue(any("fuse_conv" in e for e in request_errors(r)))
+        with self.assertRaises(ValueError):
+            dispatch_gdn_decode(r)
+
+    def test_norm_gqa_accepted(self):
+        s = dispatch_gdn_decode(
+            self.req(gate_kind="gdn", num_k_heads=8, num_v_heads=16, fuse_conv=False)
+        ).spec
+        self.assertTrue(s.fuse_out_norm)
+        self.assertFalse(s.fuse_conv)
+        self.assertEqual(s.blocks_per_v_dim, 1)
+
+    def test_unfused_auto_unchanged(self):
+        s = dispatch_gdn_decode(self.req(fuse_conv=False, fuse_out_norm=False)).spec
+        self.assertEqual(self.tile(s), KDA_DEFAULT_TILE)
+        g = dispatch_gdn_decode(
+            self.req(
+                gate_kind="gdn", num_v_heads=32, fuse_conv=False, fuse_out_norm=False
+            )
+        ).spec
+        self.assertEqual(self.tile(g), DEFAULT_TILE)

@@ -171,3 +171,50 @@ def test_main_sweeps_kda_registry_with_the_requested_state_dtype(monkeypatch, ca
     assert seen == [("kda", "f32"), ("kda", "f32")]
     output = capsys.readouterr().out
     assert output.count("consider KDA_DEFAULT_TILE_F32 = (4, 16, 8)") == 2
+
+
+def test_main_sweeps_fused_registry_and_names_the_fused_default(monkeypatch, capsys):
+    """--fuse-conv / --fuse-out-norm reach every swept request, and the report
+    names the fused default entry for that gate kind and state width."""
+    seen = []
+    monkeypatch.setattr(tune, "device_is_visible", lambda: True)
+
+    def fake_results(request):
+        seen.append((request.gate_kind, request.fuse_conv, request.fuse_out_norm))
+        return (object(),)
+
+    monkeypatch.setattr(tune, "dispatch_gdn_decode_all", fake_results)
+    monkeypatch.setattr(
+        tune,
+        "sweep_registry_batch",
+        lambda batch, results: [
+            (4.0, (2, 16, 1), "kda_nw2_wtk16_bpv1", 0.0),
+            (5.0, (4, 16, 1), "kda_nw4_wtk16_bpv1", 0.0),
+        ],
+    )
+    monkeypatch.setattr(
+        tune,
+        "dispatch_gdn_decode",
+        lambda request: SimpleNamespace(
+            candidate=SimpleNamespace(spec_id="kda_nw4_wtk16_bpv1")
+        ),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "tune.py",
+            "--gate-kind",
+            "kda",
+            "--geometries",
+            "16/16",
+            "--batches",
+            "1",
+            "--fuse-conv",
+            "--fuse-out-norm",
+        ],
+    )
+
+    assert tune.main() == 0
+    assert seen == [("kda", True, True)]
+    output = capsys.readouterr().out
+    assert "consider FUSED_DEFAULT_TILES[('kda', 'bf16')] = (2, 16, 1)" in output
