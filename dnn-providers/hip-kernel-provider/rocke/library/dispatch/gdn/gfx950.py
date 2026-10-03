@@ -85,6 +85,24 @@ assert (
     KDA_DEFAULT_TILE_F32 in CONFIGURED_TILES
 ), "KDA_DEFAULT_TILE_F32 is not configured"
 
+# Fused (fuse_conv / fuse_out_norm) requests need one workgroup per head, so
+# their static defaults are BPV=1 tiles, one per gate kind and state width.
+# Measured on gfx950 MI355X with both flags on (warm tune.py sweep of all 19
+# legal BPV=1 tiles over Hk=Hv in {4,8,12,16,24,32,48,96} x batch
+# {1,8,16,32,64,128,256}): (4,16,1) has the lowest geomean slowdown against
+# each shape's fastest tile for every (gate, state) pair -- 1.000 / 1.053 for
+# KDA bf16 / f32, 1.001 / 1.007 for GDN bf16 / f32 -- with runners-up >= 10%
+# slower; the KDA f32 pick held under a cold, interleaved re-time. Re-measure
+# with ``tune.py --fuse-conv --fuse-out-norm``.
+FUSED_DEFAULT_TILES = {
+    ("gdn", "bf16"): (4, 16, 1),
+    ("gdn", "f32"): (4, 16, 1),
+    ("kda", "bf16"): (4, 16, 1),
+    ("kda", "f32"): (4, 16, 1),
+}
+for _fused_tile in FUSED_DEFAULT_TILES.values():
+    assert _fused_tile in CONFIGURED_TILES and _fused_tile[2] == 1, _fused_tile
+
 # Spec ids carry the gate kind: GDN's are ``nw{}_wtk{}_bpv{}``, KDA's add a
 # ``kda_`` prefix, so the two can never collide in the shared registry.
 _KDA_SPEC_ID_PREFIX = "kda_"
@@ -97,13 +115,16 @@ def spec_id_for(tile: Tuple[int, int, int], gate_kind: str) -> str:
     return _KDA_SPEC_ID_PREFIX + base if gate_kind == "kda" else base
 
 
-def auto_tile(gate_kind: str, state_dtype: str = "bf16") -> Tuple[int, int, int]:
-    """The static ``auto`` tile for a gate kind and state width."""
+def auto_tile(
+    gate_kind: str, state_dtype: str = "bf16", fused: bool = False
+) -> Tuple[int, int, int]:
+    """The static ``auto`` tile for a gate kind, state width and fusion mode."""
+    width = "f32" if normalize_dtype(state_dtype) == "f32" else "bf16"
+    if fused:
+        return FUSED_DEFAULT_TILES[(gate_kind, width)]
     if gate_kind != "kda":
         return DEFAULT_TILE
-    if normalize_dtype(state_dtype) == "f32":
-        return KDA_DEFAULT_TILE_F32
-    return KDA_DEFAULT_TILE
+    return KDA_DEFAULT_TILE_F32 if width == "f32" else KDA_DEFAULT_TILE
 
 
 def make_spec(req: GdnDecodeRequest, tile: Tuple[int, int, int]) -> GdnDecodeSpec:
@@ -122,6 +143,8 @@ def make_spec(req: GdnDecodeRequest, tile: Tuple[int, int, int]) -> GdnDecodeSpe
         num_warps=num_warps,
         warp_threads_k=warp_threads_k,
         blocks_per_v_dim=blocks_per_v_dim,
+        fuse_conv=bool(req.fuse_conv),
+        fuse_out_norm=bool(req.fuse_out_norm),
     )
 
 
@@ -157,7 +180,11 @@ def _make_candidate(*, tile: Tuple[int, int, int], priority: int, gate_kind: str
         if not ok:
             return False, why
         if req.spec_id.strip().lower() == "auto":
-            default = auto_tile(gate_kind, req.state_dtype)
+            default = auto_tile(
+                gate_kind,
+                req.state_dtype,
+                fused=bool(req.fuse_conv or req.fuse_out_norm),
+            )
             default_is_legal = is_valid_spec(make_spec(req, default), arch=req.arch)[0]
             if default_is_legal and tile != default:
                 return False, (

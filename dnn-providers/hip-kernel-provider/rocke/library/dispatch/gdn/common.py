@@ -68,6 +68,14 @@ class GdnDecodeRequest(OperatorRequest):
     change the grid. KDA registers the same configured tiles as GDN, each
     pinnable by its ``kda_``-prefixed ``spec_id``.
 
+    ``fuse_conv`` / ``fuse_out_norm`` select the optional fused modes: a
+    width-4 conv1d + SiLU on the packed q/k/v row (in-place conv-state shift)
+    and a sigmoid-gated RMSNorm on the output. Fused requests run one
+    workgroup per head, so only ``blocks_per_v_dim == 1`` tiles are legal, and
+    ``auto`` uses the static ``FUSED_DEFAULT_TILES`` entry for the gate kind
+    and state width. ``fuse_conv`` also requires ``num_k_heads ==
+    num_v_heads``.
+
     ``gate_kind`` selects the forget-gate granularity: ``"gdn"`` (one scalar
     decay per head) or ``"kda"`` (a per-channel decay). It reaches the spec and
     therefore the kernel name, so the two never share a compile-cache entry.
@@ -90,6 +98,8 @@ class GdnDecodeRequest(OperatorRequest):
     algorithm: str = "auto"
     gate_kind: str = "gdn"
     spec_id: str = "auto"
+    fuse_conv: bool = False
+    fuse_out_norm: bool = False
 
     def normalized(self) -> dict:
         d = asdict(self)
@@ -144,6 +154,11 @@ def request_errors(req: OperatorRequest) -> list:
         errors.append(
             "NOT_YET_IMPLEMENTED: KDA decode currently requires "
             "head_k_dim == head_v_dim == 128"
+        )
+    if req.fuse_conv and req.num_k_heads != req.num_v_heads:
+        errors.append(
+            "fuse_conv requires num_k_heads == num_v_heads (shared q/k conv "
+            f"channels would race), got {req.num_k_heads}/{req.num_v_heads}"
         )
     return errors
 

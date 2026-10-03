@@ -165,6 +165,19 @@ python3 library/builders/gfx950/gdn/tune.py \
   --batches 1,2,4,8,16,32,64,128 --top 5 [--state-dtype f32]
 ```
 
+The optional fused modes (`fuse_conv`: width-4 conv1d + SiLU on the packed
+q/k/v row; `fuse_out_norm`: sigmoid-gated RMSNorm on the output; see
+[`ALGORITHM.md` §4.9](ALGORITHM.md#49-optional-fusions-conv1d-and-gated-rmsnorm))
+have their own BPV=1 defaults, `FUSED_DEFAULT_TILES[(gate_kind, state_width)]`.
+Measure them with the same flags the request carries (`--fuse-conv` needs
+`Hk == Hv` geometries):
+
+```bash
+python3 library/builders/gfx950/gdn/tune.py \
+  --gate-kind kda --geometries 4/4,16/16,32/32 \
+  --batches 1,8,64,256 --top 5 --fuse-conv --fuse-out-norm [--state-dtype f32]
+```
+
 If the measurements justify a new default, edit the constant by hand and rerun
 dispatch wiring and numeric tests.
 

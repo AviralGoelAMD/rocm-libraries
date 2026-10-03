@@ -35,8 +35,11 @@ ARCH = "gfx950"
 DEFAULT_BATCHES = (1, 16, 64, 256)
 
 
-def default_tile_name(gate_kind: str, state_dtype: str) -> str:
+def default_tile_name(gate_kind: str, state_dtype: str, fused: bool = False) -> str:
     """Name of the dispatch constant that holds ``auto``'s tile for this cell."""
+    if fused:
+        width = "f32" if state_dtype == "f32" else "bf16"
+        return f"FUSED_DEFAULT_TILES[({gate_kind!r}, {width!r})]"
     if gate_kind != "kda":
         return "DEFAULT_TILE"
     return "KDA_DEFAULT_TILE_F32" if state_dtype == "f32" else "KDA_DEFAULT_TILE"
@@ -44,7 +47,8 @@ def default_tile_name(gate_kind: str, state_dtype: str) -> str:
 
 def device_is_visible() -> bool:
     """Load the ROCm-only measurement backend only when tuning is requested."""
-    global TOL, drain, launch, launcher_for, make_inputs, prepare, ref_fp32, torch
+    global TOL, drain, launch, launcher_for, make_inputs, out_error, prepare
+    global ref_fp32, torch
     try:
         import torch as torch_module
         from builders.gfx950.gdn.gdn_decode import (
@@ -54,6 +58,7 @@ def device_is_visible() -> bool:
             launcher_for,
             make_inputs,
             prepare,
+            out_error,
             ref_fp32,
         )
     except ModuleNotFoundError:
@@ -144,7 +149,7 @@ def sweep_registry_batch(batch: int, results):
         launch(launcher, values, cfg)
         drain()
         err = max(
-            (values["out"].float() - ref_out).abs().max().item(),
+            out_error(spec, values["out"], ref_out),
             (values["state"].float()[written] - ref_state).abs().max().item(),
         )
         err = max(err, _untouched_damage(values["state"], before, untouched))
@@ -215,6 +220,16 @@ def main() -> int:
         choices=("bf16", "f16", "f32"),
         help="recurrent-state dtype; tiles tuned for one width need not suit another",
     )
+    parser.add_argument(
+        "--fuse-conv",
+        action="store_true",
+        help="tune the fused conv1d mode (BPV=1 tiles; requires Hk == Hv)",
+    )
+    parser.add_argument(
+        "--fuse-out-norm",
+        action="store_true",
+        help="tune the fused gated-RMSNorm output mode (BPV=1 tiles)",
+    )
     parser.add_argument("--top", type=int, default=8, help="rows to print per cell")
     args = parser.parse_args()
 
@@ -228,7 +243,8 @@ def main() -> int:
         for item in args.geometries.split(",")
     ]
     failed = False
-    default_name = default_tile_name(args.gate_kind, args.state_dtype)
+    fused = args.fuse_conv or args.fuse_out_norm
+    default_name = default_tile_name(args.gate_kind, args.state_dtype, fused)
     for num_k_heads, num_v_heads in geometries:
         for batch in batches:
             request = GdnDecodeRequest(
@@ -238,6 +254,8 @@ def main() -> int:
                 state_dtype=args.state_dtype,
                 num_k_heads=num_k_heads,
                 num_v_heads=num_v_heads,
+                fuse_conv=args.fuse_conv,
+                fuse_out_norm=args.fuse_out_norm,
             )
             results = dispatch_gdn_decode_all(request)
             print(f"legal registry candidates for batch {batch}: {len(results)}")
