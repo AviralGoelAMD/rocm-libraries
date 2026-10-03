@@ -11,8 +11,9 @@ here and the numeric behaviour is covered separately by the on-device test.
 
 from __future__ import annotations
 
+import re
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 from dispatch.gdn import (
     GDN_REGISTRY,
@@ -27,8 +28,8 @@ from dispatch.gdn.gfx950 import (
     CONFIGURED_TILES,
     DEFAULT_TILE,
     KDA_DEFAULT_TILE,
-    TUNED_SPEC_IDS,
-    tile_for_work,
+    KDA_DEFAULT_TILE_F32,
+    make_spec,
 )
 from kernels.gfx950.gdn_decode import (
     gdn_decode_grid,
@@ -187,27 +188,11 @@ class TestSpecIdPin(unittest.TestCase):
                 got = dispatch_gdn_decode(req)
                 self.assertEqual(got.candidate.spec_id, candidate.spec_id)
 
-    def test_every_kda_pin_is_reachable_with_kda_gate(self):
-        for spec_id in TUNED_SPEC_IDS:
-            with self.subTest(spec_id=spec_id):
-                got = dispatch_gdn_decode(
-                    GdnDecodeRequest(
-                        batch=64,
-                        arch=ARCH,
-                        spec_id=spec_id,
-                        gate_kind="kda",
-                        num_k_heads=32,
-                        num_v_heads=32,
-                    )
-                )
-                self.assertEqual(got.candidate.spec_id, spec_id)
-                self.assertEqual(got.spec.gate_kind, "kda")
-
     def test_a_kda_pin_cannot_serve_gdn(self):
         with self.assertRaises(ValueError):
             dispatch_gdn_decode(
                 GdnDecodeRequest(
-                    batch=64, arch=ARCH, spec_id="kda_w128", gate_kind="gdn"
+                    batch=64, arch=ARCH, spec_id="kda_nw4_wtk16_bpv4", gate_kind="gdn"
                 )
             )
 
@@ -254,6 +239,24 @@ class TestDtypeCoverage(unittest.TestCase):
             with self.subTest(dtype=dtype):
                 got = dispatch_gdn_decode(_req(16, dtype=dtype))
                 self.assertEqual(got.spec.dtype, dtype)
+
+    def test_f32_reaches_the_state_but_not_the_io(self):
+        """f32 is a state dtype only. Every spelling of it must reach the
+        compiled spec for both gate kinds (the kernel name, and so the cache
+        key, carries it), and the I/O dtype must still refuse it."""
+        from kernels.gfx950.gdn_decode import STATE_DTYPES
+
+        self.assertEqual(set(STATE_DTYPES), {"bf16", "f16", "f32"})
+        for gate_kind in ("gdn", "kda"):
+            for spelling in ("f32", "fp32", "float32"):
+                with self.subTest(gate_kind=gate_kind, spelling=spelling):
+                    got = dispatch_gdn_decode(
+                        _req(16, gate_kind=gate_kind, state_dtype=spelling)
+                    )
+                    self.assertEqual(got.spec.state_dtype, "f32")
+                    self.assertIn("stf32", got.spec.kernel_name())
+        with self.assertRaises(ValueError):
+            dispatch_gdn_decode(_req(16, dtype="float32"))
 
 
 class TestLaunchGeometry(unittest.TestCase):
@@ -373,105 +376,131 @@ class TestGateKindWiring(unittest.TestCase):
 
 
 class TestKdaStaticSelection(unittest.TestCase):
-    """KDA auto must use one static default rather than the work table.
+    """KDA auto must use one static default per state width, not a work table.
 
-    The shipped tile is pinned as a literal, not as ``KDA_DEFAULT_TILE``: a
-    test that follows the constant cannot notice the default moving. Changing
-    it changes what every gfx950 KDA ``auto`` user runs, so it needs KDA
-    measurements (``tune.py --gate-kind kda``) in the same change.
+    The shipped tiles are pinned as literals, not as ``KDA_DEFAULT_TILE`` /
+    ``KDA_DEFAULT_TILE_F32``: a test that follows the constant cannot notice
+    the default moving. Changing one changes what every gfx950 KDA ``auto``
+    user with that state width runs, so it needs KDA measurements
+    (``tune.py --gate-kind kda``) in the same change.
     """
 
     _SHIPPED_TILE = (4, 16, 4)
+    _SHIPPED_TILE_F32 = (8, 16, 4)
+    # state dtype spelling -> (normalized state dtype, tile, carrying spec id)
+    _EXPECTED = {
+        "bf16": ("bf16", (4, 16, 4), "kda_nw4_wtk16_bpv4"),
+        "f16": ("f16", (4, 16, 4), "kda_nw4_wtk16_bpv4"),
+        "f32": ("f32", (8, 16, 4), "kda_nw8_wtk16_bpv4"),
+        "fp32": ("f32", (8, 16, 4), "kda_nw8_wtk16_bpv4"),
+    }
 
-    def test_default_tile_is_the_shipped_tile(self):
+    def test_default_tiles_are_the_shipped_tiles(self):
         self.assertEqual(KDA_DEFAULT_TILE, self._SHIPPED_TILE)
+        self.assertEqual(KDA_DEFAULT_TILE_F32, self._SHIPPED_TILE_F32)
 
     def test_selection_is_frozen_across_head_counts_and_batches(self):
         # Tensor-parallel sharding changes the local head count, and the old
-        # work-keyed selection moved with it; the static default must not.
+        # work-keyed selection moved with it; the static defaults must not.
         for num_k_heads, num_v_heads in (
             (4, 4),
             (8, 8),
             (16, 16),
             (32, 32),
+            (64, 64),
             (8, 32),
             (4, 8),
+            (16, 64),
         ):
             for batch in (1, 4, 5, 8, 32, 33, 64, 128, 129, 256, 4096):
-                with self.subTest(hk=num_k_heads, hv=num_v_heads, batch=batch):
-                    result = dispatch_gdn_decode(
-                        GdnDecodeRequest(
-                            batch=batch,
-                            arch=ARCH,
-                            gate_kind="kda",
-                            num_k_heads=num_k_heads,
-                            num_v_heads=num_v_heads,
+                for state_dtype, (norm, tile, spec_id) in self._EXPECTED.items():
+                    with self.subTest(
+                        hk=num_k_heads,
+                        hv=num_v_heads,
+                        batch=batch,
+                        state_dtype=state_dtype,
+                    ):
+                        result = dispatch_gdn_decode(
+                            GdnDecodeRequest(
+                                batch=batch,
+                                arch=ARCH,
+                                gate_kind="kda",
+                                num_k_heads=num_k_heads,
+                                num_v_heads=num_v_heads,
+                                state_dtype=state_dtype,
+                            )
                         )
-                    )
-                    self.assertEqual(_TILE(result.spec), self._SHIPPED_TILE)
-                    self.assertEqual(result.spec.gate_kind, "kda")
+                        self.assertEqual(_TILE(result.spec), tile)
+                        self.assertEqual(result.candidate.spec_id, spec_id)
+                        self.assertEqual(result.spec.state_dtype, norm)
+                        self.assertEqual(result.spec.gate_kind, "kda")
 
 
-class TestKdaWorkTable(unittest.TestCase):
-    """The measured KDA work table stays pinnable; auto no longer reads it."""
+def _literal_tile(spec_id: str):
+    """Parse ``[kda_]nw{}_wtk{}_bpv{}`` independently of dispatch's formatter."""
+    match = re.fullmatch(r"(?:kda_)?nw(\d+)_wtk(\d+)_bpv(\d+)", spec_id)
+    assert match, f"unexpected spec id {spec_id!r}"
+    return tuple(int(value) for value in match.groups())
 
-    _TABLE = {
-        "kda_w128": (4, 16, 4),
-        "kda_w512": (1, 16, 4),
-        "kda_w_large": (2, 16, 1),
-    }
 
-    def test_pinned_spec_id_selects_its_table_tile_at_any_batch(self):
-        self.assertEqual(set(TUNED_SPEC_IDS), set(self._TABLE))
-        for spec_id, tile in self._TABLE.items():
-            for batch in (1, 8, 32, 256):
-                with self.subTest(spec_id=spec_id, batch=batch):
-                    result = dispatch_gdn_decode(
-                        GdnDecodeRequest(
-                            batch=batch,
-                            arch=ARCH,
-                            gate_kind="kda",
-                            spec_id=spec_id,
-                            num_k_heads=16,
-                            num_v_heads=16,
-                        )
-                    )
-                    self.assertEqual(result.candidate.spec_id, spec_id)
-                    self.assertEqual(_TILE(result.spec), tile)
+class TestKdaRegistry(unittest.TestCase):
+    """KDA registers GDN's configured tile space; every legal tile is pinnable."""
 
-    def test_equal_work_maps_to_the_same_table_tile(self):
-        self.assertEqual(tile_for_work(8 * 32, "kda"), tile_for_work(32 * 8, "kda"))
-        self.assertEqual(tile_for_work(1 * 32, "kda"), tile_for_work(4 * 8, "kda"))
+    def test_kda_registers_every_configured_tile_once(self):
+        kda = [c for c in gdn_candidates() if c.spec_id.startswith("kda_")]
+        self.assertEqual(len(kda), len(CONFIGURED_TILES))
+        self.assertEqual(
+            [_literal_tile(c.spec_id) for c in kda], list(CONFIGURED_TILES)
+        )
 
-    def test_table_band_edges(self):
-        for work, tile in (
-            (1, (4, 16, 4)),
-            (128, (4, 16, 4)),
-            (129, (1, 16, 4)),
-            (512, (1, 16, 4)),
-            (513, (2, 16, 1)),
-            (10**6, (2, 16, 1)),
-        ):
-            with self.subTest(work=work):
-                self.assertEqual(tile_for_work(work, "kda"), tile)
+    def test_every_legal_kda_pin_selects_its_literal_tile(self):
+        for state_dtype in ("bf16", "f32"):
+            base = GdnDecodeRequest(
+                batch=16,
+                arch=ARCH,
+                gate_kind="kda",
+                num_k_heads=16,
+                num_v_heads=16,
+                state_dtype=state_dtype,
+            )
+            legal = 0
+            for candidate in gdn_candidates():
+                if not candidate.spec_id.startswith("kda_"):
+                    continue
+                req = replace(base, spec_id=candidate.spec_id)
+                tile = _literal_tile(candidate.spec_id)
+                if not is_valid_spec(make_spec(base, tile), arch=ARCH)[0]:
+                    with self.assertRaises(ValueError):
+                        dispatch_gdn_decode(req)
+                    continue
+                legal += 1
+                for batch in (1, 256):
+                    with self.subTest(
+                        spec_id=candidate.spec_id, state=state_dtype, batch=batch
+                    ):
+                        result = dispatch_gdn_decode(replace(req, batch=batch))
+                        self.assertEqual(result.candidate.spec_id, candidate.spec_id)
+                        self.assertEqual(_TILE(result.spec), tile)
+                        self.assertEqual(result.spec.gate_kind, "kda")
+                        self.assertEqual(result.spec.state_dtype, state_dtype)
+            self.assertGreater(legal, 0)
 
-    def test_table_has_no_gdn_rows(self):
+    def test_a_gdn_pin_cannot_serve_kda(self):
         with self.assertRaises(ValueError):
-            tile_for_work(128, "gdn")
+            dispatch_gdn_decode(
+                GdnDecodeRequest(
+                    batch=64, arch=ARCH, spec_id="nw4_wtk16_bpv4", gate_kind="kda"
+                )
+            )
 
 
 class TestGdnAndKdaTileNamespaces(unittest.TestCase):
     """The shared registry keeps GDN and KDA selectable identities disjoint."""
 
-    def test_kda_spec_ids_cannot_collide_with_gdn_spec_ids(self):
-        gdn_ids = {
-            candidate.spec_id
-            for candidate in gdn_candidates()
-            if not candidate.spec_id.startswith("kda_")
-        }
-        kda_ids = {
-            candidate.spec_id
-            for candidate in gdn_candidates()
-            if candidate.spec_id.startswith("kda_")
-        }
-        self.assertFalse(gdn_ids & kda_ids)
+    def test_spec_ids_and_names_are_unique_across_gate_kinds(self):
+        candidates = gdn_candidates()
+        self.assertEqual(len(candidates), 2 * len(CONFIGURED_TILES))
+        self.assertEqual(
+            len({c.spec_id for c in candidates}), 2 * len(CONFIGURED_TILES)
+        )
+        self.assertEqual(len({c.name for c in candidates}), 2 * len(CONFIGURED_TILES))

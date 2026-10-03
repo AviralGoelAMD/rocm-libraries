@@ -34,7 +34,7 @@ def test_production_variants_derive_from_the_dispatched_tile():
         names=("fused", "precomputed", "simple"),
     )
 
-    assert result.candidate.spec_id == "kda_w128"
+    assert result.candidate.spec_id == "kda_nw4_wtk16_bpv4"
     fused = variants["fused"]
     raw = variants["precomputed"]
     simple = variants["simple"]
@@ -48,9 +48,9 @@ def test_production_variants_derive_from_the_dispatched_tile():
 
 def test_compare_selected_to_sweep_reports_best_and_ratio():
     rows = [
-        (4.0, (2, 16, 1), 1e-3),
-        (5.0, (1, 16, 4), 1e-3),
-        (6.0, (4, 16, 4), 1e-3),
+        (4.0, (2, 16, 1), "kda_nw2_wtk16_bpv1", 1e-3),
+        (5.0, (1, 16, 4), "kda_nw1_wtk16_bpv4", 1e-3),
+        (6.0, (4, 16, 4), "kda_nw4_wtk16_bpv4", 1e-3),
     ]
     result = bench.compare_selected_to_sweep((1, 16, 4), rows)
 
@@ -64,7 +64,9 @@ def test_compare_selected_to_sweep_fails_when_selected_missing_or_rows_empty():
     with pytest.raises(ValueError, match="no correct, timeable tile"):
         bench.compare_selected_to_sweep((1, 16, 4), [])
     with pytest.raises(ValueError, match="selected tile"):
-        bench.compare_selected_to_sweep((1, 16, 4), [(4.0, (2, 16, 1), 1e-3)])
+        bench.compare_selected_to_sweep(
+            (1, 16, 4), [(4.0, (2, 16, 1), "kda_nw2_wtk16_bpv1", 1e-3)]
+        )
 
 
 def test_failure_accumulator_is_fail_closed():

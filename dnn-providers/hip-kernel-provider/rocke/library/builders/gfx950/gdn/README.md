@@ -32,11 +32,11 @@ retune either decode mode or the GDN prefill path.
 | File | Purpose |
 |---|---|
 | [`gdn_decode.py`](gdn_decode.py) | Compile a spec, build inputs, launch the shared decode emitter, and compare with the independent fp32 reference |
-| [`tune.py`](tune.py) | Measure legal GDN registry candidates, or every legal KDA tile against the static KDA default and work-keyed table |
+| [`tune.py`](tune.py) | Measure every legal GDN or KDA registry candidate against that gate kind's static default |
 | [`ALGORITHM.md`](ALGORITHM.md) | Explain the gated delta rule, gate kinds, and GPU mapping |
 | [`library/benchmarks/gfx950/gdn/benchmark_gdn_decode.py`](../../../benchmarks/gfx950/gdn/benchmark_gdn_decode.py) | Benchmark every legal GDN registry candidate and the static dispatcher default |
-| [`library/benchmarks/gfx950/gdn/benchmark_kda_decode.py`](../../../benchmarks/gfx950/gdn/benchmark_kda_decode.py) | Benchmark KDA fused/precomputed/simple variants from the dispatcher; optionally sweep all legal tiles |
-| [`library/dispatch/gdn/gfx950.py`](../../../dispatch/gdn/gfx950.py) | Declare the GDN registry/static default, the static KDA default, and the pinnable KDA work-keyed table |
+| [`library/benchmarks/gfx950/gdn/benchmark_kda_decode.py`](../../../benchmarks/gfx950/gdn/benchmark_kda_decode.py) | Benchmark KDA fused/precomputed/simple variants from the dispatcher; optionally sweep every legal KDA registry candidate |
+| [`library/dispatch/gdn/gfx950.py`](../../../dispatch/gdn/gfx950.py) | Declare the GDN and KDA registries (one shared tile space) and their static defaults |
 | [`library/tests/dispatch/gdn/test_gfx950_registry.py`](../../../tests/dispatch/gdn/test_gfx950_registry.py) | CPU GDN registry count, identity, legality, and selection coverage |
 | [`library/tests/test_gdn_decode_spec.py`](../../../tests/test_gdn_decode_spec.py) | CPU validator and IR-emission coverage |
 | [`library/tests/test_gdn_decode_prepare.py`](../../../tests/test_gdn_decode_prepare.py) | Host-side input validation: shapes, dtypes, contiguity, pool-index range |
@@ -125,9 +125,10 @@ Each row includes a stable `spec_id`
 `nw<num_warps>_wtk<warp_threads_k>_bpv<blocks_per_v_dim>`. Dispatcher `auto`
 prefers `(2, 16, 8)` whenever legal; measurements never change that choice.
 
-KDA has its own benchmark. KDA `auto` prefers `(4, 16, 4)` (`kda_w128`)
-whenever legal; the work-keyed table's `kda_w128`, `kda_w512` and
-`kda_w_large` stay pinnable by `spec_id`:
+KDA has its own benchmark. KDA registers the same 180 triples under
+`kda_`-prefixed spec ids (`kda_nw4_wtk16_bpv4`, ...); every legal one is
+pinnable by `spec_id`. KDA `auto` prefers `(4, 16, 4)` for a bf16/f16 state and
+`(8, 16, 4)` for an f32 state whenever legal:
 
 ```bash
 python3 -m benchmarks.gfx950.gdn.benchmark_kda_decode \
@@ -150,22 +151,22 @@ python3 library/builders/gfx950/gdn/tune.py \
   --gate-kind gdn --batches 1,16,64,256 --top 5
 ```
 
-For every GDN cell, it also reports the static dispatcher default, the fastest
-legal candidate, the default's rank and time ratio, and a manual
-`DEFAULT_TILE` recommendation. Measurements never update the shipped default.
+For every cell, it also reports the static dispatcher default, the fastest
+legal candidate, the default's rank and time ratio, and a manual recommendation
+for the default constant (`DEFAULT_TILE`, `KDA_DEFAULT_TILE` or
+`KDA_DEFAULT_TILE_F32`). Measurements never update the shipped default.
 
-Use the KDA study across head geometries when retuning KDA. It challenges the
-static `KDA_DEFAULT_TILE` and reports how the pinnable work-keyed table holds up:
+Retune KDA across head geometries with `--gate-kind kda`; add
+`--state-dtype f32` to measure against the f32-state default:
 
 ```bash
 python3 library/builders/gfx950/gdn/tune.py \
   --gate-kind kda --geometries 16/32,8/16,4/8 \
-  --batches 1,2,4,8,16,32,64,128 --top 5
+  --batches 1,2,4,8,16,32,64,128 --top 5 [--state-dtype f32]
 ```
 
-GDN and KDA measurements are report-only; they never update a shipped default.
-If they justify a new `KDA_DEFAULT_TILE` or new KDA table bands, edit them by
-hand and rerun dispatch wiring and numeric tests.
+If the measurements justify a new default, edit the constant by hand and rerun
+dispatch wiring and numeric tests.
 
 ## Run tests
 

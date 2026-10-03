@@ -122,12 +122,14 @@ blocks_per_v_dim=8)` whenever it is legal. It never measures at runtime and
 does not select by batch. An explicit `spec_id`, such as `nw4_wtk16_bpv8`,
 selects an exact legal GDN candidate for benchmarking or replay.
 
-KDA `auto` is also one static tile, `(4, 16, 4)`, whenever it is legal; batch
-and head count change only the grid. KDA's separately measured work table
-(`work = batch * num_v_heads`) stays registered as pinnable candidates
-`kda_w128`, `kda_w512` and `kda_w_large`. Re-measure KDA with
-`library/builders/gfx950/gdn/tune.py`; exact measurements live outside the
-public source tree.
+KDA registers the same 180 tile identities under `kda_`-prefixed spec ids
+(such as `kda_nw4_wtk16_bpv4`), filtered by `is_valid_spec()` the same way; a
+candidate never serves the other gate kind. KDA `auto` is one static tile per
+state width whenever it is legal -- `(4, 16, 4)` for a bf16/f16 state and
+`(8, 16, 4)` for an f32 state -- and batch and head count change only the
+grid. An illegal default falls back the same way GDN's does. Re-measure either
+gate kind with `library/builders/gfx950/gdn/tune.py`; exact measurements live
+outside the public source tree.
 
 ## Dispatch
 

@@ -13,13 +13,13 @@ import pytest
 from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode
 
 ARCH = "gfx950"
-# (spec_id request, expected candidate, expected tile). "auto" is the static
-# KDA default; the table rows are the pinnable production candidates.
+# (state dtype, expected candidate, expected tile): the static KDA ``auto``
+# default for each state width. Every other registered KDA tile is compiled for
+# scratch by test_gdn_decode_spec.py.
 CASES = (
-    ("auto", "kda_w128", (4, 16, 4)),
-    ("kda_w128", "kda_w128", (4, 16, 4)),
-    ("kda_w512", "kda_w512", (1, 16, 4)),
-    ("kda_w_large", "kda_w_large", (2, 16, 1)),
+    ("bf16", "kda_nw4_wtk16_bpv4", (4, 16, 4)),
+    ("f16", "kda_nw4_wtk16_bpv4", (4, 16, 4)),
+    ("f32", "kda_nw8_wtk16_bpv4", (8, 16, 4)),
 )
 
 
@@ -63,19 +63,21 @@ def test_scratch_gate_rejects_nonzero_metadata():
         )
 
 
-@pytest.mark.parametrize("spec_id,expected_spec_id,expected_tile", CASES)
-def test_dispatched_kda_tile_is_scratch_free(spec_id, expected_spec_id, expected_tile):
-    """Compile each production candidate and reject register spills."""
+@pytest.mark.parametrize("state_dtype,expected_spec_id,expected_tile", CASES)
+def test_dispatched_kda_tile_is_scratch_free(
+    state_dtype, expected_spec_id, expected_tile
+):
+    """Compile each auto default and reject register spills."""
     result = dispatch_gdn_decode(
         GdnDecodeRequest(
             batch=8,
             arch=ARCH,
             gate_kind="kda",
-            spec_id=spec_id,
             num_k_heads=32,
             num_v_heads=32,
             head_k_dim=128,
             head_v_dim=128,
+            state_dtype=state_dtype,
         )
     )
     tile = (

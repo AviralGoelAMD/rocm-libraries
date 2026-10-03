@@ -52,7 +52,6 @@ def _cases():
     tile, so a change to any selectable configuration is visible.
     """
     from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode_all
-    from dispatch.gdn.gfx950 import _TUNED_TILES_KDA
     from kernels.gfx950.gdn_decode import GdnDecodeSpec, build_gdn_decode
 
     def build(**overrides):
@@ -75,13 +74,17 @@ def _cases():
         cases[f"registered_{result.candidate.spec_id}"] = (
             lambda spec=result.spec: build_gdn_decode(spec, arch=_ARCH)
         )
-    for _, tile, spec_id in _TUNED_TILES_KDA:
-        cases[f"tuned_{spec_id}"] = build(
-            gate_kind="kda",
-            num_warps=tile[0],
-            warp_threads_k=tile[1],
-            blocks_per_v_dim=tile[2],
+    # KDA registers the same tile space under ``kda_``-prefixed spec ids. Each
+    # state width is a different kernel, so f32 ids carry an ``_stf32`` suffix
+    # (the same marker the kernel name uses).
+    for state_dtype, suffix in (("bf16", ""), ("f32", "_stf32")):
+        kda_request = GdnDecodeRequest(
+            batch=16, arch=_ARCH, gate_kind="kda", state_dtype=state_dtype
         )
+        for result in dispatch_gdn_decode_all(kda_request):
+            cases[f"registered_{result.candidate.spec_id}{suffix}"] = (
+                lambda spec=result.spec: build_gdn_decode(spec, arch=_ARCH)
+            )
     return cases
 
 
@@ -147,7 +150,7 @@ def test_gdn_decode_ir_matches_golden():
 
 
 def test_every_shipped_configuration_is_recorded():
-    """A new tuned tile must arrive with a golden entry, not silently uncovered."""
+    """A new registered tile must arrive with a golden entry, not uncovered."""
     import pytest
 
     if not _GOLDEN.exists():
@@ -258,9 +261,9 @@ def test_gdn_cases_carry_no_kda_marker():
     quietly measuring the wrong kernel.
 
     KDA appears in an id two ways -- as a prefix for the hand-written cases
-    (``kda_default``) and as an infix for the tuned ones (``tuned_kda_w128``,
-    which inherits its gate kind from the spec id in the KDA table) -- so the
-    split is on containment, not prefix.
+    (``kda_default``) and as an infix for the registered ones
+    (``registered_kda_nw4_wtk16_bpv4``, whose spec id carries the gate kind) --
+    so the split is on containment, not prefix.
     """
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
 
@@ -269,7 +272,7 @@ def test_gdn_cases_carry_no_kda_marker():
     gdn_ids = [cid for cid in ids if "kda" not in cid]
     kda_ids = [cid for cid in ids if "kda" in cid]
 
-    # The original GDN set: default, simple, no_l2norm + one per GDN tuned tile.
+    # The original GDN set: default, simple, no_l2norm + one per GDN registry tile.
     assert len(gdn_ids) >= 7, f"expected the original GDN case set, got {gdn_ids}"
     assert kda_ids, "the KDA gate kind is unpinned"
     assert not set(gdn_ids) & set(kda_ids)
