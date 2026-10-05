@@ -547,11 +547,11 @@ std::optional<BoundTokens> gfx950AttentionDenseGraphMatches(const MatchContext& 
     // cuDNN's default: its SDPA node multiplies by attn_scale only when one is set. It is
     // resolved here, once, and prepare() launches with the bound value.
     const float scale = attributes.attn_scale_value().value_or(1.0F);
-    // The kernel takes the row max on unscaled scores (valid only for scale > 0) and masks
-    // raw scores with a power-of-two sentinel that must stay exact and finite after the
-    // scale. Mirrors run_attention_dense_torch's [2^-64, 2^24] range; the negated
-    // comparison also declines NaN, and the bounds decline +-inf.
-    if(!(scale >= 0x1p-64F && scale <= 0x1p24F))
+    // The kernel takes the row max on unscaled scores (valid only for scale > 0), folds the
+    // scale into an fma whose rounding residue grows with the scale, and masks raw scores
+    // with a power-of-two sentinel. Mirrors run_attention_dense_torch's [2^-64, 2^8] range;
+    // the negated comparison also declines NaN, and the bounds decline +-inf.
+    if(!(scale >= 0x1p-64F && scale <= 0x1p8F))
     {
         return std::nullopt;
     }

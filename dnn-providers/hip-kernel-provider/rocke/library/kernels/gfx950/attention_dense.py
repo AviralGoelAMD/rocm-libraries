@@ -10,7 +10,7 @@ step-1 pipeline with every WINNING lever baked in as always-on (no env gates):
   * **LDS bank-conflict padding on K** (``[NBUF, BN, D+8]``) — kills the 8-way conflict
     on the QK K-reads. The dominant base win (+80% over the naive baseline).
   * **native exp2_fast** (``v_exp_f32``, no overflow guard — the softmax argument is
-    always <= 0) — +11.5%.
+    bounded: at most the lazy-rescale threshold plus a small fma rounding residue) — +11.5%.
   * **full-population ``sched_group_barrier`` template** naming DS_READ/MFMA/VALU/TRANS
     per PV step.
   * **diagonal-only causal masking** — a mask-free body loop over below-diagonal KV
@@ -109,13 +109,17 @@ _LDS_PAD = 8
 # Lazy-rescale re-anchor threshold in the log2 domain: skip the O/l rescale when
 # every lane's (tile_max - running_max) <= this. exp2(8)=256 bounds P safely.
 _LAZY_RESCALE_THRESHOLD = 8.0
-# Accepted softmax-scale range. The ordinary kernel takes the row max on unscaled
-# scores (valid only for scale > 0) and masks raw scores with a -2**99 sentinel
-# that must stay exact, finite, and far below every real score once multiplied
-# by scale * log2(e). Inside these power-of-two bounds it does; NaN, +-inf,
-# scale <= 0 and denormal-range scales are rejected rather than mis-masked.
+# Accepted softmax-scale range, a chosen safety margin (not a hardware limit).
+# The ordinary kernel takes the row max on unscaled scores (valid only for
+# scale > 0) and computes exp2(fma(s, qk_scale, -m)) with m = fl(max * qk_scale).
+# For the row-max element that argument is the product's rounding residue, at
+# most |max * qk_scale| * 2**-24, so a large scale lets it grow until exp2
+# overflows. The bounds keep it a small fraction of the lazy-rescale budget for
+# raw scores up to ~1e6, and keep the -2**99 mask sentinel exact, finite and far
+# below real scores after the scale. Scales outside [2**-64, 2**8], including
+# NaN, +-inf and scale <= 0, are rejected rather than mis-computed.
 _MIN_SCALE = 2.0**-64
-_MAX_SCALE = 2.0**24
+_MAX_SCALE = 2.0**8
 
 
 @dataclass(frozen=True)
@@ -455,7 +459,7 @@ def build_attention_dense(
         bt_stride = b.param("block_table_stride", I32)
     qk_scale = b.fmul(scale, b.const_f32(LOG2E))
 
-    _exp2 = b.exp2_fast  # native v_exp_f32 (softmax arg always <= 0)
+    _exp2 = b.exp2_fast  # native v_exp_f32 (softmax arg bounded; see _MAX_SCALE)
 
     tid = b.thread_id_x()
     wave = b.div(tid, b.const_i32(64))
@@ -463,10 +467,14 @@ def build_attention_dense(
     lane_m = b.mod(lane, b.const_i32(32))
     lane_h = b.div(lane, b.const_i32(32))
     d_base = b.mul(lane_h, b.const_i32(8))
-    # Mask sentinel, written into RAW (unscaled) scores. It is a power of two so
-    # sentinel * qk_scale is exact in fp32: a row whose visited tile is fully
-    # masked then gets fma(sentinel, qk_scale, -m) == 0 exactly, not the huge
-    # rounding residue of a non-power-of-two product (exp2 of which is inf).
+    # Mask sentinel, written into RAW (unscaled) scores; it also seeds the running
+    # max m (log2 units) when there are no sinks. It is a power of two so
+    # sentinel * qk_scale is exact. A row fully masked in its first visited tile
+    # then gets, exactly: P = exp2(0) = 1 when qk_scale < 1 (m = sentinel *
+    # qk_scale), or P = exp2(sentinel * (qk_scale - 1)) = 0 when qk_scale >= 1
+    # (m stays at the sentinel). Either way the next tile with a real key has
+    # alpha = exp2(m_old - m_new) = 0, which clears it. A non-power-of-two
+    # sentinel would instead leave a huge rounding residue, and exp2 of it is inf.
     neg_inf = b.const_f32(-(2.0**99))
     if use_sinks:
         rcp_ln2 = b.const_f32(LOG2E)
@@ -2193,9 +2201,9 @@ def run_attention_dense_torch(
     """High-level framework entry: compile (cached) + launch the dense prefill
     kernel on torch tensors. ``q``/``k``/``v``/``out`` are dense contiguous
     tensors ([B, S, H, D] for q/out, [B, Skv, Hkv, D] for k/v); ``scale`` is the
-    softmax scale (1/sqrt(D)) and must lie in ``[2**-64, 2**24]`` (the ordinary
-    kernel takes the row max on unscaled scores and masks them with a finite
-    power-of-two sentinel; ``ValueError`` otherwise). Returns ``out``.
+    softmax scale (1/sqrt(D)) and must lie in ``[2**-64, 2**8]`` (the ordinary
+    kernel takes the row max on unscaled scores and folds the scale into an fma;
+    see ``_MAX_SCALE``; ``ValueError`` otherwise). Returns ``out``.
     torch is imported lazily by the launcher — this module stays torch-free at
     import time.
 
@@ -2236,7 +2244,7 @@ def run_attention_dense_torch(
     if not ok:
         raise NotImplementedError(f"attention_dense unsupported for spec: {why}")
     if not _MIN_SCALE <= scale <= _MAX_SCALE:  # also rejects NaN and +-inf
-        raise ValueError(f"scale must be in [2**-64, 2**24], got {scale!r}")
+        raise ValueError(f"scale must be in [2**-64, 2**8], got {scale!r}")
     if spec.varlen and (cu_seqlens_q is None or cu_seqlens_kv is None):
         raise ValueError(
             "varlen=True requires cu_seqlens_q and cu_seqlens_kv (int32 [batch+1]); "

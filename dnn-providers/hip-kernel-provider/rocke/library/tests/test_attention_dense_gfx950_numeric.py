@@ -242,7 +242,9 @@ class TestDenseNumeric:
     @requires_gfx950_gpu
     @pytest.mark.gpu
     @pytest.mark.parametrize("persistent", [False, True])
-    @pytest.mark.parametrize("d,scale", [(64, 1.0 / math.sqrt(64)), (128, 0.5)])
+    @pytest.mark.parametrize(
+        "d,scale", [(64, 1.0 / math.sqrt(64)), (128, 0.5), (128, 1.0)]
+    )
     def test_bf16_sliding_window_no_sinks(self, d, scale, persistent):
         """Causal sliding window without sinks, where whole query rows of the
         first visited KV tile are masked.
@@ -250,7 +252,9 @@ class TestDenseNumeric:
         Those rows start the online softmax from the mask sentinel, not from a
         real score or a sink logit. The sentinel must survive the softmax scale
         exactly, or exp2 of a huge rounding residue turns the row into inf/NaN.
-        Covers a scale below and above the default for each head size.
+        scale * log2(e) < 1 (D64 at its default scale, D128 at 0.5) and >= 1
+        (D128 at 1.0, the hipDNN default when no scale is given) take different
+        exact branches in the ordinary kernel; both are covered.
         """
         import torch
 
