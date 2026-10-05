@@ -522,7 +522,10 @@ def build_attention_dense(
         k_lane_grp = None
         k_sub_col = None
 
-    # Q packs (B operand), scaled once by qk_scale = softmax_scale * log2(e).
+    # Q packs (B operand), loaded unscaled. qk_scale = softmax_scale * log2(e) is
+    # applied in fp32 after the QK MFMA (softmax_max + the exp2 FMA below):
+    # rounding Q * qk_scale back to bf16 costs up to 2^-9 relative error per
+    # element, and the score error it causes grows with the scale.
     # ragged: a bounds-checked buffer load returns 0 for OOB query rows (the
     # partial last block), so padded rows are register-zero (their output is
     # dropped by the guarded store). Aligned: direct global load (unchanged IR).
@@ -538,11 +541,7 @@ def build_attention_dense(
             )
         else:
             raw = b.global_load_vN(q, addr, dtype, 8, align=16)
-        elems = [
-            b.cast_f32_to(b.fmul(b.cast_to_f32(b.vec_extract(raw, j)), qk_scale), dtype)
-            for j in range(8)
-        ]
-        q_packs.append(b.vec_pack(elems, dtype))
+        q_packs.append(raw)
 
     # ragged: ceil so the partial last KV tile is visited (its OOB keys load 0
     # into LDS and are masked out); aligned: exact.
@@ -730,6 +729,10 @@ def build_attention_dense(
                     col = b.add(k_sub_col, col)
                 k_pack = b.smem_load_vN(K_lds, kbuf, krow, col, dtype=dtype, n=8)
                 acc = mfma_32x32x16_for_dtype(b, dtype, k_pack, q_packs[ks], acc)
+            # Raw (unscaled) scores. qk_scale is folded into softmax_max (one
+            # multiply on the row max) and into the exp2 argument as one FMA,
+            # so the scale adds no per-score instruction. Needs qk_scale > 0
+            # (max commutes with the scale); the runner rejects scale <= 0.
             s_reg.append([b.vec_extract(acc, i) for i in range(16)])
         return s_reg
 
@@ -778,7 +781,9 @@ def build_attention_dense(
         for nsub in range(N_SUB):
             for i in range(16):
                 local_max = b.fmax(local_max, s_reg[nsub][i])
-        tile_max = b.fmax(local_max, b.warp_shuffle_xor(local_max, 32))
+        tile_max_raw = b.fmax(local_max, b.warp_shuffle_xor(local_max, 32))
+        # Into the log2 domain the running max, threshold, and sinks use.
+        tile_max = b.fmul(tile_max_raw, qk_scale)
         if LAZY_RESCALE:
             m_diff = b.fsub(tile_max, m_i)
             below_i32 = b.select(
@@ -845,11 +850,12 @@ def build_attention_dense(
         ]
 
     def pv_fused_exp(o_acc_in, p_packs, vbuf, s_reg, m_new):
-        """Depth-1 cluster: interleave exp2(s - m_new) into the PV MFMA loop so the
+        """Depth-1 cluster: interleave exp2(s * qk_scale - m_new) into the PV MFMA loop so the
         softmax VALU/TRANS co-executes in the MFMA shadow. The full per-step
         instruction population (DS_READ/MFMA/VALU/TRANS) is named to sched_group_barrier
         so the IGLP grouping matches the real stream."""
         exp_per = -(-(N_SUB * 16) // (D_TILES * KK_STEPS))
+        neg_m = b.fneg(m_new)
         slots = [(nsub, i) for nsub in range(N_SUB) for i in range(16)]
         p_vals = [[None] * 16 for _ in range(N_SUB)]
         it = iter(slots)
@@ -866,7 +872,7 @@ def build_attention_dense(
                     if slot is None:
                         break
                     nsub, i = slot
-                    p_vals[nsub][i] = _exp2(b.fsub(s_reg[nsub][i], m_new))
+                    p_vals[nsub][i] = _exp2(b.fma(s_reg[nsub][i], qk_scale, neg_m))
                     n_emit += 1
                 b.sched_group_barrier(DS_READ, 2, 0)
                 b.sched_group_barrier(MFMA, 1, 0)
@@ -875,7 +881,7 @@ def build_attention_dense(
             out.append(acc_o)
         for slot in it:
             nsub, i = slot
-            p_vals[nsub][i] = _exp2(b.fsub(s_reg[nsub][i], m_new))
+            p_vals[nsub][i] = _exp2(b.fma(s_reg[nsub][i], qk_scale, neg_m))
         l_local = b.const_f32(0.0)
         for nsub in range(N_SUB):
             for i in range(16):
@@ -943,8 +949,10 @@ def build_attention_dense(
 
     m0, alpha0, _skip0 = softmax_max(s0, m_init)
     # tile-0 softmax exp + relayout only; PV lags by one tile (fused into the loop).
+    neg_m0 = b.fneg(m0)
     p0_vals = [
-        [_exp2(b.fsub(s0[nsub][i], m0)) for i in range(16)] for nsub in range(N_SUB)
+        [_exp2(b.fma(s0[nsub][i], qk_scale, neg_m0)) for i in range(16)]
+        for nsub in range(N_SUB)
     ]
     l0_local = b.const_f32(0.0)
     for nsub in range(N_SUB):
@@ -1396,13 +1404,7 @@ def _build_attention_dense_persistent(spec: AttentionDenseSpec) -> KernelDef:
                 )
             else:
                 raw = b.global_load_vN(q, addr, dtype, 8, align=16)
-            elems = [
-                b.cast_f32_to(
-                    b.fmul(b.cast_to_f32(b.vec_extract(raw, j)), qk_scale), dtype
-                )
-                for j in range(8)
-            ]
-            q_packs.append(b.vec_pack(elems, dtype))
+            q_packs.append(raw)
 
         def _async_load(rsrc, lds_base, buf_val, tile_key0, bytes_per_buf, group_bytes):
             """Async DMA one K/V tile (see default builder ``_async_load``).
@@ -1601,7 +1603,9 @@ def _build_attention_dense_persistent(spec: AttentionDenseSpec) -> KernelDef:
                             K_lds, kbuf, krow, col, dtype=dtype, n=8
                         )
                     acc = mfma_32x32x16_for_dtype(b, dtype, k_pack, q_packs[ks], acc)
-                s_reg.append([b.vec_extract(acc, i) for i in range(16)])
+                s_reg.append(
+                    [b.fmul(b.vec_extract(acc, i), qk_scale) for i in range(16)]
+                )
             return s_reg
 
         def do_mask(s_reg, tile_idx, lower=False, upper=True):
@@ -2176,8 +2180,10 @@ def run_attention_dense_torch(
     """High-level framework entry: compile (cached) + launch the dense prefill
     kernel on torch tensors. ``q``/``k``/``v``/``out`` are dense contiguous
     tensors ([B, S, H, D] for q/out, [B, Skv, Hkv, D] for k/v); ``scale`` is the
-    softmax scale (1/sqrt(D)). Returns ``out``. torch is imported lazily by the
-    launcher — this module stays torch-free at import time.
+    softmax scale (1/sqrt(D)) and must be > 0 (the ordinary kernel takes the
+    row max on unscaled scores; ``ValueError`` otherwise). Returns ``out``.
+    torch is imported lazily by the launcher — this module stays torch-free at
+    import time.
 
     Arbitrary (non-256-multiple) sequence lengths are served WITHOUT host
     padding by the in-kernel ragged path: build ``spec`` with ``ragged=True``
@@ -2215,6 +2221,8 @@ def run_attention_dense_torch(
     ok, why = supports_attention_dense(spec, arch=arch)
     if not ok:
         raise NotImplementedError(f"attention_dense unsupported for spec: {why}")
+    if not scale > 0:  # also rejects NaN
+        raise ValueError(f"scale must be > 0, got {scale!r}")
     if spec.varlen and (cu_seqlens_q is None or cu_seqlens_kv is None):
         raise ValueError(
             "varlen=True requires cu_seqlens_q and cu_seqlens_kv (int32 [batch+1]); "

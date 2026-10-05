@@ -615,6 +615,45 @@ class TestSWASinkComposition(unittest.TestCase):
         self.assertIn("sinks", kname)
 
 
+class TestScaleValidation(unittest.TestCase):
+    """run_attention_dense_torch rejects a softmax scale that is not > 0."""
+
+    def test_non_positive_or_nan_scale_rejected(self):
+        """The ordinary kernel takes the row max on unscaled scores, which is the
+        max of the scaled scores only when scale > 0; anything else must raise
+        rather than silently produce a wrong softmax."""
+        from types import SimpleNamespace
+
+        from kernels.gfx950.attention_dense import (
+            AttentionDenseSpec,
+            run_attention_dense_torch,
+        )
+
+        spec = AttentionDenseSpec(
+            batch=1,
+            seqlen_q=512,
+            seqlen_kv=512,
+            num_query_heads=8,
+            num_kv_heads=8,
+            head_size=64,
+            dtype="bf16",
+        )
+        qshape = (spec.batch, spec.seqlen_q, spec.num_query_heads, spec.head_size)
+        kvshape = (spec.batch, spec.seqlen_kv, spec.num_kv_heads, spec.head_size)
+        for scale in (0.0, -0.0, -0.125, float("nan")):
+            with self.subTest(scale=scale):
+                with self.assertRaises(ValueError) as cm:
+                    run_attention_dense_torch(
+                        spec=spec,
+                        q=SimpleNamespace(shape=qshape),
+                        k=SimpleNamespace(shape=kvshape),
+                        v=SimpleNamespace(shape=kvshape),
+                        out=SimpleNamespace(shape=qshape),
+                        scale=scale,
+                    )
+                self.assertIn("scale must be > 0", str(cm.exception))
+
+
 class TestSinksValidation(unittest.TestCase):
     """Verify run_attention_dense_torch validates sinks parameter correctly."""
 

@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <set>
 #include <string>
@@ -1473,6 +1474,16 @@ TEST(TestGfx950AttentionDenseGraphMatch, AbsentAttentionScaleBindsOne)
     ASSERT_TRUE(bound.has_value());
     EXPECT_EQ(hipdnn_plugin_sdk::ingestor::tryGetBoundInt(*bound, SCALE_BITS_TOKEN).value_or(-1),
               ieee754Bits(0.5F));
+}
+
+TEST(TestGfx950AttentionDenseGraphMatch, DeclinesNonPositiveOrNanAttentionScale)
+{
+    for(const float scale : {0.0F, -0.0F, -0.5F, std::numeric_limits<float>::quiet_NaN()})
+    {
+        GraphSpec spec;
+        spec.attnScaleValue = scale;
+        EXPECT_FALSE(matchGraph(spec).has_value()) << "scale=" << scale;
+    }
 }
 
 TEST(TestGfx950AttentionDenseGraphMatch, DeclinesBothDeprecatedCausalBooleans)

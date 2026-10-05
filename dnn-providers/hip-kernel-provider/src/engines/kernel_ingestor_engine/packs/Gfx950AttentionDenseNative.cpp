@@ -547,6 +547,12 @@ std::optional<BoundTokens> gfx950AttentionDenseGraphMatches(const MatchContext& 
     // cuDNN's default: its SDPA node multiplies by attn_scale only when one is set. It is
     // resolved here, once, and prepare() launches with the bound value.
     const float scale = attributes.attn_scale_value().value_or(1.0F);
+    // The kernel takes the row max on unscaled scores, which is only the max of the
+    // scaled scores when scale > 0. `!(scale > 0)` also declines NaN.
+    if(!(scale > 0.0F))
+    {
+        return std::nullopt;
+    }
 
     BoundTokens bound;
     bound[std::string(Q_TOKEN)] = attributes.q_tensor_uid();
