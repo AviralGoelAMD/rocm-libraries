@@ -616,12 +616,13 @@ class TestSWASinkComposition(unittest.TestCase):
 
 
 class TestScaleValidation(unittest.TestCase):
-    """run_attention_dense_torch rejects a softmax scale that is not > 0."""
+    """run_attention_dense_torch rejects a softmax scale outside [2**-64, 2**24]."""
 
-    def test_non_positive_or_nan_scale_rejected(self):
-        """The ordinary kernel takes the row max on unscaled scores, which is the
-        max of the scaled scores only when scale > 0; anything else must raise
-        rather than silently produce a wrong softmax."""
+    def test_out_of_range_scale_rejected(self):
+        """The ordinary kernel takes the row max on unscaled scores (valid only
+        for scale > 0) and masks raw scores with a power-of-two sentinel that
+        must stay exact and finite after the scale; outside the accepted range
+        it must raise rather than silently produce a wrong softmax."""
         from types import SimpleNamespace
 
         from kernels.gfx950.attention_dense import (
@@ -640,7 +641,16 @@ class TestScaleValidation(unittest.TestCase):
         )
         qshape = (spec.batch, spec.seqlen_q, spec.num_query_heads, spec.head_size)
         kvshape = (spec.batch, spec.seqlen_kv, spec.num_kv_heads, spec.head_size)
-        for scale in (0.0, -0.0, -0.125, float("nan")):
+        for scale in (
+            0.0,
+            -0.0,
+            -0.125,
+            float("nan"),
+            float("inf"),
+            1e-30,
+            2.0**-64 / 2,
+            2.0**24 * 2,
+        ):
             with self.subTest(scale=scale):
                 with self.assertRaises(ValueError) as cm:
                     run_attention_dense_torch(
@@ -651,7 +661,7 @@ class TestScaleValidation(unittest.TestCase):
                         out=SimpleNamespace(shape=qshape),
                         scale=scale,
                     )
-                self.assertIn("scale must be > 0", str(cm.exception))
+                self.assertIn("scale must be in [2**-64, 2**24]", str(cm.exception))
 
 
 class TestSinksValidation(unittest.TestCase):

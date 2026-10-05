@@ -109,6 +109,13 @@ _LDS_PAD = 8
 # Lazy-rescale re-anchor threshold in the log2 domain: skip the O/l rescale when
 # every lane's (tile_max - running_max) <= this. exp2(8)=256 bounds P safely.
 _LAZY_RESCALE_THRESHOLD = 8.0
+# Accepted softmax-scale range. The ordinary kernel takes the row max on unscaled
+# scores (valid only for scale > 0) and masks raw scores with a -2**99 sentinel
+# that must stay exact, finite, and far below every real score once multiplied
+# by scale * log2(e). Inside these power-of-two bounds it does; NaN, +-inf,
+# scale <= 0 and denormal-range scales are rejected rather than mis-masked.
+_MIN_SCALE = 2.0**-64
+_MAX_SCALE = 2.0**24
 
 
 @dataclass(frozen=True)
@@ -456,7 +463,11 @@ def build_attention_dense(
     lane_m = b.mod(lane, b.const_i32(32))
     lane_h = b.div(lane, b.const_i32(32))
     d_base = b.mul(lane_h, b.const_i32(8))
-    neg_inf = b.const_f32(-1e30)
+    # Mask sentinel, written into RAW (unscaled) scores. It is a power of two so
+    # sentinel * qk_scale is exact in fp32: a row whose visited tile is fully
+    # masked then gets fma(sentinel, qk_scale, -m) == 0 exactly, not the huge
+    # rounding residue of a non-power-of-two product (exp2 of which is inf).
+    neg_inf = b.const_f32(-(2.0**99))
     if use_sinks:
         rcp_ln2 = b.const_f32(LOG2E)
         one_f = b.const_f32(1.0)
@@ -524,7 +535,7 @@ def build_attention_dense(
 
     # Q packs (B operand), loaded unscaled. qk_scale = softmax_scale * log2(e) is
     # applied in fp32 after the QK MFMA (softmax_max + the exp2 FMA below):
-    # rounding Q * qk_scale back to bf16 costs up to 2^-9 relative error per
+    # rounding Q * qk_scale back to bf16 costs up to 2^-8 relative error per
     # element, and the score error it causes grows with the scale.
     # ragged: a bounds-checked buffer load returns 0 for OOB query rows (the
     # partial last block), so padded rows are register-zero (their output is
@@ -732,7 +743,8 @@ def build_attention_dense(
             # Raw (unscaled) scores. qk_scale is folded into softmax_max (one
             # multiply on the row max) and into the exp2 argument as one FMA,
             # so the scale adds no per-score instruction. Needs qk_scale > 0
-            # (max commutes with the scale); the runner rejects scale <= 0.
+            # (max commutes with the scale); the runner enforces the
+            # [_MIN_SCALE, _MAX_SCALE] range.
             s_reg.append([b.vec_extract(acc, i) for i in range(16)])
         return s_reg
 
@@ -851,9 +863,10 @@ def build_attention_dense(
 
     def pv_fused_exp(o_acc_in, p_packs, vbuf, s_reg, m_new):
         """Depth-1 cluster: interleave exp2(s * qk_scale - m_new) into the PV MFMA loop so the
-        softmax VALU/TRANS co-executes in the MFMA shadow. The full per-step
-        instruction population (DS_READ/MFMA/VALU/TRANS) is named to sched_group_barrier
-        so the IGLP grouping matches the real stream."""
+        softmax VALU/TRANS co-executes in the MFMA shadow. The per-step instruction
+        population (DS_READ/MFMA/VALU/TRANS) is named to sched_group_barrier. The VALU
+        count is an upper bound: the compiler may pair two exp-argument FMAs into one
+        v_pk_fma_f32, so a step can issue fewer VALU ops than named."""
         exp_per = -(-(N_SUB * 16) // (D_TILES * KK_STEPS))
         neg_m = b.fneg(m_new)
         slots = [(nsub, i) for nsub in range(N_SUB) for i in range(16)]
@@ -2180,8 +2193,9 @@ def run_attention_dense_torch(
     """High-level framework entry: compile (cached) + launch the dense prefill
     kernel on torch tensors. ``q``/``k``/``v``/``out`` are dense contiguous
     tensors ([B, S, H, D] for q/out, [B, Skv, Hkv, D] for k/v); ``scale`` is the
-    softmax scale (1/sqrt(D)) and must be > 0 (the ordinary kernel takes the
-    row max on unscaled scores; ``ValueError`` otherwise). Returns ``out``.
+    softmax scale (1/sqrt(D)) and must lie in ``[2**-64, 2**24]`` (the ordinary
+    kernel takes the row max on unscaled scores and masks them with a finite
+    power-of-two sentinel; ``ValueError`` otherwise). Returns ``out``.
     torch is imported lazily by the launcher — this module stays torch-free at
     import time.
 
@@ -2221,8 +2235,8 @@ def run_attention_dense_torch(
     ok, why = supports_attention_dense(spec, arch=arch)
     if not ok:
         raise NotImplementedError(f"attention_dense unsupported for spec: {why}")
-    if not scale > 0:  # also rejects NaN
-        raise ValueError(f"scale must be > 0, got {scale!r}")
+    if not _MIN_SCALE <= scale <= _MAX_SCALE:  # also rejects NaN and +-inf
+        raise ValueError(f"scale must be in [2**-64, 2**24], got {scale!r}")
     if spec.varlen and (cu_seqlens_q is None or cu_seqlens_kv is None):
         raise ValueError(
             "varlen=True requires cu_seqlens_q and cu_seqlens_kv (int32 [batch+1]); "

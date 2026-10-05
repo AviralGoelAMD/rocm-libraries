@@ -241,6 +241,45 @@ class TestDenseNumeric:
 
     @requires_gfx950_gpu
     @pytest.mark.gpu
+    @pytest.mark.parametrize("persistent", [False, True])
+    @pytest.mark.parametrize("d,scale", [(64, 1.0 / math.sqrt(64)), (128, 0.5)])
+    def test_bf16_sliding_window_no_sinks(self, d, scale, persistent):
+        """Causal sliding window without sinks, where whole query rows of the
+        first visited KV tile are masked.
+
+        Those rows start the online softmax from the mask sentinel, not from a
+        real score or a sink logit. The sentinel must survive the softmax scale
+        exactly, or exp2 of a huge rounding residue turns the row into inf/NaN.
+        Covers a scale below and above the default for each head size.
+        """
+        import torch
+
+        dtype, hq, hkv, window = "bf16", 16, 4, 128
+        tol = _tolerance(dtype)
+        B, S = 1, 512
+        torch.manual_seed(0)
+
+        q = torch.randn(B, S, hq, d, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(B, S, hkv, d, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(B, S, hkv, d, device="cuda", dtype=torch.bfloat16)
+        out = torch.empty(B, S, hq, d, device="cuda", dtype=torch.bfloat16)
+
+        spec = _spec(
+            dtype, d, hq, hkv, persistent, batch=B, sq=S, sliding_window=window
+        )
+        run_attention_dense_torch(spec=spec, q=q, k=k, v=v, out=out, scale=scale)
+        torch.cuda.synchronize()
+
+        assert torch.isfinite(out).all(), "non-finite output"
+        ref = _standard_reference(q, k, v, scale, sliding_window=window)
+        max_abs = (ref - out.float()).abs().max().item()
+        assert max_abs < tol, (
+            f"bf16 D{d} SWA{window} scale={scale:g} "
+            f"{'persist' if persistent else 'default'}: max_abs={max_abs:.3e} >= {tol}"
+        )
+
+    @requires_gfx950_gpu
+    @pytest.mark.gpu
     def test_one_binary_serves_every_shape(self):
         """One compiled artifact, two shapes, correct numerics at both.
 
