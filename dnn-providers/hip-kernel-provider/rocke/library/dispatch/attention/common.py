@@ -131,6 +131,10 @@ class AttentionRequest(OperatorRequest):
     tuning_knobs: Tuple[Tuple[str, object], ...] = ()
     use_fp8: bool = False
     fp8_fnuz: bool = False
+    # Also write the natural-log softmax normalizer (LSE) into a caller-owned
+    # FP32 ``tensors["lse"]``. Reported as the ``lse`` feature, so only
+    # candidates whose kernels implement it (the dense ones) admit the request.
+    emit_lse: bool = False
 
     def __post_init__(self):
         # Callers rebuild pins from stored JSON; a bad value fails here, with
@@ -176,6 +180,8 @@ class AttentionRequest(OperatorRequest):
             active.add("sinks")
         if bool(self.use_fp8):
             active.add("fp8")
+        if bool(self.emit_lse):
+            active.add("lse")
         return frozenset(active)
 
 
