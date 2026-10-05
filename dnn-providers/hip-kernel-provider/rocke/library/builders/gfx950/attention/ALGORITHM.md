@@ -344,11 +344,11 @@ the shape into the kernel and reshapes the schedule around a 256-row query tile.
 | **CK-1 transposed PV** | $P$ feeds the PV MFMA in its native QK-output layout via a half-local V load (`pv32_v_load_paired`); the cross-half P-relayout shuffle is gone (~96 `ds_bpermute` removed). | +35% |
 | **LDS bank-conflict pad on K** (`[NBUF, BN, D+8]`) | kills the 8-way conflict on the QK K-reads. | +80% (base win) |
 | **LDS V pad** (`+32`) | the transposed PV read (`ds_read_b64_tr_b16`) has a stricter bank pattern than K; a `+32` V-row pad fully clears its conflicts. | +~5% |
-| **native `exp2_fast`** (`v_exp_f32`, no overflow guard — softmax arg ≤ 0) | one instruction per exp. | +11.5% |
-| **depth-1 cluster** | fuses `exp2(s − m)` into the PV-MFMA loop so the softmax VALU/TRANS co-executes in the MFMA shadow (`sched_group_barrier` names the full DS_READ/MFMA/VALU/TRANS population per step). | — |
+| **native `exp2_fast`** (`v_exp_f32`, no overflow guard — softmax arg bounded: at most the lazy threshold, plus at most 1 from the default grid's fma rounding residue) | one instruction per exp. | +11.5% |
+| **depth-1 cluster** | fuses the exp2 into the PV-MFMA loop so the softmax VALU/TRANS co-executes in the MFMA shadow (`sched_group_barrier` names the DS_READ/MFMA/VALU/TRANS population per step; the VALU count is an upper bound when the compiler packs the exp-argument FMAs). The default grid computes the argument as one `fma(s, qk_scale, -m)` on raw scores; the persistent grid as `s - m` on pre-scaled scores. | — |
 | **partial-vmcnt software prefetch** | per-tile K/V DMA drains to a *partial* `vmcnt` (keeps the freshest V prefetch in flight across the barrier) instead of a full `vmcnt(0)` serialize. | raises MfmaUtil |
 | **PV-only `s_setprio`** | the PV MFMA cluster is bracketed at raised priority so it wins issue slots; paired with the prefetch. | +3.5% |
-| **lazy online rescale** | keep the running max as a *lazy* max that only re-anchors when a tile exceeds it by >8 (log2); when every lane is within 8 (a `wave_all` vote) skip the O/ℓ rescale entirely (a 0/1-trip `scf.for` → a wave-uniform scalar branch), cutting the VALU between the QK and PV clusters. Numerically approximate ($P$ bounded by $2^8$) but parity-identical at bf16/fp16 tolerance. | +~2% |
+| **lazy online rescale** | keep the running max as a *lazy* max that only re-anchors when a tile exceeds it by >8 (log2); when every lane is within 8 (a `wave_all` vote) skip the O/ℓ rescale entirely (a 0/1-trip `scf.for` → a wave-uniform scalar branch), cutting the VALU between the QK and PV clusters. Numerically approximate ($P$ bounded by $2^8$, or $2^9$ in the default grid with its fma residue) but parity-identical at bf16/fp16 tolerance. | +~2% |
 
 **Diagonal-only causal masking.** For causal, below-diagonal KV tiles need no
 mask (~94% of tiles at $S = 8192$); the KV loop is split into a mask-free body

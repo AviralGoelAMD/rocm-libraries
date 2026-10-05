@@ -3,6 +3,7 @@
 
 #ifdef HIPDNN_ENABLE_KERNEL_INGESTOR
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -549,9 +550,10 @@ std::optional<BoundTokens> gfx950AttentionDenseGraphMatches(const MatchContext& 
     const float scale = attributes.attn_scale_value().value_or(1.0F);
     // The kernel takes the row max on unscaled scores (valid only for scale > 0), folds the
     // scale into an fma whose rounding residue grows with the scale, and masks raw scores
-    // with a power-of-two sentinel. Mirrors run_attention_dense_torch's [2^-64, 2^8] range;
-    // the negated comparison also declines NaN, and the bounds decline +-inf.
-    if(!(scale >= 0x1p-64F && scale <= 0x1p8F))
+    // with a power-of-two sentinel. Mirrors run_attention_dense_torch's [2^-64, 2^4] range.
+    // NaN compares false with both bounds, so it needs its own check; the bounds decline
+    // +-inf.
+    if(std::isnan(scale) || scale < 0x1p-64F || scale > 0x1p4F)
     {
         return std::nullopt;
     }

@@ -107,19 +107,22 @@ _LDS_PAD = 8
 #   VPAD32: 0} and TFLOPS {906, 901, 944, 953} -- i.e. +8 is useless here and
 #   only +32 fully clears the V-read conflicts (matches flyDSL's SMEM_V_PAD).
 # Lazy-rescale re-anchor threshold in the log2 domain: skip the O/l rescale when
-# every lane's (tile_max - running_max) <= this. exp2(8)=256 bounds P safely.
+# every lane's (tile_max - running_max) <= this. exp2(8)=256 bounds P, times the
+# ordinary kernel's small fma rounding residue (see _MAX_SCALE).
 _LAZY_RESCALE_THRESHOLD = 8.0
 # Accepted softmax-scale range, a chosen safety margin (not a hardware limit).
 # The ordinary kernel takes the row max on unscaled scores (valid only for
 # scale > 0) and computes exp2(fma(s, qk_scale, -m)) with m = fl(max * qk_scale).
 # For the row-max element that argument is the product's rounding residue, at
-# most |max * qk_scale| * 2**-24, so a large scale lets it grow until exp2
-# overflows. The bounds keep it a small fraction of the lazy-rescale budget for
-# raw scores up to ~1e6, and keep the -2**99 mask sentinel exact, finite and far
-# below real scores after the scale. Scales outside [2**-64, 2**8], including
-# NaN, +-inf and scale <= 0, are rejected rather than mis-computed.
+# most half an ulp of max * qk_scale, so a large scale or score lets it grow
+# until P overflows (first in the fp16 cast before the PV MFMA). At scale 2**4
+# and |raw score| <= 1e6 the residue is at most 1, so P stays within about
+# 2**9 even on top of the lazy-rescale threshold. The bounds also keep the
+# -2**99 mask sentinel exact, finite and far below real scores after the scale.
+# Scales outside [2**-64, 2**4], including NaN, +-inf and scale <= 0, are
+# rejected rather than mis-computed.
 _MIN_SCALE = 2.0**-64
-_MAX_SCALE = 2.0**8
+_MAX_SCALE = 2.0**4
 
 
 @dataclass(frozen=True)
@@ -470,8 +473,8 @@ def build_attention_dense(
     # Mask sentinel, written into RAW (unscaled) scores; it also seeds the running
     # max m (log2 units) when there are no sinks. It is a power of two so
     # sentinel * qk_scale is exact. A row fully masked in its first visited tile
-    # then gets, exactly: P = exp2(0) = 1 when qk_scale < 1 (m = sentinel *
-    # qk_scale), or P = exp2(sentinel * (qk_scale - 1)) = 0 when qk_scale >= 1
+    # then gets, exactly: P = exp2(0) = 1 when qk_scale <= 1 (m = sentinel *
+    # qk_scale), or P = exp2(sentinel * (qk_scale - 1)) = 0 when qk_scale > 1
     # (m stays at the sentinel). Either way the next tile with a real key has
     # alpha = exp2(m_old - m_new) = 0, which clears it. A non-power-of-two
     # sentinel would instead leave a huge rounding residue, and exp2 of it is inf.
@@ -2201,7 +2204,7 @@ def run_attention_dense_torch(
     """High-level framework entry: compile (cached) + launch the dense prefill
     kernel on torch tensors. ``q``/``k``/``v``/``out`` are dense contiguous
     tensors ([B, S, H, D] for q/out, [B, Skv, Hkv, D] for k/v); ``scale`` is the
-    softmax scale (1/sqrt(D)) and must lie in ``[2**-64, 2**8]`` (the ordinary
+    softmax scale (1/sqrt(D)) and must lie in ``[2**-64, 2**4]`` (the ordinary
     kernel takes the row max on unscaled scores and folds the scale into an fma;
     see ``_MAX_SCALE``; ``ValueError`` otherwise). Returns ``out``.
     torch is imported lazily by the launcher — this module stays torch-free at
@@ -2244,7 +2247,7 @@ def run_attention_dense_torch(
     if not ok:
         raise NotImplementedError(f"attention_dense unsupported for spec: {why}")
     if not _MIN_SCALE <= scale <= _MAX_SCALE:  # also rejects NaN and +-inf
-        raise ValueError(f"scale must be in [2**-64, 2**8], got {scale!r}")
+        raise ValueError(f"scale must be in [2**-64, 2**4], got {scale!r}")
     if spec.varlen and (cu_seqlens_q is None or cu_seqlens_kv is None):
         raise ValueError(
             "varlen=True requires cu_seqlens_q and cu_seqlens_kv (int32 [batch+1]); "

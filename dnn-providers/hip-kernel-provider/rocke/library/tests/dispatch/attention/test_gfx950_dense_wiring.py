@@ -616,7 +616,7 @@ class TestSWASinkComposition(unittest.TestCase):
 
 
 class TestScaleValidation(unittest.TestCase):
-    """run_attention_dense_torch rejects a softmax scale outside [2**-64, 2**8]."""
+    """run_attention_dense_torch rejects a softmax scale outside [2**-64, 2**4]."""
 
     def test_out_of_range_scale_rejected(self):
         """The ordinary kernel takes the row max on unscaled scores (valid only
@@ -649,7 +649,7 @@ class TestScaleValidation(unittest.TestCase):
             float("inf"),
             1e-30,
             2.0**-64 / 2,
-            2.0**8 * 2,
+            2.0**4 * 2,
         ):
             with self.subTest(scale=scale):
                 with self.assertRaises(ValueError) as cm:
@@ -661,7 +661,7 @@ class TestScaleValidation(unittest.TestCase):
                         out=SimpleNamespace(shape=qshape),
                         scale=scale,
                     )
-                self.assertIn("scale must be in [2**-64, 2**8]", str(cm.exception))
+                self.assertIn("scale must be in [2**-64, 2**4]", str(cm.exception))
 
 
 class TestSinksValidation(unittest.TestCase):

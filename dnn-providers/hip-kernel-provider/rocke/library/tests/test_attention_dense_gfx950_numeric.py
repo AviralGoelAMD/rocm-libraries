@@ -252,7 +252,7 @@ class TestDenseNumeric:
         Those rows start the online softmax from the mask sentinel, not from a
         real score or a sink logit. The sentinel must survive the softmax scale
         exactly, or exp2 of a huge rounding residue turns the row into inf/NaN.
-        scale * log2(e) < 1 (D64 at its default scale, D128 at 0.5) and >= 1
+        scale * log2(e) <= 1 (D64 at its default scale, D128 at 0.5) and > 1
         (D128 at 1.0, the hipDNN default when no scale is given) take different
         exact branches in the ordinary kernel; both are covered.
         """

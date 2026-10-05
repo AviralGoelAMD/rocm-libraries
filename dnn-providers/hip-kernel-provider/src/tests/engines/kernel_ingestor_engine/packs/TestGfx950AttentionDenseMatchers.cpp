@@ -1485,7 +1485,7 @@ TEST(TestGfx950AttentionDenseGraphMatch, DeclinesAttentionScaleOutsideSupportedR
                              std::numeric_limits<float>::infinity(),
                              1e-30F,
                              0x1p-65F,
-                             0x1p9F})
+                             0x1p5F})
     {
         GraphSpec spec;
         spec.attnScaleValue = scale;
@@ -1493,7 +1493,7 @@ TEST(TestGfx950AttentionDenseGraphMatch, DeclinesAttentionScaleOutsideSupportedR
     }
 
     // The range is inclusive: both bounds are still served.
-    for(const float scale : {0x1p-64F, 0x1p8F})
+    for(const float scale : {0x1p-64F, 0x1p4F})
     {
         GraphSpec spec;
         spec.attnScaleValue = scale;
