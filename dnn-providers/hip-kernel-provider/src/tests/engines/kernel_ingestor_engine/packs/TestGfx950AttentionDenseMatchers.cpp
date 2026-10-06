@@ -1483,6 +1483,7 @@ TEST(TestGfx950AttentionDenseGraphMatch, DeclinesAttentionScaleOutsideSupportedR
                              -0.5F,
                              std::numeric_limits<float>::quiet_NaN(),
                              std::numeric_limits<float>::infinity(),
+                             -std::numeric_limits<float>::infinity(),
                              1e-30F,
                              0x1p-65F,
                              0x1p5F})
