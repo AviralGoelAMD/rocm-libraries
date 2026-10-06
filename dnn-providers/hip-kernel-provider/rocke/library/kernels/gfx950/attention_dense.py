@@ -71,6 +71,7 @@ staging, score truncation, PV V-prefetch) are intentionally NOT carried over —
 the experiment's ``plan.md`` for their measured results.
 """
 
+import math
 from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass, fields as _dataclass_fields
 from types import MappingProxyType
@@ -477,7 +478,8 @@ def build_attention_dense(
     # qk_scale), or P = exp2(sentinel * (qk_scale - 1)) = 0 when qk_scale > 1
     # (m stays at the sentinel). Either way the next tile with a real key has
     # alpha = exp2(m_old - m_new) = 0, which clears it. A non-power-of-two
-    # sentinel would instead leave a huge rounding residue, and exp2 of it is inf.
+    # sentinel would instead leave a huge rounding residue whose sign depends on
+    # the scale: exp2 of it is 0 when negative and inf (then NaN) when positive.
     neg_inf = b.const_f32(-(2.0**99))
     if use_sinks:
         rcp_ln2 = b.const_f32(LOG2E)
@@ -2204,9 +2206,11 @@ def run_attention_dense_torch(
     """High-level framework entry: compile (cached) + launch the dense prefill
     kernel on torch tensors. ``q``/``k``/``v``/``out`` are dense contiguous
     tensors ([B, S, H, D] for q/out, [B, Skv, Hkv, D] for k/v); ``scale`` is the
-    softmax scale (1/sqrt(D)) and must lie in ``[2**-64, 2**4]`` (the ordinary
-    kernel takes the row max on unscaled scores and folds the scale into an fma;
-    see ``_MAX_SCALE``; ``ValueError`` otherwise). Returns ``out``.
+    softmax scale (1/sqrt(D)) and is supported in ``[2**-64, 2**4]`` (the
+    ordinary kernel takes the row max on unscaled scores and folds the scale
+    into an fma; see ``_MAX_SCALE``). A NaN or infinite scale raises
+    ``ValueError``; a finite scale outside the range raises
+    ``NotImplementedError``. Returns ``out``.
     torch is imported lazily by the launcher — this module stays torch-free at
     import time.
 
@@ -2246,8 +2250,13 @@ def run_attention_dense_torch(
     ok, why = supports_attention_dense(spec, arch=arch)
     if not ok:
         raise NotImplementedError(f"attention_dense unsupported for spec: {why}")
-    if not _MIN_SCALE <= scale <= _MAX_SCALE:  # also rejects NaN and +-inf
-        raise ValueError(f"scale must be in [2**-64, 2**4], got {scale!r}")
+    if not math.isfinite(scale):
+        raise ValueError(f"scale must be finite, got {scale!r}")
+    if not _MIN_SCALE <= scale <= _MAX_SCALE:
+        raise NotImplementedError(
+            "NOT_YET_IMPLEMENTED: the gfx950 dense kernel supports a softmax "
+            f"scale in [2**-64, 2**4], got {scale!r}"
+        )
     if spec.varlen and (cu_seqlens_q is None or cu_seqlens_kv is None):
         raise ValueError(
             "varlen=True requires cu_seqlens_q and cu_seqlens_kv (int32 [batch+1]); "

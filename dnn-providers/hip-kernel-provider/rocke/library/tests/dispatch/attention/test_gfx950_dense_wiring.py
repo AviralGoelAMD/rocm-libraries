@@ -616,13 +616,16 @@ class TestSWASinkComposition(unittest.TestCase):
 
 
 class TestScaleValidation(unittest.TestCase):
-    """run_attention_dense_torch rejects a softmax scale outside [2**-64, 2**4]."""
+    """run_attention_dense_torch rejects a non-finite softmax scale as invalid
+    and a finite one outside [2**-64, 2**4] as not yet supported."""
 
     def test_out_of_range_scale_rejected(self):
         """The ordinary kernel takes the row max on unscaled scores (valid only
         for scale > 0) and masks raw scores with a power-of-two sentinel that
-        must stay exact and finite after the scale; outside the accepted range
-        it must raise rather than silently produce a wrong softmax."""
+        must stay exact and finite after the scale; outside the supported range
+        it must raise rather than silently produce a wrong softmax. NaN and inf
+        are invalid input (ValueError); finite out-of-range scales are a
+        kernel limit (NotImplementedError)."""
         from types import SimpleNamespace
 
         from kernels.gfx950.attention_dense import (
@@ -641,18 +644,17 @@ class TestScaleValidation(unittest.TestCase):
         )
         qshape = (spec.batch, spec.seqlen_q, spec.num_query_heads, spec.head_size)
         kvshape = (spec.batch, spec.seqlen_kv, spec.num_kv_heads, spec.head_size)
-        for scale in (
-            0.0,
-            -0.0,
-            -0.125,
-            float("nan"),
-            float("inf"),
-            1e-30,
-            2.0**-64 / 2,
-            2.0**4 * 2,
-        ):
+        cases = [
+            (float("nan"), ValueError, "scale must be finite"),
+            (float("inf"), ValueError, "scale must be finite"),
+            (float("-inf"), ValueError, "scale must be finite"),
+        ] + [
+            (scale, NotImplementedError, "NOT_YET_IMPLEMENTED")
+            for scale in (0.0, -0.0, -0.125, 1e-30, 2.0**-64 / 2, 2.0**4 * 2)
+        ]
+        for scale, error, message in cases:
             with self.subTest(scale=scale):
-                with self.assertRaises(ValueError) as cm:
+                with self.assertRaises(error) as cm:
                     run_attention_dense_torch(
                         spec=spec,
                         q=SimpleNamespace(shape=qshape),
@@ -661,7 +663,7 @@ class TestScaleValidation(unittest.TestCase):
                         out=SimpleNamespace(shape=qshape),
                         scale=scale,
                     )
-                self.assertIn("scale must be in [2**-64, 2**4]", str(cm.exception))
+                self.assertIn(message, str(cm.exception))
 
 
 class TestSinksValidation(unittest.TestCase):
