@@ -323,7 +323,7 @@ You can also pass `--help` to benchmarks to print the available options.
 | `--spaces-per-indent`                    | Number of spaces per indentation level in JSON output. Set to 0 for no indentation. (default: 4)                                                                                   |
 | `--stream-blocking-timeout-secs`         | Maximum stream blocking duration in seconds before timing out. Stream is blocked while queueing kernel calls. Use `primbench::flags::sync` if kernel is synchronous. (default: 10) |
 | `--skip-header`                          | Skip printing the header to output.                                                                                                                                                |
-| `--skip-test`                          | Skip correctness tests                                                                                      |
+| `--skip-tests`                         | Skip running correctness tests.                                                                               |
 
 ### Adding Custom Options
 
