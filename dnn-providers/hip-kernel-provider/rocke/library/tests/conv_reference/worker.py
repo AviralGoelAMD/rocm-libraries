@@ -4,7 +4,7 @@
 """Isolated HIP worker, frozen with the old runtime in a qualified bundle.
 
 Source mode exercises the same dispatch and public launch entry as the existing
-SDPA test. Replay mode loads the already compiled old HSACO and frozen ABI.
+convolution test. Replay mode loads the already compiled old HSACO and frozen ABI.
 Neither mode computes independent reference answers or adjusts error budgets.
 """
 
@@ -36,16 +36,14 @@ def run(request: dict, output: Path) -> None:
         raise RuntimeError("worker imported rocKE outside its selected source/runtime")
     if get_device_arch() != target.NAME:
         raise RuntimeError(
-            f"SDPA correctness requires a HIP-visible {target.NAME} device"
+            f"convolution correctness requires a HIP-visible {target.NAME} device"
         )
+    if request["mode"] not in ("source", "replay") or request["repetitions"] < 1:
+        raise ValueError("invalid convolution worker request")
     case = Case(**request["case"])
     with np.load(request["inputs"], allow_pickle=False) as archive:
-        arrays = {name: archive[name] for name in ("q", "k", "v")}
-    expected_shapes = {
-        "q": case.shape,
-        "k": (*case.shape[:2], case.kv_heads, case.head_dim),
-        "v": (*case.shape[:2], case.kv_heads, case.head_dim),
-    }
+        arrays = {name: archive[name] for name in case.input_shapes}
+    expected_shapes = case.input_shapes
     for name, array in arrays.items():
         if array.shape != expected_shapes[name]:
             raise ValueError(f"wrong input shape for {name}: {array.shape}")
@@ -56,7 +54,7 @@ def run(request: dict, output: Path) -> None:
 
     rt = Runtime()
     storage = np.dtype("<f2" if case.dtype == "fp16" else "<u2")
-    host_out = np.empty(case.shape, dtype=storage)
+    host_out = np.empty(case.output_shape, dtype=storage)
     buffers = {name: DeviceMem(array.nbytes) for name, array in arrays.items()}
     buffers["out"] = DeviceMem(host_out.nbytes)
     try:
@@ -95,21 +93,15 @@ def run(request: dict, output: Path) -> None:
                 # launch must never inherit a plausible answer from allocation.
                 rt.memset(buffers["out"].ptr(), 0xFF, host_out.nbytes)
                 if request["mode"] == "source":
-                    target.launch(spec, buffers, case.scale)
+                    target.launch(spec, buffers)
                 else:
-                    values = {
-                        "q_ptr": buffers["q"],
-                        "k_ptr": buffers["k"],
-                        "v_ptr": buffers["v"],
-                        "o_ptr": buffers["out"],
-                        "scale": case.scale,
-                    }
-                    if metadata["runtime_shape"]:
-                        values.update(
-                            batch=case.batch,
-                            seqlen_q=case.sequence_length,
-                            seqlen_kv=case.sequence_length,
-                        )
+                    values = dict(metadata["scalars"])
+                    values.update(
+                        {
+                            name: buffers[operand]
+                            for name, operand in metadata["bindings"].items()
+                        }
+                    )
                     launcher(
                         values,
                         config=LaunchConfig(
@@ -124,7 +116,9 @@ def run(request: dict, output: Path) -> None:
                     host_out.nbytes,
                 )
                 if not np.isfinite(decode(host_out, case.dtype)).all():
-                    raise ValueError("SDPA produced non-finite or unwritten output")
+                    raise ValueError(
+                        "convolution produced non-finite or unwritten output"
+                    )
                 results[f"out_{repetition}"] = host_out.copy()
         finally:
             KernelLauncher.__call__ = launch_call
@@ -139,7 +133,7 @@ def run(request: dict, output: Path) -> None:
                 ctypes.c_void_p(returned.ctypes.data), buffers[name].ptr(), array.nbytes
             )
             if array_digest(returned) != request["input_digests"][name]:
-                raise AssertionError(f"SDPA modified read-only input: {name}")
+                raise AssertionError(f"convolution modified read-only input: {name}")
 
         report = {
             "launches": launches,
