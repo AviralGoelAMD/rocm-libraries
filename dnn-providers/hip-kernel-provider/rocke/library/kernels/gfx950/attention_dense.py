@@ -125,6 +125,19 @@ _LAZY_RESCALE_THRESHOLD = 8.0
 # the literals 0x1p-64F / 0x1p4F in Gfx950AttentionDenseNative.cpp
 # (gfx950AttentionDenseGraphMatches) and its gtest; change them together.
 # TestScaleValidation pins both bounds to those literals.
+#
+# KNOWN LIMITATION (ordinary grid only): nothing bounds the raw score, so the
+# residue above is bounded only by the size of the log2-domain row max m, not by
+# the scale. Once |m| >= 2**28 (pre-softmax logit |q.k * scale| >~ 1.9e8) the
+# residue can exceed 8 and fp16 P overflows; once |m| >= 2**31 (logit >~ 1.5e9)
+# it can exceed 120 and exp2 itself overflows, for any dtype. The output is then
+# inf/NaN. Real logits are many orders of magnitude smaller, so this is accepted.
+# The persistent grid (which scales each fp32 score before the max), and this
+# kernel's earlier form (Q pre-scaled before the MFMA), use the same rounded score
+# for the max and every exponent, so the row max's exp2 argument is exactly 0 and
+# the output stays finite at any magnitude. If this limit is ever hit, apply the
+# persistent grid's form here: multiply each fp32 score by qk_scale after the QK
+# MFMA and use exp2(s - m). That costs the ordinary path a little speed.
 _MIN_SCALE = 2.0**-64
 _MAX_SCALE = 2.0**4
 
@@ -884,6 +897,8 @@ def build_attention_dense(
         count is an upper bound: the compiler may pair two exp-argument FMAs into one
         v_pk_fma_f32, so a step can issue fewer VALU ops than named."""
         exp_per = -(-(N_SUB * 16) // (D_TILES * KK_STEPS))
+        # fma(s, qk_scale, -m) is not bounded for huge scores: see the KNOWN
+        # LIMITATION note at _MAX_SCALE.
         neg_m = b.fneg(m_new)
         slots = [(nsub, i) for nsub in range(N_SUB) for i in range(16)]
         p_vals = [[None] * 16 for _ in range(N_SUB)]
@@ -978,7 +993,7 @@ def build_attention_dense(
 
     m0, alpha0, _skip0 = softmax_max(s0, m_init)
     # tile-0 softmax exp + relayout only; PV lags by one tile (fused into the loop).
-    neg_m0 = b.fneg(m0)
+    neg_m0 = b.fneg(m0)  # same unbounded-score limitation; see _MAX_SCALE
     p0_vals = [
         [_exp2(b.fma(s0[nsub][i], qk_scale, neg_m0)) for i in range(16)]
         for nsub in range(N_SUB)
