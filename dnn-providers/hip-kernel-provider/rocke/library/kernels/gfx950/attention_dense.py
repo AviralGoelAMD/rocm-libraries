@@ -121,7 +121,10 @@ _LAZY_RESCALE_THRESHOLD = 8.0
 # 2**9 even on top of the lazy-rescale threshold. The bounds also keep the
 # -2**99 mask sentinel exact, finite and far below real scores after the scale.
 # Scales outside [2**-64, 2**4], including NaN, +-inf and scale <= 0, are
-# rejected rather than mis-computed.
+# rejected rather than mis-computed. The hipDNN matcher mirrors this range as
+# the literals 0x1p-64F / 0x1p4F in Gfx950AttentionDenseNative.cpp
+# (gfx950AttentionDenseGraphMatches) and its gtest; change them together.
+# TestScaleValidation pins both bounds to those literals.
 _MIN_SCALE = 2.0**-64
 _MAX_SCALE = 2.0**4
 
