@@ -140,12 +140,39 @@ def _spec(
     )
 
 
+def _sdpa_reference(q, k, v, scale, *, causal=True, attn_mask=None):
+    """fp32 SDPA oracle for ``[B,S,H,D]`` tensors, returned as ``[B,S,Hq,D]``.
+
+    GQA is expanded HERE, by repeating each kv head to its query heads, rather than
+    via the ``enable_gqa=`` kwarg: that kwarg is a recent addition to
+    ``scaled_dot_product_attention``, and on an older ROCm torch passing it raises
+    TypeError -- which ERRORS the whole gpu cohort instead of leaving it to the
+    device gate. ``repeat_interleave`` along the head axis is exactly what
+    ``enable_gqa`` does internally, and it is the mapping the kernel itself uses
+    (hkv = hq // gqa). rep == 1 (MHA) makes it a plain copy. Pass ``attn_mask``
+    (a boolean keep-mask) instead of ``causal`` for masks SDPA has no flag for.
+    """
+    import torch.nn.functional as F
+
+    rep = q.shape[2] // k.shape[2]
+    qf = q.transpose(1, 2).float()
+    kf = k.transpose(1, 2).float().repeat_interleave(rep, dim=1)
+    vf = v.transpose(1, 2).float().repeat_interleave(rep, dim=1)
+    return F.scaled_dot_product_attention(
+        qf,
+        kf,
+        vf,
+        attn_mask=attn_mask,
+        is_causal=causal and attn_mask is None,
+        scale=scale,
+    ).transpose(1, 2)
+
+
 @requires_gfx942_gpu
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype,d,hq,hkv,persistent,causal", _COHORT)
 def test_dense_numeric_vs_fp32_sdpa(dtype, d, hq, hkv, persistent, causal):
     import torch
-    import torch.nn.functional as F
 
     tol = 2e-2 if dtype == "fp16" else 4e-2
     tdt = getattr(torch, _TORCH_DT[dtype])
@@ -163,29 +190,89 @@ def test_dense_numeric_vs_fp32_sdpa(dtype, d, hq, hkv, persistent, causal):
     run_attention_dense_torch(spec=spec, q=q, k=k, v=v, out=out, scale=scale)
     torch.cuda.synchronize()
 
-    # fp32 SDPA oracle in [B,H,S,D] layout. GQA is expanded HERE, by repeating each
-    # kv head to its query heads, rather than via the ``enable_gqa=`` kwarg: that
-    # kwarg is a recent addition to ``scaled_dot_product_attention``, and on an older
-    # ROCm torch passing it raises TypeError -- which ERRORS the whole gpu cohort
-    # instead of leaving it to the device gate. ``repeat_interleave`` along the head
-    # axis is exactly what ``enable_gqa`` does internally, and it is the mapping the
-    # kernel itself uses (hkv = hq // gqa), so the asserted reference is unchanged.
-    # rep == 1 (the MHA row) makes it a plain copy, matching the old
-    # ``enable_gqa=(hkv != hq)`` no-op.
-    rep = hq // hkv
-    qf = q.transpose(1, 2).float()
-    kf = k.transpose(1, 2).float().repeat_interleave(rep, dim=1)
-    vf = v.transpose(1, 2).float().repeat_interleave(rep, dim=1)
-    ref = F.scaled_dot_product_attention(
-        qf, kf, vf, is_causal=causal, scale=scale
-    ).transpose(
-        1, 2
-    )  # -> [B,S,Hq,D]
+    ref = _sdpa_reference(q, k, v, scale, causal=causal)
 
     max_abs = (ref - out.float()).abs().max().item()
     assert max_abs < tol, (
         f"{dtype} D{d} GQA{hq}/{hkv} {'causal' if causal else 'full'} "
         f"{'persist' if persistent else 'default'}: max_abs={max_abs:.3e} >= {tol}"
+    )
+
+
+@requires_gfx942_gpu
+@pytest.mark.gpu
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("dtype", ["bf16", "fp16"])
+@pytest.mark.parametrize("scale", [0.5, 1.0])
+def test_dense_d128_non_default_scale(scale, dtype, persistent):
+    """D128 at softmax scales well above the default 1/sqrt(D).
+
+    The score error a lossy scale step introduces grows with ``scale``, so the
+    default-scale cohort above cannot see it. Rounding ``Q * scale * log2(e)``
+    back to bf16/fp16 before the QK MFMA puts bf16 past its tolerance at both
+    scales on both grids; the kernel must apply the scale to the fp32 scores.
+    fp16 has three more mantissa bits and stays inside its tolerance either way,
+    so the fp16 rows guard against regressions rather than catch this defect.
+    Not covered: D64, sliding window, and scales other than 0.5 and 1.0.
+    """
+    import torch
+
+    d, hq, hkv = 128, 16, 4
+    tol = 2e-2 if dtype == "fp16" else 4e-2
+    tdt = getattr(torch, _TORCH_DT[dtype])
+    B, S = 1, 512
+    torch.manual_seed(0)
+
+    q = torch.randn(B, S, hq, d, device="cuda", dtype=tdt)
+    k = torch.randn(B, S, hkv, d, device="cuda", dtype=tdt)
+    v = torch.randn(B, S, hkv, d, device="cuda", dtype=tdt)
+    out = torch.empty(B, S, hq, d, device="cuda", dtype=tdt)
+
+    spec = _spec(dtype, d, hq, hkv, persistent, batch=B, sq=S)
+    run_attention_dense_torch(spec=spec, q=q, k=k, v=v, out=out, scale=scale)
+    torch.cuda.synchronize()
+
+    max_abs = (_sdpa_reference(q, k, v, scale) - out.float()).abs().max().item()
+    assert max_abs < tol, (
+        f"{dtype} D128 GQA16/4 scale={scale:g} "
+        f"{'persist' if persistent else 'default'}: max_abs={max_abs:.3e} >= {tol}"
+    )
+
+
+@requires_gfx942_gpu
+@pytest.mark.gpu
+@pytest.mark.parametrize("persistent", [False, True])
+def test_dense_fp16_d128_large_equal_scores(persistent):
+    """Every score in a row is equal and large (raw 128 * 427**2 = 23338112, at
+    scale 16), so the softmax is uniform and the output is the causal running
+    mean of V. Scaling the fp32 scores keeps the row max's exp2 argument exactly
+    0 at any magnitude; it must stay finite and correct.
+
+    A regression guard, not a reproducer: the pre-fix gfx942 kernel also passes
+    it. It fails a kernel that takes the row max on unscaled scores and folds the
+    scale into the exp2 argument (fp16 P overflows there), which is the form the
+    gfx950 ordinary grid uses. Only fp16, D128 and this one magnitude are covered.
+    """
+    import torch
+
+    d, hq, hkv, scale = 128, 16, 4, 16.0
+    B, S = 1, 512
+    torch.manual_seed(0)
+
+    q = torch.full((B, S, hq, d), 427.0, device="cuda", dtype=torch.float16)
+    k = torch.full((B, S, hkv, d), 427.0, device="cuda", dtype=torch.float16)
+    v = torch.randn(B, S, hkv, d, device="cuda", dtype=torch.float16)
+    out = torch.empty(B, S, hq, d, device="cuda", dtype=torch.float16)
+
+    spec = _spec("fp16", d, hq, hkv, persistent, batch=B, sq=S)
+    run_attention_dense_torch(spec=spec, q=q, k=k, v=v, out=out, scale=scale)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(out).all(), "non-finite output"
+    max_abs = (_sdpa_reference(q, k, v, scale) - out.float()).abs().max().item()
+    assert max_abs < 2e-2, (
+        f"fp16 D128 equal scores scale=16 "
+        f"{'persist' if persistent else 'default'}: max_abs={max_abs:.3e}"
     )
 
 
@@ -229,7 +316,6 @@ def test_one_binary_serves_every_shape():
     most of.
     """
     import torch
-    import torch.nn.functional as F
 
     from kernels.common.attention_dense_spec import attention_dense_cache_key
     from kernels.gfx942.attention_dense import _DENSE_LAUNCHER_CACHE
@@ -257,7 +343,6 @@ def test_one_binary_serves_every_shape():
     _DENSE_LAUNCHER_CACHE.pop(keys[0], None)
     before = set(_DENSE_LAUNCHER_CACHE)
 
-    rep = hq // hkv
     launchers = []
     for (B, S), spec in zip(shapes, specs):
         torch.manual_seed(0)
@@ -270,13 +355,7 @@ def test_one_binary_serves_every_shape():
         torch.cuda.synchronize()
         launchers.append(_launcher_for(spec))
 
-        ref = F.scaled_dot_product_attention(
-            q.transpose(1, 2).float(),
-            k.transpose(1, 2).float().repeat_interleave(rep, dim=1),
-            v.transpose(1, 2).float().repeat_interleave(rep, dim=1),
-            is_causal=True,
-            scale=scale,
-        ).transpose(1, 2)
+        ref = _sdpa_reference(q, k, v, scale)
         max_abs = (ref - out.float()).abs().max().item()
         assert max_abs < tol, f"B={B} S={S}: max_abs={max_abs:.3e} >= {tol}"
 
@@ -309,7 +388,6 @@ def test_dense_swa_numeric_vs_fp32_sdpa(dtype, d, hq, hkv, persistent, sliding_w
     which exists only because gfx950 also concatenates a sink column (gfx942 has no
     sinks yet). The diagonal k==q is always kept (W>0), so no row is fully masked."""
     import torch
-    import torch.nn.functional as F
 
     tol = 2e-2 if dtype == "fp16" else 4e-2
     tdt = getattr(torch, _TORCH_DT[dtype])
@@ -339,15 +417,7 @@ def test_dense_swa_numeric_vs_fp32_sdpa(dtype, d, hq, hkv, persistent, sliding_w
     qi = torch.arange(S, device="cuda").view(-1, 1)
     ki = torch.arange(S, device="cuda").view(1, -1)
     keep = (ki <= qi) & (ki > qi - sliding_window)  # [S, S] bool, True = attend
-    rep = hq // hkv
-    qf = q.transpose(1, 2).float()
-    kf = k.transpose(1, 2).float().repeat_interleave(rep, dim=1)
-    vf = v.transpose(1, 2).float().repeat_interleave(rep, dim=1)
-    ref = F.scaled_dot_product_attention(
-        qf, kf, vf, attn_mask=keep, scale=scale
-    ).transpose(
-        1, 2
-    )  # -> [B,S,Hq,D]
+    ref = _sdpa_reference(q, k, v, scale, attn_mask=keep)
 
     max_abs = (ref - out.float()).abs().max().item()
     assert max_abs < tol, (
@@ -367,7 +437,6 @@ def test_dense_fp16_d128_numeric_correct_at_non_shipped_tile_width(block_n):
     ``test_cfvst_swizzle_is_emitted_in_ir_with_matching_store_read_mask`` (CPU lane)
     covers that. This is the on-silicon correctness guard for the tile-width axis."""
     import torch
-    import torch.nn.functional as F
 
     d, hq, hkv, tol = 128, 16, 4, 2e-2
     B, S, scale = 1, 512, 1.0 / math.sqrt(128)
@@ -381,13 +450,7 @@ def test_dense_fp16_d128_numeric_correct_at_non_shipped_tile_width(block_n):
     )
     run_attention_dense_torch(spec=spec, q=q, k=k, v=v, out=out, scale=scale)
     torch.cuda.synchronize()
-    rep = hq // hkv
-    qf = q.transpose(1, 2).float()
-    kf = k.transpose(1, 2).float().repeat_interleave(rep, dim=1)
-    vf = v.transpose(1, 2).float().repeat_interleave(rep, dim=1)
-    ref = F.scaled_dot_product_attention(
-        qf, kf, vf, is_causal=True, scale=scale
-    ).transpose(1, 2)
+    ref = _sdpa_reference(q, k, v, scale)
     max_abs = (ref - out.float()).abs().max().item()
     assert max_abs < tol, f"fp16 D128 block_n={block_n}: max_abs={max_abs:.3e} >= {tol}"
 
