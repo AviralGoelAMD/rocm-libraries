@@ -73,20 +73,33 @@ _COHORT = [
     ("fp16", 128, 16, 4, False, False),  # fp16 D128 non-causal default -- swizzle path
 ]
 
-# (dtype, head_size, num_query_heads, num_kv_heads, persistent, sliding_window) --
-# STANDALONE sliding-window (no sinks; gfx942 dense has no sink support yet). All rows
-# are causal (sliding_window > 0 requires causal). Window is a multiple of the shipped
-# block_n (64): 128, 256. Covers both dtypes, D64/D128, and BOTH grid variants -- the
-# persistent rows exercise the per-work-item start_tile prune that the default grid
-# does not.
+# (dtype, head_size, num_query_heads, num_kv_heads, persistent, sliding_window, scale)
+# -- STANDALONE sliding-window (no sinks; gfx942 dense has no sink support yet). All
+# rows are causal (sliding_window > 0 requires causal). Window is a multiple of the
+# shipped block_n (64): 128, 256. Covers both dtypes, D64/D128, and BOTH grid
+# variants -- the persistent rows exercise the per-work-item start_tile prune that the
+# default grid does not. ``scale`` None is the default 1/sqrt(D); the two scale-1.0
+# rows run the window mask on fp32 scores scaled after the QK MFMA, one per grid.
 _SWA_COHORT = [
-    ("bf16", 128, 16, 4, False, 128),
-    ("bf16", 128, 16, 4, True, 128),
-    ("fp16", 128, 16, 4, False, 256),
-    ("fp16", 128, 16, 4, True, 256),
-    ("bf16", 64, 16, 4, False, 128),
-    ("bf16", 64, 16, 4, True, 128),
+    ("bf16", 128, 16, 4, False, 128, None),
+    ("bf16", 128, 16, 4, True, 128, None),
+    ("fp16", 128, 16, 4, False, 256, None),
+    ("fp16", 128, 16, 4, True, 256, None),
+    ("bf16", 64, 16, 4, False, 128, None),
+    ("bf16", 64, 16, 4, True, 128, None),
+    ("bf16", 128, 16, 4, False, 128, 1.0),
+    ("bf16", 64, 16, 4, True, 128, 1.0),
 ]
+
+# (head_size, dtype, persistent, scale) for test_dense_non_default_scale: every D128
+# combination, plus bf16 D64 at the larger scale on both grids. D64 has its own K
+# layout and, for bf16, its own waves-per-eu; the scaling line is shared.
+_NON_DEFAULT_SCALE_ROWS = [
+    (128, dtype, persistent, scale)
+    for scale in (0.5, 1.0)
+    for dtype in ("bf16", "fp16")
+    for persistent in (False, True)
+] + [(64, "bf16", False, 1.0), (64, "bf16", True, 1.0)]
 
 
 def _spec(
@@ -201,23 +214,22 @@ def test_dense_numeric_vs_fp32_sdpa(dtype, d, hq, hkv, persistent, causal):
 
 @requires_gfx942_gpu
 @pytest.mark.gpu
-@pytest.mark.parametrize("persistent", [False, True])
-@pytest.mark.parametrize("dtype", ["bf16", "fp16"])
-@pytest.mark.parametrize("scale", [0.5, 1.0])
-def test_dense_d128_non_default_scale(scale, dtype, persistent):
-    """D128 at softmax scales well above the default 1/sqrt(D).
+@pytest.mark.parametrize("d,dtype,persistent,scale", _NON_DEFAULT_SCALE_ROWS)
+def test_dense_non_default_scale(d, dtype, persistent, scale):
+    """Softmax scales well above the default 1/sqrt(D).
 
     The score error a lossy scale step introduces grows with ``scale``, so the
     default-scale cohort above cannot see it. Rounding ``Q * scale * log2(e)``
-    back to bf16/fp16 before the QK MFMA puts bf16 past its tolerance at both
-    scales on both grids; the kernel must apply the scale to the fp32 scores.
-    fp16 has three more mantissa bits and stays inside its tolerance either way,
-    so the fp16 rows guard against regressions rather than catch this defect.
-    Not covered: D64, sliding window, and scales other than 0.5 and 1.0.
+    back to bf16/fp16 before the QK MFMA puts bf16 past its tolerance on both grids:
+    D128 at both scales and D64 at 1.0. The kernel must apply the scale to the fp32
+    scores. fp16 has three more mantissa bits and stays inside its tolerance either
+    way, so the fp16 rows guard against regressions rather than catch this defect.
+    The sliding-window paths are covered by the scale-1.0 rows of ``_SWA_COHORT``.
+    Not covered: scales other than 0.5 and 1.0.
     """
     import torch
 
-    d, hq, hkv = 128, 16, 4
+    hq, hkv = 16, 4
     tol = 2e-2 if dtype == "fp16" else 4e-2
     tdt = getattr(torch, _TORCH_DT[dtype])
     B, S = 1, 512
@@ -234,7 +246,7 @@ def test_dense_d128_non_default_scale(scale, dtype, persistent):
 
     max_abs = (_sdpa_reference(q, k, v, scale) - out.float()).abs().max().item()
     assert max_abs < tol, (
-        f"{dtype} D128 GQA16/4 scale={scale:g} "
+        f"{dtype} D{d} GQA16/4 scale={scale:g} "
         f"{'persist' if persistent else 'default'}: max_abs={max_abs:.3e} >= {tol}"
     )
 
@@ -376,8 +388,10 @@ def test_one_binary_serves_every_shape():
 
 @requires_gfx942_gpu
 @pytest.mark.gpu
-@pytest.mark.parametrize("dtype,d,hq,hkv,persistent,sliding_window", _SWA_COHORT)
-def test_dense_swa_numeric_vs_fp32_sdpa(dtype, d, hq, hkv, persistent, sliding_window):
+@pytest.mark.parametrize("dtype,d,hq,hkv,persistent,sliding_window,scale", _SWA_COHORT)
+def test_dense_swa_numeric_vs_fp32_sdpa(
+    dtype, d, hq, hkv, persistent, sliding_window, scale
+):
     """Sliding-window (SWA) numeric parity, standalone (no sinks), both grids.
 
     The band is the same one the gfx950 sibling masks (``_sink_reference``: causal
@@ -392,7 +406,7 @@ def test_dense_swa_numeric_vs_fp32_sdpa(dtype, d, hq, hkv, persistent, sliding_w
     tol = 2e-2 if dtype == "fp16" else 4e-2
     tdt = getattr(torch, _TORCH_DT[dtype])
     B, S = 1, 512
-    scale = 1.0 / math.sqrt(d)
+    scale = 1.0 / math.sqrt(d) if scale is None else scale
     torch.manual_seed(0)
 
     q = torch.randn(B, S, hq, d, device="cuda", dtype=tdt)
@@ -421,7 +435,7 @@ def test_dense_swa_numeric_vs_fp32_sdpa(dtype, d, hq, hkv, persistent, sliding_w
 
     max_abs = (ref - out.float()).abs().max().item()
     assert max_abs < tol, (
-        f"{dtype} D{d} GQA{hq}/{hkv} swa{sliding_window} "
+        f"{dtype} D{d} GQA{hq}/{hkv} swa{sliding_window} scale={scale:g} "
         f"{'persist' if persistent else 'default'}: max_abs={max_abs:.3e} >= {tol}"
     )
 

@@ -769,8 +769,8 @@ def _tuned_waves_per_eu(head_size: int, dtype: str) -> int:
     215 VGPR down to ~117 (0 spill). D64's LDS is only 16 KB (allows 4 WGs), so the
     smaller per-wave budget lets a SECOND WG co-reside (2 WG/CU), and the bf16 ``.1k``
     schedule is serialized enough at wpe=2 that its HBM latency is EXPOSED -- the
-    extra resident WG hides it. Measured on MI300X: S512 +~77%, S8192 +~48%, S256
-    neutral, S2048 ~-1.5% (noise); strongly net-positive, so no seqlen gate.
+    extra resident WG hides it. Measured on MI300X it is a large win at S512 and S8192
+    and neutral at S256 and S2048, so there is no seqlen gate.
 
     Why not the other configs (all measured, all kept at 2):
       * fp16 D64: wpe=3 already reaches 2 WG/CU at 116 VGPR / 0 spill, but its wpe=2
