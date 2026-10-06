@@ -10,7 +10,8 @@ step-1 pipeline with every WINNING lever baked in as always-on (no env gates):
   * **LDS bank-conflict padding on K** (``[NBUF, BN, D+8]``) — kills the 8-way conflict
     on the QK K-reads. The dominant base win (+80% over the naive baseline).
   * **native exp2_fast** (``v_exp_f32``, no overflow guard — the softmax argument is
-    bounded: at most the lazy-rescale threshold plus a small fma rounding residue) — +11.5%.
+    bounded: at most the lazy-rescale threshold plus a small fma rounding residue) — one
+    instruction per exp.
   * **full-population ``sched_group_barrier`` template** naming DS_READ/MFMA/VALU/TRANS
     per PV step.
   * **diagonal-only causal masking** — a mask-free body loop over below-diagonal KV
