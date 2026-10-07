@@ -432,6 +432,14 @@ def _direct_builders():
             ),
         ),
         (
+            "depthwise_col",
+            dict(cpg=1, kpg=1, groups=32),
+            "fwd",
+            lambda pr: dc.build_direct_depthwise_col(
+                dc.DirectDepthwiseColSpec(problem=pr, block_h=4, block_w=2), arch=_ARCH
+            ),
+        ),
+        (
             "depthwise_spatial",
             dict(cpg=1, kpg=1, groups=32),
             "fwd",
