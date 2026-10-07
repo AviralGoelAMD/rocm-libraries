@@ -671,11 +671,10 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             # deliberately not done here; see the follow-up ticket. Anyone
             # editing this loop should consider whether the sibling is still
             # waiting.
+            # A/B ARM ONLY (never merge): every offset on ds_swizzle, i.e. the
+            # kernel as it was before quad_perm.
             for off in shfl:
-                if off <= 2:
-                    v = b.fadd(v, b.warp_shuffle_xor_quad(v, off))
-                else:
-                    v = b.fadd(v, b.warp_shuffle_xor(v, off))
+                v = b.fadd(v, b.warp_shuffle_xor(v, off))
             return v
 
         # Issue every global load before any math that consumes one. The AMDGPU
