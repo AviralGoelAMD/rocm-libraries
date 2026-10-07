@@ -20,37 +20,31 @@
  * THE SOFTWARE.
  *
  * ************************************************************************ */
-
 #pragma once
 
-#include <memory>
+// Optimizer that keeps a run of back-to-back matrix instructions free of waits.
+//
+// The WMMA FIFO only treats WMMAs issued back-to-back as one batch; any
+// instruction between them, an s_wait_* included, splits it. The dataflow plans
+// each WMMA's own wait, so a scheduled batch comes out as
+//   s_wait_dscnt 56 W  s_wait_dscnt 52 W  s_wait_dscnt 48 W
+// No memory op issues inside the run, so every counter's queue is the same at each
+// member and the waits compare directly: the run gets one wait, the per-counter
+// minimum, before its first WMMA. finalizePlan then finds the rest already drained.
 
-#include "stinkytofu/Export.hpp"
+#include "stinkytofu/transforms/asm/waitcnt/WaitPlanOptimizer.hpp"
 
 namespace stinkytofu {
-class Pass;
+namespace waitcnt {
 
-struct WaitCntInsertionOptions {
-    /// Disabled by default: CK_Tensor dataflow freezes after the first solver
-    /// sweep, preventing tensor state from propagating through back-edges.
-    /// Enable to restore conservative tensor fixed-point iteration.
-    bool enableLoopCarriedTokenDeps = false;
-    /// Plan one wait per run of back-to-back matrix instructions, before its
-    /// first WMMA, instead of one per WMMA, so a scheduled WMMA batch stays
-    /// back-to-back (see WmmaRunWaitMerge). Set when WMMA batching is on.
-    bool mergeWaitsInWmmaRuns = false;
+class WmmaRunWaitMerge : public WaitPlanOptimizer {
+   public:
+    const char* getName() const override {
+        return "WmmaRunWaitMerge";
+    }
+
+    void rewrite(WaitInsertionPlan& plan, const DataflowResult& dfr, Function& func) override;
 };
 
-/**
- * @brief Creates a minimal wait-count insertion pass.
- *
- * Inserts architecture-specific wait instructions so asynchronous memory operations
- * complete before their results are used. Each tracked hardware counter gets its own
- * wait opcode: DS ops -> s_wait_dscnt, vector global/buffer ops -> s_wait_loadcnt,
- * SMRD scalar loads (s_load_*) -> s_wait_kmcnt, and tensor loads -> s_wait_tensorcnt.
- * Tensor waits are reinserted at barriers via a token-matching heuristic.
- */
-STINKYTOFU_EXPORT std::unique_ptr<Pass> createStinkyWaitCntInsertionPass(
-    WaitCntInsertionOptions options = {});
-
+}  // namespace waitcnt
 }  // namespace stinkytofu

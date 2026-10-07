@@ -3150,3 +3150,85 @@ TEST_F(DAGSchedulerPassTest, DsReadThrottle_PreservesInstructionCount) {
     runPassWithDsReadThrottle(/*queueDepth=*/2, /*throttleLatency=*/8);
     EXPECT_EQ(countStinkyInstructions(*body), beforeCount) << "throttle must not drop instructions";
 }
+
+// WMMA issue queue. Registers stay below v256 (one VGPR MSB bank).
+namespace {
+// "W" for a WMMA, "d" for a ds_load, "." for anything else.
+std::string wdShape(const std::vector<std::string>& seq) {
+    std::string s;
+    for (const std::string& m : seq) {
+        s += m.find("wmma") != std::string::npos ? 'W' : m.find("ds_load") == 0 ? 'd' : '.';
+    }
+    return s;
+}
+}  // namespace
+
+// The queue model needs depth > 1 and a cover > 0. With either one off the schedule is the
+// original single-window one, whatever the other queue field says.
+TEST_F(DAGSchedulerPassTest, WmmaQueue_OffIsTheOriginalSchedule) {
+    struct Variant {
+        int depth, cover;
+    };
+    const Variant variants[] = {{0, 0}, {8, 0}, {1, 32}, {1, 0}};
+    std::string shapes[4];
+    for (int v = 0; v < 4; ++v) {
+        SetUp();
+        for (int i = 0; i < 6; i++) createMovableDsLoad(200 + i * 4, 80, i + 1);
+        for (int i = 0; i < 6; i++) createWmmaF32_16x16x16_bf16(8 * i, 100 + 8 * i);
+        PassContext ctx;
+        ctx.setGemmTileConfig(config);
+        PassFeatureConfig pfc;
+        pfc.loopConfig.unrollGemm = true;
+        pfc.dagFeatures.dsReadQueueDepth = 16;
+        pfc.dagFeatures.dsReadThrottleLatency = 1;
+        pfc.dagFeatures.dsReadPerCap = 100;
+        pfc.dagFeatures.wmmaQueueDepth = variants[v].depth;
+        pfc.dagFeatures.wmmaQueueCoverCycles = variants[v].cover;
+        ctx.setPassFeatureConfig(pfc);
+        pass->run(*func, ctx, am);
+        shapes[v] = wdShape(mnemonicSequence(*bb));
+    }
+    for (int v = 1; v < 4; ++v) EXPECT_EQ(shapes[0], shapes[v]) << "variant " << v;
+    // While ds_loads are ready each WMMA window is filled, so the first two are not adjacent.
+    EXPECT_NE(shapes[0].substr(0, 2), "WW") << shapes[0];
+}
+
+// A long queue run (more than 64 cycles of pipe window) keeps every instruction and
+// issues all WMMAs: exercises the window compaction.
+TEST_F(DAGSchedulerPassTest, WmmaQueue_LongRunKeepsEveryInstruction) {
+    for (int i = 0; i < 24; i++) createWmmaF32_16x16x16_bf16(8 * (i % 12), 100 + 8 * i);
+    for (int i = 0; i < 12; i++) createMovableDsLoad(400 + i * 4, 80, i + 1);
+    PassContext ctx;
+    ctx.setGemmTileConfig(config);
+    PassFeatureConfig pfc;
+    pfc.loopConfig.unrollGemm = true;
+    pfc.dagFeatures.dsReadQueueDepth = 16;
+    pfc.dagFeatures.dsReadThrottleLatency = 1;
+    pfc.dagFeatures.dsReadPerCap = 100;
+    pfc.dagFeatures.wmmaQueueDepth = 8;
+    pfc.dagFeatures.wmmaQueueCoverCycles = 16;
+    ctx.setPassFeatureConfig(pfc);
+    pass->run(*func, ctx, am);
+    const std::string shape = wdShape(mnemonicSequence(*bb));
+    EXPECT_EQ(std::count(shape.begin(), shape.end(), 'W'), 24) << shape;
+    EXPECT_EQ(std::count(shape.begin(), shape.end(), 'd'), 12) << shape;
+}
+
+// Depth 4, cover 16: ds_loads go while at least 16 cycles of WMMA work are queued, and the
+// next WMMA goes first once less is, so the queue never runs dry.
+TEST_F(DAGSchedulerPassTest, WmmaQueue_KeepsTheQueueFed) {
+    for (int i = 0; i < 8; i++) createMovableDsLoad(200 + i * 4, 80, i + 1);
+    for (int i = 0; i < 8; i++) createWmmaF32_16x16x16_bf16(8 * i, 100 + 8 * i);
+    PassContext ctx;
+    ctx.setGemmTileConfig(config);
+    PassFeatureConfig pfc;
+    pfc.loopConfig.unrollGemm = true;
+    pfc.dagFeatures.dsReadQueueDepth = 16;
+    pfc.dagFeatures.dsReadThrottleLatency = 1;
+    pfc.dagFeatures.dsReadPerCap = 100;
+    pfc.dagFeatures.wmmaQueueDepth = 4;
+    pfc.dagFeatures.wmmaQueueCoverCycles = 16;
+    ctx.setPassFeatureConfig(pfc);
+    pass->run(*func, ctx, am);
+    EXPECT_EQ(wdShape(mnemonicSequence(*bb)), "WWWddddddWddWWWW");
+}
