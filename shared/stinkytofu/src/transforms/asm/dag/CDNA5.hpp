@@ -42,6 +42,7 @@
 #include <utility>
 #include <vector>
 
+#include "DsIssueCap.hpp"
 #include "InFlightQueue.hpp"
 #include "ReadyQueue.hpp"
 #include "RegionDAG.hpp"
@@ -430,7 +431,7 @@ class CDNA5ReadyQueue : public ReadyQueue {
     //
     // It stays a CAP: N may issue back-to-back while the window has room, and a
     // busy in-flight queue places fewer, so windows stay unevenly filled.
-    InFlightQueue dsIssueCap_;
+    DsIssueCap dsIssueCap_;
 
     int globalReadQueueDepth() const {
         return getPassContext().getPassFeatureConfig().dagFeatures.globalReadQueueDepth;
@@ -836,8 +837,15 @@ class CDNA5ReadyQueue : public ReadyQueue {
 
     std::map<int, int> crossBBDsResiduals_;
 
-    void advanceTime(int cycles);
-    void advanceIssueCycles(int issueCycles);
+    // What the number of cycles given to advanceTime() means. There is no default: every caller
+    // says which, so a span is never converted twice.
+    //  Elapsed   - wall time already (a wait, the distance to a window end, barrier latency).
+    //  Issue     - the wave needs this many issue cycles; a blocked (LD_SCALE) cycle inside the
+    //              span stalls it for one more (queue model only, queued windows are concatenated).
+    //  ValuIssue - the same for a VALU, which can only issue in the window's co-issue slots.
+    enum class TimeKind { Elapsed, Issue, ValuIssue };
+    void advanceTime(int cycles, TimeKind kind);
+    void elapseDsPacingWait(int wait);
     int computeValuAdvanceCycles(int issueCycles) const;
     void updateWMMAStatus(DAGNode* node);
     void stampDataReady(const StinkyInstruction& inst, int extraDelay = 0);
@@ -1109,25 +1117,36 @@ int CDNA5ReadyQueue::freeCoIssueSpace() const {
     return activeWmmaLatency_ - coIssueCyclePos_;
 }
 
-// The wave needs \p issueCycles of issue time. Queued windows are concatenated, so a blocked
-// (LD_SCALE) cycle can lie inside the span: each one stalls the wave for a cycle on top. Only
-// issue work goes through here; spans that are already elapsed time (a wait, the distance to a
-// window end, computeValuAdvanceCycles) use advanceTime directly or they would be charged twice.
-void CDNA5ReadyQueue::advanceIssueCycles(int issueCycles) {
-    if (wmmaQueueCover() > 0) {
-        int landing = coIssueCyclePos_;
-        for (int c = 0; c < issueCycles; ++c) {
-            while (isBlockedCycle(landing)) ++landing;
-            ++landing;
-        }
-        issueCycles = landing - coIssueCyclePos_;
+// A ds_load's pacing wait. The Periodic cap (A ds_loads per X-cycle period) is a hardware rate
+// limit: the wave really stalls until the period ends, so that wait elapses and moves the cap's
+// clock. Left unelapsed the period never ends and the next ds_load is counted into the same,
+// full period, exceeding A. The rest of the wait (LDS return-queue throttle) stays pacing only,
+// as does every wait with the Sliding cap, so the default schedule is unchanged.
+void CDNA5ReadyQueue::elapseDsPacingWait(int wait) {
+    int capWait = 0;
+    if (dsIssueCap_.mode() == DsIssueCap::Mode::Periodic && dsIssueCap_.full())
+        capWait = std::max(1, dsIssueCap_.minResidual());
+    wait = std::max(wait, capWait);
+    if (capWait > 0) advanceTime(capWait, TimeKind::Elapsed);
+    if (wait > capWait) {
+        dsSchedulingBudgetUsed_ += wait - capWait;
+        dsReadInflight_.advanceThrottle(wait - capWait);
     }
-    advanceTime(issueCycles);
 }
 
 // Advance the co-issue timeline and the elapse-time clock, and decay the RAW
-// data-ready counters by \p cycles.
-void CDNA5ReadyQueue::advanceTime(int cycles) {
+// data-ready counters. \p kind says what \p cycles is (see TimeKind).
+void CDNA5ReadyQueue::advanceTime(int cycles, TimeKind kind) {
+    if (kind == TimeKind::ValuIssue) {
+        cycles = computeValuAdvanceCycles(cycles);  // skips the slots a VALU cannot use
+    } else if (kind == TimeKind::Issue && wmmaQueueCover() > 0) {
+        int at = coIssueCyclePos_;
+        for (int c = 0; c < cycles; ++c) {
+            while (isBlockedCycle(at)) ++at;
+            ++at;
+        }
+        cycles = at - coIssueCyclePos_;
+    }
     // Never let the timeline come to rest on a blocked cycle -- every pick path
     // reads coIssueCyclePos_ to decide what may issue next, and nothing may issue
     // there. Roll on to the next issuable cycle instead; the skipped cycles still
@@ -1185,20 +1204,16 @@ int CDNA5ReadyQueue::computeValuAdvanceCycles(int issueCycles) const {
 // progress; others use issueCycles.
 void CDNA5ReadyQueue::updateWMMAStatus(DAGNode* node) {
     int cycles = node->inst->issueCycles;
-    bool isIssueTime = true;  // false: already elapsed time
+    TimeKind kind = TimeKind::Issue;
     if (isBarrier(*node->inst)) {
         cycles = node->inst->latencyCycles;
-        isIssueTime = false;
+        kind = TimeKind::Elapsed;
     } else if (isVectorALU(*node->inst) || isTranscendental(*node->inst)) {
-        cycles = computeValuAdvanceCycles(node->inst->issueCycles);  // skips blocked slots
-        isIssueTime = false;
+        kind = TimeKind::ValuIssue;
     } else if (isDSRead(*node->inst)) {
         cycles = dsIssueCost(*node->inst);
     }
-    if (isIssueTime)
-        advanceIssueCycles(cycles);
-    else
-        advanceTime(cycles);
+    advanceTime(cycles, kind);
 }
 
 // True if VALU can be picked in the current co-issue timeline position.
@@ -1553,7 +1568,8 @@ DAGNode* CDNA5ReadyQueue::pickOneFromWMMA(DAGNode* pick) {
 
     // Wait until the queue has room (depth 1: until the previous WMMA finished). The
     // queue never waits for a window end while it has room.
-    while (outstandingWmmas() >= wmmaQueueDepth()) advanceTime(soonestQueueEnd());
+    while (outstandingWmmas() >= wmmaQueueDepth())
+        advanceTime(soonestQueueEnd(), TimeKind::Elapsed);
     if (coIssueCyclePos_ >= activeWmmaLatency_) resetActiveWindow();
     // Appended before the advanceTime() below so its blocked cycles are never picked into.
     appendWindowSegment(*node->inst);
@@ -1574,7 +1590,7 @@ DAGNode* CDNA5ReadyQueue::pickOneFromWMMA(DAGNode* pick) {
     // Advance by WMMA issue cycles after opening a new timeline window.
     // This keeps coIssueCyclePos_ aligned with elapsed cycles right after WMMA
     // issue.
-    advanceIssueCycles(node->inst->issueCycles);
+    advanceTime(node->inst->issueCycles, TimeKind::Issue);
     wmmaIssueConfig.issuedCount--;
 
     if (deferHeadBalanceThisRegion_) deferFirstHeadWmmaActive_ = false;
@@ -1931,7 +1947,10 @@ DAGNode* CDNA5ReadyQueue::extractForcedBarrier() {
 // entries use the scaled throttle interval and later entries use the full one.
 DsLoadBudgetConfig CDNA5ReadyQueue::dsLoadBudgetConfig() const {
     DsLoadBudgetConfig config;
-    config.dsReadPerCap = dsReadPerCap();
+    // The budget windows are one WMMA window, but the cap is "cap per span": scale it.
+    const int budgetWindow =
+        wmmaIssueConfig.latency > 0 ? wmmaIssueConfig.latency : config_.dsIssueCapSpanCycles;
+    config.dsReadPerCap = dsCapPerBudgetWindow(dsReadPerCap(), budgetWindow, dsIssueCapSpan());
     config.dsReadQueueDepth = dsReadQueueDepth();
     config.dsReadThrottleLatency = dsReadThrottleLatency();
     config.dsReadThrottleTransitionFactor = dsReadThrottleTransitionFactor();
@@ -2517,17 +2536,17 @@ DAGNode* CDNA5ReadyQueue::pickOne() {
                 // budget. RAW/hazard waits remain genuine elapsed stalls.
                 if (pickWait > 0) {
                     if (pickKind == kLocalRead) {
-                        dsSchedulingBudgetUsed_ += pickWait;
-                        dsReadInflight_.advanceThrottle(pickWait);
+                        elapseDsPacingWait(pickWait);
                     } else {
-                        advanceTime(pickWait);
+                        advanceTime(pickWait, TimeKind::Elapsed);
                     }
                 }
                 return rememberPick(popNonWmma(smallestPickable, pickKind));
             }
 
             // Only to the oldest queued WMMA's end: the queue is not drained (depth 1: window end).
-            advanceTime(std::min(activeWmmaLatency_ - coIssueCyclePos_, soonestQueueEnd()));
+            advanceTime(std::min(activeWmmaLatency_ - coIssueCyclePos_, soonestQueueEnd()),
+                        TimeKind::Elapsed);
         }
 
         // Phase D — outside WMMA latency.
@@ -2541,10 +2560,9 @@ DAGNode* CDNA5ReadyQueue::pickOne() {
             // stall).
             if (pickWait > 0) {
                 if (pickKind == kLocalRead) {
-                    dsSchedulingBudgetUsed_ += pickWait;
-                    dsReadInflight_.advanceThrottle(pickWait);
+                    elapseDsPacingWait(pickWait);
                 } else {
-                    advanceTime(pickWait);
+                    advanceTime(pickWait, TimeKind::Elapsed);
                 }
             }
             return rememberPick(popNonWmma(smallestPickable, pickKind));
@@ -2555,7 +2573,7 @@ DAGNode* CDNA5ReadyQueue::pickOne() {
     if (isPromote(PromotePhase::ForcedWmma) && !wmmaQueue.empty()) {
         auto [bestWMMA, bestLatency] = findMostReadyWMMA();
         // The queued WMMA can only start once its sources arrive: that stall elapses.
-        if (wmmaQueueCover() > 0 && bestLatency > 0) advanceTime(bestLatency);
+        if (wmmaQueueCover() > 0 && bestLatency > 0) advanceTime(bestLatency, TimeKind::Elapsed);
         DAGNode* node = pickOneFromWMMA(bestWMMA);
         return rememberPick(node);
     }
@@ -2604,15 +2622,12 @@ DAGNode* CDNA5ReadyQueue::pickOne() {
         int realWait = fallbackWait;
         if (fallbackKind == kGlobalRead && globalReadQueueFull())
             realWait = std::max(realWait, globalReadInflight_.minResidual());
-        if (realWait > 0) advanceTime(realWait);
+        if (realWait > 0) advanceTime(realWait, TimeKind::Elapsed);
 
         int throttleWait = 0;
         if (fallbackKind == kLocalRead) {
             throttleWait = dsReadThrottleWait();
-            if (throttleWait > 0) {
-                dsSchedulingBudgetUsed_ += throttleWait;
-                dsReadInflight_.advanceThrottle(throttleWait);
-            }
+            elapseDsPacingWait(throttleWait);
         }
         PASS_DEBUG(std::cerr << "[CDNA5 pickOne] Phase G fallback pick dagId=" << fallback->id
                              << " kind=" << fallbackKind << " wait=" << realWait
@@ -2725,7 +2740,13 @@ void CDNA5ReadyQueue::onInit(IRList::iterator regionStart, IRList::iterator regi
     // scheduler's single RPO pass (a loop header is visited before its latch, so
     // sawLoopPred never goes true -- see restoreCrossBBStateFromLoop), so
     // carrying the cap window would be code with no effect until that is fixed.
-    dsIssueCap_ = InFlightQueue(dsReadPerCap());
+    const auto capMode = getPassContext().getPassFeatureConfig().dagFeatures.dsIssueCapMode;
+    if (capMode != PassFeatureConfig::DsIssueCapMode::Sliding &&
+        capMode != PassFeatureConfig::DsIssueCapMode::Periodic) {
+        report_fatal_error("dagFeatures.dsIssueCapMode must be 0 (sliding) or 1 (periodic); got " +
+                           std::to_string(static_cast<int>(capMode)) + ".");
+    }
+    dsIssueCap_ = DsIssueCap(capMode, dsReadPerCap());
     assert(dsIssueCap_.depth() > 0 && "rule (4) cap must have a positive depth");
     const int dsDepth = dsReadQueueDepth();
     const double dsThrottleInterval =
@@ -2976,8 +2997,11 @@ void CDNA5ReadyQueue::onInitRegion(IRList::iterator regionStart, IRList::iterato
     // dsIssueCapSpan() cycles of the real timeline. Sliding, so it is defined
     // in the region tail too, where no WMMA remains to delimit a window. The
     // window itself lives across regions -- it is built in onInit(), not here.
-    PASS_DEBUG(std::cerr << "[CDNA5 dsCap] dsReadPerCap=" << dsReadPerCap()
-                         << " span=" << dsIssueCapSpan() << "\n");
+    PASS_DEBUG(
+        std::cerr << "[CDNA5 dsCap] dsReadPerCap=" << dsReadPerCap() << " span=" << dsIssueCapSpan()
+                  << " mode="
+                  << (dsIssueCap_.mode() == DsIssueCap::Mode::Periodic ? "periodic" : "sliding")
+                  << "\n");
 
     barrierWmmaThresholds_.clear();
     barrierDsLoadCounts_.clear();

@@ -141,11 +141,12 @@ struct CDNA5ReadyQueueTestPeer {
     static std::vector<std::vector<StinkyRegister>>& srcs(CDNA5ReadyQueue& q) {
         return q.queuedSrcs_;
     }
-    static void advance(CDNA5ReadyQueue& q, int cycles) {
-        q.advanceTime(cycles);
+    using TimeKind = CDNA5ReadyQueue::TimeKind;
+    static void advance(CDNA5ReadyQueue& q, int cycles, TimeKind kind) {
+        q.advanceTime(cycles, kind);
     }
-    static void advanceIssue(CDNA5ReadyQueue& q, int cycles) {
-        q.advanceIssueCycles(cycles);
+    static void setDsCap(CDNA5ReadyQueue& q, DsIssueCap::Mode mode, int depth) {
+        q.dsIssueCap_ = DsIssueCap(mode, depth);
     }
     static void carry(CDNA5ReadyQueue& q) {
         q.carryQueuedWar();
@@ -328,27 +329,35 @@ TEST_F(CDNA5ReadyQueueTest, MixedDrainCapUsesMaxDrainInBurst) {
 }
 
 // Queued windows are concatenated, so a blocked (LD_SCALE) cycle can lie inside an advance. At
-// position 14 with slot 15 blocked:
-//  - two cycles of issue work cross it: 3 cycles elapse, not 2 (queue model on; off keeps the
-//    original landing-only rule);
-//  - an advance that is already elapsed time (a wait, the distance to a window end,
-//    computeValuAdvanceCycles) is not charged for the blocked cycle again.
-TEST_F(CDNA5ReadyQueueTest, BlockedCyclesAreChargedOnceInAQueuedWindow) {
+// position 14 with slot 15 blocked, advanceTime() reads its argument by kind:
+//  - Issue: two cycles of issue work cross the blocked one, so 3 elapse (queue model on; off keeps
+//    the original landing-only rule);
+//  - ValuIssue: the same for a VALU (it skips the blocked slot in both modes);
+//  - Elapsed: already wall time, so the blocked cycle is not charged a second time.
+TEST_F(CDNA5ReadyQueueTest, AdvanceTimeReadsItsArgumentByKind) {
+    using Peer = CDNA5ReadyQueueTestPeer;
     for (int on = 0; on < 2; ++on) {
         PassContext ctx = on ? makeQueueCtx(8, 16) : makeQueueCtx(1, 0);
-        for (int issue = 0; issue < 2; ++issue) {
+        struct Case {
+            Peer::TimeKind kind;
+            int cycles;
+            int wantOff, wantOn;
+            const char* name;
+        };
+        const Case cases[] = {
+            {Peer::TimeKind::Issue, 2, 16, 17, "issue"},
+            {Peer::TimeKind::ValuIssue, 2, 17, 17, "valu issue"},
+            {Peer::TimeKind::Elapsed, 3, 17, 17, "elapsed (14 -> 17, slot 15 included)"},
+        };
+        for (const Case& c : cases) {
             CDNA5ReadyQueue queue(ctx);
-            CDNA5ReadyQueueTestPeer::slots(queue).assign(20, 1);
-            CDNA5ReadyQueueTestPeer::slots(queue)[15] = CDNA5ReadyQueueTestPeer::kBlocked;
-            CDNA5ReadyQueueTestPeer::latency(queue) = 20;
-            CDNA5ReadyQueueTestPeer::pos(queue) = 14;
-            if (issue)
-                CDNA5ReadyQueueTestPeer::advanceIssue(queue, 2);
-            else
-                CDNA5ReadyQueueTestPeer::advance(queue, 3);  // 14 -> 17 elapsed, slot 15 included
-            const int want = issue ? (on ? 17 : 16) : 17;
-            EXPECT_EQ(CDNA5ReadyQueueTestPeer::pos(queue), want)
-                << "queue model " << on << (issue ? ", issue cycles" : ", elapsed cycles");
+            Peer::slots(queue).assign(20, 1);
+            Peer::slots(queue)[15] = Peer::kBlocked;
+            Peer::latency(queue) = 20;
+            Peer::pos(queue) = 14;
+            Peer::advance(queue, c.cycles, c.kind);
+            EXPECT_EQ(Peer::pos(queue), on ? c.wantOn : c.wantOff)
+                << c.name << ", queue model " << on;
         }
     }
 }
@@ -419,4 +428,48 @@ TEST_F(CDNA5ReadyQueueTest, ForcedWmmaChargesItsSourceStallWhenTheQueueModelIsOn
     }
     EXPECT_LT(elapsed[0], 20) << "queue model off: unchanged";
     EXPECT_GE(elapsed[1], 40) << "queue model on: the source stall elapses";
+}
+
+// Periodic cap: at most A ds_loads per X-cycle period. With only ds_loads to issue nothing else
+// supplies elapsed time, so the cap wait itself must elapse; otherwise the period never ends and
+// the ds_loads are all counted into the same full period, exceeding A.
+TEST_F(CDNA5ReadyQueueTest, PeriodicDsCapNeverIssuesMoreThanItsLimitInOnePeriod) {
+    constexpr int kCap = 4, kSpan = 32, kLoads = 10;
+    PassContext ctx;
+    GemmTileConfig config;
+    config.arch = {12, 5, 0};
+    ctx.setGemmTileConfig(config);
+    PassFeatureConfig pfc;
+    pfc.dagFeatures.dsReadPerCap = kCap;
+    pfc.dagFeatures.dsIssueCapSpanCycles = kSpan;
+    pfc.dagFeatures.dsIssueCapMode = PassFeatureConfig::DsIssueCapMode::Periodic;
+    pfc.dagFeatures.dsReadQueueDepth = 16;
+    pfc.dagFeatures.dsReadThrottleLatency = 1;  // the LDS throttle is out of the way
+    ctx.setPassFeatureConfig(pfc);
+    CDNA5ReadyQueue queue(ctx);
+    CDNA5ReadyQueueTestPeer::setDsCap(queue, DsIssueCap::Mode::Periodic, kCap);
+
+    std::vector<DAGNode> nodes;
+    nodes.reserve(kLoads);
+    for (int i = 0; i < kLoads; ++i) {
+        StinkyInstruction* ds =
+            createDsReadB128InBlock(bb, GfxArchID::Gfx1250, /*destReg=*/100 + 4 * i, 80);
+        ds->addSrcReg(StinkyRegister(RegType::LDS, i + 1, 1));
+        nodes.emplace_back(ds, /*id=*/i);
+    }
+    for (DAGNode& n : nodes) queue.push(&n);
+
+    std::vector<int> issuedAt;  // timeline clock once each ds_load has issued (after any wait)
+    for (int i = 0; i < kLoads; ++i) {
+        ASSERT_NE(queue.pickOne(), nullptr);
+        issuedAt.push_back(CDNA5ReadyQueueTestPeer::clock(queue));
+    }
+    std::string times;
+    for (int t : issuedAt) times += std::to_string(t) + " ";
+    // No window of kSpan cycles opened by a ds_load holds more than kCap of them.
+    for (int i = 0; i < kLoads; ++i) {
+        int inPeriod = 0;
+        for (int j = i; j < kLoads; ++j) inPeriod += issuedAt[j] < issuedAt[i] + kSpan;
+        EXPECT_LE(inPeriod, kCap) << "period opened by ds_load " << i << ", issue times: " << times;
+    }
 }
