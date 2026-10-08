@@ -217,6 +217,12 @@ set(ROCSPARSE_UNIT_TEST_DEVICE_SOURCES
   # sibling branches appending elsewhere. Needs the defining library TU in
   # ROCSPARSE_UNIT_TEST_DEVICE_LIB_SOURCES below.
   unit_test_internal_conversion_csr2ell_batch.cpp
+  # --- csrmm merge path / nnz split grid.x extents [AISPARSE-671, 672] -------
+  # Distinct anchor at the end of the list so this leaf does not conflict with
+  # the sibling unit-test branches above. Drives the public rocsparse_spmm entry
+  # point with handle->properties.maxGridSize[0] shrunk, so no internal
+  # translation unit has to be compiled in.
+  unit_test_internal_level3_csrmm_grids.cpp
 )
 
 # Host building-block library translation units under test by the
