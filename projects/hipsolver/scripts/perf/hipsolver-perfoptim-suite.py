@@ -26,11 +26,11 @@
 # ##########################################################################
 
 """
-Benchmark execution script for rocSOLVER.
+Benchmark execution script for hipSOLVER.
 
 This script executes selected benchmark suites and collates the results to CSV.
-For profiling functionality, use rocsolver-profile.py (to be added).
-For graphing functionality, use rocsolver-graph.py (to be added).
+For profiling functionality, use hipsolver-profile.py (to be added).
+For graphing functionality, use hipsolver-graph.py (to be added).
 """
 
 import argparse
@@ -41,7 +41,7 @@ import shlex
 import sys
 from subprocess import Popen, PIPE
 
-from rocsolver_suites import SUITES
+from hipsolver_suites import SUITES
 
 
 #################################################
@@ -57,9 +57,9 @@ def setup_vprint(args):
     vprint = print if args.verbose else lambda *a, **k: None
 
 
-def call_rocsolver_bench(bench_executable, *args):
+def call_hipsolver_bench(bench_executable, *args):
     """
-    CALL_ROCSOLVER_BENCH executes system call to the benchmark
+    CALL_HIPSOLVER_BENCH executes system call to the benchmark
     client executable with the given list of arguments
     """
     cmd = [bench_executable]
@@ -78,7 +78,7 @@ def call_rocsolver_bench(bench_executable, *args):
             process.returncode)
 
 
-def execute_benchmarks(output_file, suite, precision, case, bench_executable, local):
+def execute_benchmarks(output_file, suite, precision, case, bench_executable, local, emulated):
     """
     EXECUTE_BENCHMARKS collects the arguments for the benchmark client, calls
     the client, gets the resulting time, and writes everything to output file
@@ -87,12 +87,17 @@ def execute_benchmarks(output_file, suite, precision, case, bench_executable, lo
     benchmark_generator = SUITES[suite]
 
     for roww, n, bench_args in benchmark_generator(suite=suite, precision=precision, case=case):
+        if emulated:
+            bench_args += ' --math_mode fp32_fp64'
+        
         # Run benchmark
-        out, err, exitcode = call_rocsolver_bench(bench_executable, bench_args)
+        # TODO: for some reason, the hipsolver-bench outputs results to stderr. 
+        # this may need revision in the future.
+        out, err, exitcode = call_hipsolver_bench(bench_executable, bench_args)
         if exitcode != 0:
-            sys.exit("rocsolver-bench call failure: {}".format(err))
+            sys.exit("hipsolver-bench call failure: {}".format(err))
         try:
-            time = float(out)
+            time = float(err) #preferred case should be float(out)
         except ValueError:
             time="n/a"
         # write results
@@ -120,8 +125,11 @@ def execute_benchmarks(output_file, suite, precision, case, bench_executable, lo
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        prog='rocsolver-perfoptim-suite',
+        prog='hipsolver-perfoptim-suite',
         description='Executes a selected suite of benchmarks and collates the results.')
+    parser.add_argument('--emulated',
+            action='store_true',
+            help='perform computations with emulated single and double precision (only cusolver path)')
     parser.add_argument('-v','--verbose',
             action='store_true',
             help='display more information about operations being performed')
@@ -129,7 +137,7 @@ if __name__ == '__main__':
             action='store_true',
             help='prints to screen only size and time as results')
     parser.add_argument('--exe',
-            default='../../build/release/clients/staging/rocsolver-bench',
+            default='../../build/release/clients/staging/hipsolver-bench',
             help='the benchmark executable to run')
     parser.add_argument('-o',
             dest='output_path',
@@ -150,6 +158,6 @@ if __name__ == '__main__':
 
     if args.output_path is not None and not args.local:
         with open(args.output_path, 'w', buffering=1, encoding='utf-8') as output_file:
-            execute_benchmarks(output_file, args.suite, args.precision, args.case, args.exe, args.local)
+            execute_benchmarks(output_file, args.suite, args.precision, args.case, args.exe, args.local, args.emulated)
     else:
-        execute_benchmarks(sys.stdout, args.suite, args.precision, args.case, args.exe, args.local)
+        execute_benchmarks(sys.stdout, args.suite, args.precision, args.case, args.exe, args.local, args.emulated)
