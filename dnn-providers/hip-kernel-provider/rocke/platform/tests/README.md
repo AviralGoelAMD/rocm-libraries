@@ -147,20 +147,24 @@ environment without Torch; they do not invoke the offline CPU oracles.
 
 | CTest entry | Scope | Registration |
 |---|---|---|
-| `rocke_reference_common_pytest` | Shared artifact integrity and worker import isolation | Host suite; independent of bundles |
+| `rocke_reference_common_pytest` | Shared numerical budgets, artifact integrity, and worker isolation | Host suite; independent of bundles |
 | `rocke_sdpa_reference_unit_pytest` | SDPA numerical contract and qualification guards | Host suite; independent of bundles |
 | `rocke_conv_reference_unit_pytest` | Convolution numerical contract and qualification guards | Host suite; independent of bundles |
 | `rocke_sdpa_gpu_gfx942_pytest` | Eight gfx942 numerical cases and three failure checks | When the SDPA bundle is installed |
-| `rocke_conv_gpu_gfx942_pytest` | Twelve gfx942 forward cases and three failure checks | When the convolution bundle is installed |
+| `rocke_conv_gpu_gfx942_pytest` | Sixteen gfx942 forward cases and three failure checks | When the convolution bundle is installed |
 
 `ROCKE_INSTALL_TEST_GPU_REFERENCES` controls installation of all published
 operation/architecture pairs. SDPA/gfx942 and convolution/gfx942 are published
-and installed by default for provider builds. Local source/lock overrides
-select replacement candidates. Each operation
+and installed by default for provider builds. Publication is listed in
+`platform/cmake/PublishedGpuReferences.cmake` relative to the rocKE root. CMake
+uses the standard archives and committed locks; verify replacement candidates
+with the offline CLI using explicit `--bundle` and `--lock` paths. Each operation
 and architecture retains a separate archive, lock, and installed payload.
 
 The optional `conv_reference/check_torch_reference.py` is an explicit offline
 oracle audit. It is excluded from installation and normal pytest discovery.
+For adding cases, replacing bundles, or enrolling targets, follow the
+[authoritative reference workflow](../../docs/gpu-reference-workflow.md).
 See [the installed reference procedure](../../TESTING.md#running-installed-reference-tests-without-torch)
 and the [convolution guide](../../docs/conv-test-reference.md) for commands,
 publication requirements, and coverage limits.
