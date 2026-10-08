@@ -544,7 +544,7 @@ if(ROCKE_INSTALL_TESTS)
       string(APPEND _ROCKE_INSTALLED_CTEST_ENTRIES
              "set_tests_properties(rocke_pytest PROPERTIES\n"
              "  LABELS \"ckc\\;python\\;quick\"\n"
-             "  ENVIRONMENT \"PYTHONPATH=.\"\n"
+             "  ENVIRONMENT \"PYTHONPATH=.;ROCKE_REPLAY_CLI=${ROCKE_TEST_CTEST_REL}tests/portable_ir/rocke_portable_ir_replay_cli${CMAKE_EXECUTABLE_SUFFIX}\"\n"
              "  TIMEOUT 300)\n")
     endif()
 
