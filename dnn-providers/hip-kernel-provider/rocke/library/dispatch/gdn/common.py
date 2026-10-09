@@ -21,6 +21,7 @@ from kernels.gfx950.gdn_decode import (
     # learned to run.
     GDN_DTYPES,
     STATE_DTYPES,
+    STATE_HINTS,
 )
 from rocke.dispatch.core import (
     OperatorRequest,
@@ -76,6 +77,12 @@ class GdnDecodeRequest(OperatorRequest):
     and state width. ``fuse_conv`` also requires ``num_k_heads ==
     num_v_heads``.
 
+    ``state_load_hint`` / ``state_store_hint`` set the cache policy of the
+    recurrent-state loads and stores: ``"streaming"`` (nontemporal),
+    ``"default"``, or ``"auto"`` (dispatch picks per mode; see
+    ``auto_state_hints`` in the per-arch module). They reach the spec and the
+    kernel name, so each policy is its own compile-cache entry.
+
     ``gate_kind`` selects the forget-gate granularity: ``"gdn"`` (one scalar
     decay per head) or ``"kda"`` (a per-channel decay). It reaches the spec and
     therefore the kernel name, so the two never share a compile-cache entry.
@@ -100,6 +107,8 @@ class GdnDecodeRequest(OperatorRequest):
     spec_id: str = "auto"
     fuse_conv: bool = False
     fuse_out_norm: bool = False
+    state_load_hint: str = "auto"
+    state_store_hint: str = "auto"
 
     def normalized(self) -> dict:
         d = asdict(self)
@@ -160,6 +169,12 @@ def request_errors(req: OperatorRequest) -> list:
             "fuse_conv requires num_k_heads == num_v_heads (shared q/k conv "
             f"channels would race), got {req.num_k_heads}/{req.num_v_heads}"
         )
+    for field in ("state_load_hint", "state_store_hint"):
+        hint = getattr(req, field)
+        if hint != "auto" and hint not in STATE_HINTS:
+            errors.append(
+                f"unsupported {field} {hint!r} (expected 'auto' or one of {STATE_HINTS})"
+            )
     return errors
 
 

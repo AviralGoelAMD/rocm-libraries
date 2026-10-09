@@ -98,6 +98,7 @@ __all__ = [
     "gdn_decode_signature",
     "GDN_DTYPES",
     "STATE_DTYPES",
+    "STATE_HINTS",
 ]
 
 DType = Literal["f16", "bf16"]
@@ -123,14 +124,27 @@ _STATE_BYTES = {"f16": 2, "bf16": 2, "f32": 4}
 # The ``state`` param promises 16 B alignment (one pool row starts at a
 # multiple of 16 B); an f32 access must not claim its 32 B payload size.
 _STATE_ALIGN = 16
+# Cache policy of the recurrent-state loads and stores, one knob each. The state
+# is read once and written once per call, so "streaming" (LLVM !nontemporal)
+# is the natural choice, and it wins on tiles that own one state row per lane.
+# It is not universal: on a tile whose lanes own several rows (the BPV=1 fused
+# tile (4,16,1) holds 8), nontemporal stores send each 64 B line to HBM ~1.56x
+# (gfx950, measured: 822 vs 528 MB written at Hk=Hv=32, batch 256), and default
+# stores are faster. Dispatch picks per mode; see ``auto_state_hints``.
+StateHint = Literal["streaming", "default"]
+STATE_HINTS = get_args(StateHint)
+_TEMPORAL = {"streaming": TemporalHint.STREAMING, "default": TemporalHint.DEFAULT}
+# kernel_name() token for a non-default hint; "streaming" adds nothing so every
+# name recorded before these knobs existed stays the same.
+_HINT_TOKEN = {"default": "def"}
 
 
 def _state_ir_type(state_dtype: str):
     return F32 if state_dtype == "f32" else io_ir_type(state_dtype)
 
 
-def _load_state_f32(b: IRBuilder, ptr, idx, *, state_dtype: str, n: int):
-    """Streamed load of ``n`` state elements as f32 values."""
+def _load_state_f32(b: IRBuilder, ptr, idx, *, state_dtype: str, n: int, hint: str):
+    """Load ``n`` state elements as f32 values with cache policy ``hint``."""
     if state_dtype == "f32":
         v = b.global_load_vN(
             ptr,
@@ -138,11 +152,11 @@ def _load_state_f32(b: IRBuilder, ptr, idx, *, state_dtype: str, n: int):
             F32,
             n,
             align=_STATE_ALIGN,
-            temporal_hint=TemporalHint.STREAMING,
+            temporal_hint=_TEMPORAL[hint],
         )
         return [b.vec_extract(v, i) for i in range(n)]
     return load_vec_as_f32(
-        b, ptr, idx, dtype=state_dtype, n=n, temporal_hint=TemporalHint.STREAMING
+        b, ptr, idx, dtype=state_dtype, n=n, temporal_hint=_TEMPORAL[hint]
     )
 
 
@@ -153,8 +167,10 @@ def _pack_state(b: IRBuilder, values, *, state_dtype: str):
     return pack_f32_to(b, values, dtype=state_dtype)
 
 
-def _store_state(b: IRBuilder, ptr, idx, vec, *, state_dtype: str, n: int) -> None:
-    """Streamed store of a packed state vector."""
+def _store_state(
+    b: IRBuilder, ptr, idx, vec, *, state_dtype: str, n: int, hint: str
+) -> None:
+    """Store a packed state vector with cache policy ``hint``."""
     if state_dtype == "f32":
         b.global_store_vN(
             ptr,
@@ -162,10 +178,10 @@ def _store_state(b: IRBuilder, ptr, idx, vec, *, state_dtype: str, n: int) -> No
             vec,
             n,
             align=_STATE_ALIGN,
-            temporal_hint=TemporalHint.STREAMING,
+            temporal_hint=_TEMPORAL[hint],
         )
         return
-    store_vec(b, ptr, idx, vec, n=n, temporal_hint=TemporalHint.STREAMING)
+    store_vec(b, ptr, idx, vec, n=n, temporal_hint=_TEMPORAL[hint])
 
 
 @dataclass(frozen=True)
@@ -211,6 +227,9 @@ class GdnDecodeSpec:
     fuse_out_norm: bool = (
         False  # o * rsqrt(mean(o^2)+eps) * norm_weight * sigmoid(gate)
     )
+    # Cache policy of the state loads / stores ("streaming" = !nontemporal).
+    state_load_hint: StateHint = "streaming"
+    state_store_hint: StateHint = "streaming"
     name: str = "rocke_gdn_decode"
 
     @property
@@ -250,6 +269,16 @@ class GdnDecodeSpec:
                 parts += ("nofg",)
         if self.wave_size != 64:
             parts += (f"ws{self.wave_size}",)
+        # Deviation-only: a streaming hint adds nothing, so names (and every
+        # golden hash) recorded before these knobs existed are unchanged.
+        if self.state_load_hint != "streaming":
+            parts += (
+                f"lh{_HINT_TOKEN.get(self.state_load_hint, self.state_load_hint)}",
+            )
+        if self.state_store_hint != "streaming":
+            parts += (
+                f"sh{_HINT_TOKEN.get(self.state_store_hint, self.state_store_hint)}",
+            )
         return kernel_name_join(
             self.name,
             *parts,
@@ -289,6 +318,14 @@ def is_valid_spec(spec: GdnDecodeSpec, arch: str = "gfx950") -> Tuple[bool, str]
         return False, f"gate_kind must be 'gdn' or 'kda' (got {spec.gate_kind!r})"
     if spec.gate_kind == "gdn" and not spec.fuse_gate:
         return False, "gate_kind='gdn' requires fuse_gate=True"
+    if (
+        spec.state_load_hint not in STATE_HINTS
+        or spec.state_store_hint not in STATE_HINTS
+    ):
+        return False, (
+            f"state_load_hint / state_store_hint must be one of {STATE_HINTS}, got "
+            f"{spec.state_load_hint!r} / {spec.state_store_hint!r}"
+        )
     if spec.fuse_conv or spec.fuse_out_norm:
         if spec.simple:
             return False, (
@@ -551,7 +588,12 @@ def _build_simple(spec: GdnDecodeSpec) -> KernelDef:
         for c in range(0, DK, STATE_VEC):
             off = b.add(rs_base, b.const_i32(c))
             sv += _load_state_f32(
-                b, state_r, off, state_dtype=spec.state_dtype, n=STATE_VEC
+                b,
+                state_r,
+                off,
+                state_dtype=spec.state_dtype,
+                n=STATE_VEC,
+                hint=spec.state_load_hint,
             )
         # Gated forget. A scalar decay broadcasts over the row; a per-channel
         # decay zips with it -- `sv` and `decay` are both indexed by K channel,
@@ -589,6 +631,7 @@ def _build_simple(spec: GdnDecodeSpec) -> KernelDef:
                 vec,
                 state_dtype=spec.state_dtype,
                 n=STATE_VEC,
+                hint=spec.state_store_hint,
             )
 
     return b.kernel
@@ -852,7 +895,12 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             for ki in range(WTK_ITERS):
                 off = b.add(rs_row, b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K)))
                 s_raw[(vi, ki)] = _load_state_f32(
-                    b, state_r, off, state_dtype=spec.state_dtype, n=VPT
+                    b,
+                    state_r,
+                    off,
+                    state_dtype=spec.state_dtype,
+                    n=VPT,
+                    hint=spec.state_load_hint,
                 )
 
         # this lane's v, one per V row
@@ -1063,7 +1111,15 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
                 new = [b.fma(kn[ki][i], v_new, sv[(vi, ki)][i]) for i in range(VPT)]
                 vec = _pack_state(b, new, state_dtype=spec.state_dtype)
                 off = b.add(ws_row, b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K)))
-                _store_state(b, state_w, off, vec, state_dtype=spec.state_dtype, n=VPT)
+                _store_state(
+                    b,
+                    state_w,
+                    off,
+                    vec,
+                    state_dtype=spec.state_dtype,
+                    n=VPT,
+                    hint=spec.state_store_hint,
+                )
 
         if RN:
             # Sum of o^2 over the head's DV rows. Every k-lane of a row holds

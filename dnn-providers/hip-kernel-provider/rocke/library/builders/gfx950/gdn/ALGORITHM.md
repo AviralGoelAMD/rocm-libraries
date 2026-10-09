@@ -358,10 +358,19 @@ batch; larger tiles still split into two or three. The floating-point arithmetic
 the same order as an interleaved emission. The simple path (`spec.simple`) keeps the interleaved
 order: q/k, norms, gates, dot, then the state row.
 
-Cache policy: the state is read once and written once per call, so the state loads (step 3) and
-stores (step 8) are **nontemporal** (`temporal_hint=TemporalHint.STREAMING` → LLVM `!nontemporal`
-→ the `nt` bit on gfx950) in both paths and for every state dtype. This is always on, not a spec
-field or kernel-name tag. `q`, `k`, `v`, the gates and `out` keep the default cache policy.
+Cache policy: the state is read once and written once per call. Two spec fields set the policy of
+the state loads (step 3) and stores (step 8), in both paths and for every state dtype:
+`state_load_hint` and `state_store_hint`, each `"streaming"` (`TemporalHint.STREAMING` → LLVM
+`!nontemporal` → the `nt` bit on gfx950) or `"default"`. A non-streaming value adds `lhdef` /
+`shdef` to the kernel name; streaming adds nothing, so pre-knob names and golden hashes are
+unchanged. `q`, `k`, `v`, the gates and `out` always keep the default cache policy.
+
+Dispatch `auto` (`auto_state_hints`) streams both, except the fused f32 path, whose stores use the
+default policy. The f32 state row of one lane is stored as two 16 B halves of a 32 B vector; on the
+BPV=1 fused tile (4,16,1), where each lane owns 8 rows, nontemporal stores send each 64 B line to
+HBM about 1.56× (gfx950 MI355X, KDA f32, Hk=Hv=32, batch 256: 850 MB vs 547 MB written, 311.5 µs
+vs 282.5 µs with conv + norm). On the unfused tile (8,16,4), one row per lane, nontemporal stores
+are faster (217.8 µs vs 230.0 µs). A 2-byte state stores one 16 B vector per row and keeps streaming.
 
 Two consequences of the identity in §1.2 item 3: the output store and the state write in step 8 are
 **independent** — neither reads the other's result — and the output is broadcast across the k-lane
@@ -715,7 +724,11 @@ Widening the range needs nested chunking or per-token rescaling.
 5. Host-struct consolidation of the GDN and KDA request lineage.
 6. Machine-checked byte-identity for the cross-engine surfaces this family touches — currently
    reasoned and Python-verified.
-7. A fast fused decode path (§4.9). The BPV=1 fused kernel holds the whole head's tile plus conv
-   taps in registers; streaming the state in row chunks with a few chunks in flight (as AITER's
-   Gluon packed KDA decode does) would cut live registers, or `BPV > 1` with an out-of-place conv
-   state and a cross-workgroup norm would restore small-batch parallelism.
+7. A fast fused decode path (§4.9). AITER's Gluon packed KDA decode, which is ~1.7× faster, has the
+   same skeleton for single-token decode (one 256-thread workgroup per head, 16 lanes per row, all
+   of the f32 state in registers and issued first), so state streaming is not the gap. The
+   measured gap is the conv/gate prologue: every lane recomputes the conv and gate of its channels
+   (q/k conv ×16 row groups, v conv ×16 k-lanes) and holds ~168 conv values, giving 232 VGPRs and
+   ~3× the load instructions. Computing each channel once and broadcasting through LDS (as vLLM's
+   and AITER's kernels do) is the next step; `BPV > 1` with an out-of-place conv state and a
+   cross-workgroup norm would add small-batch parallelism.

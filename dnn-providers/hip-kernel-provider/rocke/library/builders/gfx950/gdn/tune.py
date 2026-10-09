@@ -30,6 +30,7 @@ import argparse
 import sys
 
 from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode, dispatch_gdn_decode_all
+from kernels.gfx950.gdn_decode import STATE_HINTS
 
 ARCH = "gfx950"
 DEFAULT_BATCHES = (1, 16, 64, 256)
@@ -230,6 +231,13 @@ def main() -> int:
         action="store_true",
         help="tune the fused gated-RMSNorm output mode (BPV=1 tiles)",
     )
+    for hint_flag in ("--state-load-hint", "--state-store-hint"):
+        parser.add_argument(
+            hint_flag,
+            default="auto",
+            choices=("auto",) + STATE_HINTS,
+            help="state cache policy (streaming = nontemporal); auto = dispatcher's choice",
+        )
     parser.add_argument("--top", type=int, default=8, help="rows to print per cell")
     args = parser.parse_args()
 
@@ -256,6 +264,8 @@ def main() -> int:
                 num_v_heads=num_v_heads,
                 fuse_conv=args.fuse_conv,
                 fuse_out_norm=args.fuse_out_norm,
+                state_load_hint=args.state_load_hint,
+                state_store_hint=args.state_store_hint,
             )
             results = dispatch_gdn_decode_all(request)
             print(f"legal registry candidates for batch {batch}: {len(results)}")

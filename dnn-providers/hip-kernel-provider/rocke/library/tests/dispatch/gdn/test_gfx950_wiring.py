@@ -582,3 +582,105 @@ class TestFusedDispatch(unittest.TestCase):
             )
         ).spec
         self.assertEqual(self.tile(g), DEFAULT_TILE)
+
+
+class TestStateHintKnobs(unittest.TestCase):
+    """state_load_hint / state_store_hint: auto policy, explicit pins, rejection,
+    the compile key, and the cache policy actually emitted on state accesses."""
+
+    @staticmethod
+    def req(**kw):
+        base = dict(batch=8, arch=ARCH, num_k_heads=16, num_v_heads=16, gate_kind="kda")
+        base.update(kw)
+        return GdnDecodeRequest(**base)
+
+    @staticmethod
+    def hints(spec):
+        return spec.state_load_hint, spec.state_store_hint
+
+    def test_auto_policy_per_mode_and_state_width(self):
+        fused = dict(fuse_conv=True, fuse_out_norm=True)
+        cases = (
+            # (request extras, expected (load, store))
+            (dict(state_dtype="f32", **fused), ("streaming", "default")),
+            (dict(state_dtype="f32", fuse_out_norm=True), ("streaming", "default")),
+            (dict(state_dtype="bf16", **fused), ("streaming", "streaming")),
+            (dict(state_dtype="f32"), ("streaming", "streaming")),
+            (dict(state_dtype="bf16"), ("streaming", "streaming")),
+        )
+        for gate in ("gdn", "kda"):
+            for extra, want in cases:
+                with self.subTest(gate=gate, **extra):
+                    s = dispatch_gdn_decode(self.req(gate_kind=gate, **extra)).spec
+                    self.assertEqual(self.hints(s), want)
+
+    def test_explicit_hints_override_auto(self):
+        for load in ("streaming", "default"):
+            for store in ("streaming", "default"):
+                for extra in (
+                    dict(state_dtype="f32"),
+                    dict(state_dtype="f32", fuse_conv=True),
+                ):
+                    with self.subTest(load=load, store=store, **extra):
+                        s = dispatch_gdn_decode(
+                            self.req(
+                                state_load_hint=load, state_store_hint=store, **extra
+                            )
+                        ).spec
+                        self.assertEqual(self.hints(s), (load, store))
+
+    def test_unknown_hint_is_rejected(self):
+        for field in ("state_load_hint", "state_store_hint"):
+            with self.subTest(field=field):
+                r = self.req(**{field: "nontemporal"})
+                self.assertTrue(any(field in e for e in request_errors(r)))
+                with self.assertRaises(ValueError):
+                    dispatch_gdn_decode(r)
+                bad = replace(dispatch_gdn_decode(self.req()).spec, **{field: "nt"})
+                self.assertFalse(is_valid_spec(bad, arch=ARCH)[0])
+
+    def test_every_hint_pair_has_its_own_compile_key(self):
+        base = dispatch_gdn_decode(self.req(state_dtype="f32")).spec
+        names = {
+            replace(base, state_load_hint=l, state_store_hint=s).kernel_name()
+            for l in ("streaming", "default")
+            for s in ("streaming", "default")
+        }
+        self.assertEqual(len(names), 4)
+        # Streaming is the pre-knob behaviour, so it must keep the pre-knob name.
+        self.assertNotRegex(base.kernel_name(), r"_(lh|sh)")
+
+    def test_emitted_state_accesses_follow_the_hints(self):
+        from kernels.gfx950.gdn_decode import build_gdn_decode
+        from rocke.core.lower_llvm import _lower_kernel_to_llvm_python
+
+        # f32 state is accessed as <8 x float>; no other operand of this kernel is.
+        for fused in (False, True):
+            for load in ("streaming", "default"):
+                for store in ("streaming", "default"):
+                    with self.subTest(fused=fused, load=load, store=store):
+                        spec = dispatch_gdn_decode(
+                            self.req(
+                                state_dtype="f32",
+                                fuse_conv=fused,
+                                fuse_out_norm=fused,
+                                state_load_hint=load,
+                                state_store_hint=store,
+                            )
+                        ).spec
+                        ir = _lower_kernel_to_llvm_python(
+                            build_gdn_decode(spec, arch=ARCH), arch=ARCH
+                        ).splitlines()
+                        stores = [l for l in ir if re.search(r"\bstore <8 x float>", l)]
+                        loads = [
+                            l
+                            for l in ir
+                            if re.search(r"load <8 x float>, ptr addrspace\(1\)", l)
+                            and "!nontemporal" in l
+                        ]
+                        self.assertTrue(stores)
+                        nt_stores = sum("!nontemporal" in l for l in stores)
+                        self.assertEqual(
+                            nt_stores, len(stores) if store == "streaming" else 0
+                        )
+                        self.assertEqual(bool(loads), load == "streaming")

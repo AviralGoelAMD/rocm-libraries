@@ -103,6 +103,37 @@ def _cases():
                     fuse_conv=conv,
                     fuse_out_norm=norm,
                 )
+    # State cache-policy knobs. Every case above keeps the streaming default, so
+    # their hashes are the pre-knob hashes; these pin the non-default policies
+    # on the plain KDA f32 tile and on the fused one.
+    for load, store in (
+        ("streaming", "default"),
+        ("default", "streaming"),
+        ("default", "default"),
+    ):
+        tag = f"lh{load[:3]}_sh{store[:3]}"
+        cases[f"kda_stf32_w8k16b4_{tag}"] = build(
+            gate_kind="kda",
+            state_dtype="f32",
+            num_warps=8,
+            warp_threads_k=16,
+            blocks_per_v_dim=4,
+            state_load_hint=load,
+            state_store_hint=store,
+        )
+        cases[f"fused_kda_stf32_cv_rn_{tag}"] = build(
+            num_k_heads=16,
+            num_v_heads=16,
+            gate_kind="kda",
+            state_dtype="f32",
+            num_warps=4,
+            warp_threads_k=16,
+            blocks_per_v_dim=1,
+            fuse_conv=True,
+            fuse_out_norm=True,
+            state_load_hint=load,
+            state_store_hint=store,
+        )
     return cases
 
 

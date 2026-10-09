@@ -127,9 +127,31 @@ def auto_tile(
     return KDA_DEFAULT_TILE_F32 if width == "f32" else KDA_DEFAULT_TILE
 
 
+# ``auto`` cache policy of the state (load, store). Streaming (nontemporal) is
+# the default: the state is read and written once per call, and on the unfused
+# tiles nontemporal stores win (KDA f32 tile (8,16,4), Hk=Hv=32, batch 256:
+# 217.8 us streaming vs 230.0 us default). The fused f32 path is the exception.
+# Its BPV=1 tiles give each lane several state rows, each stored as two 16 B
+# halves of a 32 B f32 vector, and with nontemporal stores the 64 B lines reach
+# HBM ~1.56x (KDA f32, tile (4,16,1), conv + norm, same shape: 850 MB written,
+# 311.5 us streaming vs 547 MB, 282.5 us default). A 2-byte state stores one
+# 16 B vector per row, so it keeps streaming. GDN shares the store code; its
+# fused f32 default follows by construction, not by a separate measurement.
+# To revisit, sweep both hints per tile (tune.py --state-store-hint).
+def auto_state_hints(state_dtype: str = "bf16", fused: bool = False) -> Tuple[str, str]:
+    """The ``auto`` (state_load_hint, state_store_hint) for a state width and mode."""
+    if fused and normalize_dtype(state_dtype) == "f32":
+        return "streaming", "default"
+    return "streaming", "streaming"
+
+
 def make_spec(req: GdnDecodeRequest, tile: Tuple[int, int, int]) -> GdnDecodeSpec:
     """Map a request plus a chosen tile onto a concrete kernel spec."""
     num_warps, warp_threads_k, blocks_per_v_dim = tile
+    fused = bool(req.fuse_conv or req.fuse_out_norm)
+    auto_load, auto_store = auto_state_hints(req.state_dtype, fused)
+    load_hint = auto_load if req.state_load_hint == "auto" else req.state_load_hint
+    store_hint = auto_store if req.state_store_hint == "auto" else req.state_store_hint
     return dc.replace(
         GdnDecodeSpec(),
         num_k_heads=int(req.num_k_heads),
@@ -145,6 +167,8 @@ def make_spec(req: GdnDecodeRequest, tile: Tuple[int, int, int]) -> GdnDecodeSpe
         blocks_per_v_dim=blocks_per_v_dim,
         fuse_conv=bool(req.fuse_conv),
         fuse_out_norm=bool(req.fuse_out_norm),
+        state_load_hint=load_hint,
+        state_store_hint=store_hint,
     )
 
 
