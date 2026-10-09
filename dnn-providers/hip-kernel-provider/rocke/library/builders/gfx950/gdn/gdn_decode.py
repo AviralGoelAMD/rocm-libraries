@@ -59,7 +59,8 @@ _LAUNCHER_CACHE: Dict[Tuple, KernelLauncher] = {}
 # Spec dtype name -> the torch dtype the kernel is compiled against. The kernel
 # receives a raw pointer, so this mapping is the only thing tying a caller's
 # tensor to the element type frozen into the machine code.
-_TORCH_DT = {"bf16": torch.bfloat16, "f16": torch.float16}
+# f32 is a state dtype only; is_valid_spec rejects it as the I/O dtype.
+_TORCH_DT = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
 
 
 def launcher_for(spec: GdnDecodeSpec, arch: str = _ARCH) -> KernelLauncher:
@@ -145,7 +146,7 @@ def make_inputs(
 
     hk, hv = spec.num_k_heads, spec.num_v_heads
     dk, dv = spec.head_k_dim, spec.head_v_dim
-    return {
+    inp = {
         "query": rnd(batch, 1, hk, dk),
         "key": rnd(batch, 1, hk, dk),
         "value": rnd(batch, 1, hv, dv),
@@ -170,6 +171,32 @@ def make_inputs(
         ),
         "state": rnd(depth, hv, dv, dk, dtype=state_dtype, scale=0.01),
     }
+    # Fused-mode tensors are drawn after every unfused draw, so a fused spec's
+    # gate and state inputs equal its unfused twin's, seed for seed (fuse_conv
+    # replaces q/k/v with views of the packed row drawn below).
+    if spec.fuse_conv:
+        conv_dim = 2 * hk * dk + hv * dv
+        mixed = rnd(batch, conv_dim)
+        inp["mixed_qkv"] = mixed
+        inp["qkv_stride"] = conv_dim
+        # The kernel reads the packed row; q/k/v are views of it for the
+        # reference only and are never passed to the kernel.
+        inp["query"] = mixed[:, : hk * dk].reshape(batch, 1, hk, dk)
+        inp["key"] = mixed[:, hk * dk : 2 * hk * dk].reshape(batch, 1, hk, dk)
+        inp["value"] = mixed[:, 2 * hk * dk :].reshape(batch, 1, hv, dv)
+        inp["conv_state"] = rnd(depth, conv_dim, 3)
+        inp["conv_weight"] = (
+            torch.randn(conv_dim, 4, device=device, generator=gen, dtype=torch.float32)
+            * 0.5
+        )
+    if spec.fuse_out_norm:
+        inp["out_gate"] = rnd(batch, hv * dv)
+        inp["og_stride"] = hv * dv
+        inp["norm_weight"] = 1.0 + 0.1 * torch.randn(
+            dv, device=device, generator=gen, dtype=torch.float32
+        )
+        inp["norm_eps"] = 1e-6
+    return inp
 
 
 def precompute_kda_log_decay(spec: GdnDecodeSpec, inp) -> torch.Tensor:
@@ -187,13 +214,63 @@ def precompute_kda_log_decay(spec: GdnDecodeSpec, inp) -> torch.Tensor:
     return spec.lower_bound * torch.sigmoid(inner)
 
 
+def _ref_conv(spec: GdnDecodeSpec, inp) -> Tuple[torch.Tensor, torch.Tensor]:
+    """fp32 width-4 causal conv1d + SiLU over the packed q/k/v row.
+
+    Returns ``(convolved [B, C], taps_after [B, C, 3])``: tap 0 is the oldest,
+    and the shift drops it and appends the current token.
+    """
+    taps = inp["conv_state"].float()[inp["read_indices"].long()]  # [B, C, 3]
+    x = inp["mixed_qkv"].float()  # [B, C]
+    w = inp["conv_weight"].float()  # [C, 4]
+    acc = (
+        taps[..., 0] * w[:, 0]
+        + taps[..., 1] * w[:, 1]
+        + taps[..., 2] * w[:, 2]
+        + x * w[:, 3]
+    )
+    y = acc * torch.sigmoid(acc)
+    after = torch.stack((taps[..., 1], taps[..., 2], x), dim=-1)
+    return y, after
+
+
+def ref_conv_state_after(spec: GdnDecodeSpec, inp) -> torch.Tensor:
+    """Expected conv-state taps written to each sequence's write slot: [B, C, 3]."""
+    return _ref_conv(spec, inp)[1]
+
+
+def out_error(spec: GdnDecodeSpec, out: torch.Tensor, ref_out: torch.Tensor) -> float:
+    """Max output error against the fp32 reference, comparable with ``TOL``.
+
+    The plain decode output is small (|o| << 1), so the absolute error is used.
+    With ``fuse_out_norm`` the output is RMS-normalised and gated, |o| reaches
+    ~5-7 for these inputs, and one bf16 rounding step of the exact reference
+    alone exceeds ``TOL`` there; the error is then taken relative to
+    ``max(1, |ref|)`` (identical to the absolute error wherever |ref| <= 1).
+    """
+    diff = (out.float().reshape(ref_out.shape) - ref_out).abs()
+    if spec.fuse_out_norm:
+        diff = diff / ref_out.abs().clamp(min=1.0)
+    return diff.max().item()
+
+
 def ref_fp32(spec: GdnDecodeSpec, inp) -> Tuple[torch.Tensor, torch.Tensor]:
     """Whole-tensor fp32 reference for one decode step.
 
     Returns ``(out, state_after)``. Written directly from the gated delta rule
     with no chunking, tiling or cross-lane structure, so it shares no algebra
-    with the kernel beyond the definition itself.
+    with the kernel beyond the definition itself. Fused specs apply the conv1d
+    to q/k/v first (:func:`_ref_conv`) and the gated RMSNorm to ``out`` last;
+    the norm runs on the fp32 output.
     """
+    if spec.fuse_conv:
+        y, _ = _ref_conv(spec, inp)
+        hk, dk, dv = spec.num_k_heads, spec.head_k_dim, spec.head_v_dim
+        bsz = y.shape[0]
+        inp = dict(inp)
+        inp["query"] = y[:, : hk * dk].reshape(bsz, 1, hk, dk)
+        inp["key"] = y[:, hk * dk : 2 * hk * dk].reshape(bsz, 1, hk, dk)
+        inp["value"] = y[:, 2 * hk * dk :].reshape(bsz, 1, spec.num_v_heads, dv)
     hv, g = spec.num_v_heads, spec.v_per_k_head
     scale = 1.0 / math.sqrt(spec.head_k_dim)
     eps = 1e-6
@@ -247,6 +324,10 @@ def ref_fp32(spec: GdnDecodeSpec, inp) -> Tuple[torch.Tensor, torch.Tensor]:
 
     out = sq + v_new * kq[..., None]
     s_after = s + v_new[..., None] * k[..., None, :]
+    if spec.fuse_out_norm:
+        og = inp["out_gate"].float().reshape(out.shape)  # [B, HV, DV]
+        rstd = torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + inp["norm_eps"])
+        out = out * rstd * inp["norm_weight"].float() * torch.sigmoid(og)
     return out.unsqueeze(1), s_after
 
 
@@ -339,6 +420,74 @@ def _validate_decode_inputs(
     }
     if spec.gate_kind == "gdn":
         want_shapes.update({"a": (batch, 1, hv), "dt_bias": (hv,)})
+    if spec.fuse_conv:
+        # The kernel reads q/k/v from the packed row; the query/key/value
+        # entries are reference-only views and are never passed to it.
+        for name in ("query", "key", "value"):
+            want_shapes.pop(name)
+        conv_dim = 2 * hk * dk + hv * dv
+        mixed = inp["mixed_qkv"]
+        if mixed.ndim != 2 or mixed.shape[0] != batch or mixed.shape[1] < conv_dim:
+            raise ValueError(
+                f"mixed_qkv must be [batch={batch}, >= {conv_dim}]; "
+                f"got {tuple(mixed.shape)}"
+            )
+        if mixed.dtype is not io_dt or mixed.stride(1) != 1:
+            raise ValueError(
+                f"mixed_qkv must be {io_dt} with a unit channel stride; got "
+                f"{mixed.dtype}, strides {tuple(mixed.stride())}"
+            )
+        if inp["qkv_stride"] != mixed.stride(0):
+            raise ValueError(
+                f"qkv_stride {inp['qkv_stride']} != mixed_qkv.stride(0) "
+                f"{mixed.stride(0)}"
+            )
+        cs, cw = inp["conv_state"], inp["conv_weight"]
+        want_cs = (pool_depth, conv_dim, 3)
+        if (
+            tuple(cs.shape) != want_cs
+            or cs.dtype is not io_dt
+            or not cs.is_contiguous()
+        ):
+            raise ValueError(
+                f"conv_state must be contiguous {want_cs} {io_dt}; got "
+                f"{tuple(cs.shape)} {cs.dtype}"
+            )
+        if (
+            tuple(cw.shape) != (conv_dim, 4)
+            or cw.dtype is not torch.float32
+            or not cw.is_contiguous()
+        ):
+            raise ValueError(
+                f"conv_weight must be contiguous ({conv_dim}, 4) float32; got "
+                f"{tuple(cw.shape)} {cw.dtype}"
+            )
+    if spec.fuse_out_norm:
+        og, nw = inp["out_gate"], inp["norm_weight"]
+        if (
+            og.ndim != 2
+            or og.shape[0] != batch
+            or og.shape[1] < hv * dv
+            or og.dtype is not io_dt
+            or og.stride(1) != 1
+        ):
+            raise ValueError(
+                f"out_gate must be [batch={batch}, >= {hv * dv}] {io_dt} with a "
+                f"unit stride; got {tuple(og.shape)} {og.dtype}"
+            )
+        if inp["og_stride"] != og.stride(0):
+            raise ValueError(
+                f"og_stride {inp['og_stride']} != out_gate.stride(0) {og.stride(0)}"
+            )
+        if (
+            tuple(nw.shape) != (dv,)
+            or nw.dtype is not torch.float32
+            or not nw.is_contiguous()
+        ):
+            raise ValueError(
+                f"norm_weight must be contiguous ({dv},) float32; got "
+                f"{tuple(nw.shape)} {nw.dtype}"
+            )
     for name, want_shape in want_shapes.items():
         t = inp[name]
         if tuple(t.shape) != want_shape:
@@ -398,6 +547,8 @@ def prepare(spec: GdnDecodeSpec, inp, batch: int, *, validate_indices: bool = Tr
     )
     values = dict(inp)
     values["state"] = inp["state"].clone()  # the kernel updates the state in place
+    if spec.fuse_conv:
+        values["conv_state"] = inp["conv_state"].clone()  # shifted in place too
     values["out"] = out
     values["batch_size"] = batch
     cfg = LaunchConfig(
@@ -443,13 +594,17 @@ def check(spec: GdnDecodeSpec, batch: int, seed: int = 0) -> Tuple[float, float]
     contents. Comparing written pages alone cannot see a write that landed in
     the wrong slot -- the slot written checks out and the slot damaged is never
     looked at -- and a misplaced write is the failure mode a paged state pool
-    invites.
+    invites. For ``fuse_conv`` specs it also covers the conv-state pool, by the
+    same written/untouched rule.
     """
     inp = make_inputs(spec, batch, seed=seed)
     ref_out, ref_state = ref_fp32(spec, inp)
     before = inp["state"].clone()
-    out, state = run(spec, inp, launcher_for(spec), batch)
-    out_err = (out.float() - ref_out).abs().max().item()
+    values, cfg = prepare(spec, inp, batch)
+    launch(launcher_for(spec), values, cfg)
+    drain()
+    out, state = values["out"], values["state"]
+    out_err = out_error(spec, out, ref_out)
     written = inp["write_indices"].long()
     state_err = (state.float()[written] - ref_state).abs().max().item()
     untouched = torch.ones(state.shape[0], dtype=torch.bool, device=state.device)
@@ -457,6 +612,17 @@ def check(spec: GdnDecodeSpec, batch: int, seed: int = 0) -> Tuple[float, float]
     if untouched.any():
         spill = (state[untouched].float() - before[untouched].float()).abs().max()
         state_err = max(state_err, spill.item())
+    if spec.fuse_conv:
+        conv = values["conv_state"]
+        want = ref_conv_state_after(spec, inp)
+        state_err = max(state_err, (conv.float()[written] - want).abs().max().item())
+        if untouched.any():
+            cspill = (
+                (conv[untouched].float() - inp["conv_state"][untouched].float())
+                .abs()
+                .max()
+            )
+            state_err = max(state_err, cspill.item())
     return out_err, state_err
 
 

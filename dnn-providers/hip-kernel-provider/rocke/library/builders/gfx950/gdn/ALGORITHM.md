@@ -37,6 +37,7 @@
   - [4.6 Registry and tile selection](#46-registry-and-tile-selection)
   - [4.7 The reference path](#47-the-reference-path)
   - [4.8 Spec validation](#48-spec-validation)
+  - [4.9 Optional fusions: conv1d and gated RMSNorm](#49-optional-fusions-conv1d-and-gated-rmsnorm)
 - [5. Prefill kernel](#5-prefill-kernel)
   - [5.1 Chunkwise factorization](#51-chunkwise-factorization)
   - [5.2 The triangular solve](#52-the-triangular-solve)
@@ -298,6 +299,10 @@ of the gate inputs, not the recurrent-state layout or the rest of the ABI:
 | `read_indices`, `write_indices` | `[B]`, `i32` | same | in |
 | `state` | `[pool, num_v_heads, head_v_dim, head_k_dim]`, `state_dtype` | same | in-place |
 
+`state_dtype` is `bf16`, `f16` or `f32`; the I/O `dtype` is `bf16` or `f16`. The kernel
+updates the state in f32 registers either way, so `f32` only widens the state loads and
+stores (two 16-byte accesses per 8 elements instead of one).
+
 The launch also passes a trailing `batch_size` `i32` scalar (not a tensor).
 `prepare()` validates the gate-kind-dependent shapes, dtypes, devices and
 contiguity before launch, in addition to the state-pool checks in §4.5.
@@ -321,7 +326,8 @@ three ways:
 | across k-lanes | `WTK` | `WTK` lanes cover a row, `VPT = 8` contiguous channels each, repeated `WTK_ITERS = DK / (WTK × VPT)` times |
 
 Live state per lane is `WTV_ITERS × WTK_ITERS × VPT` values, held **in registers**. The design is
-deliberately register-resident: the kernel allocates **no LDS and issues no barriers**.
+deliberately register-resident: in the unfused mode the kernel allocates **no LDS and issues no
+barriers** (the fused-norm mode of §4.9 adds one `num_warps`-float LDS reduction and a barrier).
 
 `BPV` is a parallelism-manufacturing knob, not a work-reducing one — each of the `BPV` workgroups
 re-loads `q` and `k` and re-runs the normalisation reductions. It buys occupancy at small batch and
@@ -329,18 +335,43 @@ is retired at large batch, where the grid is already ample.
 
 ### 4.3 Dataflow and pipeline
 
-One workgroup, one decode step, in emission order:
+One workgroup, one decode step, in emission order (warp-tiled path):
 
 1. decode `bidx` and `tid` into `(sequence, value head, v-sub-block)` and `(wave, k-lane, v-lane)`;
 2. load `read_indices` / `write_indices` and form the `active` predicate — **outside** the guard, so
    a padded lane costs two `i32` loads and exits;
-3. under `scf_if(active)`: evaluate `decay` and `β`;
-4. load the lane's `q` and `k` slices as 16-byte vectors, promoted to `f32`;
+3. under `scf_if(active)`, issue **every** global load before any math: the gate inputs (GDN: the
+   `a`, `b`, `dt_bias` and `A_log` scalars; KDA: `b` and `A_log` plus the lane's per-channel gate and
+   `dt_bias` vectors), the lane's `q` and `k` slices as 16-byte vectors, the raw lane tile of the
+   state, and one `v` per owned V row — all promoted to `f32`;
+4. evaluate `decay` and `β`;
 5. reduce the two L2 norms (two cross-lane reductions, §4.4);
 6. reduce `dot(k̂, q̂)` (one more);
-7. form the state read pointer, load the whole lane tile, applying `decay` as it lands;
+7. apply `decay` to the raw state tile;
 8. per owned V row: reduce `s·k̂` and `s·q̂`, form `v_new = β (v − s·k̂)`, then emit the output and
    the rank-1 state update.
+
+Why loads first: the AMDGPU scheduler does not hoist a load above earlier math or across the
+`k_lane == 0` output-store branch, so emission order bounds how many separate load batches (each
+ended by a `vmcnt` wait) a wave exposes. Loads first gives the default and small tiles a single
+batch; larger tiles still split into two or three. The floating-point arithmetic is the same and in
+the same order as an interleaved emission. The simple path (`spec.simple`) keeps the interleaved
+order: q/k, norms, gates, dot, then the state row.
+
+Cache policy: the state is read once and written once per call. Two spec fields set the policy of
+the state loads (step 3) and stores (step 8), in both paths and for every state dtype:
+`state_load_hint` and `state_store_hint`, each `"streaming"` (`TemporalHint.STREAMING` → LLVM
+`!nontemporal` → the `nt` bit on gfx950) or `"default"`. A non-streaming value adds `lhdef` /
+`shdef` to the kernel name; streaming adds nothing, so pre-knob names and golden hashes are
+unchanged. `q`, `k`, `v`, the gates and `out` always keep the default cache policy.
+
+Dispatch `auto` (`auto_state_hints`) streams both, except the fused f32 path, which uses the default
+policy for loads and stores. The f32 state row of one lane is stored as two 16 B halves of a 32 B
+vector. On the BPV=1 fused tile (4,16,1), where each lane owns 8 rows, write counters on gfx950
+showed nontemporal stores sending each 64 B line to HBM more than once; default stores wrote only the
+state's own bytes. A cold sweep of every BPV=1 tile with all four (load, store) pairs found default
+loads and stores on (4,16,1) the best static choice. On the unfused tile (8,16,4), one row per lane,
+nontemporal accesses were fastest. A 2-byte state stores one 16 B vector per row and keeps streaming.
 
 Two consequences of the identity in §1.2 item 3: the output store and the state write in step 8 are
 **independent** — neither reads the other's result — and the output is broadcast across the k-lane
@@ -362,7 +393,7 @@ XOR is chosen over a shift-down tree deliberately: the pattern is symmetric, so 
 holding the full sum**. That is what each lane needs — it must scale its own channels — so no
 broadcast step is required afterwards. Offsets 1 and 2 lower to `quad_perm`, a lane-read modifier
 on the arithmetic instruction itself; wider offsets use `ds_swizzle`. Neither allocates shared
-memory, which is why the kernel has no LDS and no `lgkmcnt` barrier stalls on the narrow steps.
+memory, which is why the unfused kernel has no LDS and no `lgkmcnt` barrier stalls on the narrow steps.
 
 ### 4.5 State pool addressing
 
@@ -381,33 +412,44 @@ before launch.
 
 ### 4.6 Registry and tile selection
 
-GDN exposes the Cartesian product of:
+GDN and KDA each register the Cartesian product of:
 
 - `num_warps ∈ {1, 2, 4, 8, 16}`;
 - `warp_threads_k ∈ {1, 2, 4, 8, 16, 32}`;
 - `blocks_per_v_dim ∈ {1, 2, 4, 8, 16, 32}`.
 
-This produces 180 stable identities. `is_valid_spec()` is the only legality
-authority and admits 54 GDN candidates for the default D128 shape. Production
-`auto` deterministically prefers `(2, 16, 8)` whenever legal; batch changes
-grid size, not GDN tile selection. A caller may pin an exact candidate with
-`nw<num_warps>_wtk<warp_threads_k>_bpv<blocks_per_v_dim>`.
+This produces 180 stable identities per gate kind. `is_valid_spec()` is the
+only legality authority and admits 54 candidates of each gate kind for the
+default D128 shape (for KDA, with either state width). A caller may pin an
+exact candidate with `nw<num_warps>_wtk<warp_threads_k>_bpv<blocks_per_v_dim>`
+(GDN) or the same id prefixed with `kda_` (KDA); a candidate never serves the
+other gate kind.
 
+Production `auto` is one static tile, and batch and `num_v_heads` change grid
+size, not the tile:
 
-KDA remains keyed on `work = batch × num_v_heads`. Tensor-parallel sharding
-changes `num_v_heads` per rank, so two launches with the same batch can expose
-different amounts of GPU work:
+| Gate kind | State dtype | `auto` tile | Constant |
+| --- | --- | --- | --- |
+| GDN | any | `(2, 16, 8)` | `DEFAULT_TILE` |
+| KDA | `bf16`, `f16` | `(4, 16, 4)` | `KDA_DEFAULT_TILE` |
+| KDA | `f32` | `(8, 16, 4)` | `KDA_DEFAULT_TILE_F32` |
 
-| Band | Work | `(num_warps, warp_threads_k, blocks_per_v_dim)` |
-| --- | --- | --- |
-| `kda_w128` | `≤ 128` | `(4, 16, 4)` |
-| `kda_w512` | `≤ 512` | `(1, 16, 4)` |
-| `kda_w_large` | larger | `(2, 16, 1)` |
+If the default is illegal for a request, dispatch falls back to the first legal
+candidate of that gate kind in registration order (`DEFAULT_TILE`, then product
+order), for both gate kinds.
 
-`BPV` manufactures workgroups when the natural grid is too small. KDA's table
-comes from exhaustive legal-tile sweeps with every candidate correctness-gated
-before timing. Its band edges interpolate measured anchors; exact measurements
-live in the protected performance record.
+The KDA defaults replaced work-keyed tables (`work = batch × num_v_heads`). They were chosen on
+gfx950 with cold memory over `Hk = Hv ∈ {4, 8, 12, 16, 24, 32, 48, 96}` × batch
+`{1, 8, 16, 32, 64, 128, 256}`, every candidate correctness-gated before timing:
+
+- 2-byte state: `(4, 16, 4)` had the lowest geomean and worst-case slowdown against each shape's
+  fastest shortlisted single tile, at a small average cost against the bf16 work table.
+- f32 state: `(8, 16, 4)` had the lowest geomean slowdown against each shape's fastest tile, is
+  slightly slower than the f32 work table (most at batch 1), and spills nothing.
+
+`BPV` manufactures workgroups when the natural grid is too small. Re-measure
+either gate kind with `tune.py`; exact measurements live in the protected
+performance record.
 
 ### 4.7 The reference path
 
@@ -427,6 +469,45 @@ across the workgroup's value lanes.
 
 The dispatcher's support check ends by calling this same validator, so "the spec the kernel can
 emit" and "the spec dispatch may select" are one rule rather than two copies that can drift.
+
+### 4.9 Optional fusions: conv1d and gated RMSNorm
+
+A hybrid model runs two neighbours around this decode step: a width-4 causal conv1d + SiLU on the
+packed `[q | k | v]` row before it, and a sigmoid-gated RMSNorm on its output after it. Two spec
+flags fuse them into the kernel, independently:
+
+| Flag | Computes | Extra arguments |
+| --- | --- | --- |
+| `fuse_conv` | per channel `x' = silu(h0·w0 + h1·w1 + h2·w2 + x·w3)`; taps shift in place to `(h1, h2, x)` | `mixed_qkv [B, 2·Hk·K + Hv·V]` (replaces `query`/`key`/`value`) + `qkv_stride`; `conv_state [slot, C, 3]` (I/O dtype, same read/write slots as the recurrent state); `conv_weight [C, 4]` f32 |
+| `fuse_out_norm` | `o · rsqrt(mean(o²) + eps) · norm_weight · sigmoid(out_gate)` over the head's `DV` outputs | `out_gate [B, Hv·V]` + `og_stride`; `norm_weight [V]` f32; runtime `norm_eps` |
+
+Both flags off emit exactly the unfused kernel: the name gains `_cv` / `_rn` only when a flag is
+on, and every pre-existing golden IR hash is unchanged.
+
+**One workgroup per head.** Both flags require `blocks_per_v_dim == 1`. The norm needs all `DV`
+outputs of a head in one workgroup, and with `BPV > 1` several workgroups would read the q/k conv
+taps while one shifts them in place. `fuse_conv` also requires `Hk == Hv`: with `Hv > Hk` the
+`Hv/Hk` workgroups of one k-head share the q/k conv channels and the in-place shift would race
+across workgroups, which no barrier can order. GQA GDN models (e.g. Hk/Hv 16/32) therefore fuse
+the norm only and keep a separate conv kernel; KDA models (Hk == Hv) can fuse both.
+
+**Dataflow.** The conv taps and weights join the load-first batch; conv + SiLU run before the L2
+norms; the recurrence is unchanged. With the norm on, each wave reduces its `Σo²` (k-lane 0 only,
+since every k-lane holds the row's output), writes one float to LDS, and a workgroup barrier
+precedes the gated store. That barrier also guarantees every wave has read its taps before any
+tap is overwritten; with conv on and the norm off, a barrier is emitted for that alone when
+`num_warps > 1`. Each conv channel is written once: q/k channels by wave 0 v-lane 0, a V row's
+channel by its k-lane-0 owner. The norm runs on the fp32 output (a reference implementation that
+rounds `o` to bf16 first differs by up to one bf16 step).
+
+**Defaults and cost.** `FUSED_DEFAULT_TILES` holds one static BPV=1 tile per gate kind and state
+width; `(4, 16, 1)` had the lowest geomean slowdown against each shape's best in all four sweeps,
+with a clear margin over the runners-up, and the KDA f32 pick held under a cold re-time. `fuse_conv`
+with a single wave spills (that wave owns all `DV` rows plus their taps) and is exempt from the
+zero-scratch gate, like the unfused `(1,1,1)`. The fused mode is an enablement path, not yet a fast
+path: on gfx950 (cold) the fused KDA kernel is slower than the unfused kernel plus separate conv and
+norm kernels, because one workgroup per head with conv taps held in registers roughly halves
+occupancy. See §8.
 
 ---
 
@@ -634,10 +715,17 @@ Widening the range needs nested chunking or per-token rescaling.
 **Follow-ups.**
 
 1. A fused-path GDN prefill kernel (§5.4).
-2. gfx942 support; KDA work bands are arch-specific and need re-sweeping.
+2. gfx942 support; the static decode tile defaults are arch-specific and need re-sweeping.
 3. Extending the supported decay range.
 4. Scan-side parallelism beyond the current `value_splits` cap, or a shorter serial chain — the scan
    is the critical path at small `BH` (§5.4).
 5. Host-struct consolidation of the GDN and KDA request lineage.
 6. Machine-checked byte-identity for the cross-engine surfaces this family touches — currently
    reasoned and Python-verified.
+7. A fast fused decode path (§4.9). Streaming the state in row chunks is not the gap: the fused
+   kernel already keeps the whole f32 state slice in registers with every state load issued first.
+   The gap is the conv/gate prologue: every lane recomputes the conv and gate of its channels (q/k
+   conv ×16 row groups, v conv ×16 k-lanes) and holds the conv taps and weights, which raises VGPR
+   use and the load-instruction count. Computing each channel once and broadcasting it through LDS
+   is the next step; `BPV > 1` with an out-of-place conv state and a cross-workgroup norm would add
+   small-batch parallelism.

@@ -32,11 +32,11 @@ retune either decode mode or the GDN prefill path.
 | File | Purpose |
 |---|---|
 | [`gdn_decode.py`](gdn_decode.py) | Compile a spec, build inputs, launch the shared decode emitter, and compare with the independent fp32 reference |
-| [`tune.py`](tune.py) | Measure legal GDN registry candidates or KDA work-keyed candidates |
+| [`tune.py`](tune.py) | Measure every legal GDN or KDA registry candidate against that gate kind's static default |
 | [`ALGORITHM.md`](ALGORITHM.md) | Explain the gated delta rule, gate kinds, and GPU mapping |
 | [`library/benchmarks/gfx950/gdn/benchmark_gdn_decode.py`](../../../benchmarks/gfx950/gdn/benchmark_gdn_decode.py) | Benchmark every legal GDN registry candidate and the static dispatcher default |
-| [`library/benchmarks/gfx950/gdn/benchmark_kda_decode.py`](../../../benchmarks/gfx950/gdn/benchmark_kda_decode.py) | Benchmark KDA fused/precomputed/simple variants from the dispatcher; optionally sweep all legal tiles |
-| [`library/dispatch/gdn/gfx950.py`](../../../dispatch/gdn/gfx950.py) | Declare the GDN registry/static default and KDA work-keyed table |
+| [`library/benchmarks/gfx950/gdn/benchmark_kda_decode.py`](../../../benchmarks/gfx950/gdn/benchmark_kda_decode.py) | Benchmark KDA fused/precomputed/simple variants from the dispatcher; optionally sweep every legal KDA registry candidate |
+| [`library/dispatch/gdn/gfx950.py`](../../../dispatch/gdn/gfx950.py) | Declare the GDN and KDA registries (one shared tile space) and their static defaults |
 | [`library/tests/dispatch/gdn/test_gfx950_registry.py`](../../../tests/dispatch/gdn/test_gfx950_registry.py) | CPU GDN registry count, identity, legality, and selection coverage |
 | [`library/tests/test_gdn_decode_spec.py`](../../../tests/test_gdn_decode_spec.py) | CPU validator and IR-emission coverage |
 | [`library/tests/test_gdn_decode_prepare.py`](../../../tests/test_gdn_decode_prepare.py) | Host-side input validation: shapes, dtypes, contiguity, pool-index range |
@@ -125,7 +125,10 @@ Each row includes a stable `spec_id`
 `nw<num_warps>_wtk<warp_threads_k>_bpv<blocks_per_v_dim>`. Dispatcher `auto`
 prefers `(2, 16, 8)` whenever legal; measurements never change that choice.
 
-KDA remains a separate work-keyed benchmark:
+KDA has its own benchmark. KDA registers the same 180 triples under
+`kda_`-prefixed spec ids (`kda_nw4_wtk16_bpv4`, ...); every legal one is
+pinnable by `spec_id`. KDA `auto` prefers `(4, 16, 4)` for a bf16/f16 state and
+`(8, 16, 4)` for an f32 state whenever legal:
 
 ```bash
 python3 -m benchmarks.gfx950.gdn.benchmark_kda_decode \
@@ -148,20 +151,35 @@ python3 library/builders/gfx950/gdn/tune.py \
   --gate-kind gdn --batches 1,16,64,256 --top 5
 ```
 
-For every GDN cell, it also reports the static dispatcher default, the fastest
-legal candidate, the default's rank and time ratio, and a manual
-`DEFAULT_TILE` recommendation. Measurements never update the shipped default.
+For every cell, it also reports the static dispatcher default, the fastest
+legal candidate, the default's rank and time ratio, and a manual recommendation
+for the default constant (`DEFAULT_TILE`, `KDA_DEFAULT_TILE` or
+`KDA_DEFAULT_TILE_F32`). Measurements never update the shipped default.
 
-Use KDA's work-keyed study across head geometries when retuning KDA:
+Retune KDA across head geometries with `--gate-kind kda`; add
+`--state-dtype f32` to measure against the f32-state default:
 
 ```bash
 python3 library/builders/gfx950/gdn/tune.py \
   --gate-kind kda --geometries 16/32,8/16,4/8 \
-  --batches 1,2,4,8,16,32,64,128 --top 5
+  --batches 1,2,4,8,16,32,64,128 --top 5 [--state-dtype f32]
 ```
 
-GDN measurements are report-only. KDA's measured winners may justify updating
-its work-keyed bands; rerun dispatch wiring and numeric tests after doing so.
+The optional fused modes (`fuse_conv`: width-4 conv1d + SiLU on the packed
+q/k/v row; `fuse_out_norm`: sigmoid-gated RMSNorm on the output; see
+[`ALGORITHM.md` §4.9](ALGORITHM.md#49-optional-fusions-conv1d-and-gated-rmsnorm))
+have their own BPV=1 defaults, `FUSED_DEFAULT_TILES[(gate_kind, state_width)]`.
+Measure them with the same flags the request carries (`--fuse-conv` needs
+`Hk == Hv` geometries):
+
+```bash
+python3 library/builders/gfx950/gdn/tune.py \
+  --gate-kind kda --geometries 4/4,16/16,32/32 \
+  --batches 1,8,64,256 --top 5 --fuse-conv --fuse-out-norm [--state-dtype f32]
+```
+
+If the measurements justify a new default, edit the constant by hand and rerun
+dispatch wiring and numeric tests.
 
 ## Run tests
 
@@ -249,8 +267,8 @@ grid = batch * num_v_heads
 ```
 
 For GDN, `auto` always uses the static `(2, 16, 8)` registry priority when it
-is legal; batch changes the grid but not the tile. KDA alone changes its
-work-keyed table choice with `batch * num_v_heads`.
+is legal; batch changes the grid but not the tile. KDA `auto` likewise uses the
+static `(4, 16, 4)` when it is legal.
 
 `out_err` and `state_err` are maximum absolute errors against the fp32 reference.
 In the current coverage, state error is larger than output error. Both remain

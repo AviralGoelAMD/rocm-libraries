@@ -5,36 +5,9 @@
 
 from __future__ import annotations
 
-import dataclasses as dc
-from itertools import product
 from types import SimpleNamespace
 
 from builders.gfx950.gdn import tune
-from dispatch.gdn.gfx950 import BLOCKS_PER_V_DIM, NUM_WARPS, WARP_THREADS_K
-from kernels.gfx950.gdn_decode import GdnDecodeSpec, is_valid_spec
-
-
-def test_legal_configs_reuses_registry_tile_space():
-    assert tune.NUM_WARPS is NUM_WARPS
-    assert tune.WARP_THREADS_K is WARP_THREADS_K
-    assert tune.BLOCKS_PER_V_DIM is BLOCKS_PER_V_DIM
-
-    base = dc.replace(GdnDecodeSpec(), gate_kind="kda", num_k_heads=16, num_v_heads=32)
-    expected = [
-        tile
-        for tile in product(NUM_WARPS, WARP_THREADS_K, BLOCKS_PER_V_DIM)
-        if is_valid_spec(
-            dc.replace(
-                base,
-                num_warps=tile[0],
-                warp_threads_k=tile[1],
-                blocks_per_v_dim=tile[2],
-            ),
-            arch=tune.ARCH,
-        )[0]
-    ]
-
-    assert tune.legal_configs(base) == expected
 
 
 def test_sweep_registry_batch_returns_empty_without_registry_results():
@@ -142,8 +115,10 @@ def test_main_reports_missing_gdn_default_and_continues(monkeypatch, capsys):
     assert "manual review: retain DEFAULT_TILE" in output
 
 
-def test_report_gdn_dispatcher_default_keeps_fastest_default(capsys):
-    tune.report_gdn_dispatcher_default([(5.0, (2, 16, 8), "default", 0.0)], "default")
+def test_report_dispatcher_default_keeps_fastest_default(capsys):
+    tune.report_dispatcher_default(
+        [(5.0, (2, 16, 8), "default", 0.0)], "default", "DEFAULT_TILE"
+    )
 
     assert capsys.readouterr().out.splitlines() == [
         "  dispatcher default: 5.000us  default tile=(2, 16, 8) rank=1/1",
@@ -153,34 +128,77 @@ def test_report_gdn_dispatcher_default_keeps_fastest_default(capsys):
     ]
 
 
-def test_main_flags_kda_cells_with_equal_work_and_different_best_tiles(
-    monkeypatch, capsys
-):
-    """Equal batch * Hv must pick one tile, or the work-keyed table is invalid."""
-    shipped = (4, 16, 4)
+def test_main_sweeps_kda_registry_with_the_requested_state_dtype(monkeypatch, capsys):
+    """KDA cells sweep the registry for the requested gate kind and state width,
+    and name the default constant that state width ships."""
+    seen = []
     monkeypatch.setattr(tune, "device_is_visible", lambda: True)
+
+    def fake_results(request):
+        seen.append((request.gate_kind, request.state_dtype))
+        return (object(), object())
+
+    monkeypatch.setattr(tune, "dispatch_gdn_decode_all", fake_results)
+    monkeypatch.setattr(
+        tune,
+        "sweep_registry_batch",
+        lambda batch, results: [
+            (4.0, (4, 16, 8), "kda_nw4_wtk16_bpv8", 0.0),
+            (5.0, (8, 16, 4), "kda_nw8_wtk16_bpv4", 0.0),
+        ],
+    )
     monkeypatch.setattr(
         tune,
         "dispatch_gdn_decode",
         lambda request: SimpleNamespace(
-            spec=SimpleNamespace(
-                num_warps=shipped[0],
-                warp_threads_k=shipped[1],
-                blocks_per_v_dim=shipped[2],
-                num_v_heads=request.num_v_heads,
-            )
+            candidate=SimpleNamespace(spec_id="kda_nw8_wtk16_bpv4")
         ),
     )
-    monkeypatch.setattr(tune, "legal_configs", lambda base: [])
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "tune.py",
+            "--gate-kind",
+            "kda",
+            "--state-dtype",
+            "f32",
+            "--batches",
+            "1,8",
+        ],
+    )
 
-    # Hv=32 cells win with the shipped tile; Hv=16 cells win with another tile
-    # and never measure the shipped one.
-    def fake_sweep(base, batch, configs):
-        if base.num_v_heads == 32:
-            return [(1.0, shipped, 0.0)]
-        return [(1.0, (1, 16, 4), 0.0)]
+    assert tune.main() == 0
+    assert seen == [("kda", "f32"), ("kda", "f32")]
+    output = capsys.readouterr().out
+    assert output.count("consider KDA_DEFAULT_TILE_F32 = (4, 16, 8)") == 2
 
-    monkeypatch.setattr(tune, "sweep_batch", fake_sweep)
+
+def test_main_sweeps_fused_registry_and_names_the_fused_default(monkeypatch, capsys):
+    """--fuse-conv / --fuse-out-norm reach every swept request, and the report
+    names the fused default entry for that gate kind and state width."""
+    seen = []
+    monkeypatch.setattr(tune, "device_is_visible", lambda: True)
+
+    def fake_results(request):
+        seen.append((request.gate_kind, request.fuse_conv, request.fuse_out_norm))
+        return (object(),)
+
+    monkeypatch.setattr(tune, "dispatch_gdn_decode_all", fake_results)
+    monkeypatch.setattr(
+        tune,
+        "sweep_registry_batch",
+        lambda batch, results: [
+            (4.0, (2, 16, 1), "kda_nw2_wtk16_bpv1", 0.0),
+            (5.0, (4, 16, 1), "kda_nw4_wtk16_bpv1", 0.0),
+        ],
+    )
+    monkeypatch.setattr(
+        tune,
+        "dispatch_gdn_decode",
+        lambda request: SimpleNamespace(
+            candidate=SimpleNamespace(spec_id="kda_nw4_wtk16_bpv1")
+        ),
+    )
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -188,24 +206,15 @@ def test_main_flags_kda_cells_with_equal_work_and_different_best_tiles(
             "--gate-kind",
             "kda",
             "--geometries",
-            "16/32,8/16",
+            "16/16",
             "--batches",
-            "4,8",
+            "1",
+            "--fuse-conv",
+            "--fuse-out-norm",
         ],
     )
 
     assert tune.main() == 0
-    lines = capsys.readouterr().out.splitlines()
-    # work 128 = 4x32 (shipped wins) and 8x16 (other tile wins).
-    work_128 = next(line for line in lines if line.lstrip().startswith("128 "))
-    assert "4x32 8x16" in work_128
-    assert "TILES DISAGREE" in work_128
-    # work 64 (4x16) and 256 (8x32) each have a single cell, so no flag.
-    assert sum("TILES DISAGREE" in line for line in lines) == 1
-    assert "WARNING: work alone did not fix the best tile at 1 work value(s)." in (
-        "\n".join(lines)
-    )
-    assert (
-        sum("dispatcher default (4, 16, 4) is NOT in the" in line for line in lines)
-        == 2
-    )
+    assert seen == [("kda", True, True)]
+    output = capsys.readouterr().out
+    assert "consider FUSED_DEFAULT_TILES[('kda', 'bf16')] = (2, 16, 1)" in output

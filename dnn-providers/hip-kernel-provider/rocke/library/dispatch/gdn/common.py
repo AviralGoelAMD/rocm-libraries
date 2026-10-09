@@ -20,6 +20,8 @@ from kernels.gfx950.gdn_decode import (
     # direction that fails silently, rejecting a shape the kernel has since
     # learned to run.
     GDN_DTYPES,
+    STATE_DTYPES,
+    STATE_HINTS,
 )
 from rocke.dispatch.core import (
     OperatorRequest,
@@ -38,6 +40,9 @@ _DTYPE_ALIASES = {
     "f16": "f16",
     "fp16": "f16",
     "float16": "f16",
+    "f32": "f32",
+    "fp32": "f32",
+    "float32": "f32",
 }
 
 
@@ -57,8 +62,26 @@ class GdnDecodeRequest(OperatorRequest):
     it is legal; otherwise dispatch chooses a validator-admitted fallback.
     Neither ``batch`` nor ``num_v_heads`` chooses GDN's auto tile.
 
-    For ``gate_kind="kda"``, ``auto`` is keyed on ``batch * num_v_heads`` -- the
-    "work" -- so tensor parallelism selects the tile for heads local to a rank.
+    For ``gate_kind="kda"``, ``auto`` likewise uses one static tile per state
+    width -- ``KDA_DEFAULT_TILE`` for 2-byte states (bf16/f16) and
+    ``KDA_DEFAULT_TILE_F32`` for f32 -- whenever it is legal, with a
+    validator-admitted fallback otherwise; ``batch`` and ``num_v_heads`` only
+    change the grid. KDA registers the same configured tiles as GDN, each
+    pinnable by its ``kda_``-prefixed ``spec_id``.
+
+    ``fuse_conv`` / ``fuse_out_norm`` select the optional fused modes: a
+    width-4 conv1d + SiLU on the packed q/k/v row (in-place conv-state shift)
+    and a sigmoid-gated RMSNorm on the output. Fused requests run one
+    workgroup per head, so only ``blocks_per_v_dim == 1`` tiles are legal, and
+    ``auto`` uses the static ``FUSED_DEFAULT_TILES`` entry for the gate kind
+    and state width. ``fuse_conv`` also requires ``num_k_heads ==
+    num_v_heads``.
+
+    ``state_load_hint`` / ``state_store_hint`` set the cache policy of the
+    recurrent-state loads and stores: ``"streaming"`` (nontemporal),
+    ``"default"``, or ``"auto"`` (dispatch picks per mode; see
+    ``auto_state_hints`` in the per-arch module). They reach the spec and the
+    kernel name, so each policy is its own compile-cache entry.
 
     ``gate_kind`` selects the forget-gate granularity: ``"gdn"`` (one scalar
     decay per head) or ``"kda"`` (a per-channel decay). It reaches the spec and
@@ -82,6 +105,10 @@ class GdnDecodeRequest(OperatorRequest):
     algorithm: str = "auto"
     gate_kind: str = "gdn"
     spec_id: str = "auto"
+    fuse_conv: bool = False
+    fuse_out_norm: bool = False
+    state_load_hint: str = "auto"
+    state_store_hint: str = "auto"
 
     def normalized(self) -> dict:
         d = asdict(self)
@@ -126,7 +153,7 @@ def request_errors(req: OperatorRequest) -> list:
         errors.append("head dims must be positive")
     if normalize_dtype(req.dtype) not in GDN_DTYPES:
         errors.append(f"unsupported dtype {req.dtype!r}")
-    if normalize_dtype(req.state_dtype) not in GDN_DTYPES:
+    if normalize_dtype(req.state_dtype) not in STATE_DTYPES:
         errors.append(f"unsupported state_dtype {req.state_dtype!r}")
     if req.gate_kind not in ("gdn", "kda"):
         errors.append(
@@ -137,6 +164,17 @@ def request_errors(req: OperatorRequest) -> list:
             "NOT_YET_IMPLEMENTED: KDA decode currently requires "
             "head_k_dim == head_v_dim == 128"
         )
+    if req.fuse_conv and req.num_k_heads != req.num_v_heads:
+        errors.append(
+            "fuse_conv requires num_k_heads == num_v_heads (shared q/k conv "
+            f"channels would race), got {req.num_k_heads}/{req.num_v_heads}"
+        )
+    for field in ("state_load_hint", "state_store_hint"):
+        hint = getattr(req, field)
+        if hint != "auto" and hint not in STATE_HINTS:
+            errors.append(
+                f"unsupported {field} {hint!r} (expected 'auto' or one of {STATE_HINTS})"
+            )
     return errors
 
 
