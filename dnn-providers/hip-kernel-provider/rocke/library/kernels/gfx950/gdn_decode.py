@@ -231,6 +231,13 @@ class GdnDecodeSpec:
     # once per workgroup, one thread per channel, and hand the results to the
     # lanes through LDS. Off, every lane recomputes the channels it consumes.
     conv_once: bool = False
+    # conv_once + fuse_out_norm only: also compute sigmoid(out_gate) *
+    # norm_weight once per output row into LDS, instead of every lane loading
+    # its rows' gate and weight. Unread otherwise.
+    norm_gate_once: bool = True
+    # Minimum waves per SIMD the compiler must fit (amdgpu-waves-per-eu); it
+    # caps registers per lane accordingly. 0 leaves occupancy to the compiler.
+    waves_per_eu: int = 0
     # Cache policy of the state loads / stores ("streaming" = !nontemporal).
     state_load_hint: StateHint = "streaming"
     state_store_hint: StateHint = "streaming"
@@ -283,6 +290,12 @@ class GdnDecodeSpec:
             parts += (
                 f"sh{_HINT_TOKEN.get(self.state_store_hint, self.state_store_hint)}",
             )
+        if self.waves_per_eu:
+            parts += (f"wpe{self.waves_per_eu}",)
+        # Nested like lower_bound: the field only reaches the name where it
+        # changes emitted code, and only when it deviates from the default.
+        if self.conv_once and self.fuse_out_norm and not self.norm_gate_once:
+            parts += ("nglane",)
         return kernel_name_join(
             self.name,
             *parts,
@@ -348,6 +361,8 @@ def is_valid_spec(spec: GdnDecodeSpec, arch: str = "gfx950") -> Tuple[bool, str]
         )
     if spec.conv_once and not spec.fuse_conv:
         return False, "conv_once requires fuse_conv"
+    if not 0 <= spec.waves_per_eu <= 8:
+        return False, f"waves_per_eu must be in [0, 8], got {spec.waves_per_eu}"
     if (
         spec.gate_kind == "kda"
         and spec.fuse_gate
@@ -682,6 +697,8 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
     st_ty = _state_ir_type(spec.state_dtype)
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = BS
+    if spec.waves_per_eu:
+        b.kernel.attrs["waves_per_eu"] = (spec.waves_per_eu, 8)
 
     if CONV:
         QKV = b.param(
@@ -733,10 +750,14 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
         lds_rn = b.smem_alloc_f32([NW], name_hint="rn_partials") if NW > 1 else None
     if ONCE:
         # Post-SiLU f32 conv outputs [q DK | k DK | v DV], then (KDA) the DK
-        # per-channel decays; one slot per channel, written once, read by all.
+        # per-channel decays, then (fused norm) the DV per-row products
+        # sigmoid(out_gate) * norm_weight; one slot per channel, written once,
+        # read by all.
         N_CONV = 2 * DK + DV
         N_DEC = DK if spec.gate_kind == "kda" else 0
-        N_ONCE = N_CONV + N_DEC
+        N_GW = DV if RN and spec.norm_gate_once else 0
+        GW0 = N_CONV + N_DEC
+        N_ONCE = GW0 + N_GW
         lds_once = b.smem_alloc_f32([N_ONCE], name_hint="conv_once")
 
     tid = b.thread_id_x()
@@ -854,9 +875,7 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
                             b, Ag, b.add(g_row, koff), dtype=spec.dtype, n=VPT
                         )
                     )
-                    dtvecs.append(
-                        b.global_load_vN(DTB, b.add(dtb_row, koff), F32, VPT)
-                    )
+                    dtvecs.append(b.global_load_vN(DTB, b.add(dtb_row, koff), F32, VPT))
 
         # this lane's q,k K-chunks -> f32
         if CONV:
@@ -924,24 +943,33 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
                     ]
                     wv = b.global_load_vN(CW, b.mul(ch, b.const_i32(4)), F32, 4)
                     item["w"] = [b.vec_extract(wv, i) for i in range(4)]
-                if N_DEC and hi > N_CONV:
+                if N_DEC and hi > N_CONV and lo < GW0:
                     d = b.sub(f, b.const_i32(N_CONV))
                     if lo < N_CONV:
                         d = b.smax(d, b.const_i32(0))
-                    if hi > N_ONCE:
+                    if hi > GW0:
                         d = b.smin(d, b.const_i32(N_DEC - 1))
                     item["a"] = load_scalar_as_f32(
                         b, Ag, b.add(g_row, d), dtype=spec.dtype
                     )
                     item["dt"] = b.global_load_f32(DTB, b.add(dtb_row, d))
+                if N_GW and hi > GW0:
+                    g = b.sub(f, b.const_i32(GW0))
+                    if lo < GW0:
+                        g = b.smax(g, b.const_i32(0))
+                    if hi > N_ONCE:
+                        g = b.smin(g, b.const_i32(N_GW - 1))
+                    og_row0 = b.add(b.mul(b_i, og_stride), b.mul(hv_i, b.const_i32(DV)))
+                    item["og"] = load_scalar_as_f32(
+                        b, OG, b.add(og_row0, g), dtype=spec.dtype
+                    )
+                    item["nw"] = b.global_load_f32(NWT, g)
                 once_items.append(item)
         else:
             qn = [None] * WTK_ITERS
             kn = [None] * WTK_ITERS
             for ki in range(WTK_ITERS):
-                off = b.add(
-                    qk_base, b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K))
-                )
+                off = b.add(qk_base, b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K)))
                 qn[ki] = load_vec_as_f32(b, Q, off, dtype=spec.dtype, n=VPT)
                 if CONV:
                     kn[ki] = load_vec_as_f32(
@@ -1028,7 +1056,7 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
                 v_w.append([b.vec_extract(wv, i) for i in range(4)])
         else:
             rv = [load_scalar_as_f32(b, Vv, i, dtype=spec.dtype) for i in v_idx]
-        if RN:
+        if RN and not (ONCE and N_GW):
             og_row = b.add(b.mul(b_i, og_stride), b.mul(hv_i, b.const_i32(DV)))
             r_og = [
                 load_scalar_as_f32(b, OG, b.add(og_row, v_row), dtype=spec.dtype)
@@ -1096,6 +1124,16 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
                         dec
                         if val is None
                         else b.select(b.cmp_lt(f, b.const_i32(N_CONV)), val, dec)
+                    )
+                if "og" in item:
+                    gate = b.rcp_fast(
+                        b.fadd(b.const_f32(1.0), exp_f32(b.fneg(item["og"])))
+                    )
+                    gw = b.fmul(gate, item["nw"])
+                    val = (
+                        gw
+                        if val is None
+                        else b.select(b.cmp_lt(f, b.const_i32(GW0)), val, gw)
                     )
                 if hi > N_ONCE:
                     with b.scf_if(b.cmp_lt(f, b.const_i32(N_ONCE))):
@@ -1298,8 +1336,19 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             )
             rstd = b.rsqrt(b.fadd(b.fmul(total, b.const_f32(1.0 / DV)), norm_eps))
             for vi in range(WTV_ITERS):
-                gate = b.rcp_fast(b.fadd(b.const_f32(1.0), exp_f32(b.fneg(r_og[vi]))))
-                y = b.fmul(b.fmul(b.fmul(outs[vi], rstd), r_nw[vi]), gate)
+                if ONCE and N_GW:
+                    gw = b.vec_extract(
+                        b.smem_load_vN_f32(
+                            lds_once, b.add(v_rows[vi], b.const_i32(GW0)), n=1
+                        ),
+                        0,
+                    )
+                    y = b.fmul(b.fmul(outs[vi], rstd), gw)
+                else:
+                    gate = b.rcp_fast(
+                        b.fadd(b.const_f32(1.0), exp_f32(b.fneg(r_og[vi])))
+                    )
+                    y = b.fmul(b.fmul(b.fmul(outs[vi], rstd), r_nw[vi]), gate)
                 with b.scf_if(b.cmp_eq(k_lane, b.const_i32(0))):
                     store_scalar_from_f32(b, OUT, v_idx[vi], y, dtype=spec.dtype)
 

@@ -101,9 +101,13 @@ def test_every_legal_fused_tile(gate, state_dtype):
 @requires_gfx950
 @pytest.mark.parametrize("gate", ["gdn", "kda"])
 @pytest.mark.parametrize("state_dtype", ["bf16", "f32"])
-@pytest.mark.parametrize("norm", [False, True], ids=["cv", "cv_rn"])
+@pytest.mark.parametrize(
+    "norm, gate_once",
+    [(False, True), (True, True), (True, False)],
+    ids=["cv", "cv_rn", "cv_rn_nglane"],
+)
 @pytest.mark.parametrize("batch", [1, 3, 16])
-def test_conv_once_every_legal_fused_tile(gate, state_dtype, norm, batch):
+def test_conv_once_every_legal_fused_tile(gate, state_dtype, norm, gate_once, batch):
     """conv_once on every BPV=1 registry tile the validator admits: output,
     written state and conv taps, and untouched pages, against the oracle."""
     from builders.gfx950.gdn.gdn_decode import TOL, check
@@ -117,6 +121,7 @@ def test_conv_once_every_legal_fused_tile(gate, state_dtype, norm, batch):
             fuse_conv=True,
             fuse_out_norm=norm,
             conv_once=True,
+            norm_gate_once=gate_once,
         )
     )
     assert results, "no legal conv_once candidate"
@@ -129,6 +134,31 @@ def test_conv_once_every_legal_fused_tile(gate, state_dtype, norm, batch):
             out_err,
             state_err,
         )
+
+
+@requires_gfx950
+@pytest.mark.parametrize("gate", ["gdn", "kda"])
+@pytest.mark.parametrize("state_dtype", ["bf16", "f32"])
+def test_conv_once_with_waves_per_eu(gate, state_dtype):
+    """waves_per_eu=4 changes register allocation only, never the result."""
+    from builders.gfx950.gdn.gdn_decode import TOL, check
+    from dispatch.gdn import dispatch_gdn_decode
+
+    spec = dispatch_gdn_decode(
+        _request(
+            batch=16,
+            gate_kind=gate,
+            state_dtype=state_dtype,
+            fuse_conv=True,
+            fuse_out_norm=True,
+            conv_once=True,
+            waves_per_eu=4,
+        )
+    ).spec
+    assert spec.waves_per_eu == 4, spec.kernel_name()
+    out_err, state_err = check(spec, 16)
+    assert out_err < TOL and state_err < TOL, (spec.kernel_name(), out_err, state_err)
+
 
 @requires_gfx950
 @pytest.mark.parametrize("state_dtype", ["bf16", "f32"])

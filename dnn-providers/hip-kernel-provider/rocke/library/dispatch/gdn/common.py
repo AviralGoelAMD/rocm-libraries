@@ -76,7 +76,10 @@ class GdnDecodeRequest(OperatorRequest):
     ``auto`` uses the static ``FUSED_DEFAULT_TILES`` entry for the gate kind
     and state width. ``fuse_conv`` also requires ``num_k_heads ==
     num_v_heads``. ``conv_once`` (needs ``fuse_conv``) computes each conv and
-    KDA decay channel once per workgroup and shares it through LDS.
+    KDA decay channel once per workgroup and shares it through LDS; with
+    ``fuse_out_norm`` it also shares the per-row norm gate x weight unless
+    ``norm_gate_once`` is False. ``waves_per_eu`` (0 = off) asks the compiler
+    for at least that many waves per SIMD.
 
     ``state_load_hint`` / ``state_store_hint`` set the cache policy of the
     recurrent-state loads and stores: ``"streaming"`` (nontemporal),
@@ -109,6 +112,8 @@ class GdnDecodeRequest(OperatorRequest):
     fuse_conv: bool = False
     fuse_out_norm: bool = False
     conv_once: bool = False
+    norm_gate_once: bool = True
+    waves_per_eu: int = 0
     state_load_hint: str = "auto"
     state_store_hint: str = "auto"
 
@@ -173,6 +178,8 @@ def request_errors(req: OperatorRequest) -> list:
         )
     if req.conv_once and not req.fuse_conv:
         errors.append("conv_once requires fuse_conv")
+    if not 0 <= int(req.waves_per_eu) <= 8:
+        errors.append(f"waves_per_eu must be in [0, 8], got {req.waves_per_eu}")
     for field in ("state_load_hint", "state_store_hint"):
         hint = getattr(req, field)
         if hint != "auto" and hint not in STATE_HINTS:

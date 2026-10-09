@@ -10,6 +10,7 @@ conditional kernel ABI. On-device numerics live in
 from __future__ import annotations
 
 import dataclasses as dc
+import re
 import unittest
 
 from kernels.gfx950.gdn_decode import (
@@ -271,6 +272,67 @@ class TestConvOnce(unittest.TestCase):
                         with self.subTest(name=s.kernel_name()):
                             self.assertEqual(_scratch_bytes(self, s), 0)
 
+    def test_norm_gate_once_is_default_and_named_only_when_off(self):
+        on = _fused(fuse_conv=True, fuse_out_norm=True, conv_once=True)
+        self.assertTrue(on.norm_gate_once)
+        off = dc.replace(on, norm_gate_once=False)
+        self.assertIn("_nglane", off.kernel_name())
+        self.assertNotEqual(on.kernel_name(), off.kernel_name())
+        # Where the field changes no emitted code it never reaches the name.
+        for s in (
+            _fused(fuse_conv=True, conv_once=True),
+            _fused(fuse_conv=True, fuse_out_norm=True),
+        ):
+            with self.subTest(name=s.kernel_name()):
+                self.assertEqual(
+                    s.kernel_name(), dc.replace(s, norm_gate_once=False).kernel_name()
+                )
+
+    def test_norm_gate_once_moves_gate_and_weight_into_lds(self):
+        from kernels.gfx950.gdn_decode import build_gdn_decode
+        from rocke.core.lower_llvm import _lower_kernel_to_llvm_python
+
+        base = _fused(
+            gate_kind="kda", fuse_conv=True, fuse_out_norm=True, conv_once=True
+        )
+
+        def lowered(spec):
+            return _lower_kernel_to_llvm_python(
+                build_gdn_decode(spec, arch=ARCH), arch=ARCH
+            )
+
+        on, off = lowered(base), lowered(dc.replace(base, norm_gate_once=False))
+        # q, k, v, decay: 4 x 128 slots; the gate x weight rows add 128.
+        self.assertIn("[640 x float]", on)
+        self.assertIn("[512 x float]", off)
+
+        # Each lane's per-row gate and weight global loads disappear; the rows
+        # are read back from LDS instead.
+        def count(ir, space):
+            return len(re.findall(rf"= load [^,]+, ptr addrspace\({space}\)", ir))
+
+        self.assertLess(count(on, 1), count(off, 1))
+        self.assertGreater(count(on, 3), count(off, 3))
+
+    def test_waves_per_eu_reaches_name_and_compiler(self):
+        from kernels.gfx950.gdn_decode import build_gdn_decode
+        from rocke.core.lower_llvm import _lower_kernel_to_llvm_python
+
+        def lowered(spec):
+            return _lower_kernel_to_llvm_python(
+                build_gdn_decode(spec, arch=ARCH), arch=ARCH
+            )
+
+        s = _fused(fuse_conv=True, fuse_out_norm=True, conv_once=True)
+        self.assertNotIn("wpe", s.kernel_name())
+        self.assertNotIn("amdgpu-waves-per-eu", lowered(s))
+        w = dc.replace(s, waves_per_eu=4)
+        self.assertIn("_wpe4", w.kernel_name())
+        self.assertIn('"amdgpu-waves-per-eu"="4,8"', lowered(w))
+        for bad in (-1, 9):
+            with self.subTest(waves_per_eu=bad):
+                ok, _ = is_valid_spec(dc.replace(s, waves_per_eu=bad), arch=ARCH)
+                self.assertFalse(ok)
 
 
 class TestFusedReference(unittest.TestCase):

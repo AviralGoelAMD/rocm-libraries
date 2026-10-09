@@ -162,6 +162,22 @@ def _cases():
             state_load_hint=load,
             state_store_hint=store,
         )
+    # conv_once knobs on the fused KDA f32 tile: per-lane norm gate/weight
+    # loads (norm_gate_once off) and a waves-per-EU occupancy floor.
+    fused_co = dict(
+        num_k_heads=16,
+        num_v_heads=16,
+        gate_kind="kda",
+        state_dtype="f32",
+        num_warps=4,
+        warp_threads_k=16,
+        blocks_per_v_dim=1,
+        fuse_conv=True,
+        fuse_out_norm=True,
+        conv_once=True,
+    )
+    cases["fused_kda_stf32_cv_rn_co_nglane"] = build(**fused_co, norm_gate_once=False)
+    cases["fused_kda_stf32_cv_rn_co_wpe4"] = build(**fused_co, waves_per_eu=4)
     return cases
 
 
