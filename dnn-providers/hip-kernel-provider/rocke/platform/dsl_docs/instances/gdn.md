@@ -122,11 +122,21 @@ blocks_per_v_dim=8)` whenever it is legal. It never measures at runtime and
 does not select by batch. An explicit `spec_id`, such as `nw4_wtk16_bpv8`,
 selects an exact legal GDN candidate for benchmarking or replay.
 
-KDA keeps its separately measured table keyed by
-`work = batch * num_v_heads`, so tensor-parallel head sharding maps to the same
-key as an equivalent amount of batch work. Re-measure KDA with
-`library/builders/gfx950/gdn/tune.py`; exact measurements live outside the
-public source tree.
+KDA registers the same 180 tile identities under `kda_`-prefixed spec ids
+(such as `kda_nw4_wtk16_bpv4`), filtered by `is_valid_spec()` the same way; a
+candidate never serves the other gate kind. KDA `auto` is one static tile per
+state width whenever it is legal -- `(4, 16, 4)` for a bf16/f16 state and
+`(8, 16, 4)` for an f32 state -- and batch and head count change only the
+grid. An illegal default falls back the same way GDN's does. Re-measure either
+gate kind with `library/builders/gfx950/gdn/tune.py`; exact measurements live
+outside the public source tree.
+
+Requests with `fuse_conv` (width-4 conv1d + SiLU on the packed q/k/v row) or
+`fuse_out_norm` (sigmoid-gated RMSNorm on the output) admit only
+`blocks_per_v_dim == 1` tiles, and `fuse_conv` also needs `num_k_heads ==
+num_v_heads`. Their `auto` is `FUSED_DEFAULT_TILES[(gate_kind, state_width)]`,
+currently `(4, 16, 1)` for both gate kinds and state widths. Both flags off
+select and emit exactly the unfused kernel.
 
 ## Dispatch
 

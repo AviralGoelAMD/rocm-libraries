@@ -373,11 +373,14 @@ def test_results_are_deterministic(harness):
 
 
 @requires_gfx950
-def test_state_dtype_variant_is_correct(harness):
-    """An f16 recurrent state is a distinct kernel; it must be checked too."""
+@pytest.mark.parametrize("state_dtype", ["f16", "f32"])
+@pytest.mark.parametrize("simple", [False, True])
+def test_state_dtype_variant_is_correct(harness, state_dtype, simple):
+    """Each non-default recurrent-state dtype is a distinct kernel on both
+    emitters; it must be checked too."""
     from kernels.gfx950.gdn_decode import GdnDecodeSpec, is_valid_spec
 
-    spec = dc.replace(GdnDecodeSpec(), state_dtype="f16")
+    spec = dc.replace(GdnDecodeSpec(), state_dtype=state_dtype, simple=simple)
     ok, why = is_valid_spec(spec, arch=ARCH)
     assert ok, why
     out_err, state_err = harness["check"](spec, 8)

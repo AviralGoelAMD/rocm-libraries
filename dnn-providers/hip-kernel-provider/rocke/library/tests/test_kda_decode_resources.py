@@ -13,10 +13,13 @@ import pytest
 from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode
 
 ARCH = "gfx950"
+# (state dtype, expected candidate, expected tile): the static KDA ``auto``
+# default for each state width. Every other registered KDA tile is compiled for
+# scratch by test_gdn_decode_spec.py.
 CASES = (
-    (1, "kda_w128", (4, 16, 4)),
-    (8, "kda_w512", (1, 16, 4)),
-    (32, "kda_w_large", (2, 16, 1)),
+    ("bf16", "kda_nw4_wtk16_bpv4", (4, 16, 4)),
+    ("f16", "kda_nw4_wtk16_bpv4", (4, 16, 4)),
+    ("f32", "kda_nw8_wtk16_bpv4", (8, 16, 4)),
 )
 
 
@@ -60,18 +63,21 @@ def test_scratch_gate_rejects_nonzero_metadata():
         )
 
 
-@pytest.mark.parametrize("batch,expected_spec_id,expected_tile", CASES)
-def test_dispatched_kda_tile_is_scratch_free(batch, expected_spec_id, expected_tile):
-    """Compile each production candidate and reject register spills."""
+@pytest.mark.parametrize("state_dtype,expected_spec_id,expected_tile", CASES)
+def test_dispatched_kda_tile_is_scratch_free(
+    state_dtype, expected_spec_id, expected_tile
+):
+    """Compile each auto default and reject register spills."""
     result = dispatch_gdn_decode(
         GdnDecodeRequest(
-            batch=batch,
+            batch=8,
             arch=ARCH,
             gate_kind="kda",
             num_k_heads=32,
             num_v_heads=32,
             head_k_dim=128,
             head_v_dim=128,
+            state_dtype=state_dtype,
         )
     )
     tile = (
@@ -84,3 +90,31 @@ def test_dispatched_kda_tile_is_scratch_free(batch, expected_spec_id, expected_t
 
     resources = _resources_for(result.build())
     _assert_scratch_free(resources, spec_id=expected_spec_id, tile=tile)
+
+
+@pytest.mark.parametrize("gate_kind", ["gdn", "kda"])
+@pytest.mark.parametrize("state_dtype", ["bf16", "f32"])
+def test_dispatched_fused_default_is_scratch_free(gate_kind, state_dtype):
+    """The static fused (conv + out-norm) ``auto`` tile compiles without spills."""
+    from dispatch.gdn.gfx950 import FUSED_DEFAULT_TILES
+
+    result = dispatch_gdn_decode(
+        GdnDecodeRequest(
+            batch=8,
+            arch=ARCH,
+            gate_kind=gate_kind,
+            num_k_heads=32,
+            num_v_heads=32,
+            state_dtype=state_dtype,
+            fuse_conv=True,
+            fuse_out_norm=True,
+        )
+    )
+    tile = (
+        result.spec.num_warps,
+        result.spec.warp_threads_k,
+        result.spec.blocks_per_v_dim,
+    )
+    assert tile == FUSED_DEFAULT_TILES[(gate_kind, state_dtype)]
+    resources = _resources_for(result.build())
+    _assert_scratch_free(resources, spec_id=result.candidate.spec_id, tile=tile)

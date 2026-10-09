@@ -15,8 +15,8 @@ then times that spec and selected variants derived from it:
 Every variant is checked against the independent fp32 oracle before timing.
 The default run reports both eager host-observed latency and HIP-graph device
 time. ``--sweep-tiles`` additionally reuses the tuner to measure every legal
-KDA tile and reports the dispatcher-selected tile against the fastest correct
-one for that exact shape.
+registered KDA candidate (from the dispatcher registry) and reports the
+dispatcher-selected tile against the fastest correct one for that exact shape.
 
 Run::
 
@@ -50,8 +50,8 @@ from builders.gfx950.gdn.gdn_decode import (
     prepare,
     ref_fp32,
 )
-from builders.gfx950.gdn.tune import legal_configs, sweep_batch
-from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode
+from builders.gfx950.gdn import tune
+from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode, dispatch_gdn_decode_all
 from kernels.gfx950.gdn_decode import GdnDecodeSpec, gdn_decode_grid
 from rocke.runtime.hip_module import get_device_arch
 
@@ -103,6 +103,21 @@ def tile_of(spec: GdnDecodeSpec) -> tuple[int, int, int]:
     return (spec.num_warps, spec.warp_threads_k, spec.blocks_per_v_dim)
 
 
+def kda_request(
+    *, batch: int, num_k_heads: int, num_v_heads: int, head_dim: int
+) -> GdnDecodeRequest:
+    """The ``auto`` KDA decode request this benchmark measures."""
+    return GdnDecodeRequest(
+        batch=batch,
+        arch=ARCH,
+        gate_kind="kda",
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        head_k_dim=head_dim,
+        head_v_dim=head_dim,
+    )
+
+
 def production_variants(
     *,
     batch: int,
@@ -113,14 +128,11 @@ def production_variants(
 ):
     """Build every requested variant from the dispatcher-selected KDA spec."""
     result = dispatch_gdn_decode(
-        GdnDecodeRequest(
+        kda_request(
             batch=batch,
-            arch=ARCH,
-            gate_kind="kda",
             num_k_heads=num_k_heads,
             num_v_heads=num_v_heads,
-            head_k_dim=head_dim,
-            head_v_dim=head_dim,
+            head_dim=head_dim,
         )
     )
     fused = result.spec
@@ -140,13 +152,17 @@ def production_variants(
 def compare_selected_to_sweep(
     selected_tile: tuple[int, int, int], rows
 ) -> SweepComparison:
-    """Compare one dispatched tile with a correctness-gated sweep result."""
+    """Compare one dispatched tile with a correctness-gated registry sweep.
+
+    ``rows`` are ``tune.sweep_registry_batch`` rows, fastest first:
+    ``(us, tile, spec_id, max_err)``.
+    """
     if not rows:
-        raise ValueError("no correct, timeable tile in exhaustive sweep")
+        raise ValueError("no correct, timeable tile in registry sweep")
     selected = next((row for row in rows if row[1] == selected_tile), None)
     if selected is None:
         raise ValueError(f"selected tile {selected_tile} is absent from sweep results")
-    best_us, best_tile, _ = rows[0]
+    best_us, best_tile = rows[0][0], rows[0][1]
     selected_us = selected[0]
     return SweepComparison(
         selected_tile=selected_tile,
@@ -320,7 +336,12 @@ def run_default(
 
 def run_sweep(*, batches, num_k_heads, num_v_heads, head_dim, top) -> Failures:
     failures = Failures()
-    print("\n=== exhaustive legal-tile proof ===")
+    print("\n=== registry candidate sweep ===")
+    # The tuner binds its measurement backend (inputs, reference, launcher)
+    # lazily; its sweep cannot run until this has been called.
+    if not tune.device_is_visible():
+        failures.add("registry sweep: no HIP device visible to the tuner")
+        return failures
     for batch in batches:
         try:
             variants, result = production_variants(
@@ -331,7 +352,13 @@ def run_sweep(*, batches, num_k_heads, num_v_heads, head_dim, top) -> Failures:
                 names=("fused",),
             )
             selected = variants["fused"]
-            rows = sweep_batch(selected, batch, legal_configs(selected))
+            request = kda_request(
+                batch=batch,
+                num_k_heads=num_k_heads,
+                num_v_heads=num_v_heads,
+                head_dim=head_dim,
+            )
+            rows = tune.sweep_registry_batch(batch, dispatch_gdn_decode_all(request))
             comparison = compare_selected_to_sweep(tile_of(selected), rows)
             print(
                 f"batch {batch} work {batch*num_v_heads} spec_id={result.candidate.spec_id} "
@@ -339,8 +366,8 @@ def run_sweep(*, batches, num_k_heads, num_v_heads, head_dim, top) -> Failures:
                 f"fastest={comparison.best_tile} {comparison.best_us:.3f}us "
                 f"selected/fastest={comparison.selected_over_best:.3f}"
             )
-            for micros, tile, error in rows[:top]:
-                print(f"  {micros:9.3f}us tile={tile} max_err={error:.3e}")
+            for micros, tile, spec_id, error in rows[:top]:
+                print(f"  {micros:9.3f}us {spec_id} tile={tile} max_err={error:.3e}")
         except Exception as exc:
             failures.add(f"batch {batch} sweep: {type(exc).__name__}: {exc}")
             print(f"batch {batch} sweep FAILED: {type(exc).__name__}: {exc}")
