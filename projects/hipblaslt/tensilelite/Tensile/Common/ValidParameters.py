@@ -1221,6 +1221,10 @@ validParameters = { # we need to make sure this matches develop
     # wave issues the deferrable one. Handled by the StinkyTofu TDMLoadWaveSyncPass;
     # gfx1250 / ScheduleIterAlg=4 path only, off by default.
     "TDMLoadWaveSync": [False, True],
+    # StinkyTofu module-option overrides, e.g. {DsReadPerCap: 4, WmmaBatchSize: 2}. Tuning-only:
+    # Solution moves it to the internal _StinkyTofuParameters, which tags the kernel name
+    # (only when set) and is dropped from the solution before the logic yaml is written.
+    "StinkyTofuParameters": -1,
     # TDMFuse -- which tensors share one TDM descriptor set per tensor_load_to_lds.
     # Fused means one rocisa::TensorLoadToLds descriptor programmed per wave,
     # not two heterogeneous regions in one instruction.
