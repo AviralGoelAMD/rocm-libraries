@@ -602,8 +602,8 @@ class TestStateHintKnobs(unittest.TestCase):
         fused = dict(fuse_conv=True, fuse_out_norm=True)
         cases = (
             # (request extras, expected (load, store))
-            (dict(state_dtype="f32", **fused), ("streaming", "default")),
-            (dict(state_dtype="f32", fuse_out_norm=True), ("streaming", "default")),
+            (dict(state_dtype="f32", **fused), ("default", "default")),
+            (dict(state_dtype="f32", fuse_out_norm=True), ("default", "default")),
             (dict(state_dtype="bf16", **fused), ("streaming", "streaming")),
             (dict(state_dtype="f32"), ("streaming", "streaming")),
             (dict(state_dtype="bf16"), ("streaming", "streaming")),

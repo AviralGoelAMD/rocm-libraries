@@ -365,12 +365,13 @@ the state loads (step 3) and stores (step 8), in both paths and for every state 
 `shdef` to the kernel name; streaming adds nothing, so pre-knob names and golden hashes are
 unchanged. `q`, `k`, `v`, the gates and `out` always keep the default cache policy.
 
-Dispatch `auto` (`auto_state_hints`) streams both, except the fused f32 path, whose stores use the
-default policy. The f32 state row of one lane is stored as two 16 B halves of a 32 B vector. On the
-BPV=1 fused tile (4,16,1), where each lane owns 8 rows, write counters on gfx950 showed nontemporal
-stores sending each 64 B line to HBM more than once; default stores wrote only the state's own bytes
-and ran faster. On the unfused tile (8,16,4), one row per lane, nontemporal stores were faster. A
-2-byte state stores one 16 B vector per row and keeps streaming.
+Dispatch `auto` (`auto_state_hints`) streams both, except the fused f32 path, which uses the default
+policy for loads and stores. The f32 state row of one lane is stored as two 16 B halves of a 32 B
+vector. On the BPV=1 fused tile (4,16,1), where each lane owns 8 rows, write counters on gfx950
+showed nontemporal stores sending each 64 B line to HBM more than once; default stores wrote only the
+state's own bytes. A cold sweep of every BPV=1 tile with all four (load, store) pairs found default
+loads and stores on (4,16,1) the best static choice. On the unfused tile (8,16,4), one row per lane,
+nontemporal accesses were fastest. A 2-byte state stores one 16 B vector per row and keeps streaming.
 
 Two consequences of the identity in §1.2 item 3: the output store and the state write in step 8 are
 **independent** — neither reads the other's result — and the output is broadcast across the k-lane

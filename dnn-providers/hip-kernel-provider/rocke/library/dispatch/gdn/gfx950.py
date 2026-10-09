@@ -126,18 +126,22 @@ def auto_tile(
 
 # ``auto`` cache policy of the state (load, store). Streaming (nontemporal) is
 # the default: the state is read and written once per call, and on the unfused
-# tiles nontemporal stores were faster on gfx950. The fused f32 path is the
-# exception. Its BPV=1 tiles give each lane several state rows, each stored as
-# two 16 B halves of a 32 B f32 vector; with nontemporal stores, write
-# counters showed each 64 B line reaching HBM more than once, and default
-# stores wrote only the state's own bytes and ran faster. A 2-byte state
-# stores one 16 B vector per row, so it keeps streaming. GDN shares the store
+# tiles nontemporal accesses were fastest on gfx950. The fused f32 path is the
+# exception and uses the default policy for both. Its BPV=1 tiles give each
+# lane several state rows, each stored as two 16 B halves of a 32 B f32 vector;
+# with nontemporal stores, write counters showed each 64 B line reaching HBM
+# more than once, and default stores wrote only the state's own bytes. A cold
+# sweep of every BPV=1 tile with all four (load, store) pairs over
+# Hk=Hv in {4,8,12,16,24,32,48,96} x batch {1,8,16,32,64,128,256} found default
+# loads and stores on (4,16,1) the best static choice. A 2-byte state stores
+# one 16 B vector per row, so it keeps streaming. GDN shares the state access
 # code; its fused f32 default follows by construction, not by a separate
-# measurement. To revisit, sweep both hints per tile (tune.py --state-store-hint).
+# measurement. To revisit, sweep the hints per tile (tune.py --state-load-hint /
+# --state-store-hint).
 def auto_state_hints(state_dtype: str = "bf16", fused: bool = False) -> Tuple[str, str]:
     """The ``auto`` (state_load_hint, state_store_hint) for a state width and mode."""
     if fused and normalize_dtype(state_dtype) == "f32":
-        return "streaming", "default"
+        return "default", "default"
     return "streaming", "streaming"
 
 
