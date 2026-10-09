@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "fast_check.hpp"
+#include "d_vector.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -9,11 +10,19 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <sstream>
 #include <type_traits>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace
 {
@@ -1985,4 +1994,60 @@ FastCheckResult fast_check_bias_gradient(const FastCheckProblem& p,
                          + std::string(1, source) + ") are wrong:" + msg.str() + "\n";
     }
     return result;
+}
+
+namespace
+{
+    // Host memory the operating system reports as available, or 0 when it cannot tell.
+    size_t available_host_bytes()
+    {
+#ifdef _WIN32
+        MEMORYSTATUSEX status = {};
+        status.dwLength       = sizeof(status);
+        return GlobalMemoryStatusEx(&status) ? size_t(status.ullAvailPhys) : 0;
+#else
+        std::ifstream meminfo("/proc/meminfo");
+        std::string   key;
+        size_t        kib = 0;
+        while(meminfo >> key >> kib)
+        {
+            if(key == "MemAvailable:")
+                return kib * 1024;
+            meminfo.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+        }
+        return 0;
+#endif
+    }
+}
+
+std::string fast_check_memory_shortfall(size_t device_bytes, size_t host_bytes)
+{
+    auto gib = [](size_t bytes) {
+        std::ostringstream s;
+        s.precision(3);
+        s << double(bytes) / double(size_t(1) << 30) << " GiB";
+        return s.str();
+    };
+    auto shortfall = [&]() -> std::string {
+        size_t free_bytes = 0, total_bytes = 0;
+        if(hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess && device_bytes > free_bytes)
+            return "this case needs " + gib(device_bytes) + " of device memory and "
+                   + gib(free_bytes) + " is free";
+
+        const size_t available = available_host_bytes();
+        if(available > 0 && host_bytes > available)
+            return "this case needs " + gib(host_bytes) + " of host memory and " + gib(available)
+                   + " is available";
+        return {};
+    };
+    std::string why = shortfall();
+    if(!why.empty())
+    {
+        // A previous large case can retain most of the free memory in these pools. The
+        // allocator could reuse or release it, but a preflight skip never reaches allocation.
+        memory_pool<d_memory>::ReleaseCached();
+        memory_pool<h_memory>::ReleaseCached();
+        why = shortfall();
+    }
+    return why;
 }

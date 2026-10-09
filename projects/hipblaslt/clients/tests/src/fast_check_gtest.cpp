@@ -15,6 +15,7 @@
 #include "hipBuffer.hpp"
 #include "hip_placement.hpp"
 #include "hipblaslt_init.hpp"
+#include "hipblaslt_test.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -1153,6 +1154,58 @@ namespace
         p.beta    = 0x1p40;
         p.scale_c = 0x1p30;
         refused(p, "combine to values below 2^61");
+    }
+
+    // A case that cannot fit must say which memory is short and by how much; one that fits must
+    // get an empty answer.
+    // The large fast_check tiers run only under a gtest filter: an unfiltered run, or one that
+    // only excludes, skips them; any selecting pattern runs them.
+    TEST(FastCheck_pre_checkin, large_tiers_need_a_selecting_filter)
+    {
+        const std::string saved = ::testing::GTEST_FLAG(filter);
+        for(const auto& [filter, given] : std::vector<std::pair<std::string, bool>>{
+                {"*", false},
+                {"", false},
+                {"*-*known_bug*", false},
+                {"*stress*-*known_bug*", true},
+                {"*threshold*", true},
+                {"*smoke*:*quick*:*pre_checkin*-*known_bug*", true}})
+        {
+            ::testing::GTEST_FLAG(filter) = filter;
+            EXPECT_EQ(hipblaslt_gtest_filter_given(), given) << filter;
+        }
+        ::testing::GTEST_FLAG(filter) = saved;
+        EXPECT_TRUE(hipblaslt_category_needs_a_filter("stress"));
+        EXPECT_FALSE(hipblaslt_category_needs_a_filter("nightly"));
+    }
+
+    TEST(FastCheckDevice_pre_checkin, memory_shortfall_names_the_short_memory)
+    {
+        EXPECT_EQ(fast_check_memory_shortfall(0, 0), "");
+        std::string device = fast_check_memory_shortfall(size_t(1) << 60, 0);
+        EXPECT_NE(device.find("of device memory"), std::string::npos) << device;
+        std::string host = fast_check_memory_shortfall(0, size_t(1) << 60);
+        EXPECT_NE(host.find("of host memory"), std::string::npos) << host;
+    }
+
+    TEST(FastCheckDevice_pre_checkin, memory_shortfall_reclaims_idle_buffers)
+    {
+        // Hold one live allocation while returning another to the client pool. The latter
+        // is reusable capacity, so it must not make an otherwise fitting case skip.
+        auto live = memory_pool<d_memory>::Get(4096);
+        ASSERT_NE(live.get(), nullptr);
+        ASSERT_EQ(hipMemset(live.get(), 42, live.bytes()), hipSuccess);
+        auto cached = memory_pool<d_memory>::Get(size_t(16) << 20);
+        ASSERT_NE(cached.get(), nullptr);
+        const size_t capacity = cached.capacity();
+        memory_pool<d_memory>::Restore(cached);
+        size_t free_bytes = 0, total_bytes = 0;
+        ASSERT_EQ(hipMemGetInfo(&free_bytes, &total_bytes), hipSuccess);
+        EXPECT_EQ(fast_check_memory_shortfall(free_bytes + capacity / 2, 0), "");
+        unsigned char value = 0;
+        ASSERT_EQ(hipMemcpy(&value, live.get(), 1, hipMemcpyDeviceToHost), hipSuccess);
+        EXPECT_EQ(value, 42);
+        memory_pool<d_memory>::Restore(live);
     }
 
     // The fast_check_inject self-test corrupts exactly one element, and never leaves it holding
