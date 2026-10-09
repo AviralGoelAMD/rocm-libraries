@@ -52,7 +52,8 @@ linear-attention decode contract:
 **warp-tiled**: ``num_warps * wave_size`` threads per workgroup and
 ``blocks_per_v_dim`` workgroups per ``(sequence, value_head)``. Each warp splits
 the ``head_k_dim`` reduction across ``warp_threads_k`` lanes and recombines with
-an XOR butterfly (``quad_perm`` at offsets 1-2, ``ds_swizzle`` wider), so no LDS
+an XOR butterfly (``quad_perm`` at offsets 1-2, ``ds_swizzle`` wider; with
+``dpp_reduce`` offsets 4 and 8 use DPP row mirrors instead), so no LDS
 is allocated. Dispatch selects this tile from the gfx950 GDN registry: `auto`
 uses a deterministic static priority, while an explicit `spec_id` pins a tile.
 
@@ -238,6 +239,11 @@ class GdnDecodeSpec:
     # Minimum waves per SIMD the compiler must fit (amdgpu-waves-per-eu); it
     # caps registers per lane accordingly. 0 leaves occupancy to the compiler.
     waves_per_eu: int = 0
+    # In-group sum reduction (wsum): xor 4 / xor 8 stages on DPP
+    # row_half_mirror / row_mirror instead of ds_swizzle. Same sum: after the
+    # two quad stages every lane of a quad holds the quad sum, so mirrors pair
+    # quads, then half-rows. Stages above 8 (WTK 32/64) are unchanged.
+    dpp_reduce: bool = False
     # Cache policy of the state loads / stores ("streaming" = !nontemporal).
     state_load_hint: StateHint = "streaming"
     state_store_hint: StateHint = "streaming"
@@ -292,6 +298,9 @@ class GdnDecodeSpec:
             )
         if self.waves_per_eu:
             parts += (f"wpe{self.waves_per_eu}",)
+        # Nested: the knob only changes code where wsum has an xor-4 stage.
+        if self.dpp_reduce and not self.simple and self.warp_threads_k >= 8:
+            parts += ("dppr",)
         # Nested like lower_bound: the field only reaches the name where it
         # changes emitted code, and only when it deviates from the default.
         if self.conv_once and self.fuse_out_norm and not self.norm_gate_once:
@@ -791,7 +800,12 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
 
         def wsum(v):  # xor-butterfly sum over the WTK-lane group (broadcast in-group)
             # xor 1/2 via quad_perm (VALU DPP: no LDS crossbar / no lgkmcnt(0) stall);
-            # xor 4 crosses the 4-lane quad so it stays on ds_swizzle.
+            # xor 4 crosses the 4-lane quad so it stays on ds_swizzle, unless
+            # dpp_reduce: then 4 / 8 use row_half_mirror / row_mirror. That is
+            # only a sum-preserving stage because shfl is ascending -- by the
+            # time a mirror runs, every lane already holds its quad (half-row)
+            # sum, so pairing with the mirrored lane equals pairing with xor 4
+            # (xor 8). Offsets above 8 keep ds_swizzle.
             #
             # This split is NOT applied at the four sibling sites that make the
             # same choice -- they are all still on plain warp_shuffle_xor, and
@@ -808,6 +822,9 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             for off in shfl:
                 if off <= 2:
                     v = b.fadd(v, b.warp_shuffle_xor_quad(v, off))
+                elif spec.dpp_reduce and off <= 8:
+                    m = b.dpp_row_mirror(b.bitcast(v, I32), half=off == 4)
+                    v = b.fadd(v, b.bitcast(m, F32))
                 else:
                     v = b.fadd(v, b.warp_shuffle_xor(v, off))
             return v

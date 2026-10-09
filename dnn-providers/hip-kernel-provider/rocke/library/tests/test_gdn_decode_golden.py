@@ -178,6 +178,17 @@ def _cases():
     )
     cases["fused_kda_stf32_cv_rn_co_nglane"] = build(**fused_co, norm_gate_once=False)
     cases["fused_kda_stf32_cv_rn_co_wpe4"] = build(**fused_co, waves_per_eu=4)
+    # dpp_reduce: wsum's xor-4 / xor-8 stages on DPP row mirrors, fused and
+    # on the plain KDA f32 tile.
+    cases["fused_kda_stf32_cv_rn_co_dppr"] = build(**fused_co, dpp_reduce=True)
+    cases["kda_stf32_w8k16b4_dppr"] = build(
+        gate_kind="kda",
+        state_dtype="f32",
+        num_warps=8,
+        warp_threads_k=16,
+        blocks_per_v_dim=4,
+        dpp_reduce=True,
+    )
     return cases
 
 

@@ -335,6 +335,89 @@ class TestConvOnce(unittest.TestCase):
                 self.assertFalse(ok)
 
 
+class TestDppReduce(unittest.TestCase):
+    """dpp_reduce: the in-group sum's xor-4 / xor-8 stages move from
+    ds_swizzle to DPP row_half_mirror / row_mirror."""
+
+    @staticmethod
+    def _lowered(spec):
+        from rocke.core.lower_llvm import _lower_kernel_to_llvm_python
+
+        return _lower_kernel_to_llvm_python(
+            build_gdn_decode(spec, arch=ARCH), arch=ARCH
+        )
+
+    @staticmethod
+    def _counts(ir):
+        swizzle = len(re.findall(r"call i32 @llvm\.amdgcn\.ds\.swizzle\(", ir))
+        ctrls = re.findall(
+            r"call i32 @llvm\.amdgcn\.update\.dpp\.i32\(i32 [^,]+, i32 [^,]+, i32 (\d+),",
+            ir,
+        )
+        return swizzle, ctrls.count("321"), ctrls.count("320")
+
+    def test_name_token_only_when_on(self):
+        for s in (
+            _fused(state_dtype="f32"),
+            _fused(
+                state_dtype="f32", fuse_conv=True, fuse_out_norm=True, conv_once=True
+            ),
+        ):
+            with self.subTest(name=s.kernel_name()):
+                self.assertNotIn("dppr", s.kernel_name())
+                on = dc.replace(s, dpp_reduce=True)
+                self.assertIn("_dppr", on.kernel_name())
+                self.assertTrue(is_valid_spec(on, arch=ARCH)[0])
+
+    def test_name_token_absent_where_no_code_changes(self):
+        # No xor-4 stage (WTK=4) and the simple path: byte-identical kernels
+        # must keep one name.
+        for s in (
+            GdnDecodeSpec(num_warps=8, warp_threads_k=4, blocks_per_v_dim=1),
+            GdnDecodeSpec(simple=True),
+        ):
+            with self.subTest(name=s.kernel_name()):
+                self.assertEqual(
+                    s.kernel_name(), dc.replace(s, dpp_reduce=True).kernel_name()
+                )
+
+    def test_in_group_stages_leave_ds_swizzle(self):
+        # Unfused tiles have no other cross-lane reduction, so every swizzle
+        # is a wsum stage; on, all of them become mirrors (one 0x141 and one
+        # 0x140 per former xor-4 / xor-8 pair).
+        for s in (
+            GdnDecodeSpec(
+                gate_kind="kda",
+                state_dtype="f32",
+                num_warps=8,
+                warp_threads_k=16,
+                blocks_per_v_dim=4,
+            ),
+            _fused(state_dtype="f32", fuse_conv=True, conv_once=True),
+        ):
+            with self.subTest(name=s.kernel_name()):
+                off_sw, off_h, off_m = self._counts(self._lowered(s))
+                on_sw, on_h, on_m = self._counts(
+                    self._lowered(dc.replace(s, dpp_reduce=True))
+                )
+                self.assertEqual((off_h, off_m), (0, 0))
+                self.assertGreater(off_sw, 0)
+                self.assertEqual(on_sw, 0)
+                self.assertEqual(on_h, on_m)
+                self.assertEqual(on_h + on_m, off_sw)
+
+    def test_norm_block_reduction_is_untouched(self):
+        # fuse_out_norm's block-wide reduction is a different site: only the
+        # wsum swizzles move, the norm's stay.
+        s = _fused(
+            state_dtype="f32", fuse_conv=True, fuse_out_norm=True, conv_once=True
+        )
+        off_sw, _, _ = self._counts(self._lowered(s))
+        on_sw, on_h, on_m = self._counts(self._lowered(dc.replace(s, dpp_reduce=True)))
+        self.assertGreater(on_sw, 0)
+        self.assertEqual(off_sw - on_sw, on_h + on_m)
+
+
 class TestFusedReference(unittest.TestCase):
     """Host-side contract of the fused inputs and the fp32 reference (CPU)."""
 

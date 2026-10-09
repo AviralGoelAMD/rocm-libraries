@@ -3006,6 +3006,37 @@ class IRBuilder:
             result_name_hint="qperm",
         ).result
 
+    def dpp_row_mirror(self, data: Value, half: bool) -> Value:
+        """In-row ``v_mov_b32_dpp`` mirror on the VALU.
+
+        ``half=False`` is ``row_mirror`` (DPP control ``0x140``): lane ``i``
+        of every 16-lane row reads lane ``15 - i`` of the same row.
+        ``half=True`` is ``row_half_mirror`` (``0x141``): lane ``i`` of every
+        8-lane half-row reads lane ``7 - i`` of the same half-row.
+
+        A mirror is not an XOR permutation, but for a commutative reduction
+        it is an equivalent butterfly stage once the narrower stages are
+        done: after the two :meth:`quad_perm` stages every lane of a quad
+        holds the quad's value, the half mirror pairs quad 0 with quad 1 of
+        each half-row, and the row mirror pairs the two half-rows. So
+        ``xor 1, xor 2, half mirror, mirror`` leaves the full 16-lane sum in
+        every lane, with no ``ds_swizzle``.
+
+        Like :meth:`quad_perm` the mapping is wave-size-independent (16
+        divides 32 and 64), the op needs base DPP (available on CDNA), and
+        the row and bank masks are fixed at ``15, 15`` by the lowerers.
+        """
+        if data.type.name != "i32":
+            raise ValueError("dpp_row_mirror requires i32 data")
+        ctrl = 0x141 if half else 0x140
+        return self._op(
+            "tile.dpp_row_mirror",
+            [data],
+            [I32],
+            attrs={"ctrl": ctrl},
+            result_name_hint="rmirror",
+        ).result
+
     def warp_shuffle_xor_quad(self, v: Value, xor_mask: int) -> Value:
         """XOR shuffle within a four-lane quad.
 
@@ -4666,6 +4697,7 @@ PURE_OP_NAMES = {
     "tile.ds_swizzle",
     "tile.mov_dpp8",
     "tile.quad_perm",
+    "tile.dpp_row_mirror",
     "tile.wave_reduce",
     "tile.readlane",
     "tile.writelane",

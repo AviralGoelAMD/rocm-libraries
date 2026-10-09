@@ -139,6 +139,71 @@ def test_conv_once_every_legal_fused_tile(gate, state_dtype, norm, gate_once, ba
 @requires_gfx950
 @pytest.mark.parametrize("gate", ["gdn", "kda"])
 @pytest.mark.parametrize("state_dtype", ["bf16", "f32"])
+@pytest.mark.parametrize("norm", [False, True], ids=["cv", "cv_rn"])
+@pytest.mark.parametrize("batch", [1, 3])
+def test_conv_once_dpp_reduce_every_legal_fused_tile(gate, state_dtype, norm, batch):
+    """dpp_reduce (wsum's xor-4 / xor-8 stages on DPP row mirrors) on every
+    BPV=1 conv_once tile, against the oracle."""
+    from builders.gfx950.gdn.gdn_decode import TOL, check
+    from dispatch.gdn import dispatch_gdn_decode_all
+
+    results = dispatch_gdn_decode_all(
+        _request(
+            batch=batch,
+            gate_kind=gate,
+            state_dtype=state_dtype,
+            fuse_conv=True,
+            fuse_out_norm=norm,
+            conv_once=True,
+            dpp_reduce=True,
+        )
+    )
+    assert results, "no legal dpp_reduce conv_once candidate"
+    for result in results:
+        spec = result.spec
+        assert spec.dpp_reduce, spec.kernel_name()
+        out_err, state_err = check(spec, batch)
+        assert out_err < TOL and state_err < TOL, (
+            spec.kernel_name(),
+            out_err,
+            state_err,
+        )
+
+
+@requires_gfx950
+@pytest.mark.parametrize("gate", ["gdn", "kda"])
+@pytest.mark.parametrize("state_dtype", ["bf16", "f32"])
+@pytest.mark.parametrize("batch", [1, 16])
+def test_dpp_reduce_every_legal_plain_tile(gate, state_dtype, batch):
+    """dpp_reduce on every unfused registry tile (default GQA heads, every
+    BPV), against the oracle."""
+    from builders.gfx950.gdn.gdn_decode import TOL, check
+    from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode_all
+
+    results = dispatch_gdn_decode_all(
+        GdnDecodeRequest(
+            batch=batch,
+            arch=ARCH,
+            gate_kind=gate,
+            state_dtype=state_dtype,
+            dpp_reduce=True,
+        )
+    )
+    assert results, "no legal dpp_reduce candidate"
+    for result in results:
+        spec = result.spec
+        assert spec.dpp_reduce, spec.kernel_name()
+        out_err, state_err = check(spec, batch)
+        assert out_err < TOL and state_err < TOL, (
+            spec.kernel_name(),
+            out_err,
+            state_err,
+        )
+
+
+@requires_gfx950
+@pytest.mark.parametrize("gate", ["gdn", "kda"])
+@pytest.mark.parametrize("state_dtype", ["bf16", "f32"])
 def test_conv_once_with_waves_per_eu(gate, state_dtype):
     """waves_per_eu=4 changes register allocation only, never the result."""
     from builders.gfx950.gdn.gdn_decode import TOL, check

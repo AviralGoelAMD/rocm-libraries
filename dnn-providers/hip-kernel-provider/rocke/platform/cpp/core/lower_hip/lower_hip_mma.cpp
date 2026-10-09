@@ -388,6 +388,28 @@ static rocke_status_t rocke_h_op_tile_quad_perm(rocke_h_lowerer_t* lw, const roc
     return lw->status;
 }
 
+static rocke_status_t rocke_h_op_tile_dpp_row_mirror(rocke_h_lowerer_t* lw, const rocke_op_t* op)
+{
+    const rocke_value_t* data = op->operands[0];
+    const rocke_value_t* r = h_res(op);
+    int64_t ctrl = 0;
+    if(!rocke_attr_get_int(&op->attrs, "ctrl", &ctrl))
+        return rocke_h_fail(lw, ROCKE_ERR_KEY, "tile.dpp_row_mirror: missing 'ctrl'");
+    /* Only 0x140 / 0x141 are legal (see lower_llvm/crosslane.cpp). */
+    if(ctrl != 0x140 && ctrl != 0x141)
+        return rocke_h_fail(lw,
+                            ROCKE_ERR_VALUE,
+                            "tile.dpp_row_mirror: ctrl must be 320 or 321, got %lld",
+                            (long long)ctrl);
+    rocke_h_emitf(lw,
+                  "int %s = __builtin_amdgcn_update_dpp(%s, %s, %lld, 15, 15, 1);",
+                  rocke_h_name(lw, r),
+                  rocke_h_name(lw, data),
+                  rocke_h_name(lw, data),
+                  (long long)ctrl);
+    return lw->status;
+}
+
 /* def _op_tile_mov_dpp(self, op): row_shr/row_shl -> dpp_ctrl, update_dpp. */
 static rocke_status_t rocke_h_op_tile_mov_dpp(rocke_h_lowerer_t* lw, const rocke_op_t* op)
 {
@@ -1408,6 +1430,7 @@ const rocke_h_handler_entry_t* rocke_h_handlers_mma(void)
         {ROCKE_OP_TILE_DS_BPERMUTE_B64, rocke_h_op_tile_ds_bpermute_b64},
         {ROCKE_OP_TILE_DS_SWIZZLE_XOR, rocke_h_op_tile_ds_swizzle_xor},
         {ROCKE_OP_TILE_QUAD_PERM, rocke_h_op_tile_quad_perm},
+        {ROCKE_OP_TILE_DPP_ROW_MIRROR, rocke_h_op_tile_dpp_row_mirror},
         {ROCKE_OP_TILE_MOV_DPP, rocke_h_op_tile_mov_dpp},
         {ROCKE_OP_TILE_PERMLANE32_SWAP, rocke_h_op_tile_permlane32_swap},
         {ROCKE_OP_TILE_PERM_B32, rocke_h_op_tile_perm_b32},

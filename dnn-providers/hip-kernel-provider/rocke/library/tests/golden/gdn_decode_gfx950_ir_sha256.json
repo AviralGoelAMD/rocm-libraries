@@ -82,6 +82,10 @@
           "bytes": 86448,
           "sha256": "aff485c93002666dc2a8dc38ec6af03db45ed55de7db4fa75337afa89d282ac6"
         },
+        "fused_kda_stf32_cv_rn_co_dppr": {
+          "bytes": 88458,
+          "sha256": "8776d856d0f815dff3794d91f6013540f1323434375c977ec5e28e33276b3d7a"
+        },
         "fused_kda_stf32_cv_rn_co_lhdef_shdef": {
           "bytes": 86377,
           "sha256": "df0fd4026dfc0a63eebbdce2d55864d67ad3c93ca200f6944ac7023074f67d1e"
@@ -129,6 +133,10 @@
         "kda_simple": {
           "bytes": 291569,
           "sha256": "7e68fe59785e20bfc3bad753847c8b9b9e457a80dd6c1953697d56c126f6ecda"
+        },
+        "kda_stf32_w8k16b4_dppr": {
+          "bytes": 26677,
+          "sha256": "a56b1991343376837bdfcff60089bc3497dd19a4b8df1e5ec719caac40cd80c1"
         },
         "kda_stf32_w8k16b4_lhdef_shdef": {
           "bytes": 26188,
@@ -882,6 +890,10 @@
           "bytes": 86455,
           "sha256": "f2266059eb31065ead795a5e825c9327329b0b4faa3a6157abef7066ea11cdfe"
         },
+        "fused_kda_stf32_cv_rn_co_dppr": {
+          "bytes": 88465,
+          "sha256": "edacb365c32cf91a6ee3322176cb78c68f9f87484eaf96172ff693f5c6107fa1"
+        },
         "fused_kda_stf32_cv_rn_co_lhdef_shdef": {
           "bytes": 86384,
           "sha256": "a97f097f1e414e9cc2e8ba2ed5f4401e661846d0f63436314d4d85c875f9a697"
@@ -929,6 +941,10 @@
         "kda_simple": {
           "bytes": 291576,
           "sha256": "8ed0f32bbd40bf789cc44396d05dfebd24fd5dab7901cd5852a85fca661d8f3e"
+        },
+        "kda_stf32_w8k16b4_dppr": {
+          "bytes": 26684,
+          "sha256": "b716c853b96a21235eb109fe6971e7c9266a353c3bf985293aef7fddd5495f2d"
         },
         "kda_stf32_w8k16b4_lhdef_shdef": {
           "bytes": 26195,
@@ -1682,6 +1698,10 @@
           "bytes": 86519,
           "sha256": "0da0c82aba0c59844e62061cb27c6e13d1521fd897c292ae78f3e27cc212bdf5"
         },
+        "fused_kda_stf32_cv_rn_co_dppr": {
+          "bytes": 88529,
+          "sha256": "ebf327107a0b10745681e673c6ce76e8828b5a26fbf48be30a569fcf29e1c757"
+        },
         "fused_kda_stf32_cv_rn_co_lhdef_shdef": {
           "bytes": 86448,
           "sha256": "f15e2228c6824d3fcb879212fc1ccab96e112e4ba179c8933efeb972ecd94863"
@@ -1729,6 +1749,10 @@
         "kda_simple": {
           "bytes": 291640,
           "sha256": "9b12d3e22b4783b1a31cadb94be9843b9c3b8efe80a8681b57b567ef36ed3fce"
+        },
+        "kda_stf32_w8k16b4_dppr": {
+          "bytes": 26748,
+          "sha256": "1cf4c2252886b21721019986594dbfbf9ad14fd37a2a03195e27e8dedd845fcb"
         },
         "kda_stf32_w8k16b4_lhdef_shdef": {
           "bytes": 26259,

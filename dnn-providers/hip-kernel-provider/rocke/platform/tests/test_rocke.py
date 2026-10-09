@@ -3366,6 +3366,68 @@ class TestNewTargetIntrinsics(unittest.TestCase):
         with self.assertRaises(ValueError):
             b.warp_shuffle_xor_quad(b.const_i32(1), 4)
 
+    # ---- dpp_row_mirror ----
+    def test_dpp_row_mirror_encodes_ctrl(self):
+        # row_half_mirror == 0x141 == 321, row_mirror == 0x140 == 320.
+        ll = self._lower(
+            "rmirror",
+            lambda b: (
+                b.dpp_row_mirror(b.const_i32(1), half=True),
+                b.dpp_row_mirror(b.const_i32(1), half=False),
+            ),
+        )
+        self.assertIn(
+            "call i32 @llvm.amdgcn.update.dpp.i32("
+            "i32 1, i32 1, i32 321, i32 15, i32 15, i1 true)",
+            ll,
+        )
+        self.assertIn(
+            "call i32 @llvm.amdgcn.update.dpp.i32("
+            "i32 1, i32 1, i32 320, i32 15, i32 15, i1 true)",
+            ll,
+        )
+
+    def test_dpp_row_mirror_emits_hip_builtin(self):
+        from rocke.core.ir import IRBuilder
+        from rocke.core.lower_hip import lower_kernel_to_hip
+
+        b = IRBuilder("rmirror_hip")
+        c = b.const_i32(1)
+        b.dpp_row_mirror(c, half=True)
+        b.dpp_row_mirror(c, half=False)
+        hip = lower_kernel_to_hip(b.kernel)
+        self.assertIn("__builtin_amdgcn_update_dpp(c1, c1, 321, 15, 15, 1)", hip)
+        self.assertIn("__builtin_amdgcn_update_dpp(c1, c1, 320, 15, 15, 1)", hip)
+
+    def test_dpp_row_mirror_is_pure(self):
+        from rocke.core.ir import is_pure_op_name
+
+        b = self._builder("rmirror_pure")
+        value = b.dpp_row_mirror(b.const_i32(1), half=False)
+        self.assertTrue(value.op.is_pure)
+        self.assertTrue(is_pure_op_name("tile.dpp_row_mirror"))
+
+    def test_dpp_row_mirror_rejects_non_i32(self):
+        b = self._builder("rmirror_bad")
+        with self.assertRaises(ValueError):
+            b.dpp_row_mirror(b.const_f32(1.0), half=False)
+
+    def test_dpp_row_mirror_lowering_rejects_other_ctrl(self):
+        """Any control other than 0x140/0x141 is a different lane mapping
+        (0x142 is row_bcast:15, 0x40 a quad_perm); IR that skipped the
+        builder must fail in both lowerers instead of emitting it."""
+        from rocke.core.lower_hip import lower_kernel_to_hip
+        from rocke.core.lower_llvm import _lower_kernel_to_llvm_python
+
+        for bad_ctrl in (0x142, 0x40, -1):
+            with self.subTest(ctrl=bad_ctrl):
+                b = self._builder(f"rmirror_ctrl_{bad_ctrl}")
+                value = b.dpp_row_mirror(b.const_i32(1), half=False)
+                value.op.attrs["ctrl"] = bad_ctrl
+                for lower in (_lower_kernel_to_llvm_python, lower_kernel_to_hip):
+                    with self.assertRaisesRegex(ValueError, r"ctrl must be 320 or 321"):
+                        lower(b.kernel)
+
     # ---- mov_dpp8 ----
     def test_mov_dpp8_i32_emits_typed_intrinsic(self):
         ll = self._lower("dpp8i", lambda b: b.mov_dpp8(b.const_i32(1), 0x765432))

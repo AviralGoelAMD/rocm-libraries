@@ -79,7 +79,9 @@ class GdnDecodeRequest(OperatorRequest):
     KDA decay channel once per workgroup and shares it through LDS; with
     ``fuse_out_norm`` it also shares the per-row norm gate x weight unless
     ``norm_gate_once`` is False. ``waves_per_eu`` (0 = off) asks the compiler
-    for at least that many waves per SIMD.
+    for at least that many waves per SIMD. ``dpp_reduce`` runs the
+    xor-4 / xor-8 stages of the in-group sum on DPP row mirrors instead of
+    ``ds_swizzle``.
 
     ``state_load_hint`` / ``state_store_hint`` set the cache policy of the
     recurrent-state loads and stores: ``"streaming"`` (nontemporal),
@@ -114,6 +116,7 @@ class GdnDecodeRequest(OperatorRequest):
     conv_once: bool = False
     norm_gate_once: bool = True
     waves_per_eu: int = 0
+    dpp_reduce: bool = False
     state_load_hint: str = "auto"
     state_store_hint: str = "auto"
 

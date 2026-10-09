@@ -166,6 +166,7 @@ def make_spec(req: GdnDecodeRequest, tile: Tuple[int, int, int]) -> GdnDecodeSpe
         conv_once=bool(req.conv_once),
         norm_gate_once=bool(req.norm_gate_once),
         waves_per_eu=int(req.waves_per_eu),
+        dpp_reduce=bool(req.dpp_reduce),
         state_load_hint=load_hint,
         state_store_hint=store_hint,
     )

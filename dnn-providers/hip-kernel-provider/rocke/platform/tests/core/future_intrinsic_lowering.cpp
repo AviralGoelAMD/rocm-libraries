@@ -399,6 +399,124 @@ void case_quad_perm_rejects_out_of_range_ctrl()
     expect_quad_perm_ctrl_rejected(-1);
 }
 
+/* ---- dpp_row_mirror ---- */
+void case_dpp_row_mirror()
+{
+    /* row_half_mirror == 0x141 == 321, row_mirror == 0x140 == 320. */
+    const std::string ir = lower_one("rmirror", [](rocke_ir_builder_t* b) {
+        rocke_b_dpp_row_mirror(b, rocke_b_const_i32(b, 1), true);
+        rocke_b_dpp_row_mirror(b, rocke_b_const_i32(b, 1), false);
+    });
+    EXPECT_IR(ir,
+              "declare i32 @llvm.amdgcn.update.dpp.i32("
+              "i32, i32, i32 immarg, i32 immarg, i32 immarg, i1 immarg)");
+    EXPECT_IR(ir,
+              "call i32 @llvm.amdgcn.update.dpp.i32("
+              "i32 1, i32 1, i32 321, i32 15, i32 15, i1 true)");
+    EXPECT_IR(ir,
+              "call i32 @llvm.amdgcn.update.dpp.i32("
+              "i32 1, i32 1, i32 320, i32 15, i32 15, i1 true)");
+}
+
+void case_dpp_row_mirror_hip()
+{
+    const std::string hip = lower_one_hip("rmirror_hip", [](rocke_ir_builder_t* b) {
+        rocke_value_t* c = rocke_b_const_i32(b, 1);
+        rocke_b_dpp_row_mirror(b, c, true);
+        rocke_b_dpp_row_mirror(b, c, false);
+    });
+    EXPECT_IR(hip, "__builtin_amdgcn_update_dpp(c1, c1, 321, 15, 15, 1)");
+    EXPECT_IR(hip, "__builtin_amdgcn_update_dpp(c1, c1, 320, 15, 15, 1)");
+}
+
+void case_dpp_row_mirror_rejects_non_i32()
+{
+    rocke_ir_builder_t b;
+    rocke_ir_builder_init(&b, "rmirror_f32");
+    bool rejected = false;
+    try
+    {
+        rocke_value_t* r = rocke_b_dpp_row_mirror(&b, rocke_b_const_f32(&b, 1.0), false);
+        rejected = (r == nullptr || rocke_ir_builder_status(&b) == ROCKE_ERR_VALUE);
+    }
+    catch(...)
+    {
+        rejected = true;
+    }
+    if(!rejected)
+        fail("dpp_row_mirror must reject non-i32 data", __LINE__);
+    rocke_ir_builder_free(&b);
+}
+
+/* Raw-op kernel: ctrl < 0 means "omit the attribute". */
+void build_dpp_row_mirror_raw_ctrl(rocke_ir_builder_t* b, int64_t ctrl, bool have_ctrl)
+{
+    rocke_value_t* data = rocke_b_const_i32(b, 1);
+    rocke_value_t* operands[] = {data};
+    const rocke_type_t* result_types[] = {rocke_i32()};
+    rocke_attr_map_t attrs;
+    rocke_attr_map_init(&attrs);
+    if(have_ctrl)
+        rocke_attr_set_int(b, &attrs, "ctrl", ctrl);
+    rocke_b_op(b,
+               ROCKE_OP_TILE_DPP_ROW_MIRROR,
+               operands,
+               1,
+               result_types,
+               1,
+               have_ctrl ? &attrs : nullptr,
+               nullptr,
+               0,
+               "rmirror",
+               nullptr);
+    rocke_b_ret(b);
+}
+
+void expect_dpp_row_mirror_lowering_rejected(int64_t ctrl, bool have_ctrl, rocke_status_t want)
+{
+    {
+        rocke_ir_builder_t b;
+        rocke_ir_builder_init(&b, "rmirror_bad_hip");
+        build_dpp_row_mirror_raw_ctrl(&b, ctrl, have_ctrl);
+        rocke_strbuf_t out;
+        rocke_strbuf_init(&out, 256);
+        rocke_lower_hip_opts_t opts{};
+        opts.include_prologue = false;
+        opts.include_prologue_set = true;
+        opts.arch = "gfx950";
+        const rocke_status_t st
+            = rocke_lower_kernel_to_hip(&b, rocke_ir_builder_kernel(&b), &opts, &out);
+        if(st != want)
+            fail("dpp_row_mirror HIP lowering must reject malformed ctrl", __LINE__);
+        rocke_strbuf_free(&out);
+        rocke_ir_builder_free(&b);
+    }
+    {
+        rocke_ir_builder_t b;
+        rocke_ir_builder_init(&b, "rmirror_bad_ll");
+        build_dpp_row_mirror_raw_ctrl(&b, ctrl, have_ctrl);
+        char* ll = nullptr;
+        char err[ROCKE_ERR_MSG_CAP];
+        err[0] = '\0';
+        const rocke_status_t st = rocke_lower_kernel_to_llvm_ex(
+            rocke_ir_builder_kernel(&b), ROCKE_LLVM_FLAVOR_AUTO, "gfx950", &ll, err, sizeof(err));
+        if(st != want)
+            fail("dpp_row_mirror LLVM lowering must reject malformed ctrl", __LINE__);
+        std::free(ll);
+        rocke_ir_builder_free(&b);
+    }
+}
+
+void case_dpp_row_mirror_rejects_bad_ctrl()
+{
+    expect_dpp_row_mirror_lowering_rejected(0, false, ROCKE_ERR_KEY);
+    /* Each is a legal DPP control for a different lane mapping (0x142 is
+     * row_bcast:15, 0x40 a quad_perm) or not a control at all (-1). */
+    expect_dpp_row_mirror_lowering_rejected(0x142, true, ROCKE_ERR_VALUE);
+    expect_dpp_row_mirror_lowering_rejected(0x40, true, ROCKE_ERR_VALUE);
+    expect_dpp_row_mirror_lowering_rejected(-1, true, ROCKE_ERR_VALUE);
+}
+
 /* ---- mov_dpp8 ---- */
 void case_mov_dpp8_i32()
 {
@@ -851,6 +969,7 @@ void case_opcode_names_are_aligned()
         {ROCKE_OP_TILE_DS_SWIZZLE_XOR, "tile.ds_swizzle_xor"},
         {ROCKE_OP_TILE_MOV_DPP8, "tile.mov_dpp8"},
         {ROCKE_OP_TILE_QUAD_PERM, "tile.quad_perm"},
+        {ROCKE_OP_TILE_DPP_ROW_MIRROR, "tile.dpp_row_mirror"},
         {ROCKE_OP_TILE_WAVE_REDUCE, "tile.wave_reduce"},
         {ROCKE_OP_TILE_READLANE, "tile.readlane"},
         {ROCKE_OP_TILE_WRITELANE, "tile.writelane"},
@@ -897,8 +1016,9 @@ void case_opcode_names_are_aligned()
         }
         if(rocke_opcode_from_name(e.name) != e.opcode)
             fail(e.name, __LINE__);
-        if(e.opcode == ROCKE_OP_TILE_QUAD_PERM && !rocke_opcode_is_pure(e.opcode))
-            fail("tile.quad_perm must be pure", __LINE__);
+        if((e.opcode == ROCKE_OP_TILE_QUAD_PERM || e.opcode == ROCKE_OP_TILE_DPP_ROW_MIRROR)
+           && !rocke_opcode_is_pure(e.opcode))
+            fail(e.name, __LINE__);
     }
 }
 
@@ -992,6 +1112,10 @@ const TestCase k_cases[] = {
     {"quad_perm_rejects_invalid_input", case_quad_perm_rejects_invalid_input},
     {"quad_perm_hip_rejects_missing_ctrl", case_quad_perm_hip_rejects_missing_ctrl},
     {"quad_perm_rejects_out_of_range_ctrl", case_quad_perm_rejects_out_of_range_ctrl},
+    {"dpp_row_mirror", case_dpp_row_mirror},
+    {"dpp_row_mirror_hip", case_dpp_row_mirror_hip},
+    {"dpp_row_mirror_rejects_non_i32", case_dpp_row_mirror_rejects_non_i32},
+    {"dpp_row_mirror_rejects_bad_ctrl", case_dpp_row_mirror_rejects_bad_ctrl},
     {"ds_swizzle_xor", case_ds_swizzle_xor},
     {"mov_dpp8_i32", case_mov_dpp8_i32},
     {"quad_perm", case_quad_perm},

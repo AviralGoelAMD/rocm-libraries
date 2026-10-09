@@ -3971,6 +3971,26 @@ class _Lowerer:
             f"i32 {ctrl}, i32 15, i32 15, i1 true)"
         )
 
+    def _op_tile_dpp_row_mirror(self, op: Op) -> None:
+        """Lower a DPP ``row_mirror`` (0x140) / ``row_half_mirror`` (0x141).
+
+        Only those two control words are legal. Reject anything else rather
+        than emit it: any other DPP control is a different, silently valid
+        lane mapping.
+        """
+        (data,) = op.operands
+        self._need("update.dpp.i32")
+        ctrl = int(op.attrs["ctrl"])
+        if ctrl not in (0x140, 0x141):
+            raise ValueError(
+                f"tile.dpp_row_mirror: ctrl must be 320 or 321, got {ctrl}"
+            )
+        self._current().emit(
+            f"  {op.result.name} = call i32 @llvm.amdgcn.update.dpp.i32("
+            f"i32 {self._operand(data)}, i32 {self._operand(data)}, "
+            f"i32 {ctrl}, i32 15, i32 15, i1 true)"
+        )
+
     def _op_tile_ds_swizzle_xor(self, op: Op) -> None:
         """``ds_swizzle_b32`` with XOR butterfly via SWAP-mode encoding.
 
