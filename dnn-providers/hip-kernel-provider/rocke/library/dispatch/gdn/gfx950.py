@@ -163,6 +163,7 @@ def make_spec(req: GdnDecodeRequest, tile: Tuple[int, int, int]) -> GdnDecodeSpe
         blocks_per_v_dim=blocks_per_v_dim,
         fuse_conv=bool(req.fuse_conv),
         fuse_out_norm=bool(req.fuse_out_norm),
+        conv_once=bool(req.conv_once),
         state_load_hint=load_hint,
         state_store_hint=store_hint,
     )

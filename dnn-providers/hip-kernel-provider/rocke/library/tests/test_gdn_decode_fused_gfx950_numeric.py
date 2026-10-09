@@ -99,6 +99,38 @@ def test_every_legal_fused_tile(gate, state_dtype):
 
 
 @requires_gfx950
+@pytest.mark.parametrize("gate", ["gdn", "kda"])
+@pytest.mark.parametrize("state_dtype", ["bf16", "f32"])
+@pytest.mark.parametrize("norm", [False, True], ids=["cv", "cv_rn"])
+@pytest.mark.parametrize("batch", [1, 3, 16])
+def test_conv_once_every_legal_fused_tile(gate, state_dtype, norm, batch):
+    """conv_once on every BPV=1 registry tile the validator admits: output,
+    written state and conv taps, and untouched pages, against the oracle."""
+    from builders.gfx950.gdn.gdn_decode import TOL, check
+    from dispatch.gdn import dispatch_gdn_decode_all
+
+    results = dispatch_gdn_decode_all(
+        _request(
+            batch=batch,
+            gate_kind=gate,
+            state_dtype=state_dtype,
+            fuse_conv=True,
+            fuse_out_norm=norm,
+            conv_once=True,
+        )
+    )
+    assert results, "no legal conv_once candidate"
+    for result in results:
+        spec = result.spec
+        assert spec.conv_once and spec.blocks_per_v_dim == 1, spec.kernel_name()
+        out_err, state_err = check(spec, batch)
+        assert out_err < TOL and state_err < TOL, (
+            spec.kernel_name(),
+            out_err,
+            state_err,
+        )
+
+@requires_gfx950
 @pytest.mark.parametrize("state_dtype", ["bf16", "f32"])
 def test_norm_with_gqa_heads(state_dtype):
     """fuse_out_norm alone works for Hv > Hk (the Qwen3-Next GDN shape)."""
@@ -121,7 +153,8 @@ def test_norm_with_gqa_heads(state_dtype):
 @requires_gfx950
 @pytest.mark.parametrize("gate", ["gdn", "kda"])
 @pytest.mark.parametrize("num_warps", [1, 2, 4])
-def test_conv_in_place_slots(gate, num_warps):
+@pytest.mark.parametrize("conv_once", [False, True], ids=["lane", "once"])
+def test_conv_in_place_slots(gate, num_warps, conv_once):
     """read slot == write slot: the in-place conv-state shift must stay exact
     with one wave (no barrier) and with several (barrier before the writes)."""
     from builders.gfx950.gdn.gdn_decode import (
@@ -147,6 +180,7 @@ def test_conv_in_place_slots(gate, num_warps):
         blocks_per_v_dim=1,
         fuse_conv=True,
         fuse_out_norm=True,
+        conv_once=conv_once,
     )
     batch = 8
     inp = make_inputs(spec, batch, pool_depth=batch, disjoint_writes=False)

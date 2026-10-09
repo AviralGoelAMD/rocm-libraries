@@ -583,6 +583,18 @@ class TestFusedDispatch(unittest.TestCase):
         ).spec
         self.assertEqual(self.tile(g), DEFAULT_TILE)
 
+    def test_conv_once_reaches_spec(self):
+        self.assertFalse(dispatch_gdn_decode(self.req()).spec.conv_once)
+        s = dispatch_gdn_decode(self.req(conv_once=True)).spec
+        self.assertTrue(s.conv_once and s.fuse_conv)
+        self.assertTrue(s.kernel_name().endswith("_co"))
+
+    def test_conv_once_without_conv_rejected(self):
+        r = self.req(fuse_conv=False, conv_once=True)
+        self.assertTrue(any("conv_once" in e for e in request_errors(r)))
+        with self.assertRaises(ValueError):
+            dispatch_gdn_decode(r)
+
 
 class TestStateHintKnobs(unittest.TestCase):
     """state_load_hint / state_store_hint: auto policy, explicit pins, rejection,

@@ -235,6 +235,44 @@ class TestFusedEmission(unittest.TestCase):
         self.assertNotIn("s.barrier", ll)
 
 
+class TestConvOnce(unittest.TestCase):
+    """conv_once: name tag only when on, needs fuse_conv, and every BPV=1
+    warp count compiles with no scratch (one wave included: it no longer
+    holds every row's taps and weights)."""
+
+    def test_name_tag_only_when_on(self):
+        s = _fused(fuse_conv=True, fuse_out_norm=True)
+        self.assertTrue(s.kernel_name().endswith("_l2_cv_rn"))
+        self.assertTrue(
+            dc.replace(s, conv_once=True).kernel_name().endswith("_l2_cv_rn_co")
+        )
+
+    def test_requires_fuse_conv(self):
+        ok, why = is_valid_spec(_fused(fuse_out_norm=True, conv_once=True), arch=ARCH)
+        self.assertFalse(ok)
+        self.assertIn("conv_once requires fuse_conv", why)
+        ok, why = is_valid_spec(_fused(fuse_conv=True, conv_once=True), arch=ARCH)
+        self.assertTrue(ok, why)
+
+    def test_compiles_without_scratch(self):
+        for gate in ("gdn", "kda"):
+            for st in ("bf16", "f32"):
+                for norm in (False, True):
+                    for nw, wtk in ((1, 16), (2, 16), (4, 16), (8, 16), (4, 8)):
+                        s = _fused(
+                            gate_kind=gate,
+                            state_dtype=st,
+                            num_warps=nw,
+                            warp_threads_k=wtk,
+                            fuse_conv=True,
+                            fuse_out_norm=norm,
+                            conv_once=True,
+                        )
+                        with self.subTest(name=s.kernel_name()):
+                            self.assertEqual(_scratch_bytes(self, s), 0)
+
+
+
 class TestFusedReference(unittest.TestCase):
     """Host-side contract of the fused inputs and the fp32 reference (CPU)."""
 

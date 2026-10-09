@@ -227,6 +227,10 @@ class GdnDecodeSpec:
     fuse_out_norm: bool = (
         False  # o * rsqrt(mean(o^2)+eps) * norm_weight * sigmoid(gate)
     )
+    # fuse_conv only: compute each conv channel (and each KDA decay channel)
+    # once per workgroup, one thread per channel, and hand the results to the
+    # lanes through LDS. Off, every lane recomputes the channels it consumes.
+    conv_once: bool = False
     # Cache policy of the state loads / stores ("streaming" = !nontemporal).
     state_load_hint: StateHint = "streaming"
     state_store_hint: StateHint = "streaming"
@@ -287,6 +291,7 @@ class GdnDecodeSpec:
                 "s": self.simple,
                 "cv": self.fuse_conv,
                 "rn": self.fuse_out_norm,
+                "co": self.conv_once,
             },
         )
 
@@ -341,6 +346,8 @@ def is_valid_spec(spec: GdnDecodeSpec, arch: str = "gfx950") -> Tuple[bool, str]
             "fuse_conv requires num_k_heads == num_v_heads (shared q/k conv "
             f"channels would race), got {spec.num_k_heads}/{spec.num_v_heads}"
         )
+    if spec.conv_once and not spec.fuse_conv:
+        return False, "conv_once requires fuse_conv"
     if (
         spec.gate_kind == "kda"
         and spec.fuse_gate
@@ -667,6 +674,7 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
     S_POOL, S_HV, S_VR = HV * DV * DK, DV * DK, DK
     ST_BYTES = _STATE_BYTES[spec.state_dtype]
     CONV, RN = spec.fuse_conv, spec.fuse_out_norm
+    ONCE = spec.conv_once
     CONV_DIM = 2 * HK * DK + HV * DV  # packed [q | k | v] channels
     IO_BYTES = 2  # bf16 / f16; the conv state carries the I/O dtype
 
@@ -723,6 +731,13 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
         norm_eps = b.param("norm_eps", F32)
         # one f32 partial per wave for the cross-wave sum of squares
         lds_rn = b.smem_alloc_f32([NW], name_hint="rn_partials") if NW > 1 else None
+    if ONCE:
+        # Post-SiLU f32 conv outputs [q DK | k DK | v DV], then (KDA) the DK
+        # per-channel decays; one slot per channel, written once, read by all.
+        N_CONV = 2 * DK + DV
+        N_DEC = DK if spec.gate_kind == "kda" else 0
+        N_ONCE = N_CONV + N_DEC
+        lds_once = b.smem_alloc_f32([N_ONCE], name_hint="conv_once")
 
     tid = b.thread_id_x()
     bidx = b.block_id_x()
@@ -828,15 +843,20 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
                 b.mul(b_i, b.const_i32(HV * DK)), b.mul(hv_i, b.const_i32(DK))
             )
             dtb_row = b.mul(hv_i, b.const_i32(DK))
-            gvs, dtvecs = [], []
-            for ki in range(WTK_ITERS):
-                # Same lane offset the state load uses, so slot i of this
-                # slice is the same K channel as slot i of the state vector.
-                koff = b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K))
-                gvs.append(
-                    load_vec_as_f32(b, Ag, b.add(g_row, koff), dtype=spec.dtype, n=VPT)
-                )
-                dtvecs.append(b.global_load_vN(DTB, b.add(dtb_row, koff), F32, VPT))
+            if not ONCE:
+                gvs, dtvecs = [], []
+                for ki in range(WTK_ITERS):
+                    # Same lane offset the state load uses, so slot i of this
+                    # slice is the same K channel as slot i of the state vector.
+                    koff = b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K))
+                    gvs.append(
+                        load_vec_as_f32(
+                            b, Ag, b.add(g_row, koff), dtype=spec.dtype, n=VPT
+                        )
+                    )
+                    dtvecs.append(
+                        b.global_load_vN(DTB, b.add(dtb_row, koff), F32, VPT)
+                    )
 
         # this lane's q,k K-chunks -> f32
         if CONV:
@@ -854,24 +874,88 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             qk_base = b.add(
                 b.mul(b_i, b.const_i32(Q_HN)), b.mul(hk_i, b.const_i32(Q_HK))
             )
-        qn = [None] * WTK_ITERS
-        kn = [None] * WTK_ITERS
-        for ki in range(WTK_ITERS):
-            off = b.add(qk_base, b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K)))
-            qn[ki] = load_vec_as_f32(b, Q, off, dtype=spec.dtype, n=VPT)
-            if CONV:
-                kn[ki] = load_vec_as_f32(
-                    b, K, b.add(off, k_shift), dtype=spec.dtype, n=VPT
+        if ONCE:
+            # One work item per LDS slot f = tid + it * BS: the conv channels
+            # [q | k | v] first, then the KDA decay channels. All loads are
+            # issued here, ahead of the state loads, with the index clamped into
+            # range so no load sits behind a branch; only the writes are guarded.
+            cst_w = b.global_ptr_add(
+                CST,
+                b.mul(b.sext(write_pool, I64), b.const_i64(CONV_DIM * 3 * IO_BYTES)),
+            )
+            # (first slot, end slot, channel minus slot) per conv segment
+            segs = (
+                (0, DK, b.mul(hk_i, b.const_i32(DK))),
+                (
+                    DK,
+                    2 * DK,
+                    b.add(b.mul(hk_i, b.const_i32(DK)), b.const_i32(HK * DK - DK)),
+                ),
+                (
+                    2 * DK,
+                    N_CONV,
+                    b.add(
+                        b.mul(hv_i, b.const_i32(DV)), b.const_i32(2 * HK * DK - 2 * DK)
+                    ),
+                ),
+            )
+            once_items = []
+            for it in range(-(-N_ONCE // BS)):
+                lo, hi = it * BS, (it + 1) * BS  # static range of f this round
+                f = b.add(tid, b.const_i32(lo)) if lo else tid
+                item = {"f": f, "hi": hi}
+                if lo < N_CONV:
+                    fc = b.smin(f, b.const_i32(N_CONV - 1)) if hi > N_CONV else f
+                    live = [s for s in segs if s[0] < hi and s[1] > lo]
+                    ch_off = live[-1][2]
+                    for s in reversed(live[:-1]):
+                        ch_off = b.select(b.cmp_lt(fc, b.const_i32(s[1])), s[2], ch_off)
+                    ch = b.add(fc, ch_off)
+                    item["ch"] = ch
+                    item["x"] = load_scalar_as_f32(
+                        b, QKV, b.add(qkv_row, ch), dtype=spec.dtype
+                    )
+                    tap0 = b.mul(ch, b.const_i32(3))
+                    item["taps"] = [
+                        load_scalar_as_f32(
+                            b, cst_r, b.add(tap0, b.const_i32(t)), dtype=spec.dtype
+                        )
+                        for t in range(3)
+                    ]
+                    wv = b.global_load_vN(CW, b.mul(ch, b.const_i32(4)), F32, 4)
+                    item["w"] = [b.vec_extract(wv, i) for i in range(4)]
+                if N_DEC and hi > N_CONV:
+                    d = b.sub(f, b.const_i32(N_CONV))
+                    if lo < N_CONV:
+                        d = b.smax(d, b.const_i32(0))
+                    if hi > N_ONCE:
+                        d = b.smin(d, b.const_i32(N_DEC - 1))
+                    item["a"] = load_scalar_as_f32(
+                        b, Ag, b.add(g_row, d), dtype=spec.dtype
+                    )
+                    item["dt"] = b.global_load_f32(DTB, b.add(dtb_row, d))
+                once_items.append(item)
+        else:
+            qn = [None] * WTK_ITERS
+            kn = [None] * WTK_ITERS
+            for ki in range(WTK_ITERS):
+                off = b.add(
+                    qk_base, b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K))
                 )
-                qch = b.add(
-                    b.mul(hk_i, b.const_i32(DK)),
-                    b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K)),
-                )
-                kch = b.add(qch, k_shift)
-                q_taps[ki], q_w[ki] = conv_taps8(qch), conv_weights8(qch)
-                k_taps[ki], k_w[ki] = conv_taps8(kch), conv_weights8(kch)
-            else:
-                kn[ki] = load_vec_as_f32(b, K, off, dtype=spec.dtype, n=VPT)
+                qn[ki] = load_vec_as_f32(b, Q, off, dtype=spec.dtype, n=VPT)
+                if CONV:
+                    kn[ki] = load_vec_as_f32(
+                        b, K, b.add(off, k_shift), dtype=spec.dtype, n=VPT
+                    )
+                    qch = b.add(
+                        b.mul(hk_i, b.const_i32(DK)),
+                        b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K)),
+                    )
+                    kch = b.add(qch, k_shift)
+                    q_taps[ki], q_w[ki] = conv_taps8(qch), conv_weights8(qch)
+                    k_taps[ki], k_w[ki] = conv_taps8(kch), conv_weights8(kch)
+                else:
+                    kn[ki] = load_vec_as_f32(b, K, off, dtype=spec.dtype, n=VPT)
 
         # raw state tiles. The pool base overflows i32 for large pools, so
         # advance the pointer by a 64-bit byte offset once and keep the in-slot
@@ -911,7 +995,9 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             )
             for v_row in v_rows
         ]
-        if CONV:
+        if ONCE:
+            pass  # v comes from LDS after the prologue
+        elif CONV:
             # v channel of each owned row in the packed row / conv state
             vch = [
                 b.add(
@@ -971,22 +1057,102 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             beta = b.rcp_fast(b.fadd(b.const_f32(1.0), exp_f32(b.fneg(rb))))
             exp_alog = exp_f32(ral)
             decay = {}
-            for ki in range(WTK_ITERS):
-                gv, dtvec = gvs[ki], dtvecs[ki]
-                slice_decay = []
-                for i in range(VPT):
+            if not ONCE:
+                for ki in range(WTK_ITERS):
+                    gv, dtvec = gvs[ki], dtvecs[ki]
+                    slice_decay = []
+                    for i in range(VPT):
+                        if spec.fuse_gate:
+                            inner = b.fmul(
+                                exp_alog, b.fadd(gv[i], b.vec_extract(dtvec, i))
+                            )
+                            sig = b.rcp_fast(
+                                b.fadd(b.const_f32(1.0), exp_f32(b.fneg(inner)))
+                            )
+                            log_decay = b.fmul(b.const_f32(spec.lower_bound), sig)
+                        else:
+                            log_decay = gv[i]
+                        slice_decay.append(exp_f32(log_decay))
+                    decay[ki] = slice_decay
+
+        if ONCE:
+            # Prologue math: one work item per LDS slot, then one barrier.
+            for item in once_items:
+                f, hi = item["f"], item["hi"]
+                val = None
+                if "ch" in item:
+                    val = silu(conv4(item["taps"], item["w"], item["x"]))
+                if "a" in item:
                     if spec.fuse_gate:
-                        inner = b.fmul(exp_alog, b.fadd(gv[i], b.vec_extract(dtvec, i)))
+                        inner = b.fmul(exp_alog, b.fadd(item["a"], item["dt"]))
                         sig = b.rcp_fast(
                             b.fadd(b.const_f32(1.0), exp_f32(b.fneg(inner)))
                         )
                         log_decay = b.fmul(b.const_f32(spec.lower_bound), sig)
                     else:
-                        log_decay = gv[i]
-                    slice_decay.append(exp_f32(log_decay))
-                decay[ki] = slice_decay
+                        log_decay = item["a"]
+                    dec = exp_f32(log_decay)
+                    val = (
+                        dec
+                        if val is None
+                        else b.select(b.cmp_lt(f, b.const_i32(N_CONV)), val, dec)
+                    )
+                if hi > N_ONCE:
+                    with b.scf_if(b.cmp_lt(f, b.const_i32(N_ONCE))):
+                        b.smem_store_vN_f32(lds_once, [f], val, 1)
+                else:
+                    b.smem_store_vN_f32(lds_once, [f], val, 1)
+                if "ch" in item:
+                    # Single writer: the thread that read this channel's taps
+                    # shifts them, so read slot == write slot needs no barrier.
+                    def shift_taps(item=item):
+                        base = b.mul(item["ch"], b.const_i32(3))
+                        taps = item["taps"]
+                        for t, tv in enumerate((taps[1], taps[2], item["x"])):
+                            store_scalar_from_f32(
+                                b,
+                                cst_w,
+                                b.add(base, b.const_i32(t)),
+                                tv,
+                                dtype=spec.dtype,
+                            )
 
-        if CONV:
+                    if hi > N_CONV:
+                        with b.scf_if(b.cmp_lt(f, b.const_i32(N_CONV))):
+                            shift_taps()
+                    else:
+                        shift_taps()
+            # LDS-only drain: the state loads stay in flight across it.
+            b.sync_lds_only()
+
+            def lds8(idx):  # 8 contiguous f32 slots
+                lo4 = b.smem_load_vN_f32(lds_once, idx, n=4)
+                hi4 = b.smem_load_vN_f32(lds_once, b.add(idx, b.const_i32(4)), n=4)
+                return [b.vec_extract(lo4, i) for i in range(4)] + [
+                    b.vec_extract(hi4, i) for i in range(4)
+                ]
+
+            qn = [None] * WTK_ITERS
+            kn = [None] * WTK_ITERS
+            if N_DEC:
+                decay = {}
+            for ki in range(WTK_ITERS):
+                koff = b.add(warp_k_start, b.const_i32(ki * WARP_TILE_K))
+                qn[ki] = lds8(koff)
+                kn[ki] = lds8(b.add(koff, b.const_i32(DK)))
+                if N_DEC:
+                    decay[ki] = lds8(b.add(koff, b.const_i32(N_CONV)))
+            rv = [
+                b.vec_extract(
+                    b.smem_load_vN_f32(
+                        lds_once, b.add(v_row, b.const_i32(2 * DK)), n=1
+                    ),
+                    0,
+                )
+                for v_row in v_rows
+            ]
+
+        if CONV and not ONCE:
             # conv1d + SiLU on the raw q/k/v; the raw values are kept, since
             # they become the newest conv tap.
             q_raw, k_raw, v_raw = qn, kn, rv
@@ -1137,7 +1303,7 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
                 with b.scf_if(b.cmp_eq(k_lane, b.const_i32(0))):
                     store_scalar_from_f32(b, OUT, v_idx[vi], y, dtype=spec.dtype)
 
-        if CONV:
+        if CONV and not ONCE:
             if NW > 1 and not RN:
                 # every wave has read its taps before any tap is overwritten
                 b.sync()

@@ -102,6 +102,21 @@ def _cases():
                     fuse_conv=conv,
                     fuse_out_norm=norm,
                 )
+            # conv_once: conv (and KDA decay) channels computed once, via LDS.
+            for norm in (False, True):
+                tag = "_cv" + ("_rn" if norm else "") + "_co"
+                cases[f"fused_{gate}_st{state_dtype}{tag}"] = build(
+                    num_k_heads=16,
+                    num_v_heads=16,
+                    gate_kind=gate,
+                    state_dtype=state_dtype,
+                    num_warps=4,
+                    warp_threads_k=16,
+                    blocks_per_v_dim=1,
+                    fuse_conv=True,
+                    fuse_out_norm=norm,
+                    conv_once=True,
+                )
     # State cache-policy knobs. Every case above keeps the streaming default, so
     # their hashes are the pre-knob hashes; these pin the non-default policies
     # on the plain KDA f32 tile and on the fused one.
@@ -130,6 +145,20 @@ def _cases():
             blocks_per_v_dim=1,
             fuse_conv=True,
             fuse_out_norm=True,
+            state_load_hint=load,
+            state_store_hint=store,
+        )
+        cases[f"fused_kda_stf32_cv_rn_co_{tag}"] = build(
+            num_k_heads=16,
+            num_v_heads=16,
+            gate_kind="kda",
+            state_dtype="f32",
+            num_warps=4,
+            warp_threads_k=16,
+            blocks_per_v_dim=1,
+            fuse_conv=True,
+            fuse_out_norm=True,
+            conv_once=True,
             state_load_hint=load,
             state_store_hint=store,
         )

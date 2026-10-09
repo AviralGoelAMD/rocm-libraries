@@ -75,7 +75,8 @@ class GdnDecodeRequest(OperatorRequest):
     workgroup per head, so only ``blocks_per_v_dim == 1`` tiles are legal, and
     ``auto`` uses the static ``FUSED_DEFAULT_TILES`` entry for the gate kind
     and state width. ``fuse_conv`` also requires ``num_k_heads ==
-    num_v_heads``.
+    num_v_heads``. ``conv_once`` (needs ``fuse_conv``) computes each conv and
+    KDA decay channel once per workgroup and shares it through LDS.
 
     ``state_load_hint`` / ``state_store_hint`` set the cache policy of the
     recurrent-state loads and stores: ``"streaming"`` (nontemporal),
@@ -107,6 +108,7 @@ class GdnDecodeRequest(OperatorRequest):
     spec_id: str = "auto"
     fuse_conv: bool = False
     fuse_out_norm: bool = False
+    conv_once: bool = False
     state_load_hint: str = "auto"
     state_store_hint: str = "auto"
 
@@ -169,6 +171,8 @@ def request_errors(req: OperatorRequest) -> list:
             "fuse_conv requires num_k_heads == num_v_heads (shared q/k conv "
             f"channels would race), got {req.num_k_heads}/{req.num_v_heads}"
         )
+    if req.conv_once and not req.fuse_conv:
+        errors.append("conv_once requires fuse_conv")
     for field in ("state_load_hint", "state_store_hint"):
         hint = getattr(req, field)
         if hint != "auto" and hint not in STATE_HINTS:
