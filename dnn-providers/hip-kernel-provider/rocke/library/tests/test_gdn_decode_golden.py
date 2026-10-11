@@ -116,6 +116,58 @@ def _cases():
         fuse_conv=True,
         fuse_out_norm=True,
     )
+    # Performance knobs, one flag-on case each at a tile where it changes the
+    # code, plus the fused-knob combinations. Every knob-off case above keeps
+    # its hash: the knobs default to the code emitted before they existed.
+    fused_bpv1 = dict(
+        num_k_heads=16,
+        num_v_heads=16,
+        num_warps=4,
+        warp_threads_k=16,
+        blocks_per_v_dim=1,
+    )
+    cases.update(
+        {
+            "knob_state_load_hint": build(state_load_hint="streaming"),
+            "knob_state_store_hint": build(state_store_hint="streaming"),
+            "knob_dpp_reduce": build(dpp_reduce=True),
+            "knob_xcd_remap": build(xcd_remap=True),
+            "knob_stream_rows": build(stream_rows=True),
+            "knob_interleave_cols_stf32": build(
+                state_dtype="f32", interleave_cols=True
+            ),
+            "knob_waves_per_eu": build(waves_per_eu=4),
+            "knob_conv_once": build(**fused_bpv1, fuse_conv=True, conv_once=True),
+            "knob_conv_once_kda_stf32": build(
+                **fused_bpv1,
+                gate_kind="kda",
+                state_dtype="f32",
+                fuse_conv=True,
+                conv_once=True,
+            ),
+            "knob_conv_once_norm_gate_once": build(
+                **fused_bpv1,
+                fuse_conv=True,
+                fuse_out_norm=True,
+                conv_once=True,
+                norm_gate_once=True,
+            ),
+            "knob_out_lds": build(**fused_bpv1, fuse_out_norm=True, out_lds=True),
+            "knob_out_lds_norm_gate_once_kda": build(
+                **fused_bpv1,
+                gate_kind="kda",
+                fuse_conv=True,
+                fuse_out_norm=True,
+                conv_once=True,
+                norm_gate_once=True,
+                out_lds=True,
+            ),
+        }
+    )
+    # one wave: out_lds adds its own LDS barrier (no cross-wave reduction)
+    cases["knob_out_lds_w1"] = build(
+        **{**fused_bpv1, "num_warps": 1}, fuse_out_norm=True, out_lds=True
+    )
     request = GdnDecodeRequest(batch=16, arch=_ARCH)
     for result in dispatch_gdn_decode_all(request):
         cases[f"registered_{result.candidate.spec_id}"] = (
