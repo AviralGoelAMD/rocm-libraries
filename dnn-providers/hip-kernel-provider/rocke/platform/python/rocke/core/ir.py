@@ -137,6 +137,36 @@ def require_streaming_arch(op_name: str, gfx: str) -> None:
         )
 
 
+def dpp_ctrl_attr(op: "Op") -> int:
+    """Return the validated ``ctrl`` of a one-operand i32 DPP op.
+
+    Shared by both Python lowerers for ``tile.quad_perm`` and
+    ``tile.dpp_row_mirror``. The builders already guarantee all of this; the
+    lowerers check again because IR can reach them without a builder
+    (hand-built, deserialized, or rewritten by a pass). Nothing is coerced
+    into a valid control word:
+
+    * non-i32 data is a ``ValueError`` (the DPP move is 32-bit; f32 callers
+      bitcast first);
+    * a missing ``ctrl`` is a ``KeyError``;
+    * a ``ctrl`` that is not exactly ``int`` (``bool``, ``float``, ``str``) is
+      a ``TypeError``.
+
+    The per-op range check stays with each lowerer. Mirrored in the C++
+    lowerers (``lower_llvm/crosslane.cpp``, ``lower_hip/lower_hip_mma.cpp``),
+    which return ``ROCKE_ERR_VALUE`` / ``ROCKE_ERR_KEY`` / ``ROCKE_ERR_TYPE``.
+    """
+    (data,) = op.operands
+    if data.type.name != "i32":
+        raise ValueError(f"{op.name} requires i32 data, got {data.type.name}")
+    if "ctrl" not in op.attrs:
+        raise KeyError(f"{op.name}: missing 'ctrl'")
+    ctrl = op.attrs["ctrl"]
+    if type(ctrl) is not int:
+        raise TypeError(f"{op.name}: ctrl must be an int, got {type(ctrl).__name__}")
+    return ctrl
+
+
 def _streaming(temporal_hint: TemporalHint) -> bool:
     """True for STREAMING; any value that is not a TemporalHint is rejected."""
     if not isinstance(temporal_hint, TemporalHint):
@@ -3035,6 +3065,55 @@ class IRBuilder:
             result_name_hint="qperm",
         ).result
 
+    def dpp_row_mirror(self, data: Value, half: bool) -> Value:
+        """In-row ``v_mov_b32_dpp`` mirror on the VALU.
+
+        ``half=False`` is ``row_mirror`` (DPP control ``0x140``): lane ``i``
+        of every 16-lane row reads lane ``15 - i`` of the same row.
+        ``half=True`` is ``row_half_mirror`` (``0x141``): lane ``i`` of every
+        8-lane half-row reads lane ``7 - i`` of the same half-row.
+
+        A mirror is not an XOR permutation, but for a commutative reduction
+        it is an equivalent butterfly stage once the narrower stages are
+        done: after the two :meth:`quad_perm` stages every lane of a quad
+        holds the quad's value, the half mirror pairs quad 0 with quad 1 of
+        each half-row, and the row mirror pairs the two half-rows. So
+        ``xor 1, xor 2, half mirror, mirror`` leaves the full 16-lane sum in
+        every lane, with no ``ds_swizzle`` (lane model:
+        ``TestNewTargetIntrinsics`` in ``tests/test_rocke.py``).
+
+        That recipe is only valid under two conditions. (1) The combine must
+        be commutative: different lanes see their operands in different
+        orders (lane 0 combines its half-row with the upper one, lane 15 the
+        upper with the lower), so a non-commutative combine gives different
+        values in different lanes. Floating-point add is commutative, so
+        every lane still gets the same bits. (2) The lowerers emit
+        ``bound_ctrl = 1``, so a source lane disabled in EXEC reads ``0``
+        instead of keeping the old value. Run it with every lane of the row
+        active; if lanes can be inactive, only a reduction whose identity is
+        ``0`` (a sum) stays correct, and ``max``/``min``/product do not.
+
+        Like :meth:`quad_perm` the mapping is wave-size-independent (16
+        divides 32 and 64), the op needs base DPP (available on CDNA), and
+        the row and bank masks are fixed at ``15, 15`` by the lowerers.
+
+        ``half`` must be a ``bool``: it selects the lane mapping, so a
+        truthy or falsy stand-in (``"false"``, ``None``, ``1``) is rejected
+        instead of silently picking one.
+        """
+        if type(half) is not bool:
+            raise TypeError(f"dpp_row_mirror: half must be a bool, got {half!r}")
+        if data.type.name != "i32":
+            raise ValueError("dpp_row_mirror requires i32 data")
+        ctrl = 0x141 if half else 0x140
+        return self._op(
+            "tile.dpp_row_mirror",
+            [data],
+            [I32],
+            attrs={"ctrl": ctrl},
+            result_name_hint="rmirror",
+        ).result
+
     def warp_shuffle_xor_quad(self, v: Value, xor_mask: int) -> Value:
         """XOR shuffle within a four-lane quad.
 
@@ -4695,6 +4774,7 @@ PURE_OP_NAMES = {
     "tile.ds_swizzle",
     "tile.mov_dpp8",
     "tile.quad_perm",
+    "tile.dpp_row_mirror",
     "tile.wave_reduce",
     "tile.readlane",
     "tile.writelane",
