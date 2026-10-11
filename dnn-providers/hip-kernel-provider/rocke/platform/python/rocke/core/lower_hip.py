@@ -28,6 +28,7 @@ from .ir import (
     Type,
     Value,
     VectorType,
+    dpp_ctrl_attr,
     require_streaming_arch,
 )
 
@@ -2065,12 +2066,30 @@ class _Lowerer:
 
         See :meth:`_op_tile_quad_perm` in ``lower_llvm.py``: ``ctrl``
         packs four two-bit lane selectors, so ``0..255`` is the whole
-        legal range and out-of-range values are malformed IR.
+        legal range and out-of-range values are malformed IR. The data must
+        be i32: HIP would convert a float operand to ``int`` without a word.
         """
         (data,) = op.operands
-        ctrl = int(op.attrs["ctrl"])
+        ctrl = dpp_ctrl_attr(op)
         if not 0 <= ctrl <= 255:
             raise ValueError(f"tile.quad_perm: ctrl must be in 0..255, got {ctrl}")
+        self._emit(
+            f"int {_name(op.result)} = __builtin_amdgcn_update_dpp("
+            f"{_name(data)}, {_name(data)}, {ctrl}, 15, 15, 1);"
+        )
+
+    def _op_tile_dpp_row_mirror(self, op: Op) -> None:
+        """Lower a DPP ``row_mirror`` / ``row_half_mirror`` control word.
+
+        See :meth:`_op_tile_dpp_row_mirror` in ``lower_llvm.py``: only
+        ``0x140`` and ``0x141`` are legal, and the data must be i32.
+        """
+        (data,) = op.operands
+        ctrl = dpp_ctrl_attr(op)
+        if ctrl not in (0x140, 0x141):
+            raise ValueError(
+                f"tile.dpp_row_mirror: ctrl must be 320 or 321, got {ctrl}"
+            )
         self._emit(
             f"int {_name(op.result)} = __builtin_amdgcn_update_dpp("
             f"{_name(data)}, {_name(data)}, {ctrl}, 15, 15, 1);"
