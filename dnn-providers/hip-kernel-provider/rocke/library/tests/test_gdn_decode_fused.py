@@ -296,23 +296,40 @@ def _root_param(value) -> str:
 
 
 def _specs_for_ir_checks():
-    """Both emitters, both gate kinds, every state width and fusion mode."""
+    """Both emitters, both gate kinds, every state width and fusion mode, and
+    the performance knobs that add or reshape global accesses."""
     for gate in ("gdn", "kda"):
         for st in ("bf16", "f32"):
             yield dc.replace(GdnDecodeSpec(), gate_kind=gate, state_dtype=st)
             yield dc.replace(
                 GdnDecodeSpec(), gate_kind=gate, state_dtype=st, simple=True
             )
+            yield dc.replace(
+                GdnDecodeSpec(),
+                gate_kind=gate,
+                state_dtype=st,
+                interleave_cols=True,
+                state_load_hint="streaming",
+                state_store_hint="streaming",
+            )
             for dtype in ("bf16", "f16"):
                 for conv, norm in _FLAGS:
                     for nw in (1, 4):
-                        yield _fused(
+                        spec = _fused(
                             gate_kind=gate,
                             dtype=dtype,
                             state_dtype=st,
                             num_warps=nw,
                             fuse_conv=conv,
                             fuse_out_norm=norm,
+                        )
+                        yield spec
+                        yield dc.replace(
+                            spec,
+                            interleave_cols=True,
+                            conv_once=conv,
+                            norm_gate_once=conv and norm,
+                            out_lds=norm,
                         )
 
 

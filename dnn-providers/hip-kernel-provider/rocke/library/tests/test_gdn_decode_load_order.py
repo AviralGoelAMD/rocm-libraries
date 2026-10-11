@@ -70,6 +70,19 @@ def _active_region_ops(kernel):
     return [op.name for op in _flatten(guards[0].regions[0].ops)]
 
 
+# Every tile knob on that applies to the spec it is added to; the knob code
+# must keep the loads-first order too.
+_TILE_KNOBS = dict(
+    state_load_hint="streaming",
+    state_store_hint="streaming",
+    dpp_reduce=True,
+    xcd_remap=True,
+    stream_rows=True,
+    interleave_cols=True,
+    waves_per_eu=4,
+)
+
+
 def _specs():
     out = {}
     for result in dispatch_gdn_decode_all(GdnDecodeRequest(batch=16, arch=_ARCH)):
@@ -77,13 +90,17 @@ def _specs():
     base = GdnDecodeSpec()
     for _, tile, spec_id in _TUNED_TILES_KDA:
         for state_dtype in ("bf16", "f16", "f32"):
-            out[f"tuned_{spec_id}_st{state_dtype}"] = dc.replace(
+            spec = dc.replace(
                 base,
                 gate_kind="kda",
                 state_dtype=state_dtype,
                 num_warps=tile[0],
                 warp_threads_k=tile[1],
                 blocks_per_v_dim=tile[2],
+            )
+            out[f"tuned_{spec_id}_st{state_dtype}"] = spec
+            out[f"tuned_{spec_id}_st{state_dtype}_knobs"] = dc.replace(
+                spec, **_TILE_KNOBS
             )
     out["kda_raw_gate"] = dc.replace(base, gate_kind="kda", fuse_gate=False)
     out["no_l2norm"] = dc.replace(base, use_qk_l2norm=False)
@@ -94,7 +111,7 @@ def _specs():
                     if conv and nw == 1:
                         continue  # the exempt tile (module docstring)
                     tag = ("_cv" if conv else "") + ("_rn" if norm else "")
-                    out[f"fused_{gate}_st{state_dtype}{tag}_w{nw}"] = dc.replace(
+                    spec = dc.replace(
                         base,
                         num_k_heads=16,
                         num_v_heads=16,
@@ -106,6 +123,14 @@ def _specs():
                         fuse_conv=conv,
                         fuse_out_norm=norm,
                     )
+                    case = f"fused_{gate}_st{state_dtype}{tag}_w{nw}"
+                    out[case] = spec
+                    # the fused knobs with every lane loading its own norm
+                    # gate, then with the once-per-row LDS products
+                    lane = dc.replace(spec, conv_once=conv, out_lds=norm, **_TILE_KNOBS)
+                    out[f"{case}_knobs"] = lane
+                    if conv and norm:
+                        out[f"{case}_knobs_ngo"] = dc.replace(lane, norm_gate_once=True)
     return out
 
 
