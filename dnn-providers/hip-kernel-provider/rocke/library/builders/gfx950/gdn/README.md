@@ -20,7 +20,7 @@ retune either decode mode or the GDN prefill path.
 - [Environment](#environment)
 - [Check correctness](#check-correctness)
 - [Benchmark registered candidates](#benchmark-registered-candidates)
-- [Measure candidate tiles](#measure-candidate-tiles)
+- [Measure and re-tune defaults](#measure-and-re-tune-defaults)
 - [Run tests](#run-tests)
 - [Prefill](#prefill)
 - [Understand the output](#understand-the-output)
@@ -32,10 +32,12 @@ retune either decode mode or the GDN prefill path.
 | File | Purpose |
 |---|---|
 | [`gdn_decode.py`](gdn_decode.py) | Compile a spec, build inputs, launch the shared decode emitter, and compare with the independent fp32 reference |
-| [`tune.py`](tune.py) | Measure every legal GDN registry tile or KDA tile (base configuration) against the `auto` tile |
+| [`library/benchmarks/gfx950/gdn/decode_table_sweep.py`](../../../benchmarks/gfx950/gdn/decode_table_sweep.py) | Time every registered (tile x knob) configuration of each decode shape in cold memory, fp32-gated, in two stages, against `auto`; JSON rows, sharding, summary |
+| [`library/benchmarks/gfx950/gdn/decode_defaults_report.py`](../../../benchmarks/gfx950/gdn/decode_defaults_report.py) | From those rows, `auto` against the best per shape and per case, and an advisory proposal per case by the `AUTO_DEFAULTS` rule |
+| [`library/benchmarks/gfx950/gdn/decode_shapes.json`](../../../benchmarks/gfx950/gdn/decode_shapes.json) | The shapes `AUTO_DEFAULTS` was measured on (8 cases x 3 head geometries x 7 batches) |
 | [`ALGORITHM.md`](ALGORITHM.md) | Explain the gated delta rule, gate kinds, and GPU mapping |
 | [`library/benchmarks/gfx950/gdn/benchmark_gdn_decode.py`](../../../benchmarks/gfx950/gdn/benchmark_gdn_decode.py) | Benchmark every legal GDN registry tile (base configuration) and the dispatcher `auto` configuration (its case's tile and knob stack) |
-| [`library/benchmarks/gfx950/gdn/benchmark_kda_decode.py`](../../../benchmarks/gfx950/gdn/benchmark_kda_decode.py) | Benchmark KDA fused/precomputed/simple variants from the dispatcher; optionally sweep all legal tiles |
+| [`library/benchmarks/gfx950/gdn/benchmark_kda_decode.py`](../../../benchmarks/gfx950/gdn/benchmark_kda_decode.py) | Benchmark KDA fused/precomputed/simple variants from the dispatcher; optionally time every legal tile's base configuration and `auto` (`decode_table_sweep.py` stage 1) |
 | [`library/dispatch/gdn/gfx950.py`](../../../dispatch/gdn/gfx950.py) | Register every (gate kind, tile) and select the `auto` configuration of each case; the per-case defaults are data in [`axes.py`](../../../dispatch/gdn/axes.py) (`AUTO_DEFAULTS`) |
 | [`library/dispatch/gdn/axes.py`](../../../dispatch/gdn/axes.py), [`rules.py`](../../../dispatch/gdn/rules.py) | Each tile's knob space: the knob axes as data, and their scope and legality |
 | [`library/tests/dispatch/gdn/test_gfx950_registry.py`](../../../tests/dispatch/gdn/test_gfx950_registry.py) | CPU GDN registry count, identity, legality, and selection coverage |
@@ -65,7 +67,7 @@ platform Python package on `PYTHONPATH`:
 export PYTHONPATH="$PWD/library:$PWD/platform/python${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-The driver, benchmark, tuning sweep, and numeric tests require:
+The driver, benchmarks, sweep, and numeric tests require:
 
 - ROCm torch with a visible gfx950 GPU;
 - a working ROCm comgr library for compiling the emitted LLVM IR;
@@ -87,20 +89,23 @@ Example output shape:
 
 ```text
 kernel: <compiled kernel name>  block=<threads per workgroup>
-B=1     grid=<workgroups> out_err=<error> state_err=<error> OK
-B=16    grid=<workgroups> out_err=<error> state_err=<error> OK
-worst=<largest error> tol=1.0e-02
+B=1     grid=<workgroups> out_err=<error> state_err=<error> conv_err=<error> spill=False OK
+B=16    grid=<workgroups> out_err=<error> state_err=<error> conv_err=<error> spill=False OK
+0 batches failed the fp32 gate (tol=1.0e-02)
 ```
 
-The driver checks **two results**:
+`check()` runs one launch and scores it with `gate()`, the one fp32 pass test
+every tool here uses (`Gate.passed`):
 
 - `out_err`: maximum absolute error in this token's output (for a
   `fuse_out_norm` spec, relative to `max(1, |ref|)`; see below);
-- `state_err`: maximum absolute error in the updated recurrent state (and, for
-  a `fuse_conv` spec, the conv state).
+- `state_err`: maximum absolute error in the written recurrent state slots;
+- `conv_err`: the same for the written conv-state slots (`fuse_conv` only);
+- `spill`: whether any slot the kernel was not told to write changed at all.
 
-Both must stay below `TOL`. Checking only `out` is insufficient because a bad
-state write may not affect the visible output until the next decode step.
+It passes when every error is finite and within `TOL` and nothing spilled; a
+NaN anywhere fails. Checking only `out` is insufficient because a bad state
+write may not affect the visible output until the next decode step.
 
 Check the simple one-thread-per-row reference body:
 
@@ -109,7 +114,8 @@ python3 library/builders/gfx950/gdn/gdn_decode.py \
   --batches 1,16 --variant simple
 ```
 
-Also report wall time from the driver:
+Also report the cold-memory device time of each batch (see
+[Benchmark registered candidates](#benchmark-registered-candidates)):
 
 ```bash
 python3 library/builders/gfx950/gdn/gdn_decode.py \
@@ -138,14 +144,14 @@ rounding step of an exact answer already exceeds `TOL` in absolute terms. It
 equals the absolute error wherever `|ref| <= 1`:
 
 ```python
-from builders.gfx950.gdn.gdn_decode import TOL, check
+from builders.gfx950.gdn.gdn_decode import check
 from kernels.gfx950.gdn_decode import GdnDecodeSpec
 
 spec = GdnDecodeSpec(num_k_heads=16, num_v_heads=16, gate_kind="kda",
                      state_dtype="f32", num_warps=4, warp_threads_k=16,
                      blocks_per_v_dim=1, fuse_conv=True, fuse_out_norm=True)
-out_err, state_err = check(spec, batch=8)
-assert max(out_err, state_err) < TOL
+verdict = check(spec, batch=8)
+assert verdict.passed, verdict
 ```
 
 The same modes are reachable through dispatch. `GdnDecodeRequest` takes
@@ -222,41 +228,116 @@ python3 -m benchmarks.gfx950.gdn.benchmark_kda_decode \
 ```
 
 Both benchmarks print eager and device timing. Eager includes host launch and
-synchronisation; device timing uses replayed HIP graphs. Small-batch decode can
-be launch-bound, so the two clocks answer different questions. If graph capture
-is unavailable, pass `--no-device`.
+synchronisation; device timing is the median per-launch time of replayed HIP
+graphs. Small-batch decode can be launch-bound, so the two clocks answer
+different questions. If graph capture is unavailable, pass `--no-device`.
 
-## Measure candidate tiles
+All timing (both benchmarks, `decode_table_sweep.py` and
+`gdn_decode.py --bench`) is cold memory, through the driver's shared helpers
+(`gdn_decode.py`: `device_us`, `eager_us`, `capture_cold`). In a model, each
+decode step reads every sequence's state from HBM, because the rest of the step
+evicts it from the caches. So the tools rotate through independent copies of
+the inputs and state, sized by `--rotate-mb` (what it guarantees, and how far
+apart two uses of one copy are, is in `gdn_decode.cold_copies`), and report
+medians. Re-launching on one buffer set would time the caches instead, and can
+rank configurations differently: the state cache hints and `interleave_cols`
+only pay off when the state comes from HBM. `--rotate-mb 0` times warm, for
+debugging only, and the output says so in a `WARNING` line.
 
-`tune.py` consumes the dispatch candidate set. It correctness-checks every tile
-against the FP32 reference, graph-times the correct candidates, then reports
-them fastest first:
+## Measure and re-tune defaults
+
+Two tools measure the registry and propose `auto` defaults. Neither changes
+what `auto` selects. After `pip install -e library` they are also the
+`rocke-gdn-decode-table-sweep` and `rocke-gdn-decode-defaults-report` commands.
+
+**`decode_table_sweep.py`** walks `dispatch_gdn_decode_all` for each decode
+*shape* (gate kind, `--mode plain|fused`, state dtype, `Hk/Hv`, head dim,
+batch): every registered tile x knob configuration at `--sweep-level`
+(`production`: every knob set at `waves_per_eu` 0 and 4; `full` with
+`--tuning-sample N`: N random configurations per tile). It checks each
+configuration once against the fp32 reference on disjoint read and write slots
+(output, written state and conv-state slots, untouched slots bit-exact), then
+times the ones that pass, on in-place slots as a serving engine updates them:
+
+1. Stage 1: each configuration on its own, median of `--rounds` (5) replays.
+2. Stage 2: the shape's `--top-k` (8) fastest plus `auto`, re-timed together:
+   replays interleaved, the order reversed every round and changed between
+   runs, `--s2-rounds` (30) rounds x `--runs` (3); the reported time is the
+   median of the run medians.
+
+`auto` is always timed. Each JSON row records the shape, `spec_id`, tile,
+`tuning_id`, knobs, status (`ok`, `fail` = fp32 gate, `error`, `no_graph`),
+errors, median time, per-run medians, buffer sets, the source sha and the
+device. Any row's `spec_id` + `tuning_id` + knobs pin that configuration
+(see [Performance knobs](#performance-knobs)). The run, and `--summarize`,
+exit 1 if any row of any stage is not `ok`. A `--tuning-ids` entry the walk
+does not list is an error, never dropped, and flags a mode would ignore are
+refused.
 
 ```bash
-python3 library/builders/gfx950/gdn/tune.py \
-  --gate-kind gdn --batches 1,16,64,256 --top 5
+# One shape, both stages.
+python3 -m benchmarks.gfx950.gdn.decode_table_sweep \
+  --gate-kind kda --mode fused --state-dtype f32 --heads 32/32 --batches 16 \
+  --output-json kda_fused_f32.json
+
+# Each tile's base configuration (and auto) only, stage 1: the quick tile view.
+python3 -m benchmarks.gfx950.gdn.decode_table_sweep \
+  --gate-kind gdn --heads 16/32 --batches 1,16,64,256 --bases-only --stage1-only
+
+# What a run would time, on a CPU host.
+python3 -m benchmarks.gfx950.gdn.decode_table_sweep \
+  --shapes library/benchmarks/gfx950/gdn/decode_shapes.json --list-only
+
+# Best configuration per shape against auto, from saved rows.
+python3 -m benchmarks.gfx950.gdn.decode_table_sweep --summarize 'out/*.json'
 ```
 
-For every GDN cell, it also reports the `auto` tile at its base configuration,
-the fastest legal candidate, that tile's rank and time ratio, and a manual
-review line. Both gate kinds time tiles at their base configuration only (every
-knob off), not the `auto` knob stack; measurements never update the shipped
-default.
-
-The KDA tile study across head geometries:
+`--shapes FILE` reads a JSON list of entries (`gate_kind`, `mode`,
+`state_dtype`, `heads` list, `batches` list, optional `head_dim`); the shape
+flags then filter it. A long run splits across GPUs: `--shard I/N` takes every
+N-th configuration of each shape in stage 1 (`--offset` / `--limit` take a
+window, to resume), and stage 2 then runs from the saved stage-1 rows, with
+`--shard` splitting the shapes. For example, one case on an `N`-task array job:
 
 ```bash
-python3 library/builders/gfx950/gdn/tune.py \
-  --gate-kind kda --geometries 16/32,8/16,4/8 \
-  --batches 1,2,4,8,16,32,64,128 --top 5
+I=$SLURM_ARRAY_TASK_ID N=$SLURM_ARRAY_TASK_COUNT
+python3 -m benchmarks.gfx950.gdn.decode_table_sweep \
+  --shapes library/benchmarks/gfx950/gdn/decode_shapes.json \
+  --gate-kind kda --mode plain --state-dtype bf16 \
+  --stage1-only --shard $I/$N --output-json s1_$I.json
+# after every stage-1 task finished:
+python3 -m benchmarks.gfx950.gdn.decode_table_sweep \
+  --stage1-json 's1_*.json' --shard $I/$N --output-json s2_$I.json
 ```
 
-Both are report-only. Changing an `auto` default needs a cold-memory sweep of
-the case's tiles x knobs, which `tune.py` does not do (an in-tree sweep is a
-follow-up, [`ALGORITHM.md` §8](ALGORITHM.md#8-known-limits-and-follow-ups)). Change the row in
-`AUTO_DEFAULTS`, the literal table in `test_gfx950_wiring.py` and the table in
-[`ALGORITHM.md` §4.6](ALGORITHM.md#46-registry-and-tile-selection) together,
-then rerun the dispatch wiring, golden and numeric tests.
+**`decode_defaults_report.py`** reads those rows and prints, per case
+(`AUTO_DEFAULTS` row: gate kind x fused x state width), `auto` and the
+proposal against the fastest configuration of every shape, `auto`'s score
+(the geomean of those ratios) and worst shape, and the proposed default by
+the rule `AUTO_DEFAULTS` was chosen with
+([`ALGORITHM.md` §4.6](ALGORITHM.md#46-registry-and-tile-selection)): the step
+of the rule that decided, its score, worst shape, non-default knob count, its
+score over `auto`'s, a ready-to-paste `AUTO_DEFAULTS` entry and a shortlist.
+A shape with no timed row, or where `auto` failed, is listed as `UNSCORED`
+and the report exits 1. It is advisory. To revisit a case:
+
+1. Stage 1 of every shape of the case (above, `decode_shapes.json` holds the
+   measured shapes).
+2. `python3 -m benchmarks.gfx950.gdn.decode_defaults_report 's1_*.json'` scores
+   every configuration timed at every shape and prints a `re-time:` line: the
+   stage-1 walk flags and a `--tuning-ids` shortlist (the top candidates, the
+   proposal and each shape's fastest).
+3. Re-time the shortlist together at every shape (both stages; split the jobs
+   by `--heads` / `--batches`):
+   `decode_table_sweep.py --shapes ... --gate-kind ... <the re-time: flags>
+   --output-json retime_<part>.json`, i.e. `--sweep-level`, `--tuning-sample`
+   and `--seed` as in stage 1, `--tuning-ids <list> --top-k <its length>`.
+4. `python3 -m benchmarks.gfx950.gdn.decode_defaults_report --stage 2
+   'retime_*.json'` gives the proposal at stage-2 precision.
+5. A person reviews it and changes the row in `AUTO_DEFAULTS`, the literal
+   table in `test_gfx950_wiring.py` and the table in
+   [`ALGORITHM.md` §4.6](ALGORITHM.md#46-registry-and-tile-selection) together,
+   then reruns the dispatch wiring, golden and numeric tests.
 
 ## Run tests
 
@@ -273,7 +354,10 @@ python3 -m pytest \
   library/tests/dispatch/gdn/test_gfx950_registry.py \
   library/tests/dispatch/gdn/test_gfx950_wiring.py \
   library/tests/dispatch/gdn/test_tuning_contract.py \
-  library/tests/test_gdn_decode_tune.py \
+  library/tests/test_gdn_decode_timing.py \
+  library/tests/test_gdn_decode_table_sweep.py \
+  library/tests/test_gdn_decode_defaults_report.py \
+  library/tests/test_kda_decode_benchmark.py \
   -m "not gpu"
 ```
 
@@ -375,7 +459,8 @@ Exit codes differ slightly by command:
 | `gdn_decode.py` | all requested checks passed, or checks were disabled | at least one checked batch exceeded tolerance | no GPU visible or the fixed spec was rejected |
 | `benchmark_gdn_decode.py` | every batch passed correctness and was timed | at least one batch exceeded tolerance | no GPU visible |
 | `benchmark_kda_decode.py` | every requested variant/sweep passed correctness and timing | any requested variant/sweep failed or was incomplete | visible HIP device is not gfx950 |
-| `tune.py` | every requested cell produced at least one correct, timed tile | some requested cell produced no correct, timeable tile | no GPU visible |
+| `decode_table_sweep.py` | every row passed the gate and was timed, and every shape timed `auto` (also `--summarize`, `--list-only`) | some configuration failed the gate, raised or could not be timed, a shape has no timed `auto` (not checked in a `--shard` / `--offset` / `--limit` stage-1 run, which times `auto` in one window), or (`--list-only`) a shape was refused | no gfx950 device visible, or no torch |
+| `decode_defaults_report.py` | a proposal and an `auto` score for every case | some case has no configuration timed at every shape, or `auto` untimed at a shape | - |
 
 Scripts and CI should check the exit code instead of relying on printed text.
 

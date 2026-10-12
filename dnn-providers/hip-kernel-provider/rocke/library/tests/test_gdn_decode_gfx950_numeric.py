@@ -117,9 +117,8 @@ def test_matches_fp32_reference(harness, batch):
     """Output and updated state both agree with the reference."""
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
 
-    out_err, state_err = harness["check"](GdnDecodeSpec(), batch)
-    assert out_err <= harness["TOL"], f"output error {out_err:.3e}"
-    assert state_err <= harness["TOL"], f"state error {state_err:.3e}"
+    verdict = harness["check"](GdnDecodeSpec(), batch)
+    assert verdict.passed, verdict
 
 
 @requires_gfx950
@@ -127,8 +126,8 @@ def test_simple_reference_path_matches(harness):
     """The one-thread-per-row path is a correctness baseline; keep it working."""
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
 
-    out_err, state_err = harness["check"](GdnDecodeSpec(simple=True), 4)
-    assert max(out_err, state_err) <= harness["TOL"]
+    verdict = harness["check"](GdnDecodeSpec(simple=True), 4)
+    assert verdict.passed, verdict
 
 
 def _assert_dispatch_result_matches_fp32(harness, result, batch, launchers):
@@ -388,8 +387,8 @@ def test_state_dtype_variant_is_correct(harness, state_dtype, simple):
     spec = dc.replace(GdnDecodeSpec(), state_dtype=state_dtype, simple=simple)
     ok, why = is_valid_spec(spec, arch=ARCH)
     assert ok, why
-    out_err, state_err = harness["check"](spec, 8)
-    assert max(out_err, state_err) <= harness["TOL"]
+    verdict = harness["check"](spec, 8)
+    assert verdict.passed, verdict
 
 
 @requires_gfx950
@@ -407,8 +406,8 @@ def test_f16_io_variant_is_correct(harness, state_dtype, gate):
     )
     ok, why = is_valid_spec(spec, arch=ARCH)
     assert ok, why
-    out_err, state_err = harness["check"](spec, 8)
-    assert max(out_err, state_err) <= harness["TOL"]
+    verdict = harness["check"](spec, 8)
+    assert verdict.passed, verdict
 
 
 @requires_gfx950
@@ -446,8 +445,8 @@ def test_use_qk_l2norm_off_matches_reference(harness):
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
 
     spec = dc.replace(GdnDecodeSpec(), use_qk_l2norm=False)
-    out_err, state_err = harness["check"](spec, 8)
-    assert max(out_err, state_err) <= 3.5e-2
+    verdict = harness["check"](spec, 8)
+    assert verdict.worst <= 3.5e-2 and not verdict.spill, verdict
 
 
 @requires_gfx950
@@ -461,8 +460,8 @@ def test_fallback_head_dim_geometry_is_numerically_correct(harness):
         GdnDecodeRequest(batch=1, head_k_dim=64, arch=ARCH)
     ).spec.kernel_spec
     assert spec.head_k_dim == 64
-    out_err, state_err = harness["check"](spec, 1)
-    assert max(out_err, state_err) <= harness["TOL"]
+    verdict = harness["check"](spec, 1)
+    assert verdict.passed, verdict
 
 
 @requires_gfx950

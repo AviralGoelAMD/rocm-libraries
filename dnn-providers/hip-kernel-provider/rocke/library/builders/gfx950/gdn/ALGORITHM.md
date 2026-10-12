@@ -532,8 +532,8 @@ off (`waves_per_eu` `0`).
 | KDA | fused | f32 | `(4, 8, 1)` | `dpp_reduce`, `stream_rows`, `interleave_cols`, `conv_once`, `out_lds` |
 
 Provenance. The table comes from a cold-memory sweep on gfx950 (every call reads its state from
-HBM; ≥ 1 GiB of inputs rotate per cycle). A *shape* is one head geometry `Hk/Hv` at one batch.
-Each case was measured at `DK = DV = 128` and batch 1, 8, 16, 32, 64, 128 and 256 on three head
+HBM; one rotation cycle of input copies touches ≥ 1 GiB). A *shape* is one head geometry `Hk/Hv`
+at one batch. Each case was measured at `DK = DV = 128` and batch 1, 8, 16, 32, 64, 128 and 256 on three head
 geometries: KDA 8/8, 32/32, 96/96; GDN plain 16/32, 4/8, 32/32; GDN fused 8/8, 16/16, 32/32. The
 fused cases were measured with both `fuse_conv` and `fuse_out_norm` on (`Hk = Hv`). Stage 1 timed
 every legal tile × knob configuration of each case, correctness-gated against the fp32 reference;
@@ -547,16 +547,19 @@ knobs; then the lower score. One override: for KDA fused f32 the rule picks `(16
 `interleave_cols`, `conv_once`, `out_lds`, `waves_per_eu=4`, which is slower than the shipped row
 at batch 1 (the latency case) on the two smaller head geometries. The row shipped is the
 `(4, 8, 1)` configuration with the best score among the `(4, 8, 1)` arms: near-tied with the
-rule's pick on the score, with a slightly better worst shape. The tie band and the measured
-ratios are in the pull request that set this table. One row serves every batch.
+rule's pick on the score, with a slightly better worst shape. The tie band is 1%
+(`decode_defaults_report.py`, `TIE` / `--tie`); the measured ratios are in the pull request that
+set this table. One row serves every batch.
 
 Not measured: a fused request with one flag (it runs its row with the other flag's knobs
 dropped, below; e.g. `fuse_out_norm` alone at `Hk ≠ Hv`, where `fuse_conv` is not allowed), other
 head dims where the case tile is legal (e.g. GDN at `DK = 256`, which runs the row), an `f16`
 state (it moves the same bytes as bf16, so it runs the bf16 row), and gfx942. To revisit a case,
-sweep its tiles × knobs cold (`tune.py` times tiles at their base configuration only; an in-tree
-tiles × knobs sweep is a follow-up, §8), then change its row in `AUTO_DEFAULTS`, the literal
-table in `test_gfx950_wiring.py` and this table together.
+sweep its tiles × knobs cold with `library/benchmarks/gfx950/gdn/decode_table_sweep.py` (stage 1
+over every shape of the case in `decode_shapes.json`), score them with `decode_defaults_report.py`
+(this rule; it prints a shortlist), re-time the shortlist with the sweep's stage 2 and score that
+(`--stage 2`); the report is advisory (README, *Measure and re-tune defaults*). Then change the
+row in `AUTO_DEFAULTS`, the literal table in `test_gfx950_wiring.py` and this table together.
 
 A knob the request cannot read is dropped for it (the scope rule above): a request with only one
 fused flag drops the knobs of the other (`out_lds` and `norm_gate_once` need `fuse_out_norm`;
@@ -954,5 +957,3 @@ Widening the range needs nested chunking or per-token rescaling.
    then (§4.8).
 9. A footprint-based `auto` fallback order (§4.6): when a case's tile is illegal (GDN at `DK` 64 or
    192), the first legal tile in product order is `(1, 1, 1)`, which is register-heavy.
-10. An in-tree tiles × knobs sweep (§4.6) that regenerates `AUTO_DEFAULTS`: `tune.py` times tiles
-    at their base configuration only.

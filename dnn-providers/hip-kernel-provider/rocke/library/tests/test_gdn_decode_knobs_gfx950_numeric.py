@@ -133,15 +133,10 @@ def _knob_specs(knob, gate, fused, state_dtype):
 
 
 def _assert_exact(spec, batch):
-    from builders.gfx950.gdn.gdn_decode import TOL, check
+    from builders.gfx950.gdn.gdn_decode import check
 
-    out_err, state_err = check(spec, batch)
-    assert out_err < TOL and state_err < TOL, (
-        spec.kernel_name(),
-        batch,
-        out_err,
-        state_err,
-    )
+    verdict = check(spec, batch)
+    assert verdict.passed, (spec.kernel_name(), batch, verdict)
 
 
 @requires_gfx950

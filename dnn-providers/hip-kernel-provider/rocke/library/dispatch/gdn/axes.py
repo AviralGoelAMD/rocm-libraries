@@ -122,9 +122,10 @@ AUTO_STATE_ROW: Mapping[str, str] = MappingProxyType(
 # A knob a request cannot read is dropped for it, never refused (rules.py
 # scope): the fused-only knobs on a request with only one fused flag, and
 # dpp_reduce / stream_rows / interleave_cols where the tile's ``*_applies``
-# predicate is False. To revisit, sweep the case's tiles x knobs cold, then
-# change the row here, the literal table in test_gfx950_wiring.py and the
-# table in ALGORITHM.md §4.6 together.
+# predicate is False. To revisit, sweep the case's tiles x knobs cold
+# (benchmarks/gfx950/gdn/decode_table_sweep.py), score them with the rule above
+# (decode_defaults_report.py, advisory), then change the row here, the literal
+# table in test_gfx950_wiring.py and the table in ALGORITHM.md §4.6 together.
 AUTO_DEFAULTS: Mapping[Tuple[str, bool, str], AutoDefault] = MappingProxyType(
     {
         ("gdn", False, "bf16"): _auto((2, 16, 8), dpp_reduce=True),

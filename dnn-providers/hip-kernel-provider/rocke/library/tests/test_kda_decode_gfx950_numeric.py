@@ -92,10 +92,8 @@ def test_kda_simple_path_matches_reference(harness, batch, state_dtype):
     gate-formula bug.
     """
     spec = _kda(simple=True, state_dtype=state_dtype)
-    out_err, state_err = harness["check"](spec, batch)
-
-    assert out_err <= harness["TOL"], f"KDA simple output error {out_err:.3e}"
-    assert state_err <= harness["TOL"], f"KDA simple state error {state_err:.3e}"
+    verdict = harness["check"](spec, batch)
+    assert verdict.passed, f"KDA simple path: {verdict}"
 
 
 @requires_gfx950
@@ -103,9 +101,8 @@ def test_gdn_simple_path_still_matches_reference(harness):
     """The GDN gate must be untouched by the KDA branch living beside it."""
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
 
-    out_err, state_err = harness["check"](GdnDecodeSpec(simple=True), 4)
-
-    assert max(out_err, state_err) <= harness["TOL"]
+    verdict = harness["check"](GdnDecodeSpec(simple=True), 4)
+    assert verdict.passed, verdict
 
 
 @requires_gfx950
@@ -118,10 +115,8 @@ def test_kda_warp_tiled_matches_reference(harness, batch, state_dtype):
     is an indexing bug: this emitter splits the DK axis across lanes, and the
     decay vector has to line up with the state slice each lane owns.
     """
-    out_err, state_err = harness["check"](_kda(state_dtype=state_dtype), batch)
-
-    assert out_err <= harness["TOL"], f"KDA warp-tiled output error {out_err:.3e}"
-    assert state_err <= harness["TOL"], f"KDA warp-tiled state error {state_err:.3e}"
+    verdict = harness["check"](_kda(state_dtype=state_dtype), batch)
+    assert verdict.passed, f"KDA warp-tiled: {verdict}"
 
 
 @requires_gfx950
@@ -138,14 +133,8 @@ def test_every_kda_auto_tile_is_correct(harness, tile, state_dtype):
         blocks_per_v_dim=blocks_per_v_dim,
         state_dtype=state_dtype,
     )
-    out_err, state_err = harness["check"](spec, batch=16)
-
-    assert (
-        out_err <= harness["TOL"]
-    ), f"KDA tile {tile} (state {state_dtype}) output error {out_err:.3e}"
-    assert (
-        state_err <= harness["TOL"]
-    ), f"KDA tile {tile} (state {state_dtype}) state error {state_err:.3e}"
+    verdict = harness["check"](spec, batch=16)
+    assert verdict.passed, f"KDA tile {tile} (state {state_dtype}): {verdict}"
 
 
 @requires_gfx950
@@ -212,20 +201,16 @@ def test_kda_mha_shape_matches_reference(harness):
     The GDN shapes are all GQA (Hv > Hk), so this is the first time the gather
     that maps a value head to its key head runs with no grouping at all.
     """
-    out_err, state_err = harness["check"](_kda(num_k_heads=32, num_v_heads=32), 8)
-
-    assert out_err <= harness["TOL"], f"KDA MHA output error {out_err:.3e}"
-    assert state_err <= harness["TOL"], f"KDA MHA state error {state_err:.3e}"
+    verdict = harness["check"](_kda(num_k_heads=32, num_v_heads=32), 8)
+    assert verdict.passed, f"KDA MHA: {verdict}"
 
 
 @requires_gfx950
 @pytest.mark.parametrize("batch", [1, 16])
 def test_precomputed_decay_matches_reference(harness, batch):
     """fuse_gate=False: `a` carries log-decay, the kernel only exponentiates."""
-    out_err, state_err = harness["check"](_kda(fuse_gate=False), batch)
-
-    assert out_err <= harness["TOL"], f"raw-gate output error {out_err:.3e}"
-    assert state_err <= harness["TOL"], f"raw-gate state error {state_err:.3e}"
+    verdict = harness["check"](_kda(fuse_gate=False), batch)
+    assert verdict.passed, f"raw gate: {verdict}"
 
 
 @requires_gfx950
