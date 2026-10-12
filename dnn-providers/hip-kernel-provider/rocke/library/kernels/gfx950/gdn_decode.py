@@ -75,10 +75,9 @@ an XOR butterfly (``quad_perm`` at offsets 1-2, ``ds_swizzle`` wider; with
 ``dpp_reduce`` offsets 4 and 8 use DPP row mirrors instead), so the
 unfused kernel allocates no LDS (``fuse_out_norm`` adds a ``num_warps``-float
 LDS reduction when ``num_warps > 1``; ALGORITHM.md section 4.9). Dispatch
-selects this tile from the gfx950 GDN registry: `auto` prefers one tile per
-request (``dispatch.gdn.gfx950.auto_tile``: GDN's static default, KDA's
-work-keyed table, or the shared fused default for a fused request), while an
-explicit `spec_id` pins a tile.
+selects this tile from the gfx950 GDN registry: `auto` runs one static tile
+and knob stack per case (``dispatch.gdn.axes.AUTO_DEFAULTS``: gate kind x
+fused x state width), while an explicit `spec_id` pins a tile.
 
 ``simple=True`` is the v1 reference: one workgroup per ``(sequence, value_head)``,
 ``head_v_dim`` threads, thread ``t`` owning state row ``t`` (the full
