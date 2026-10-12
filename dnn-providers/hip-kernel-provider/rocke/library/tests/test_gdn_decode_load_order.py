@@ -34,8 +34,8 @@ _LIB_ROOT = str(Path(__file__).resolve().parent.parent)
 if sys.path and sys.path[0] != _LIB_ROOT:
     sys.path.insert(0, _LIB_ROOT)
 
-from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode_all  # noqa: E402
-from dispatch.gdn.gfx950 import _TUNED_TILES_KDA  # noqa: E402
+from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode_bases  # noqa: E402
+from dispatch.gdn.gfx950 import _TUNED_TILES_KDA, spec_id_for  # noqa: E402
 from kernels.gfx950.gdn_decode import (  # noqa: E402
     GdnDecodeSpec,
     build_gdn_decode,
@@ -93,10 +93,11 @@ _TILE_KNOBS = dict(
 
 def _specs():
     out = {}
-    for result in dispatch_gdn_decode_all(GdnDecodeRequest(batch=16, arch=_ARCH)):
-        out[f"registered_{result.candidate.spec_id}"] = result.spec
+    for result in dispatch_gdn_decode_bases(GdnDecodeRequest(batch=16, arch=_ARCH)):
+        out[f"registered_{result.candidate.spec_id}"] = result.spec.kernel_spec
     base = GdnDecodeSpec()
-    for _, tile, spec_id in _TUNED_TILES_KDA:
+    for _, tile in _TUNED_TILES_KDA:
+        spec_id = spec_id_for(tile, "kda")
         for state_dtype in ("bf16", "f16", "f32"):
             spec = dc.replace(
                 base,
