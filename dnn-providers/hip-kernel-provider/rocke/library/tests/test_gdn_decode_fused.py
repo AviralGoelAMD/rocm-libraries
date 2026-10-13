@@ -255,13 +255,12 @@ class TestFusedEmission(unittest.TestCase):
                             self.assertEqual(_scratch_bytes(self, s), 0)
 
     def test_one_wave_conv_once_loads_first_without_a_new_spill(self):
-        """Where late_row_inputs lets single-wave fuse_conv load its rows'
-        state and norm inputs first (conv_once, WTK 4 / 8), the hoisted
-        kernel spills no more than the late order it replaces. The specs are
-        the register-heaviest of that set: the per-lane norm inputs,
-        stream_rows and, with an f32 state, both column maps."""
-        from unittest import mock
-
+        """Where auto_late_row_inputs lets single-wave fuse_conv load its
+        rows' state and norm inputs first (conv_once, WTK 4 / 8), the hoisted
+        kernel spills no more than the late order it replaces
+        (``row_loads="late"``). The specs are the register-heaviest of that
+        set: the per-lane norm inputs, stream_rows and, with an f32 state,
+        both column maps."""
         from kernels.gfx950 import gdn_decode
 
         for gate in ("gdn", "kda"):
@@ -284,15 +283,12 @@ class TestFusedEmission(unittest.TestCase):
                         )
                         with self.subTest(name=s.kernel_name()):
                             self.assertFalse(gdn_decode.late_row_inputs(s))
+                            late_spec = dc.replace(s, row_loads="late")
+                            self.assertTrue(gdn_decode.late_row_inputs(late_spec))
                             hoisted = _scratch_bytes(self, s)
-                            hoisted_ops = _op_names(s)
-                            with mock.patch.object(
-                                gdn_decode, "late_row_inputs", lambda _: True
-                            ):
-                                late = _scratch_bytes(self, s)
-                                late_ops = _op_names(s)
-                            # the patch reached the emitter: the order moved
-                            self.assertNotEqual(hoisted_ops, late_ops)
+                            late = _scratch_bytes(self, late_spec)
+                            # the knob reached the emitter: the order moved
+                            self.assertNotEqual(_op_names(s), _op_names(late_spec))
                             self.assertLessEqual(hoisted, late)
 
     def test_unfused_kernel_has_no_lds_or_barrier(self):

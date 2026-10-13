@@ -175,23 +175,31 @@ values = run_values(spec, inp, launcher_for(spec), 8)
 
 ### Performance knobs
 
-Ten spec fields change how the warp-tiled kernel computes, not what it
+Eleven spec fields change how the warp-tiled kernel computes, not what it
 computes: `state_load_hint`, `state_store_hint`, `dpp_reduce`, `xcd_remap`,
-`stream_rows`, `interleave_cols`, `conv_once`, `norm_gate_once`, `out_lds` and
-`waves_per_eu`. Every one defaults to the code the kernel emitted before it
-existed, so a default spec keeps its name and its IR. `auto` runs its case's
+`stream_rows`, `interleave_cols`, `conv_once`, `norm_gate_once`, `out_lds`,
+`waves_per_eu` and `row_loads`. Every one defaults to the code the kernel
+emitted before it existed, so a default spec keeps its name and its IR.
+`row_loads` (`"auto"`, `"first"`, `"late"`) forces where a single-wave
+`fuse_conv` kernel loads its rows' late inputs (§4.3, "One exception"); `auto`
+dispatch never sets it. `auto` runs its case's
 knob stack (§4.6); a bare `spec_id` pin runs the tile with every knob at its
-default (flags off, hints `default`, `waves_per_eu` `0`). Each registered
-tile's knob space holds them, so any (tile x knob) configuration is
-selectable by pinning its `spec_id` plus `tuning_knobs` (and the `tuning_id` a
-sweep recorded with them). `dispatch_gdn_decode_all` lists every configuration
-of the listed axes: all nine knob axes, and `waves_per_eu` `{0, 4}` at the
-default `production` sweep level or every legal value `0`-`8` at `full`; any
-legal `waves_per_eu` is pinnable. `dispatch_gdn_decode_bases` lists only each
+default (flags off, hints `default`, `waves_per_eu` `0`, `row_loads` `auto`).
+Each registered tile's knob space holds them, so any (tile x knob)
+configuration is selectable by pinning its `spec_id` plus `tuning_knobs` (and
+the `tuning_id` a sweep recorded with them). `dispatch_gdn_decode_all` lists
+every configuration of the listed axes: the nine other knob axes whole (where
+in scope), `waves_per_eu` `{0, 4}` at the default `production` sweep level or
+every legal value `0`-`8` at `full`, and on single-wave `fuse_conv` tiles each
+knob set at each `waves_per_eu` value also in the `row_loads` order auto does
+not choose there; any legal `waves_per_eu` is pinnable. Adding
+`row_loads` changed every `config_key`: re-sweep a `tuning_id` recorded
+before it. `dispatch_gdn_decode_bases` lists only each
 tile's base configuration. `tuning_knobs` alone carry a configuration to
-another shape (a knob that shape does not read is dropped); a stored
-`tuning_id` replays only where all of its knobs are still read, and is
-refused elsewhere. Their rules and the tiles where each changes code are in
+another shape (a knob that changes no code there is dropped: one that shape
+does not read, or a `row_loads` that restates auto's order there); a stored
+`tuning_id` replays only where none of its knobs is dropped, and is refused
+elsewhere. Their rules and the tiles where each changes code are in
 [`ALGORITHM.md` §4.10](ALGORITHM.md#410-performance-knobs); the registry and
 pin rules in [§4.6](ALGORITHM.md#46-registry-and-tile-selection).
 
