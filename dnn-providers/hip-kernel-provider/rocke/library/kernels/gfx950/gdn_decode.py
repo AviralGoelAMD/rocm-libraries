@@ -133,6 +133,11 @@ __all__ = [
     "xcd_remap_applies",
     "stream_rows_applies",
     "interleave_cols_applies",
+    "ROW_LOADS",
+    "row_loads_applies",
+    "auto_late_row_inputs",
+    "late_row_inputs",
+    "row_loads_overrides",
 ]
 
 DType = Literal["f16", "bf16"]
@@ -208,6 +213,13 @@ _TEMPORAL = {"default": TemporalHint.DEFAULT, "streaming": TemporalHint.STREAMIN
 _HINT_TOKEN = {"streaming": "nt"}
 # Highest amdgpu-waves-per-eu value: a gfx950 SIMD holds at most 8 waves.
 _MAX_WAVES_PER_EU = 8
+# Where a single-wave fuse_conv kernel loads its rows' late inputs (the
+# ``row_loads`` knob): "auto" keeps auto_late_row_inputs' rule, "first" loads them
+# with the other inputs ahead of the math, "late" where each is first used.
+RowLoads = Literal["auto", "first", "late"]
+ROW_LOADS = get_args(RowLoads)
+# kernel_name() token of a forced order that differs from auto's ("rlf" / "rll").
+_ROW_LOADS_TOKEN = {"first": "rlf", "late": "rll"}
 
 
 def _state_ir_type(state_dtype: str):
@@ -280,11 +292,21 @@ def interleave_cols_applies(spec: "GdnDecodeSpec") -> bool:
     return not spec.simple and spec.state_dtype == "f32" and spec.warp_threads_k > 1
 
 
-def late_row_inputs(spec: "GdnDecodeSpec") -> bool:
-    """Whether the warp-tiled emitter loads each row's late inputs where the
-    parent order did instead of first (ALGORITHM.md §4.3, "One exception"):
-    each row's ``v`` conv inputs in the row loop, each state chunk at its
-    decay, and the per-lane ``out_gate`` / ``norm_weight`` at the norm.
+def row_loads_applies(spec: "GdnDecodeSpec") -> bool:
+    """``row_loads``: a single wave with ``fuse_conv``, the one kernel whose
+    rows' late inputs (each row's ``v`` conv inputs, each state chunk, the
+    per-lane ``out_gate`` / ``norm_weight``) have two load orders. Every other
+    warp-tiled kernel loads them first, and the reference path has no rows to
+    order."""
+    return not spec.simple and spec.fuse_conv and spec.num_warps == 1
+
+
+def auto_late_row_inputs(spec: "GdnDecodeSpec") -> bool:
+    """``row_loads="auto"``'s order: whether the warp-tiled emitter loads each
+    row's late inputs where the parent order did instead of first
+    (ALGORITHM.md §4.3, "One exception"): each row's ``v`` conv inputs in the
+    row loop, each state chunk at its decay, and the per-lane ``out_gate`` /
+    ``norm_weight`` at the norm.
 
     Only a single wave with ``fuse_conv`` takes the exception. It owns every
     V row of the head, and hoisting their ``v`` conv inputs together with the
@@ -295,7 +317,7 @@ def late_row_inputs(spec: "GdnDecodeSpec") -> bool:
     other ``WTK``, at ``DK = DV = 256`` and under a ``waves_per_eu`` cap
     hoisting adds spills, and the other head dims are not characterized.
     """
-    if not (spec.fuse_conv and spec.num_warps == 1):
+    if not row_loads_applies(spec):
         return False
     hoists = (
         spec.conv_once
@@ -304,6 +326,21 @@ def late_row_inputs(spec: "GdnDecodeSpec") -> bool:
         and spec.warp_threads_k in (4, 8)
     )
     return not hoists
+
+
+def late_row_inputs(spec: "GdnDecodeSpec") -> bool:
+    """The order the emitter uses: ``row_loads`` where it applies and forces
+    one (``"late"`` / ``"first"``), else :func:`auto_late_row_inputs`."""
+    if spec.row_loads == "auto" or not row_loads_applies(spec):
+        return auto_late_row_inputs(spec)
+    return spec.row_loads == "late"
+
+
+def row_loads_overrides(spec: "GdnDecodeSpec") -> bool:
+    """Whether ``row_loads`` changes the emitted code: it applies and forces
+    the order ``auto`` does not choose. A forced order equal to auto's emits
+    auto's kernel, so it adds no name token either."""
+    return late_row_inputs(spec) != auto_late_row_inputs(spec)
 
 
 def _exp_f32(b: IRBuilder, x):
@@ -432,6 +469,11 @@ class GdnDecodeSpec:
     # it caps registers per lane accordingly. 0 leaves occupancy to the
     # compiler and emits no attribute.
     waves_per_eu: int = 0
+    # Single-wave fuse_conv only (row_loads_applies): where each row's late
+    # inputs load. "auto" is auto_late_row_inputs' rule; "first" / "late"
+    # force one order. A forced order equal to auto's is auto's kernel, and
+    # elsewhere the field changes no code.
+    row_loads: RowLoads = "auto"
     name: str = "rocke_gdn_decode"
 
     @property
@@ -502,6 +544,11 @@ class GdnDecodeSpec:
             )
         if self.waves_per_eu:
             parts += (f"wpe{self.waves_per_eu}",)
+        # A value outside ROW_LOADS (is_valid_spec refuses it) keeps a name of
+        # its own, like a bad hint, so it can never hit a launcher cached
+        # under auto's name.
+        if type(self.row_loads) is not str or self.row_loads not in ROW_LOADS:
+            parts += (f"rl{self.row_loads!r}",)
         return kernel_name_join(
             self.name,
             *parts,
@@ -517,6 +564,11 @@ class GdnDecodeSpec:
                 "co": self.conv_once,
                 "ngo": self.norm_gate_once,
                 "olds": self.out_lds,
+                # A forced order adds its token only where it is not auto's.
+                **{
+                    token: self.row_loads == order and row_loads_overrides(self)
+                    for order, token in _ROW_LOADS_TOKEN.items()
+                },
             },
         )
 
@@ -597,6 +649,11 @@ def is_valid_spec(spec: GdnDecodeSpec, arch: str = "gfx950") -> Tuple[bool, str]
         _value = getattr(spec, _field)
         if _value not in STATE_HINTS:
             return False, f"{_field} must be one of {STATE_HINTS}, got {_value!r}"
+    # Any order on any spec: a forced order builds and compiles wherever it
+    # applies. Where it spills more than auto's order is a performance
+    # question for the sweep, not a legality one (ALGORITHM.md §4.10).
+    if type(spec.row_loads) is not str or spec.row_loads not in ROW_LOADS:
+        return False, f"row_loads must be one of {ROW_LOADS}, got {spec.row_loads!r}"
     if not 0 <= spec.waves_per_eu <= _MAX_WAVES_PER_EU:
         return False, (
             f"waves_per_eu must be in [0, {_MAX_WAVES_PER_EU}], "
@@ -966,7 +1023,8 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
     ST_BYTES = _ELEM_BYTES[spec.state_dtype]
     CONV, RN = spec.fuse_conv, spec.fuse_out_norm
     # A single wave with fuse_conv may keep some inputs late to avoid a spill
-    # (late_row_inputs; ALGORITHM.md §4.3, "One exception").
+    # (late_row_inputs: auto's rule or the row_loads knob; ALGORITHM.md §4.3,
+    # "One exception").
     LATE_ROW_INPUTS = late_row_inputs(spec)
     CONV_DIM = spec.conv_dim  # packed [q | k | v] channels
     IO_BYTES = _ELEM_BYTES[spec.dtype]  # the conv state carries the I/O dtype

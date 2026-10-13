@@ -15,9 +15,11 @@ so: one wave owns all ``DV`` rows, and hoisting their inputs as well would
 spill, so it loads each row's ``v`` conv inputs, the state and the norm
 inputs where the parent order did (ALGORITHM.md §4.3, "One exception").
 With ``conv_once`` at ``DK = DV = 128``, ``WTK`` 4 or 8 and no
-``waves_per_eu`` floor it loads first like every other tile. The predicate
-and the order on both sides of it are pinned below; the no-new-spill check
-of the tiles that load first is in ``test_gdn_decode_fused.py``.
+``waves_per_eu`` floor ``auto`` loads first like every other tile, and the
+``row_loads`` knob forces either order on any single-wave ``fuse_conv`` spec.
+The predicate, the knob and the order on both sides of them are pinned below;
+the no-new-spill check of the tiles that load first is in
+``test_gdn_decode_fused.py``.
 
 Builds IR only: no lowering, no GPU, no comgr.
 """
@@ -240,4 +242,19 @@ def test_late_row_inputs_predicate_and_load_order(case):
     assert late_row_inputs(spec) is keeps_late, case
     late, first_math = _late_loads(spec)
     # the predicate is what the emitter does: late loads exactly where it says
+    assert bool(late) is keeps_late, (case, first_math, late[:4])
+
+
+@pytest.mark.parametrize("order", ["first", "late"])
+@pytest.mark.parametrize("case", sorted(_PREDICATE_CASES))
+def test_row_loads_forces_the_order_on_one_wave_with_fuse_conv(case, order):
+    overrides, auto_late = _PREDICATE_CASES[case]
+    spec = dc.replace(GdnDecodeSpec(), **dict(_ONE_WAVE, **overrides), row_loads=order)
+    assert is_valid_spec(spec, arch=_ARCH)[0], is_valid_spec(spec, arch=_ARCH)[1]
+    # Every case is one wave with fuse_conv except two_waves_no_co and
+    # norm_only, where the knob changes nothing and the order is auto's (first).
+    applies = spec.fuse_conv and spec.num_warps == 1
+    keeps_late = order == "late" if applies else auto_late
+    assert late_row_inputs(spec) is keeps_late, case
+    late, first_math = _late_loads(spec)
     assert bool(late) is keeps_late, (case, first_math, late[:4])
