@@ -15,6 +15,8 @@ from dataclasses import MISSING, dataclass, fields as _dataclass_fields
 from functools import lru_cache
 from typing import Any, Iterable, Mapping, NamedTuple, Optional, Tuple
 
+from rocke.dispatch.tuning import WavesPerEuSpace
+
 from .axes import (
     DEAD_END_KNOBS,
     KNOWN_WRONG_KNOBS,
@@ -41,7 +43,7 @@ from .tuning_specs import (
     make_explicit_attention_2d_spec,
     make_explicit_attention_3d_specs,
 )
-from .waves import FULL_WAVES, PRODUCTION_WAVES, WavesPerEuSpace
+from .waves import FULL_WAVES, PRODUCTION_WAVES
 
 TUNING_ALGORITHM = "unified_tuning"
 
