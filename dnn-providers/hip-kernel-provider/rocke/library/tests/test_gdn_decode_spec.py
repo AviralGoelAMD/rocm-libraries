@@ -383,12 +383,12 @@ class TestEmission(unittest.TestCase):
         #   kda_nw1_wtk1_bpv2    0 B      388 B
         #   kda_nw2_wtk1_bpv1    0 B      364 B
         # (the KDA gate holds a decay per K channel, hence more registers).
-        # ``auto`` never selects them (GDN always picks DEFAULT_TILE, KDA its
-        # work table); they stay registered for both gate kinds because they
-        # can be pinned and (1,1,1) is the fallback when the auto tile is
-        # illegal. They may spill up to their gate kind's budget, which absorbs
-        # compiler drift but still catches a register-pressure blowup. Every
-        # other registered tile of either gate kind must not spill.
+        # ``auto`` never selects them on a legal case tile; they stay
+        # registered for both gate kinds because they can be pinned and
+        # (1,1,1) is the fallback when a case's tile is illegal. They may
+        # spill up to their gate kind's budget, which absorbs compiler drift
+        # but still catches a register-pressure blowup. Every other registered
+        # tile of either gate kind must not spill.
         spill_budget_bytes = {"gdn": 512, "kda": 1024}
         register_bound = ((1, 1, 1), (1, 1, 2), (2, 1, 1))
         for gate_kind in ("gdn", "kda"):
@@ -407,22 +407,29 @@ class TestEmission(unittest.TestCase):
                     else:
                         self.assertEqual(scratch, 0)
 
-    def test_every_kda_tuned_tile_compiles(self):
-        from dispatch.gdn.gfx950 import _TUNED_TILES_KDA
+    def test_every_auto_configuration_compiles_without_spilling(self):
+        from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode
 
-        # f32 doubles the state registers each lane loads, so both widths run.
-        for state_dtype in ("bf16", "f32"):
-            for _, tile in _TUNED_TILES_KDA:
-                with self.subTest(tile=tile, state_dtype=state_dtype):
-                    spec = dc.replace(
-                        GdnDecodeSpec(),
-                        gate_kind="kda",
-                        num_warps=tile[0],
-                        warp_threads_k=tile[1],
-                        blocks_per_v_dim=tile[2],
+        # Every case's tile and knob stack, on each state width (f32 doubles
+        # the state registers each lane loads).
+        for gate_kind in ("gdn", "kda"):
+            for fused in (False, True):
+                for state_dtype in ("bf16", "f16", "f32"):
+                    req = GdnDecodeRequest(
+                        batch=16,
+                        arch="gfx950",
+                        gate_kind=gate_kind,
+                        num_k_heads=16,
+                        num_v_heads=16,
                         state_dtype=state_dtype,
+                        fuse_conv=fused,
+                        fuse_out_norm=fused,
                     )
-                    self.assertEqual(_compiled_scratch_bytes(self, spec), 0)
+                    spec = dispatch_gdn_decode(req).spec
+                    with self.subTest(tuning_id=spec.tuning_id, state=state_dtype):
+                        self.assertEqual(
+                            _compiled_scratch_bytes(self, spec.kernel_spec), 0
+                        )
 
     def test_default_gdn_tile_compiles_with_an_f32_state(self):
         spec = dc.replace(GdnDecodeSpec(), state_dtype="f32")

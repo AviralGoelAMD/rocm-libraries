@@ -47,10 +47,11 @@ if sys.path and sys.path[0] != _LIB_ROOT:
 def _cases():
     """case id -> zero-arg builder returning a KernelDef.
 
-    Covers the default spec, the reference path, and every legal registered
-    tile's base configuration (every knob at its default: the kernel ``auto``
-    runs on that tile) for both gate kinds, so a change to any tile is
-    visible. Knobs are hashed by the ``knob_*`` cases: one per knob on each
+    Covers the default spec, the reference path, every legal registered
+    tile's base configuration (every knob at its default) for both gate
+    kinds, so a change to any tile is visible, and the configuration ``auto``
+    dispatches for every case (``auto_*``), so a change to a shipped default
+    is too. Knobs are hashed by the ``knob_*`` cases: one per knob on each
     path it changes, plus the knob combinations that share LDS
     (``knob_conv_once_norm_gate_once``, ``knob_out_lds_norm_gate_once_kda``,
     ``knob_out_lds_2rounds_cv_rn_ngo``). Hashing every (tile x knob)
@@ -58,7 +59,11 @@ def _cases():
     covered on device, by the knob suite (every knob on every configured tile
     and together) and the pinned-dispatch suite, not by IR hashes.
     """
-    from dispatch.gdn import GdnDecodeRequest, dispatch_gdn_decode_bases
+    from dispatch.gdn import (
+        GdnDecodeRequest,
+        dispatch_gdn_decode,
+        dispatch_gdn_decode_bases,
+    )
     from kernels.gfx950.gdn_decode import GdnDecodeSpec, build_gdn_decode
 
     def build(**overrides):
@@ -202,6 +207,29 @@ def _cases():
             cases[f"registered_{result.candidate.spec_id}"] = (
                 lambda spec=result.spec.kernel_spec: build_gdn_decode(spec, arch=_ARCH)
             )
+    # What ``auto`` dispatches per case (gate kind x plain / conv + norm x
+    # state width; f16 runs the bf16 row on its own state type).
+    for gate_kind in ("gdn", "kda"):
+        for fused in (False, True):
+            for state_dtype in ("bf16", "f16", "f32"):
+                result = dispatch_gdn_decode(
+                    GdnDecodeRequest(
+                        batch=16,
+                        arch=_ARCH,
+                        gate_kind=gate_kind,
+                        num_k_heads=16,
+                        num_v_heads=16,
+                        state_dtype=state_dtype,
+                        fuse_conv=fused,
+                        fuse_out_norm=fused,
+                    )
+                )
+                mode = "cv_rn" if fused else "plain"
+                cases[f"auto_{gate_kind}_{mode}_st{state_dtype}"] = (
+                    lambda spec=result.spec.kernel_spec: build_gdn_decode(
+                        spec, arch=_ARCH
+                    )
+                )
     return cases
 
 
