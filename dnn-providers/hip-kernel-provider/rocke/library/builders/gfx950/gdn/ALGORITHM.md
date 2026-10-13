@@ -38,6 +38,7 @@
   - [4.7 The reference path](#47-the-reference-path)
   - [4.8 Spec validation](#48-spec-validation)
   - [4.9 Optional fusions: conv1d and gated RMSNorm](#49-optional-fusions-conv1d-and-gated-rmsnorm)
+  - [4.10 Performance knobs](#410-performance-knobs)
 - [5. Prefill kernel](#5-prefill-kernel)
   - [5.1 Chunkwise factorization](#51-chunkwise-factorization)
   - [5.2 The triangular solve](#52-the-triangular-solve)
@@ -397,7 +398,16 @@ One exception: with `fuse_conv` and a single wave, one lane owns many V rows (32
 tile and the norm inputs on top of the `q`/`k` conv inputs would need more than the 512 VGPRs a
 lane can have, so it would spill. That tile loads those inputs where the parent order did: each
 row's `v` inputs and its conv in the step-8 row loop, each state chunk at step 7, and `out_gate` /
-`norm_weight` at the norm. Its `q`, `k` and gate inputs still load first.
+`norm_weight` at the norm. Its `q`, `k` and gate inputs still load first. `late_row_inputs` in the
+emitter holds the rule.
+
+With `conv_once` (§4.10) the exception is narrower. The `v` channels then come from LDS, so only
+the state chunks and the per-lane norm inputs would stay late, and late they cost the tile one
+`vmcnt` wait per state chunk. At `DK = DV = 128` with `WTK` 4 or 8 and no `waves_per_eu` floor,
+hoisting them starts no spill in the gfx950 code object with any knob (it removes some at
+`WTK = 4`), so those tiles load first like every other tile. They keep the late order at `WTK` 1, 2
+and 16, at `DK = DV = 256` and under a `waves_per_eu` floor, where hoisting adds spills in some
+configurations, and at the other head dims, which are not characterized.
 
 Cost: holding the raw state, `q`, `k` and `v` (and, fused, their taps and weights) live at once
 raises the register count. Where that crosses a register-allocation granule it costs one wave per
@@ -407,7 +417,11 @@ SIMD or a spill. In the gfx950 code object at `DK = DV = 128`:
   `(4,16,1)` with bf16 state (with or without the norm) and with `f32` state without the norm;
 - one wave per SIMD gained: GDN `(4,16,1)`, `(16,16,1)`, and the default `(2,16,8)` with `f32` state;
 - spill grows: GDN `(1,1,1)`, which already spills at `DK = 128`;
-- spill: none starts. The single-wave `fuse_conv` tile stays at 0 B through the exception above;
+- spill: none starts at the tiles above. The exception keeps the single-wave `fuse_conv` tile at
+  0 B knob-free at `WTK` 8 and 16, but it does not make it spill-free in general: knob-free it
+  spills at `WTK` ≤ 4, some knob combinations spill at every `WTK`, and with `conv_once` (no
+  `waves_per_eu` floor) it spills at `WTK` 1 and 2. The fused tests pin 0 B for the knob-free
+  `(1,16,1)` tile and no new spill where `conv_once` loads first;
 - unchanged: the GDN default `(2,16,8)` and the KDA tuned tiles; `(1,1,1)` at `DK` 64 (no spill) and
   192 (its spill shrinks), where it is the auto route because `(2,16,8)` is illegal (§4.6).
 
@@ -436,8 +450,13 @@ group. It is done in two stages: a local balanced fold over the lane's own produ
 XOR is chosen over a shift-down tree deliberately: the pattern is symmetric, so **every lane ends
 holding the full sum**. That is what each lane needs — it must scale its own channels — so no
 broadcast step is required afterwards. Offsets 1 and 2 lower to `quad_perm`, a lane-read modifier
-on the arithmetic instruction itself; wider offsets use `ds_swizzle`. Neither allocates shared
-memory, which is why the unfused kernel has no LDS and no `lgkmcnt` barrier stalls on the narrow steps.
+on the arithmetic instruction itself; wider offsets use `ds_swizzle` by default. With the
+`dpp_reduce` knob (§4.10), offsets 4 and 8 use the DPP `row_half_mirror` / `row_mirror` modifiers
+instead, so a group of up to 16 lanes reduces without `ds_swizzle`; offsets 16 and 32 keep it. A
+mirror pairs lane `i` with `7 − i` (`15 − i`), not `i ^ 4` (`i ^ 8`), but the stages run in
+ascending order: when a mirror runs, every lane of a quad (half-row) already holds that quad's
+(half-row's) sum, so both pairings add the same two values. None of these allocates shared memory,
+which is why the unfused kernel has no LDS and no `lgkmcnt` barrier stalls on the narrow steps.
 
 ### 4.5 State pool addressing
 
@@ -511,6 +530,12 @@ dimension that is not a multiple of `VPT = 8`, a workgroup over the target's thr
 across the workgroup's value lanes. The three §4.9 fusion rules are emitter limits, not hardware
 ones, and carry the family's `NOT_YET_IMPLEMENTED:` marker.
 
+It also checks the performance knobs of §4.10: each flag must be a real `bool`, each state hint
+one of `default` / `streaming`, `waves_per_eu` an `int` in `[0, 8]`, and a fused-only knob needs
+its fusion (`conv_once` needs `fuse_conv`; `norm_gate_once` and `out_lds` need `fuse_out_norm`).
+`norm_gate_once` without `conv_once` is an emitter limit, rejected as `NOT_YET_IMPLEMENTED:`: its
+products live in `conv_once`'s LDS block (§8, follow-up 8).
+
 The dispatcher's support check ends by calling this same validator, so "the spec the kernel can
 emit" and "the spec dispatch may select" are one rule rather than two copies that can drift.
 
@@ -560,15 +585,62 @@ wave reads its taps before it writes them. Each conv channel is written once: q/
 implementation that rounds `o` to bf16 first differs by up to one bf16 step).
 
 **Cost.** `fuse_conv` with a single wave owns all `DV` rows plus their taps and weights, so it is a
-register-heavy (legal) tile, like the unfused `(1,1,1)`; it keeps part of the interleaved order so
-that it does not spill (§4.3), and most `(4,16,1)` conv tiles run one wave per SIMD lower than with
-an interleaved order (§4.3, Cost). The fused modes are an enablement path and recompute shared work
-instead of sharing it. A q/k conv channel depends only on its k-lane, so every `(wave, v-lane)`
-pair of the workgroup recomputes it: `NW × WTV = NW · 64 / WTK` times per head, each time
-re-loading its taps and weights (16 times at the `(4, 16, 1)` tile). A V channel's conv and an
-output's gate activation are computed by all `WTK` k-lanes of the row and stored by one:
-`WTK`-fold. This trades occupancy and redundant loads for fewer launches. Tile selection for the
-fused modes is not part of this emitter.
+register-heavy (legal) tile, like the unfused `(1,1,1)`; it keeps part of the interleaved order to
+limit spills (§4.3, which also lists where it still spills), and most `(4,16,1)` conv tiles run one
+wave per SIMD lower than with an interleaved order (§4.3, Cost). The fused modes are an enablement
+path and recompute shared work instead of sharing it. A q/k conv channel depends only on its
+k-lane, so every `(wave, v-lane)` pair of the workgroup recomputes it: `NW × WTV = NW · 64 / WTK`
+times per head, each time re-loading its taps and weights (16 times at the `(4, 16, 1)` tile). A V
+channel's conv and an output's gate activation are computed by all `WTK` k-lanes of the row and
+stored by one: `WTK`-fold. This trades occupancy and redundant loads for fewer launches. Tile
+selection for the fused modes is not part of this emitter.
+
+### 4.10 Performance knobs
+
+Ten spec fields change how the warp-tiled kernel computes, not what it computes. Each one's default
+is the code the kernel emitted before the knob existed, so with every knob at its default the
+kernel name and the emitted IR are byte-identical to the knob-free emitter (the golden IR test pins
+this). Dispatch does not set the knobs yet: the registry search space and per-mode defaults are
+separate changes, so today a knob is reached only by building a spec directly.
+
+| Knob | Values (default first) | Changes code where | Effect |
+| --- | --- | --- | --- |
+| `state_load_hint`, `state_store_hint` | `default`, `streaming` | always, both emitters | cache policy of the state loads / stores; `streaming` marks them LLVM `!nontemporal` (the state is read once and written once per call) |
+| `dpp_reduce` | off, on | warp-tiled, `WTK ≥ 8` (the sum has an xor-4 stage) | the xor-4 / xor-8 stages of the in-group sum (§4.4) run on DPP `row_half_mirror` / `row_mirror` instead of `ds_swizzle` |
+| `xcd_remap` | off, on | warp-tiled | workgroups are renumbered so each of the 8 XCDs (which receive workgroup `pid` round-robin, `pid % 8`) runs one contiguous range of (sequence, head, v-block) work instead of every 8th workgroup; a bijection for any grid size. It computes the grid size from the `batch_size` argument (otherwise unread), so the launch grid must be `gdn_decode_grid(batch_size, spec)`, as `prepare()` builds it |
+| `stream_rows` | off, on | warp-tiled, more than one state row per lane | each owned row is decayed, reduced, updated and stored in its own iteration, so the first math waits only for the rows loaded before it; off, every row is decayed up front |
+| `interleave_cols` | off, on | warp-tiled, `f32` state, `WTK > 1` | K columns map to lanes in 16 B runs interleaved across the WTK-lane group (run `p` of lane `l` at chunk column `p·WTK·4 + l·4`) instead of 8 consecutive columns per lane, so one 16 B state access across the group covers a contiguous `WTK·16` B span; q, k, the KDA decays and the conv taps / weights follow the same map. A 2-byte state already moves 16 B per lane |
+| `conv_once` | off, on | `fuse_conv` (required) | each conv1d + SiLU channel, and each KDA decay channel, is computed once per workgroup by one thread and shared through LDS, instead of every lane recomputing the channels it reads; that thread also shifts the channel's taps, so no barrier guards the in-place shift |
+| `norm_gate_once` | off, on | `fuse_out_norm` (required); `conv_once` (not yet implemented without it) | the norm's `act(out_gate) ⊙ norm_weight` (§4.9) is computed once per output row into `conv_once`'s LDS block; off, every lane loads its rows' `out_gate` and `norm_weight` |
+| `out_lds` | off, on | `fuse_out_norm` (required) | each row's pre-norm f32 output goes to LDS ahead of the norm's cross-wave barrier (a one-wave tile adds an LDS barrier); after it the first `DV / OUT_W` lanes each normalize `OUT_W` consecutive rows (`OUT_W` = 2, 4 or 8 as `DV` exceeds 2 and 4 wave widths; in more than one round when `DV / OUT_W` exceeds the workgroup size) and store them with one packed store, instead of one 2 B store per row from its k-lane-0 owner |
+| `waves_per_eu` | `0`, `1`–`8` | always, both emitters | `amdgpu-waves-per-eu` = `"N,8"`: the compiler must fit at least `N` waves per SIMD, which caps registers per lane; `0` emits no attribute |
+
+**Inert knobs and names.** The name is the compile and launcher cache key (§4.8), so a knob adds
+its name token only where it changes code. For the four tile-dependent knobs that is what
+`dpp_reduce_applies`, `xcd_remap_applies`, `stream_rows_applies` and `interleave_cols_applies`
+decide: on a tile where the predicate is False the knob is legal, emits the knob-off kernel, and
+keeps the knob-off name. The three fused-only knobs need no predicate, because the validator rejects
+them wherever they would be inert. The tokens are `lhnt` / `shnt` (streaming hints), `wpe<N>`,
+`dppr`, `xcd`, `sr`, `ic`, `co`, `ngo` and `olds`.
+
+**Loads first.** The knobs keep §4.3's order. `conv_once` issues its channel loads (with indices
+clamped into range, so no load sits behind a branch) ahead of the state loads, and `out_lds`
+issues its storing lanes' gate and weight loads with the other loads; the structural load-order
+test covers knob-on specs too. The single-wave `fuse_conv` tile keeps §4.3's exception except where
+`late_row_inputs` lets it load first (`conv_once` at `DK = DV = 128`, `WTK` 4 or 8, no
+`waves_per_eu` floor); elsewhere its state chunks (and, for the per-lane norm, `out_gate` /
+`norm_weight`) still load where they are first used.
+
+**Numerics.** `dpp_reduce`, `xcd_remap`, `stream_rows`, `out_lds`, the hints and `waves_per_eu`
+run the same floating-point operations on the same values (for `dpp_reduce`, the mirror partner
+holds the same quad or half-row sum as the xor partner). `conv_once` computes each channel with the
+same operations as the per-lane path. Two knobs change a rounding order: `interleave_cols` gives
+each lane different K columns, so its partial dot products sum in a different order, and
+`norm_gate_once` computes `(o ⊙ r) ⊙ (act(out_gate) ⊙ norm_weight)` instead of
+`(o ⊙ r ⊙ norm_weight) ⊙ act(out_gate)`, where `r = rsqrt(mean(o ⊙ o) + norm_eps)` (§4.9). On
+device every knob is checked against the fp32 reference, and every knob except these two is also
+compared bit for bit with the knob-off kernel's output, state and conv state (§7 lists the
+tiles).
 
 ---
 
@@ -761,6 +833,14 @@ Both kernels are validated against **independent oracles**, not against each oth
   the in-place tap shift is checked twice: on silicon by a read-slot = write-slot case with 16 waves
   (with the barrier removed, 2-8 waves stayed correct but 16 waves corrupted the taps on every run),
   and in the IR, where a barrier must sit between the last tap read and the first tap write.
+- **Performance knobs (§4.10)** — each knob alone, against the same reference, on gfx950: at the
+  default heads (`DK = DV = 128`) on every registered tile and the reference path, and in every
+  fused mode it accepts on every `BPV = 1` tile, per gate kind and state dtype; at `DK = DV = 64`
+  and `256` on one warp-tiled and one fused tile; and `out_lds` at `DV = 256` and `512` and with
+  two store rounds. The knobs that keep the floating-point order are also compared bit for bit
+  with the knob-off kernel. Each knob's flag-on IR is golden-pinned on every path where it changes
+  code: gate kind × state dtype × reference / warp-tiled / fused (both fusions, and every mode a
+  fused-only knob accepts), and at the other head dims.
 - **IR stability** — GDN golden IR entries are pinned and SHA-stable across the supported lowerer
   flavours, while **all pre-existing KDA golden hashes remain unchanged**, which is what makes the
   "byte-identical" claim in §2.3 testable rather than asserted. The golden lowers through the
@@ -797,8 +877,12 @@ Widening the range needs nested chunking or per-token rescaling.
 6. Machine-checked byte-identity for the prefill-side cross-engine surfaces this family touches —
    currently reasoned and Python-verified. (Decode is checked: the golden cases lower identically
    through both engines.)
-7. A fast fused decode path (§4.9): compute each conv channel and gate once and share it through
-   LDS instead of recomputing it per lane; an out-of-place conv state, which lifts both
+7. A fast fused decode path (§4.9): an out-of-place conv state, which lifts both
    `NOT_YET_IMPLEMENTED` rules of §4.9 — `fuse_conv` with `Hk ≠ Hv` (GQA, e.g. Qwen3-Next) and
    `BPV > 1` (with a cross-workgroup norm) for small-batch parallelism; and the fusions on the
-   `simple` reference path.
+   `simple` reference path. Computing each conv channel and gate once and sharing it through LDS
+   is now the `conv_once` / `norm_gate_once` knobs (§4.10); choosing when to use them is still
+   open.
+8. `norm_gate_once` without `conv_once`: its `act(out_gate) ⊙ norm_weight` products need their own
+   LDS block and barrier, so a norm-only spec can use it; rejected as `NOT_YET_IMPLEMENTED` until
+   then (§4.8).
