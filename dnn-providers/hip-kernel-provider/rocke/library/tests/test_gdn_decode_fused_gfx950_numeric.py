@@ -101,7 +101,7 @@ def _launch(spec, inp, batch):
 @pytest.mark.parametrize("flags", FLAGS, ids=["cv", "rn", "cv_rn"])
 @pytest.mark.parametrize("batch", [1, 3, 16])
 def test_fused_modes(gate, dtype, state_dtype, flags, batch):
-    from builders.gfx950.gdn.gdn_decode import TOL, check
+    from builders.gfx950.gdn.gdn_decode import check
 
     conv, norm = flags
     spec = _fused(
@@ -111,8 +111,8 @@ def test_fused_modes(gate, dtype, state_dtype, flags, batch):
         fuse_conv=conv,
         fuse_out_norm=norm,
     )
-    out_err, state_err = check(spec, batch)
-    assert out_err < TOL and state_err < TOL, (spec.kernel_name(), out_err, state_err)
+    verdict = check(spec, batch)
+    assert verdict.passed, (spec.kernel_name(), verdict)
 
 
 @requires_gfx950
@@ -120,19 +120,15 @@ def test_fused_modes(gate, dtype, state_dtype, flags, batch):
 @pytest.mark.parametrize("state_dtype", ["f16", "bf16", "f32"])
 def test_every_legal_fused_tile(gate, state_dtype):
     """Every BPV=1 tile the validator admits is exact, both flags on."""
-    from builders.gfx950.gdn.gdn_decode import TOL, check
+    from builders.gfx950.gdn.gdn_decode import check
 
     specs = _legal_bpv1_tiles(
         gate_kind=gate, state_dtype=state_dtype, fuse_conv=True, fuse_out_norm=True
     )
     assert specs, "no legal fused tile"
     for spec in specs:
-        out_err, state_err = check(spec, 3)
-        assert out_err < TOL and state_err < TOL, (
-            spec.kernel_name(),
-            out_err,
-            state_err,
-        )
+        verdict = check(spec, 3)
+        assert verdict.passed, (spec.kernel_name(), verdict)
 
 
 @requires_gfx950
@@ -141,7 +137,7 @@ def test_every_legal_fused_tile(gate, state_dtype):
 def test_fused_head_dims(gate, head_dim, wtk):
     """Head dims other than 128 change the conv_dim, the slot strides and the
     norm length; both flags on. A 64-wide key needs an 8-lane key group."""
-    from builders.gfx950.gdn.gdn_decode import TOL, check
+    from builders.gfx950.gdn.gdn_decode import check
     from kernels.gfx950.gdn_decode import is_valid_spec
 
     spec = _fused(
@@ -155,21 +151,21 @@ def test_fused_head_dims(gate, head_dim, wtk):
     )
     ok, why = is_valid_spec(spec, arch=ARCH)
     assert ok, why
-    out_err, state_err = check(spec, 3)
-    assert out_err < TOL and state_err < TOL, (spec.kernel_name(), out_err, state_err)
+    verdict = check(spec, 3)
+    assert verdict.passed, (spec.kernel_name(), verdict)
 
 
 @requires_gfx950
 @pytest.mark.parametrize("state_dtype", ["f16", "bf16", "f32"])
 def test_norm_with_gqa_heads(state_dtype):
     """fuse_out_norm alone works for Hv > Hk (the GDN target's head layout)."""
-    from builders.gfx950.gdn.gdn_decode import TOL, check
+    from builders.gfx950.gdn.gdn_decode import check
 
     spec = _fused(
         num_k_heads=16, num_v_heads=32, state_dtype=state_dtype, fuse_out_norm=True
     )
-    out_err, state_err = check(spec, 8)
-    assert out_err < TOL and state_err < TOL, (out_err, state_err)
+    verdict = check(spec, 8)
+    assert verdict.passed, verdict
 
 
 @requires_gfx950

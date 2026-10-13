@@ -24,7 +24,8 @@ drivers live under `library/` (`library -> platform` one-way):
 
 - `library/kernels/gfx950/gdn_decode.py` -- shared spec, validator and emitter
 - `library/builders/gfx950/gdn/gdn_decode.py` -- host driver and independent fp32 reference
-- `library/builders/gfx950/gdn/tune.py` -- exhaustive GDN/KDA tile sweep
+- `library/benchmarks/gfx950/gdn/decode_table_sweep.py` -- every registered (tile x knob) configuration per shape, timed cold against `auto`
+- `library/benchmarks/gfx950/gdn/decode_defaults_report.py` -- advisory per-case `auto` default from the sweep's rows
 - `library/benchmarks/gfx950/gdn/benchmark_gdn_decode.py` -- GDN benchmark
 - `library/benchmarks/gfx950/gdn/benchmark_kda_decode.py` -- KDA benchmark
 - `library/dispatch/gdn/` -- request, candidates and `dispatch_gdn_decode`
@@ -153,7 +154,9 @@ sweep; gfx942 not measured) and the fallback when a case's tile is illegal live
 once in
 [`ALGORITHM.md` §4.6](../../../library/builders/gfx950/gdn/ALGORITHM.md#46-registry-and-tile-selection).
 An explicit `spec_id`, such as `nw4_wtk16_bpv8`, selects an exact legal tile for
-benchmarking or replay.
+benchmarking or replay. The two tools above measure that space and re-derive the
+per-case defaults
+([README, Measure and re-tune defaults](../../../library/builders/gfx950/gdn/README.md#measure-and-re-tune-defaults)).
 
 Each registered tile is a tuned candidate (the shared `rocke.dispatch.tuning`
 template) whose knob space holds the performance knobs: every (tile x knob)
