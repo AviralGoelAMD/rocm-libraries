@@ -194,6 +194,27 @@ typedef struct rocke_unified_attention_3d_tiled_spec
      * softmax exp2 lowers without the IEEE denormal fix-up. gfx950 only (the
      * gfx942 builder rejects it). */
     bool use_f32_denormal_flush; /* False */
+    /* ---- gfx950 decode-path knobs (Python field names/defaults; the gfx942
+     * builder ignores them). Kept byte-identical with the gfx942 header. ---- */
+    /* All-decode launch: grid x == num_seqs, CTA x owns sequence x (no cu_q
+     * binary search). */
+    bool decode_fast_path; /* False */
+    /* KV tile = kv_tile_mult paged blocks (1, 2, 4 or 8). */
+    int kv_tile_mult; /* 1 */
+    /* Prefetch the next tile's K and V (and its block-table ids) one tile ahead. */
+    bool kv_prefetch; /* False */
+    /* Transposed QK/PV: one query row per lane, P stays in registers. */
+    bool transposed_softmax; /* False */
+    /* kv_prefetch (bf16/fp16 only): wait for K before QK and V before PV. */
+    bool kv_split_wait; /* False */
+    /* fp8 KV: fold k_scale into the QK scale and v_scale into the output. */
+    bool fold_kv_scale; /* False */
+    /* Buffer-load AUX cache-policy bits of the K/V DMAs (0..3). */
+    int kv_load_aux; /* 0 */
+    /* kv_prefetch block-table reads as invariant (scalar) loads. */
+    bool scalar_block_ids; /* False */
+    /* Segment-fastest CTA order (re-split of the linear launch id). */
+    bool seg_major_order; /* False */
 } rocke_unified_attention_3d_tiled_spec_t;
 
 rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_default(void);

@@ -1067,6 +1067,15 @@ rocke_unified_attention_3d_tiled_spec_t t3d_build(const py::dict& d, Store& st)
     s.use_wide_kv_load = a_bool(d, "use_wide_kv_load", s.use_wide_kv_load);
     s.use_i64_kv_addr = a_bool(d, "use_i64_kv_addr", s.use_i64_kv_addr);
     s.use_f32_denormal_flush = a_bool(d, "use_f32_denormal_flush", s.use_f32_denormal_flush);
+    s.decode_fast_path = a_bool(d, "decode_fast_path", s.decode_fast_path);
+    s.kv_tile_mult = a_int(d, "kv_tile_mult", s.kv_tile_mult);
+    s.kv_prefetch = a_bool(d, "kv_prefetch", s.kv_prefetch);
+    s.transposed_softmax = a_bool(d, "transposed_softmax", s.transposed_softmax);
+    s.kv_split_wait = a_bool(d, "kv_split_wait", s.kv_split_wait);
+    s.fold_kv_scale = a_bool(d, "fold_kv_scale", s.fold_kv_scale);
+    s.kv_load_aux = a_int(d, "kv_load_aux", s.kv_load_aux);
+    s.scalar_block_ids = a_bool(d, "scalar_block_ids", s.scalar_block_ids);
+    s.seg_major_order = a_bool(d, "seg_major_order", s.seg_major_order);
     if(d.contains("waves_per_eu") && !d["waves_per_eu"].is_none())
     {
         s.has_waves_per_eu = true;
