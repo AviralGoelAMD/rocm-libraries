@@ -205,6 +205,12 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # below 4: narrower fp16 stores change which f32->f16 conversion the backend
     # selects for some elements, moving them by one ulp, so fp16 is fixed at 4.
     o_store_width: int = field(default=4, kw_only=True)
+    # Grid body only: map the launch grid's linear workgroup id to work items.
+    # "default": block (x, y, z) = (query block, query head, batch).
+    # "lpt": query heads fastest, then batch, then query block; causal visits
+    # the query blocks from the last (most KV tiles) to the first, so the
+    # longest work items are dispatched first. The grid shape is unchanged.
+    grid_order: str = field(default="default", kw_only=True)
 
     def resolved_exp_per_pv_step(self) -> int:
         if self.exp_per_pv_step is not None:
@@ -386,6 +392,12 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
                 "iglp_mode owns loop scheduling; disable pv_sched_fence and "
                 "pv_sched_group_template when enabling it"
             )
+        if self.grid_order not in ("default", "lpt"):
+            raise ValueError(
+                f"grid_order must be 'default' or 'lpt', got {self.grid_order!r}"
+            )
+        if self.grid_order != "default" and (self.varlen or self.paged):
+            raise ValueError("grid_order='lpt' is implemented for dense batch layouts only")
 
     @property
     def resolved_persist_decode(self) -> str:
@@ -522,6 +534,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "pv_loop_order",
             "causal_diag_split",
             "o_store_width",
+            "grid_order",
         )
     }
 )
@@ -752,9 +765,29 @@ def build_attention_dense(
         rcp_ln2 = b.const_f32(LOG2E)
         one_f = b.const_f32(1.0)
 
-    qb = b.block_id_x()
-    hq = b.block_id_y()
-    bt = b.block_id_z()
+    if spec.grid_order == "lpt":
+        # Same grid (nqb, Hq, B); re-rank the linear workgroup id so query
+        # heads vary fastest and, under causal, the longest query blocks go
+        # first (the hardware dispatches workgroups in linear-id order).
+        nqb_v = b.div(
+            b.add(seqlen_q_p, b.const_i32(BLOCK_M - 1)), b.const_i32(BLOCK_M)
+        )
+        lin = b.add(
+            b.block_id_x(),
+            b.mul(
+                nqb_v,
+                b.add(b.block_id_y(), b.mul(b.block_id_z(), b.const_i32(Hq))),
+            ),
+        )
+        hq = b.mod(lin, b.const_i32(Hq))
+        lin_r = b.div(lin, b.const_i32(Hq))
+        bt = b.mod(lin_r, batch_p)
+        qb_rank = b.div(lin_r, batch_p)
+        qb = b.sub(b.sub(nqb_v, b.const_i32(1)), qb_rank) if causal else qb_rank
+    else:
+        qb = b.block_id_x()
+        hq = b.block_id_y()
+        bt = b.block_id_z()
     hkv = b.div(hq, b.const_i32(gqa))
     q_tok0 = b.add(b.mul(qb, b.const_i32(BLOCK_M)), b.mul(wave, b.const_i32(32)))
 
