@@ -191,6 +191,15 @@ def build_custom_grouped(
     n_pid_m = (M + TM - 1) // TM
     n_pid_n = (N + TN - 1) // TN
 
+    # One expert's A or B slab must fit the DTL buffer resource (byte offsets
+    # below num_records).
+    if dtl:
+        assert max(M, N) * K * 2 <= 0x7FFF0000, "per-expert slab exceeds 2 GiB"
+
+    def expert_rsrc(ptr, expert, stride):
+        slab = b.mul(b.mul(b.zext(expert, I64), b.zext(stride, I64)), b.const_i64(2))
+        return b.buffer_rsrc(b.global_ptr_add(ptr, slab), b.const_i32(0x7FFF0000))
+
     def set_tile(bid_n, bid_m, expert):
         # Returns a per-tile coords holder; the K-loop / epilogue read from it so
         # the pipelined path can store tile j-1 while computing tile j.
@@ -213,8 +222,16 @@ def build_custom_grouped(
         else:
             tb["m_base"] = U(b.mul(bid_m, b.const_i32(TM)))
             tb["n_base"] = U(b.mul(bid_n, b.const_i32(TN)))
-        tb["a_eoff"] = U(b.mul(expert, sa))
-        tb["b_eoff"] = U(b.mul(expert, sb))
+        if dtl:
+            # DTL loads go through a buffer resource whose voffset is i32 and
+            # whose num_records is 0x7FFF0000: fold the expert slab into a
+            # 64-bit resource base so only the in-expert offset is 32-bit.
+            tb["a_rsrc"] = expert_rsrc(A, expert, sa)
+            tb["b_rsrc"] = expert_rsrc(Bp, expert, sb)
+            tb["a_eoff"] = tb["b_eoff"] = b.const_i32(0)
+        else:
+            tb["a_eoff"] = U(b.mul(expert, sa))
+            tb["b_eoff"] = U(b.mul(expert, sb))
         tb["c_eoff"] = U(b.mul(expert, sc))
         return tb
 
@@ -519,9 +536,6 @@ def build_custom_grouped(
         warp_id = b.div(tid, b.const_i32(64))
         wave_off = b.zext(b.mul(warp_id, b.const_i32(64 * 16)), I64)
         zsoff = b.const_i32(0)
-        big = b.const_i32(0x7FFF0000)
-        a_rsrc = b.buffer_rsrc(A, big)
-        b_rsrc = b.buffer_rsrc(Bp, big)
         c_cpr = b.const_i32(cpr)
         c_hv = b.const_i32(HALVES)
 
@@ -549,7 +563,7 @@ def build_custom_grouped(
 
         c_cpr_n = b.const_i32(TN // HALVES)  # N-fast groups per row (RRR B load)
 
-        def dtl_load_b_rrr(buf, eoff, n_base, kt, coh):
+        def dtl_load_b_rrr(rsrc, buf, eoff, n_base, kt, coh):
             # Stage B[E,K,N] (N-contiguous) into a plain [TK,TN] LDS tile: row=k,
             # col=n, 8 contiguous N per lane. No swizzle (tr16 reads plain layout).
             base = b.smem_ptr_add(_addr(buf), wave_off)
@@ -570,7 +584,7 @@ def build_custom_grouped(
                     ),
                 )
                 b.async_buffer_load_lds_addr(
-                    b_rsrc,
+                    rsrc,
                     lds,
                     b.mul(off, b.const_i32(2)),
                     zsoff,
@@ -579,11 +593,15 @@ def build_custom_grouped(
                 )
 
         def load_tile_dtl(buf, kt, tb):
-            dtl_load(a_rsrc, tb["a_eoff"], As[buf], tb["m_base"], kt, passes_a, 0)
+            dtl_load(
+                tb["a_rsrc"], tb["a_eoff"], As[buf], tb["m_base"], kt, passes_a, 0
+            )
             if b_rrr:
-                dtl_load_b_rrr(Bs[buf], tb["b_eoff"], tb["n_base"], kt, 0)
+                dtl_load_b_rrr(tb["b_rsrc"], Bs[buf], tb["b_eoff"], tb["n_base"], kt, 0)
             else:
-                dtl_load(b_rsrc, tb["b_eoff"], Bs[buf], tb["n_base"], kt, passes_b, 0)
+                dtl_load(
+                    tb["b_rsrc"], tb["b_eoff"], Bs[buf], tb["n_base"], kt, passes_b, 0
+                )
 
     def kloop(acc, tb, final_storer=None):
         if dtl:
