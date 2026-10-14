@@ -202,6 +202,15 @@ rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_de
     s.use_wide_kv_load = false;
     s.use_i64_kv_addr = false;
     s.use_f32_denormal_flush = false;
+    s.decode_fast_path = false;
+    s.kv_tile_mult = 1;
+    s.kv_prefetch = false;
+    s.transposed_softmax = false;
+    s.kv_split_wait = false;
+    s.fold_kv_scale = false;
+    s.kv_load_aux = 0;
+    s.scalar_block_ids = false;
+    s.seg_major_order = false;
     return s;
 }
 
@@ -217,7 +226,8 @@ rocke_unified_attention_reduce_tiled_spec_t rocke_unified_attention_reduce_tiled
 
 #endif /* !ROCKE_INSTANCE_GFX942_ATTENTION_TILED_3D_H (shared spec POD defaults) */
 
-/* __post_init__: kv_storage_dtype must be None or 'fp8e4m3'. */
+/* __post_init__ (same rule order and messages as the Python dataclass; the
+ * kv_layout rules live in the strided build entry). */
 bool rocke_gfx950_unified_attention_3d_tiled_spec_validate(
     rocke_ir_builder_t* b, const rocke_unified_attention_3d_tiled_spec_t* s)
 {
@@ -236,6 +246,41 @@ bool rocke_gfx950_unified_attention_3d_tiled_spec_validate(
                         ROCKE_ERR_VALUE,
                         "kv_storage_dtype must be None or 'fp8e4m3' (got '%s')",
                         s->kv_storage_dtype);
+        return false;
+    }
+    if(s->kv_tile_mult != 1 && s->kv_tile_mult != 2 && s->kv_tile_mult != 4 && s->kv_tile_mult != 8)
+    {
+        rocke_i_set_err(
+            b, ROCKE_ERR_VALUE, "kv_tile_mult must be 1, 2, 4 or 8 (got %d)", s->kv_tile_mult);
+        return false;
+    }
+    if(s->kv_tile_mult > 1
+       && ((s->block_size * s->head_size) % 512 != 0 || s->block_size * s->kv_tile_mult > 128))
+    {
+        rocke_i_set_err(b,
+                        ROCKE_ERR_VALUE,
+                        "kv_tile_mult needs block_size*head_size %% 512 == 0 and a tile <= 128");
+        return false;
+    }
+    if(s->transposed_softmax && (s->use_alibi || s->use_qq_bias))
+    {
+        rocke_i_set_err(b, ROCKE_ERR_VALUE, "transposed_softmax does not support ALiBi or QQ bias");
+        return false;
+    }
+    if(s->kv_split_wait && (!s->kv_prefetch || s->kv_storage_dtype != NULL))
+    {
+        rocke_i_set_err(
+            b, ROCKE_ERR_VALUE, "kv_split_wait needs kv_prefetch with a bf16/fp16 KV cache");
+        return false;
+    }
+    if(s->fold_kv_scale && s->kv_storage_dtype == NULL)
+    {
+        rocke_i_set_err(b, ROCKE_ERR_VALUE, "fold_kv_scale needs an fp8 KV cache");
+        return false;
+    }
+    if(s->kv_load_aux < 0 || s->kv_load_aux > 3)
+    {
+        rocke_i_set_err(b, ROCKE_ERR_VALUE, "kv_load_aux must be 0..3 (got %d)", s->kv_load_aux);
         return false;
     }
     return true;
@@ -272,13 +317,14 @@ int rocke_gfx950_unified_attention_3d_tiled_spec_block_q(
 int rocke_gfx950_unified_attention_3d_tiled_spec_tile_size(
     const rocke_unified_attention_3d_tiled_spec_t* s)
 {
-    /* gfx950 @property: tile_size == block_size (tile_size_override is ignored;
-     * the gfx950 spec accepts the knob only for signature parity). */
+    /* gfx950 @property: tile_size == block_size * kv_tile_mult
+     * (tile_size_override is ignored; the gfx950 spec accepts the knob only for
+     * signature parity). */
     if(s == NULL)
     {
         return -1;
     }
-    return s->block_size;
+    return s->block_size * s->kv_tile_mult;
 }
 
 const rocke_type_t* rocke_gfx950_unified_attention_3d_tiled_spec_dtype_ir(
@@ -310,13 +356,19 @@ int rocke_gfx950_unified_attention_3d_tiled_spec_binary_search_iters(
     return r < 1 ? 1 : r;
 }
 
-int rocke_gfx950_unified_attention_3d_tiled_spec_kernel_name(
-    const rocke_unified_attention_3d_tiled_spec_t* s, char* buf, size_t cap)
+/* kernel_name() with the strided-KV tag. Python joins "stridedkv" (from
+ * kv_layout) after "ftz" and before the decode-path tags; the C POD carries the
+ * layout as the separate strided build entry, so it is passed in here. */
+static int rocke_attn3d950_kernel_name(const rocke_unified_attention_3d_tiled_spec_t* s,
+                                       bool strided_kv,
+                                       char* buf,
+                                       size_t cap)
 {
     /* kernel_name_join("rocke_uattn3d_tiled", d.., b.., h..kv.., seg.., dtype,
-     *   kv<...> if kv_storage_dtype else "", "sinks" if use_sinks else "",
-     *   "sw<sw>" if sw>0 else "", "softcap" if has_softcap else "",
-     *   "alibi" if use_alibi else "", "qqb" if use_qq_bias else "")
+     *   kv<...> if kv_storage_dtype else "", "i64kv", "sinks", "sw<sw>",
+     *   "softcap", "alibi", "qqb", "ftz", "stridedkv", "dec", "t<T>" (kv_tile_mult
+     *   > 1), "pf", "tsm", "kvsw", "fks", "aux<N>" (kv_load_aux != 0), "sbt",
+     *   "smo") -- each only when its knob is set.
      *
      * Positional parts list (NOT flags=...): empty parts are skipped by
      * kernel_name_join. We materialise each part and feed the non-empty ones in
@@ -328,7 +380,9 @@ int rocke_gfx950_unified_attention_3d_tiled_spec_kernel_name(
     char seg_part[32];
     char kv_part[32];
     char sw_part[32];
-    const char* parts[16];
+    char t_part[32];
+    char aux_part[32];
+    const char* parts[32];
     size_t np = 0;
     size_t out_len = 0;
     rocke_status_t st;
@@ -383,6 +437,48 @@ int rocke_gfx950_unified_attention_3d_tiled_spec_kernel_name(
     {
         parts[np++] = "ftz";
     }
+    if(strided_kv)
+    {
+        parts[np++] = "stridedkv";
+    }
+    if(s->decode_fast_path)
+    {
+        parts[np++] = "dec";
+    }
+    if(s->kv_tile_mult > 1)
+    {
+        snprintf(t_part, sizeof(t_part), "t%d", s->block_size * s->kv_tile_mult);
+        parts[np++] = t_part;
+    }
+    if(s->kv_prefetch)
+    {
+        parts[np++] = "pf";
+    }
+    if(s->transposed_softmax)
+    {
+        parts[np++] = "tsm";
+    }
+    if(s->kv_split_wait)
+    {
+        parts[np++] = "kvsw";
+    }
+    if(s->fold_kv_scale)
+    {
+        parts[np++] = "fks";
+    }
+    if(s->kv_load_aux != 0)
+    {
+        snprintf(aux_part, sizeof(aux_part), "aux%d", s->kv_load_aux);
+        parts[np++] = aux_part;
+    }
+    if(s->scalar_block_ids)
+    {
+        parts[np++] = "sbt";
+    }
+    if(s->seg_major_order)
+    {
+        parts[np++] = "smo";
+    }
 
     st = rocke_kernel_name_join("", parts, np, NULL, NULL, 0, buf, cap, &out_len);
     if(st != ROCKE_OK)
@@ -390,6 +486,12 @@ int rocke_gfx950_unified_attention_3d_tiled_spec_kernel_name(
         return -1;
     }
     return (int)out_len;
+}
+
+int rocke_gfx950_unified_attention_3d_tiled_spec_kernel_name(
+    const rocke_unified_attention_3d_tiled_spec_t* s, char* buf, size_t cap)
+{
+    return rocke_attn3d950_kernel_name(s, false, buf, cap);
 }
 
 /* ===================================================================== *
@@ -703,6 +805,28 @@ bool rocke_gfx950_attn_tiled_3d_config_from_spec(
     out->Q_VECS_PER_THREAD = (out->BLOCK_M * out->Q_VECS_PER_ROW) / out->THREADS;
     out->bm1_div_nqk = nqk > 0 ? (out->BLOCK_M - 1) / nqk : -1;
 
+    /* decode-path knobs. TILE_MULT / PREFETCH_IDS default to the paged layout;
+     * the strided build entry overrides them after ctx_init. */
+    out->DECODE_FAST_PATH = spec->decode_fast_path;
+    out->SEG_MAJOR_ORDER = spec->seg_major_order;
+    out->TILE_MULT = spec->kv_tile_mult;
+    out->PAGE_HALVES = out->BS * out->HD;
+    out->PREFETCH = spec->kv_prefetch;
+    out->PREFETCH_IDS = spec->kv_prefetch;
+    out->FP8_REG_PREFETCH = spec->kv_prefetch && out->KV_FP8;
+    out->TRANS = spec->transposed_softmax;
+    out->FOLD_SCALE = spec->fold_kv_scale && out->KV_FP8;
+    out->NR = out->TRANS ? 1 : 4;
+    out->KV_SPLIT_WAIT = spec->kv_split_wait;
+    out->SCALAR_BLOCK_IDS = spec->scalar_block_ids;
+    out->KV_LOAD_AUX = spec->kv_load_aux;
+    if(out->QK_K_ITERS > 8)
+    {
+        rocke_i_set_err(
+            b, ROCKE_ERR_VALUE, "attn_tiled_3d: QK_K_ITERS=%d outside [0,8]", out->QK_K_ITERS);
+        return false;
+    }
+
     /* reduce-kernel-only fields stay 0 for the segment kind. */
     out->HALFS_PER_THREAD = 0;
     out->SEG_PER_LANE = 0;
@@ -896,24 +1020,13 @@ static rocke_kernel_def_t* build_segment_gfx950(rocke_ir_builder_t* b,
         if(b->kernel != NULL)
         {
             char name[256];
-            if(rocke_gfx950_unified_attention_3d_tiled_spec_kernel_name(spec, name, sizeof(name))
-               < 0)
+            if(rocke_attn3d950_kernel_name(spec, strided_kv, name, sizeof(name)) < 0)
             {
                 rocke_i_set_err(
                     b,
                     ROCKE_ERR_VALUE,
                     "build_unified_attention_3d_tiled_gfx950: kernel_name encode failed");
                 return NULL;
-            }
-            if(strided_kv)
-            {
-                const size_t len = strlen(name);
-                if(len + sizeof("_stridedkv") > sizeof(name))
-                {
-                    rocke_i_set_err(b, ROCKE_ERR_VALUE, "strided KV kernel name too long");
-                    return NULL;
-                }
-                memcpy(name + len, "_stridedkv", sizeof("_stridedkv"));
             }
             b->kernel->name = rocke_arena_strdup(&b->arena, name);
             if(b->kernel->name == NULL)
@@ -930,6 +1043,10 @@ static rocke_kernel_def_t* build_segment_gfx950(rocke_ir_builder_t* b,
         }
 
         ctx.strided_kv = strided_kv;
+        /* Layout-dependent knobs: strided KV addresses one contiguous tile, so a
+         * tile is never split into pages and no block ids are prefetched. */
+        ctx.cfg.TILE_MULT = strided_kv ? 1 : spec->kv_tile_mult;
+        ctx.cfg.PREFETCH_IDS = spec->kv_prefetch && !strided_kv;
 
         /* b.kernel.attrs["max_workgroup_size"] = THREADS (line 303). */
         if(b->kernel != NULL)

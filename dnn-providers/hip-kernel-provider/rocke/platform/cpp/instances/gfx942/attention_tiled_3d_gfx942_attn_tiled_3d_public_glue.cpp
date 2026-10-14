@@ -136,6 +136,16 @@ rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_de
     s.use_invariant_hoist = false;
     s.use_wide_kv_load = false;
     s.use_f32_denormal_flush = false;
+    /* gfx950 decode-path knobs (ignored by the gfx942 builder). */
+    s.decode_fast_path = false;
+    s.kv_tile_mult = 1;
+    s.kv_prefetch = false;
+    s.transposed_softmax = false;
+    s.kv_split_wait = false;
+    s.fold_kv_scale = false;
+    s.kv_load_aux = 0;
+    s.scalar_block_ids = false;
+    s.seg_major_order = false;
     return s;
 }
 
