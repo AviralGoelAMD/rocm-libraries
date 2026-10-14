@@ -2708,6 +2708,13 @@ class KdaChunkScanSpec:
     # Costs one extra copy of every staged tile in LDS plus the registers to
     # hold a chunk's payload across the body; see :func:`build_kda_chunk_scan`.
     prefetch_tiles: bool = False
+    # Co-locate the ``value_splits`` workgroups of one (batch, head) on one XCD.
+    # The hardware deals linear workgroup ids round-robin across ``xcd_remap``
+    # XCDs, each with its own L2, so the splits of a head -- which all stage the
+    # same per-chunk tiles -- otherwise land on different XCDs and every one of
+    # them misses in its L2. 0 keeps the identity mapping. Needs the token-major
+    # ABI, whose ``batch``/``heads`` arguments give the kernel its grid size.
+    xcd_remap: int = 0
     name: str = "rocke_kda_chunk_scan"
 
     @property
@@ -2784,6 +2791,8 @@ class KdaChunkScanSpec:
             parts += ("tm",)
         if self.prefetch_tiles:
             parts += ("pf",)
+        if self.xcd_remap:
+            parts += (f"x{self.xcd_remap}",)
         return kernel_name_join(self.name, *parts)
 
 
@@ -2816,6 +2825,13 @@ def is_valid_scan_spec(
         return False, (
             f"v slice ({ev_slice}) must equal waves ({num_waves}) * scan atom m "
             f"({spec.scan_atom.m}); adjust block_size, scan_atom_m, or value_splits"
+        )
+    if spec.xcd_remap < 0:
+        return False, f"xcd_remap must be >= 0 (got {spec.xcd_remap})"
+    if spec.xcd_remap and not spec.token_major_io:
+        return False, (
+            "xcd_remap needs token_major_io: the grid size comes from its "
+            "batch/heads arguments"
         )
 
     t = spec.tile
@@ -2951,12 +2967,10 @@ def build_kda_chunk_scan(spec: KdaChunkScanSpec, arch: str = "gfx950") -> "Kerne
 
     io = None
     if spec.token_major_io:
-        # UNUSED, and deliberately not a bound. `batch` is packed and passed
-        # but never read: the kernel derives every extent from spec constants
-        # and block_id_x. Do NOT read it as a clamp on the bh range -- nothing
-        # checks the launch grid against it. Removing it would change the
-        # kernel signature and move the golden IR, so it stays until a change
-        # touches the ABI for its own reasons.
+        # `batch` is not a bound: nothing checks the launch grid against it.
+        # Only ``xcd_remap`` reads it, to recover the grid size the launcher
+        # used (``batch * heads * value_splits``); otherwise the kernel derives
+        # every extent from spec constants and block_id_x.
         batch = b.param("batch", I32)
         heads = b.param("heads", I32)
         tseq = b.param("tseq", I32)
@@ -2987,6 +3001,18 @@ def build_kda_chunk_scan(spec: KdaChunkScanSpec, arch: str = "gfx950") -> "Kerne
     lane = b.mod(tid, b.const_i32(64))
 
     wg = b.block_id_x()
+    if spec.xcd_remap:
+        # Linear id w runs on XCD w % X. Renumber so XCD x owns the contiguous
+        # logical range [x*G/X, (x+1)*G/X): consecutive logical ids -- the
+        # value splits of one (batch, head) -- then share an XCD and its L2.
+        # A bijection only when X divides G; otherwise keep the identity.
+        c_x = b.const_i32(spec.xcd_remap)
+        grid = b.mul(b.mul(batch, heads), b.const_i32(spec.value_splits))
+        per_xcd = b.div(grid, c_x)
+        remapped = b.add(b.mul(b.mod(wg, c_x), per_xcd), b.div(wg, c_x))
+        wg = b.select(
+            b.cmp_eq(b.mod(grid, c_x), b.const_i32(0)), remapped, wg
+        )
     if spec.value_splits == 1:
         bh = wg
         v_row_base = b.const_i32(0)
