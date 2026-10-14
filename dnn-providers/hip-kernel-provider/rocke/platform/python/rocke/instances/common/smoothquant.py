@@ -101,7 +101,10 @@ from ...helpers.quant import (
     quant_max_abs,
     quantize_scalar_f32,
 )
-from ...helpers.reduction import block_lds_reduce
+from ...helpers.reduction import (
+    block_lds_reduce,
+    block_lds_reduce_with_wave_prologue,
+)
 from ...helpers.spec import (
     IOSpecRule,
     SignatureBuilder,
@@ -195,6 +198,9 @@ class SmoothQuantSpec:
     vec: int = 4
     save_yscale: bool = True
     wave_size: int = 64
+    # Fold the row amax with the wave XOR butterfly plus one cross-warp LDS
+    # round instead of the full block-wide LDS tree.
+    wave_reduce: bool = False
     name: str = "rocke_smoothquant"
 
     @property
@@ -209,7 +215,7 @@ class SmoothQuantSpec:
             f"N{self.n_per_block}",
             f"b{self.block_size}",
             f"v{self.vec}",
-            flags={"ys": self.save_yscale},
+            flags={"ys": self.save_yscale, "wr": self.wave_reduce},
         )
 
 
@@ -391,7 +397,12 @@ def build_smoothquant(spec: SmoothQuantSpec, arch: str = "gfx950") -> KernelDef:
         n_off = b.add(b.mul(b.const_i32(k * BS), c_vec_p1), b.mul(tid, c_vec_p1))
         pass1_body(n_off, cached[k * VEC : (k + 1) * VEC])
 
-    total_amax = block_lds_reduce(b, s_amax, lds, tid, block_size=BS, combine="max")
+    if spec.wave_reduce:
+        total_amax = block_lds_reduce_with_wave_prologue(
+            b, s_amax, lds, tid, block_size=BS, combine="max", wave_size=spec.wave_size
+        )
+    else:
+        total_amax = block_lds_reduce(b, s_amax, lds, tid, block_size=BS, combine="max")
 
     # ``yscale = max(amax, eps) / quant_max``. ``fmax`` against ``eps``
     # avoids div-by-zero on all-zero rows (which CK Tile guards the
