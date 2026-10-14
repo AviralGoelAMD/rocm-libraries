@@ -2083,6 +2083,8 @@ selection is a typed per-kernel policy; see
 |---|---|---|
 | `-O3` | ✅ default | LLVM optimization level |
 | `CodegenPolicy(scheduler_strategy=...)` | validate per candidate | Bounded AMDGPU machine-scheduler strategy; sweep the default plus the five supported values |
+| `CodegenPolicy(f32_denormal_mode="preserve-sign")` | ✅ for softmax / exp-heavy kernels | Emits `"denormal-fp-math-f32"="preserve-sign,preserve-sign"`; precise `exp2`/`log2`/`sqrt`/`fdiv` lose their denormal fix-up sequences (see [arch/gfx950.md §21.8](arch/gfx950.md)) |
+| `-ffp-contract=fast` | ⚠️ no-op | Ignored for LLVM-IR input; contraction needs `contract` on the IR `fmul`/`fadd` |
 | `-DNDEBUG` | ✅ | Disable C++ assertions on device |
 | `-fno-offload-uniform-block` | ✅ | Required for some launch / perf assumptions |
 | `-mllvm -amdgpu-function-calls=false` | ✅ | Force inline |

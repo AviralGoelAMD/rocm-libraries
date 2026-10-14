@@ -689,6 +689,8 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
             const int64_t agpr_zero[2] = {0, 0};
             rocke_attr_set_int_list(b, &b->kernel->attrs, "agpr_alloc", agpr_zero, 2);
         }
+        /* Python: attrs[F32_DENORMAL_MODE_ATTR] = "preserve-sign". */
+        rocke_attr_set_str(b, &b->kernel->attrs, "f32_denormal_mode", "preserve-sign");
     }
 
     /* ---- parameter declarations (Py850-889) ---- */

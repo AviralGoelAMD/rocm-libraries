@@ -6580,9 +6580,12 @@ class _Lowerer:
             '"uniform-work-group-size"="true"',
             f'"amdgpu-flat-work-group-size"="64,{max_wg}"',
         ]
-        scheduler_strategy = codegen_policy_for_kernel(self.kernel).scheduler_strategy
-        if scheduler_strategy is not None:
-            attr_parts.append(f'"amdgpu-sched-strategy"="{scheduler_strategy}"')
+        policy = codegen_policy_for_kernel(self.kernel)
+        if policy.scheduler_strategy is not None:
+            attr_parts.append(f'"amdgpu-sched-strategy"="{policy.scheduler_strategy}"')
+        if policy.f32_denormal_mode is not None:
+            mode = policy.f32_denormal_mode
+            attr_parts.append(f'"denormal-fp-math-f32"="{mode},{mode}"')
         # Optional explicit waves-per-EU occupancy hint, the AMDGPU
         # equivalent of CUDA's ``__launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)``.
         # The AMDGPU backend reads this to size the register file
