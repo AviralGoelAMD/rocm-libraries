@@ -255,8 +255,13 @@ static bool enable_softmax_mfma_interleave(const rocke_unified_attn_problem_t* p
     return p->head_size == 128 && !p->use_fp8 && enable_single_batch_combo(p);
 }
 
+/* Python: KV_BUFFER_NUM_RECORDS (kernels/common/attention_kv_cache.py). The
+ * whole-cache K/V buffer resource of the i32 paged path has this num_records;
+ * a load at or past it returns zero. */
+#define ROCKE_KV_BUFFER_NUM_RECORDS 0x7FFF0000ULL
+
 /* Python: _enable_i64_kv_addr(problem). Switch to i64 addressing when the paged
- * KV-cache exceeds 2 GiB (i32 buffer voffset overflows and silently corrupts).
+ * KV-cache is larger than the i32 path's buffer resource covers.
  * num_kv_blocks==0 means unknown size -> assume small / fast i32 path. */
 static bool enable_i64_kv_addr(const rocke_unified_attn_problem_t* p)
 {
@@ -268,7 +273,7 @@ static bool enable_i64_kv_addr(const rocke_unified_attn_problem_t* p)
     uint64_t block_stride = (uint64_t)p->block_size * (uint64_t)p->num_kv_heads
                             * (uint64_t)p->head_size * (uint64_t)elem_bytes;
     uint64_t cache_bytes = (uint64_t)p->num_kv_blocks * block_stride;
-    return cache_bytes > 0x80000000ULL; /* 2^31 bytes */
+    return cache_bytes > ROCKE_KV_BUFFER_NUM_RECORDS;
 }
 
 /* Python: _d256_gfx950_cohort(problem). */
@@ -1018,14 +1023,14 @@ rocke_attention_tiled_2d_spec_t
 
     s.use_register_pv = enable_register_pv(p);
     /* i64_kv_addr: mirrors Python _enable_i64_kv_addr -- fires when the paged KV
-     * cache exceeds 2 GiB (num_kv_blocks * block_stride > 0x80000000). */
+     * cache exceeds ROCKE_KV_BUFFER_NUM_RECORDS bytes. */
     if(p->num_kv_blocks > 0)
     {
         uint64_t elem_bytes = p->use_fp8 ? 1u : 2u;
         uint64_t block_stride = (uint64_t)p->block_size * (uint64_t)p->num_kv_heads
                                 * (uint64_t)p->head_size * elem_bytes;
         uint64_t cache_bytes = (uint64_t)p->num_kv_blocks * block_stride;
-        s.use_i64_kv_addr = (cache_bytes > 0x80000000ULL);
+        s.use_i64_kv_addr = (cache_bytes > ROCKE_KV_BUFFER_NUM_RECORDS);
     }
     /* f32 denormal flush + FMA contraction: mirror Python _enable_f32_denormal_flush
      * / _enable_fp_contract, arch-wide on gfx950 (this builder is gfx950-only). */

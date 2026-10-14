@@ -33,6 +33,7 @@ from kernels.common._attention_strided_kv import (
     strided_kv_offset,
     strided_kv_resource,
 )
+from kernels.common.attention_kv_cache import KV_BUFFER_NUM_RECORDS
 
 from rocke.core.codegen_policy import (
     CodegenPolicy,
@@ -627,7 +628,7 @@ def build_unified_attention_3d_tiled(
         iter_args.append((f"acc{n}", acc_inits[n]))
 
     # ---------------- async K/V infra (identical to 2D) ----------------
-    big_bytes = b.const_i32(0x7FFF0000)
+    big_bytes = b.const_i32(KV_BUFFER_NUM_RECORDS)
     if spec.kv_layout == "strided":
         key_rsrc = strided_kv_resource(b, key, k_strides, seq_idx, kv_head_idx)
         value_rsrc = strided_kv_resource(b, value, v_strides, seq_idx, kv_head_idx)

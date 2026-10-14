@@ -59,6 +59,8 @@ from rocke.helpers.transforms import (
     do_magic_division,
 )
 
+from .attention_kv_cache import paged_kv_needs_i64
+
 # Alias the promoted log2-domain softcap helper under the local name used by
 # the scalar reference kernels (matches the gfx950 tiled modules' convention).
 _apply_softcap = apply_softcap_log2
@@ -2566,16 +2568,17 @@ def _enable_transposed_subflags(problem: UnifiedAttentionProblem) -> bool:
 
 
 def _enable_i64_kv_addr(problem: UnifiedAttentionProblem) -> bool:
-    """Enable 64-bit paged-KV addressing when the cache may exceed ~2 GiB.
+    """Enable 64-bit paged-KV addressing when the cache is too large for i32.
 
     The default load path puts the full byte offset (incl.
-    ``physical_block * block_stride``) in a 32-bit buffer voffset, which
-    overflows -- and silently corrupts -- once the paged cache exceeds
-    2 GiB. When the cache is that large we fold the per-block offset into a
-    64-bit buffer base (a tiny, wave-uniform ``make_buffer_rsrc`` per
-    block; measured within ~1-2% of the i32 path). Below the cap we keep
-    the fast i32 path. ``num_kv_blocks == 0`` means the cache size is
-    unknown (caller did not supply it) -> assume small / fast path.
+    ``physical_block * block_stride``) in a 32-bit buffer voffset against one
+    whole-cache resource whose ``num_records`` is ``KV_BUFFER_NUM_RECORDS``
+    (2 GiB - 64 KiB); a load at or past that offset returns zero. When the
+    cache is larger we fold the per-block offset into a 64-bit buffer base (a
+    tiny, wave-uniform ``make_buffer_rsrc`` per block; measured within ~1-2%
+    of the i32 path). Otherwise we keep the fast i32 path. ``num_kv_blocks ==
+    0`` means the cache size is unknown (caller did not supply it) -> assume
+    small / fast path.
     """
     if problem.num_kv_blocks <= 0:
         return False
@@ -2583,13 +2586,7 @@ def _enable_i64_kv_addr(problem: UnifiedAttentionProblem) -> bool:
     block_stride = (
         problem.block_size * problem.num_kv_heads * problem.head_size * elem_bytes
     )
-    cache_bytes = problem.num_kv_blocks * block_stride
-    # The within-block voffset is always < block_stride, so the i32 offset
-    # overflows exactly when cache_bytes > 2^31 (the last block's base alone
-    # reaches 2^31). Keep the fast i32 path at/below that; switch to i64
-    # strictly above. (Verified: cap=65536 bf16 = 2^31 bytes, max offset
-    # 2147483646 < 2^31 -> still correct on i32.)
-    return cache_bytes > 0x8000_0000
+    return paged_kv_needs_i64(problem.num_kv_blocks, block_stride)
 
 
 def _enable_f32_denormal_flush(problem: UnifiedAttentionProblem) -> bool:
@@ -4997,8 +4994,9 @@ def run_unified_attention_torch(
 
     # Fill the paged-cache block count from the K tensor (k.shape[0]) so the
     # 2D dispatcher can switch to 64-bit KV addressing when the cache exceeds
-    # the ~2 GiB i32-voffset cap. ``num_kv_blocks`` has exactly ONE consumer
-    # (``_enable_i64_kv_addr``), and only caches >2 GiB need i64 -- so only pay
+    # the i32 buffer resource (``KV_BUFFER_NUM_RECORDS``). ``num_kv_blocks``
+    # has exactly ONE consumer (``_enable_i64_kv_addr``), and only caches that
+    # large need i64 -- so only pay
     # the (~30us, fields()-introspecting) ``dataclasses.replace`` when the cache
     # is actually that large. Small caches (the common case + every test shape)
     # keep ``num_kv_blocks=0`` -> the correct fast i32 path -> no per-call
@@ -5008,7 +5006,7 @@ def run_unified_attention_torch(
         _blk_stride = (
             problem.block_size * problem.num_kv_heads * problem.head_size * _eb
         )
-        if int(k.shape[0]) * _blk_stride > 0x8000_0000:
+        if paged_kv_needs_i64(int(k.shape[0]), _blk_stride):
             problem = replace(problem, num_kv_blocks=int(k.shape[0]))
     if tuning_spec is not None:
         # Explicit specs are initially selected before framework tensors exist.

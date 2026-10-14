@@ -189,14 +189,17 @@ class TestTuningSpace(unittest.TestCase):
             "attention_gfx950_u2d_narrow_nw2_mw16_t4xb_llvm"
         )
         base = specs[0]
-        at_limit = base.with_num_kv_blocks(65536)
-        above_limit = base.with_num_kv_blocks(65537)
+        # 32 KiB blocks: 65534 fill the i32 path's 0x7FFF0000-byte K/V
+        # resource exactly; one more block (and an exact 2 GiB cache) does not.
+        at_limit = base.with_num_kv_blocks(65534)
+        above_limit = base.with_num_kv_blocks(65535)
         self.assertFalse(at_limit.kernel_spec.use_i64_kv_addr)
         self.assertEqual(at_limit.tuning_id, base.tuning_id)
         self.assertTrue(above_limit.kernel_spec.use_i64_kv_addr)
+        self.assertTrue(base.with_num_kv_blocks(65536).kernel_spec.use_i64_kv_addr)
         self.assertEqual(above_limit.tuning_id, base.tuning_id)
         self.assertNotEqual(spec_identity(above_limit), spec_identity(base))
-        self.assertEqual(above_limit.num_kv_blocks, 65537)
+        self.assertEqual(above_limit.num_kv_blocks, 65535)
 
         _candidate, _req, split_specs = _specs_for(
             "attention_gfx950_u3d_splitkv_seg64_t1xb",
@@ -204,7 +207,7 @@ class TestTuningSpace(unittest.TestCase):
             seqlen_k=4096,
         )
         split = split_specs[0]
-        split_i64 = split.with_num_kv_blocks(65537)
+        split_i64 = split.with_num_kv_blocks(65535)
         self.assertTrue(split_i64.kernel_spec.use_i64_kv_addr)
         self.assertEqual(split_i64.reduce_spec, split.reduce_spec)
         self.assertEqual(split_i64.tuning_id, split.tuning_id)
@@ -217,7 +220,7 @@ class TestTuningSpace(unittest.TestCase):
             seqlen_k=4096,
         )
         with self.assertRaisesRegex(NotImplementedError, "does not support"):
-            gfx942_split_specs[0].with_num_kv_blocks(65537)
+            gfx942_split_specs[0].with_num_kv_blocks(65535)
 
         _candidate, _req, fp8_specs = _specs_for(
             "attention_gfx950_u2d_narrow_nw2_mw16_t4xb_llvm",
@@ -225,10 +228,10 @@ class TestTuningSpace(unittest.TestCase):
             fp8_fnuz=False,
         )
         self.assertFalse(
-            fp8_specs[0].with_num_kv_blocks(131072).kernel_spec.use_i64_kv_addr
+            fp8_specs[0].with_num_kv_blocks(131068).kernel_spec.use_i64_kv_addr
         )
         self.assertTrue(
-            fp8_specs[0].with_num_kv_blocks(131073).kernel_spec.use_i64_kv_addr
+            fp8_specs[0].with_num_kv_blocks(131069).kernel_spec.use_i64_kv_addr
         )
 
     def test_tuning_wrapper_preserves_fp8_encoding(self):

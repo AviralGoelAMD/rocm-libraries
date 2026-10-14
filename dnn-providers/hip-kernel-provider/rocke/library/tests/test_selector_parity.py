@@ -389,15 +389,17 @@ class TestI64KvAddr(unittest.TestCase):
         self.assertFalse(s["use_i64_kv_addr"])
 
     def test_small_cache_no_i64(self):
-        # 65536 blocks × 32 tokens × 8 kv-heads × 64 dims × 2 bytes = 2 GiB exactly
-        # → still i32 (threshold is STRICTLY > 2 GiB)
-        s = _spec(_combo_prob(num_kv_blocks=65536))
+        # 65534 blocks × 32 tokens × 8 kv-heads × 64 dims × 2 bytes = 0x7FFF0000
+        # bytes: exactly fills the i32 path's K/V buffer resource → still i32
+        s = _spec(_combo_prob(num_kv_blocks=65534))
         self.assertFalse(s["use_i64_kv_addr"])
 
     def test_large_cache_gets_i64(self):
-        # 65537 blocks × same stride → just over 2 GiB → i64
-        s = _spec(_combo_prob(num_kv_blocks=65537))
-        self.assertTrue(s["use_i64_kv_addr"])
+        # 65535 blocks (and 65536 = exactly 2 GiB): the last 64 KiB would lie
+        # past num_records and load as zero → i64
+        for blocks in (65535, 65536):
+            s = _spec(_combo_prob(num_kv_blocks=blocks))
+            self.assertTrue(s["use_i64_kv_addr"])
 
 
 # ---------------------------------------------------------------------------

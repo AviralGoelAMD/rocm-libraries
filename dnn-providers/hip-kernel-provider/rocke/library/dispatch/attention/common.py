@@ -49,6 +49,7 @@ from enum import IntEnum
 from operator import index
 from typing import Any, Tuple
 
+from kernels.common.attention_kv_cache import paged_kv_needs_i64
 from kernels.common.attention_unified import (
     UnifiedAttentionProblem,
     # Re-exported, never redeclared. The kernel owns what it covers; dispatch's
@@ -569,7 +570,7 @@ class AttentionTuningSpec:
             * int(kernel_spec.head_size)
             * elem_bytes
         )
-        use_i64 = count > 0 and count * block_stride > 0x8000_0000
+        use_i64 = count > 0 and paged_kv_needs_i64(count, block_stride)
         return replace(
             self,
             kernel_spec=replace(kernel_spec, use_i64_kv_addr=use_i64),
