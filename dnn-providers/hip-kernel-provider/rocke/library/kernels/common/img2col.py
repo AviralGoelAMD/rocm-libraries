@@ -136,6 +136,15 @@ def is_valid_spec(spec: Img2ColSpec, arch: str = "gfx950") -> Tuple[bool, str]:
             False,
             f"block_tile_k {spec.block_tile_k} not divisible by vec_k {spec.vec_k}",
         )
+    if spec.problem.K_gemm % spec.vec_k != 0:
+        # The output is row-major [M, K_gemm] and every thread stores one
+        # vec_k-wide chunk, so a K_gemm that vec_k does not divide puts the
+        # last chunk of a row across the next row's start and misaligns every
+        # row after the first.
+        return (
+            False,
+            f"K_gemm {spec.problem.K_gemm} not divisible by vec_k {spec.vec_k}",
+        )
     if spec.block_size <= 0:
         return False, "block_size must be positive"
     if spec.block_size > 1024:

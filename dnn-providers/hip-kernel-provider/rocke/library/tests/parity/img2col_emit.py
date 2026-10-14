@@ -46,7 +46,7 @@ def _spec(idx: int) -> Img2ColSpec:
             problem=ConvProblem(N=2, Hi=16, Wi=16, C=15, K=32, Y=3, X=3),
             block_tile_m=8,
             block_tile_k=120,
-            vec_k=8,
+            vec_k=1,
         )
     if idx == 5:
         return Img2ColSpec(
