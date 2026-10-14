@@ -83,25 +83,22 @@ class FmhaBwdSpec:
     mfma_lds_pad: int = 8
     mfma_waves_per_eu: int = 0
     mfma_exp2_fast: bool = False
-    # ``mfma_atom32``: 32x32x16 atoms, one wave per 32 keys / 32 query rows
-    # (``ktiles`` / ``qtiles`` are ignored).
-    mfma_atom32: bool = False
-    # ``mfma_natural_rows``: 16x16 path keeps Q / K tile rows in natural order
-    # (a lane group's 8 K slots are rows ``4g + 0..3`` and ``16 + 4g + 0..3``)
-    # instead of permuting them to 8 contiguous rows.
+    # ``mfma_natural_rows``: Q / K tile rows stay in natural order (a lane
+    # group's 8 K slots are rows ``4g + 0..3`` and ``16 + 4g + 0..3``)
+    # instead of being permuted to 8 contiguous rows.
     mfma_natural_rows: bool = False
-    # ``mfma_pipeline``: the next tile's global loads are issued one loop
-    # iteration ahead and carried in registers. ``mfma_causal_balance``:
-    # causal dQ CTAs run heaviest-first.
-    mfma_pipeline: bool = False
-    mfma_causal_balance: bool = False
-    # ``mfma_sw_pipe``: MFMA software pipeline (implies ``mfma_pipeline``):
-    # each iteration runs tile i's gradient GEMMs and tile i+1's S / dP GEMMs
-    # from a three-deep LDS ring.
-    mfma_sw_pipe: bool = False
+    # Causal CTA order. ``"none"``: grid order. ``"lpt"``: longest-first
+    # across heads (the linear block id picks the tile, heaviest tiles of
+    # every head first). ``"pair"``: each CTA walks tile ``j`` and then tile
+    # ``n - 1 - j`` so every CTA has the same work (half the grid).
+    mfma_causal_order: str = "none"
+    # ``mfma_causal_split``: causal walks run the tiles that cross the
+    # diagonal in a separate loop; only that loop applies the mask.
+    mfma_causal_split: bool = False
     # ``mfma_fused_dq``: no dQ kernel; the dK/dV kernel also computes
-    # dQ = dS.K per Q tile and adds it with f32 atomics into dQ, which the
-    # pre-pass zero-fills.
+    # dQ = dS.K for its keys per Q tile and adds it with f32 atomics into
+    # dQ, which the pre-pass zero-fills. Atomic volume per call is
+    # ``seqlen_k / (16 * dkdv_waves * dkdv_ktiles)`` adds per dQ element.
     mfma_fused_dq: bool = False
 
     def kernel_name(self) -> str:
@@ -641,7 +638,11 @@ def build_fmha_bwd_split(spec: FmhaBwdSpec, arch: str = "gfx950"):
 #      ``dQ^T += K^T.dS^T`` (K^T by transpose read).
 #
 # dQ / dK / dV are written once (no atomics, no zero-init). Causal masks
-# bound the walks (CTA-uniform) and zero the masked P entries.
+# bound the walks (CTA-uniform) and zero the masked P entries;
+# ``mfma_causal_order`` / ``mfma_causal_split`` balance the triangular
+# work and keep the mask out of off-diagonal tiles. ``mfma_fused_dq``
+# folds the dQ GEMM into the dK/dV kernel (five GEMMs instead of seven)
+# and accumulates dQ with f32 atomics.
 # ---------------------------------------------------------------------
 
 _MFMA_BWD_STEP = 32  # rows per inner step: two permuted 16-row sub-tiles
@@ -658,14 +659,6 @@ def _mfma_bwd_setup(spec: FmhaBwdSpec, arch: str):
     s = spec.common
     atom = MfmaAtom.bf16_16x16x32() if s.dtype == "bf16" else MfmaAtom.f16_16x16x32()
     return target.mma.by_op_id(atom.name), io_ir_type(s.dtype)
-
-
-def _mfma_bwd_op32(spec: FmhaBwdSpec, arch: str):
-    from rocke.core.arch import ArchTarget
-    from rocke.helpers.atoms import MfmaAtom
-
-    atom = MfmaAtom.bf16_32x32x16() if spec.common.dtype == "bf16" else MfmaAtom.f16_32x32x16()
-    return ArchTarget.from_gfx(arch).mma.by_op_id(atom.name)
 
 
 def _mfma_bwd_lane(b, nw: int):
@@ -697,14 +690,14 @@ def _mfma_bwd_slot_rows(b, g, nat: bool):
 
 
 class _MfmaBwdStager:
-    """Cooperative multi-buffered staging of ``_MFMA_BWD_STEP``-row tiles."""
+    """Cooperative double-buffered staging of ``_MFMA_BWD_STEP``-row tiles."""
 
-    def __init__(self, b, tid, nw: int, head_size: int, dt, pad: int, srcs, nbuf: int = 2):
+    def __init__(self, b, tid, nw: int, head_size: int, dt, pad: int, srcs):
         lanes_per_row = head_size // 8
         rows_per_pass = 64 * nw // lanes_per_row
         if rows_per_pass > _MFMA_BWD_STEP or _MFMA_BWD_STEP % rows_per_pass:
             raise ValueError(f"mfma bwd staging: {nw} waves do not tile {_MFMA_BWD_STEP} rows")
-        self.b, self.dt, self.nbuf = b, dt, nbuf
+        self.b, self.dt = b, dt
         self.srcs = srcs  # [(tensor, row_base_fn(row) -> elem offset)]
         self.rows = [
             b.add(b.div(tid, b.const_i32(lanes_per_row)), b.const_i32(p * rows_per_pass))
@@ -712,7 +705,7 @@ class _MfmaBwdStager:
         ]
         self.col = b.mul(b.mod(tid, b.const_i32(lanes_per_row)), b.const_i32(8))
         self.lds = [
-            b.smem_alloc(dt, [nbuf, _MFMA_BWD_STEP, head_size + pad], name_hint=f"bwst{i}")
+            b.smem_alloc(dt, [2, _MFMA_BWD_STEP, head_size + pad], name_hint=f"bwst{i}")
             for i in range(len(srcs))
         ]
 
@@ -730,13 +723,6 @@ class _MfmaBwdStager:
         for lds, vs in zip(self.lds, vals):
             for r, v in zip(self.rows, vs):
                 self.b.smem_store_vN(lds, [buf, r, self.col], v, 8)
-
-    def flat(self, vals):
-        return [v for vs in vals for v in vs]
-
-    def unflat(self, flat):
-        n = len(self.rows)
-        return [list(flat[i * n : (i + 1) * n]) for i in range(len(self.srcs))]
 
 
 def _mfma_bwd_tr8(b, lds, buf, g, m16, nd: int, dt, nat: bool):
@@ -865,26 +851,19 @@ def _mfma_bwd_kb(spec: FmhaBwdSpec, which: str, nw: int, declare) -> FmhaKernelB
         tag = f"_mfma_dkdv_w{spec.mfma_dkdv_waves}k{spec.mfma_dkdv_ktiles}p{spec.mfma_lds_pad}"
     else:
         tag = f"_mfma_dq_w{spec.mfma_dq_waves}q{spec.mfma_dq_qtiles}p{spec.mfma_lds_pad}"
-    if spec.mfma_atom32:
-        tag = tag.replace("_mfma_", "_mfma_a32_")
     if spec.mfma_waves_per_eu:
         tag += f"_wpe{spec.mfma_waves_per_eu}"
     if spec.mfma_exp2_fast:
         tag += "_fx"
-    if spec.mfma_natural_rows and not spec.mfma_atom32:
+    if spec.mfma_natural_rows:
         tag += "_nat"
-    if spec.mfma_sw_pipe:
-        tag += "_swp"
-    elif spec.mfma_pipeline:
-        tag += "_pl"
-    if spec.mfma_causal_balance and which == "dq" and spec.common.mask_mode == "causal":
-        tag += "_cb"
+    if spec.common.mask_mode == "causal":
+        if spec.mfma_causal_order != "none":
+            tag += f"_{spec.mfma_causal_order}"
+        if spec.mfma_causal_split:
+            tag += "_cs"
     if spec.mfma_fused_dq and which == "dkdv":
         tag += "_fdq"
-    if spec.mfma_atom32 and (
-        spec.mfma_pipeline or spec.mfma_sw_pipe or spec.mfma_causal_balance or spec.mfma_natural_rows
-    ):
-        raise ValueError("fmha_bwd mfma_atom32 does not support pipeline / causal_balance / natural_rows")
     kb = FmhaKernelBuilder(spec.kernel_name() + tag, spec.common)
     kb.block_size(64 * nw)
     if spec.mfma_waves_per_eu:
@@ -897,258 +876,251 @@ def _mfma_bwd_exp2(b, spec: FmhaBwdSpec, x):
     return b.exp2_fast(x) if spec.mfma_exp2_fast else b.exp2(x)
 
 
+def _mfma_bwd_ctas(b, spec: FmhaBwdSpec, n_blocks: int, n_heads: int, heavy_low: bool):
+    """``[(tile, head), ...]``: the tiles one CTA walks, in order.
+
+    ``heavy_low``: under a causal mask tile 0 carries the most work (dK/dV);
+    otherwise the last tile does (dQ). ``"lpt"`` hands the heaviest tiles
+    of every head to the lowest linear block ids; ``"pair"`` gives each CTA
+    tiles ``x`` and ``n_blocks - 1 - x``.
+    """
+    bx, by = b.block_id_x(), b.block_id_y()
+    order = spec.mfma_causal_order if spec.common.mask_mode == "causal" else "none"
+    if order == "lpt":
+        lin = b.add(bx, b.mul(by, b.const_i32(n_blocks)))
+        rank = b.div(lin, b.const_i32(n_heads))
+        tile = rank if heavy_low else b.sub(b.const_i32(n_blocks - 1), rank)
+        return [(tile, b.mod(lin, b.const_i32(n_heads)))]
+    if order == "pair":
+        return [(bx, by), (b.sub(b.const_i32(n_blocks - 1), bx), by)]
+    return [(bx, by)]
+
+
 def _build_mfma_dkdv(spec: FmhaBwdSpec, arch: str) -> KernelDef:
-    swp = spec.mfma_sw_pipe
-    pipe = spec.mfma_pipeline or swp
     fused = spec.mfma_fused_dq
-    if fused and swp:
-        raise ValueError("fmha_bwd mfma_fused_dq does not support mfma_sw_pipe")
     s = spec.common
     op, dt = _mfma_bwd_setup(spec, arch)
     D = s.shape.head_size
     G = s.shape.num_queries_per_kv
     nw, kpw = spec.mfma_dkdv_waves, spec.mfma_dkdv_ktiles
     causal = s.mask_mode == "causal"
+    split = causal and spec.mfma_causal_split
     nat = spec.mfma_natural_rows
     BM = _MFMA_BWD_STEP
+    BN = 16 * kpw * nw
     n_a, n_d = D // 32, D // 16
     kb = _mfma_bwd_kb(spec, "dkdv", nw, lambda k: _declare_mfma_dkdv_params(k, fused))
     b = kb.builder
     Q, K, V, dO = kb.tensor("Q"), kb.tensor("K"), kb.tensor("V"), kb.tensor("dO")
     Lse2, Dsum = kb.ptr("Lse2"), kb.ptr("Dsum")
     scale_log2, seqlen_q = kb.scalar("scale_log2"), kb.scalar("seqlen_q")
-    n_cta = b.to_sgpr_u32(b.mul(b.block_id_x(), b.const_i32(16 * kpw * nw)))
-    kvh = b.to_sgpr_u32(b.block_id_y())
+    scale_inv = kb.scalar("scale_inv")
     tid, _, wave, m16, g = _mfma_bwd_lane(b, nw)
-    n_wave = b.add(n_cta, b.mul(wave, b.const_i32(16 * kpw)))
-
-    # Register-resident B operands: lane (g, m16) holds K / V[n + m16, 32a + 8g + 0..7].
-    def _kv_b(src, name, i):
-        row = kb.row_base(name, b.add(n_wave, b.add(b.const_i32(16 * i), m16)), kvh)
-        return [
-            b.global_load_vN(src, b.add(row, b.add(b.const_i32(32 * a), b.mul(g, b.const_i32(8)))), dt, 8, align=16)
-            for a in range(n_a)
-        ]
-
-    k_b = [_kv_b(K, "k", i) for i in range(kpw)]
-    v_b = [_kv_b(V, "v", i) for i in range(kpw)]
-
+    row_base, t_stride = _mfma_bwd_slot_rows(b, g, nat)
     stg = _MfmaBwdStager(
         b, tid, nw, D, dt, spec.mfma_lds_pad,
         [(Q, lambda r, h: kb.row_base("q", r, h)), (dO, lambda r, h: kb.row_base("do", r, h))],
-        nbuf=3 if swp else 2,
     )
     q_lds, do_lds = stg.lds
-    nqt = b.div(seqlen_q, b.const_i32(BM))
-    qt_lo = b.div(n_cta, b.const_i32(BM)) if causal else b.const_i32(0)
-    nq_eff = b.sub(nqt, qt_lo)
-    total = b.mul(nq_eff, b.const_i32(G))
-
-    def _coords(it):
-        hg = b.div(it, nq_eff) if G > 1 else None
-        h = b.add(b.mul(kvh, b.const_i32(G)), hg) if G > 1 else kvh
-        qt = b.add(qt_lo, b.mod(it, nq_eff)) if G > 1 else b.add(qt_lo, it)
-        return h, b.mul(qt, b.const_i32(BM))
-
-    row_base, t_stride = _mfma_bwd_slot_rows(b, g, nat)
-
-    def _stats(it):
-        # Per-lane log-sum-exp / Dsum of the query rows this lane's C slots cover.
-        h, q0 = _coords(it)
-        ws = b.add(b.add(b.mul(h, seqlen_q), q0), row_base)
-        return [
-            b.global_load_vN(ptr, b.add(ws, b.const_i32(t_stride * t)), F32, 4, align=16)
-            for ptr in (Lse2, Dsum)
-            for t in range(2)
-        ]
-
-    def _clamp(x):
-        return b.select(b.cmp_lt(x, total), x, last)
-
-    def _load(it):
-        h, q0 = _coords(_clamp(it))
-        return stg.load(q0, h)
-
-    def _sdp(it, buf, st):
-        """S = Q.K^T, dP = dO.V^T for tile ``it``; returns packed (P, dS) per key tile."""
-        lse, dsum = st[:2], st[2:]
-        _, q0 = _coords(it)
-        q_a, do_a = [
-            [
-                [b.smem_load_vN(lds, buf, _mfma_bwd_perm_row(b, m16, t, nat),
-                                b.add(b.const_i32(32 * a), b.mul(g, b.const_i32(8))), dtype=dt, n=8)
-                 for a in range(n_a)]
-                for t in range(2)
-            ]
-            for lds in (q_lds, do_lds)
-        ]
-        q_lane = b.add(q0, row_base)  # slot (t, r) -> query q_lane + t_stride * t + r
-        out = []
-        for i in range(kpw):
-            key = b.add(n_wave, b.add(b.const_i32(16 * i), m16))
-            ps, dss = [], []
-            for t in range(2):
-                s_acc = b.zero_vec_f32(4)
-                dp_acc = b.zero_vec_f32(4)
-                for a in range(n_a):
-                    s_acc = b.mma(op, q_a[t][a], k_b[i][a], s_acc)
-                for a in range(n_a):
-                    dp_acc = b.mma(op, do_a[t][a], v_b[i][a], dp_acc)
-                for r in range(4):
-                    p = _mfma_bwd_exp2(
-                        b, spec, b.fsub(b.fmul(b.vec_extract(s_acc, r), scale_log2), b.vec_extract(lse[t], r))
-                    )
-                    if causal:
-                        qpos = b.add(q_lane, b.const_i32(t_stride * t + r))
-                        p = b.select(b.cmp_le(key, qpos), p, b.const_f32(0.0))
-                    ps.append(p)
-                    dss.append(b.fmul(p, b.fsub(b.vec_extract(dp_acc, r), b.vec_extract(dsum[t], r))))
-            out += [_mfma_bwd_pack(b, ps, dt), _mfma_bwd_pack(b, dss, dt)]
-        return out
-
-    def _grads(buf, pds, dk, dv):
-        """dV^T += dO^T.P, dK^T += Q^T.dS for the tile in ``buf``."""
-        for n in range(n_d):
-            do_t = _mfma_bwd_tr8(b, do_lds, buf, g, m16, n, dt, nat)
-            for i in range(kpw):
-                dv[i][n] = b.mma(op, do_t, pds[2 * i], dv[i][n])
-            q_t = _mfma_bwd_tr8(b, q_lds, buf, g, m16, n, dt, nat)
-            for i in range(kpw):
-                dk[i][n] = b.mma(op, q_t, pds[2 * i + 1], dk[i][n])
-
-    last = b.sub(total, b.const_i32(1))
-    nbuf = stg.nbuf
-    stg.store(_load(b.const_i32(0)), b.const_i32(0))
     if fused:
         # Fused dQ: the CTA's K tile is staged once in LDS (B operand of
         # dQ = dS.K by transpose read); every wave writes its dS^T slice to a
         # double-buffered [keys, 32 queries] tile; one iteration later (after
         # the iteration barrier) wave w computes dQ[:, w * D / nw ...] over all
         # BN keys and atomically adds it into the zero-initialised dQ.
-        bn = 16 * kpw * nw
         lanes_per_row = D // 8
         rows_per_pass = 64 * nw // lanes_per_row
-        k_lds = b.smem_alloc(dt, [bn, D + spec.mfma_lds_pad], name_hint="bwk")
-        ds_lds = b.smem_alloc(dt, [2, bn, BM + 16], name_hint="bwds")
+        k_lds = b.smem_alloc(dt, [BN, D + spec.mfma_lds_pad], name_hint="bwk")
+        ds_lds = b.smem_alloc(dt, [2, BN, BM + 16], name_hint="bwds")
         st_row = b.div(tid, b.const_i32(lanes_per_row))
         st_col = b.mul(b.mod(tid, b.const_i32(lanes_per_row)), b.const_i32(8))
-        for p in range(bn // rows_per_pass):
-            row = b.add(st_row, b.const_i32(p * rows_per_pass))
-            kv = b.global_load_vN(K, b.add(kb.row_base("k", b.add(n_cta, row), kvh), st_col), dt, 8, align=16)
-            b.smem_store_vN(k_lds, [row, st_col], kv, 8)
         d_w = b.mul(wave, b.const_i32(D // nw))
-        scale_inv_f = kb.scalar("scale_inv")
+        ndw = D // (16 * nw)
+    # Q tiles per head that cross the diagonal of a BN-key block.
+    ndg = -(-(BN - 1) // BM)
 
-    def _ds_write(slot, pds):
-        for i in range(kpw):
-            n_local = b.add(b.mul(wave, b.const_i32(16 * kpw)), b.add(b.const_i32(16 * i), m16))
-            for t in range(2):
-                v4 = b.zero_vec(dt, 4)
-                for r in range(4):
-                    v4 = b.vec_insert(v4, b.vec_extract(pds[2 * i + 1], 4 * t + r), r)
-                col = b.add(row_base, b.const_i32(t_stride * t))
-                b.smem_store_vN(ds_lds, [slot, n_local, col], v4, 4)
+    def _pass(p, kblk, kvh):
+        n_cta = b.to_sgpr_u32(b.mul(kblk, b.const_i32(BN)))
+        kvh = b.to_sgpr_u32(kvh)
+        n_wave = b.add(n_cta, b.mul(wave, b.const_i32(16 * kpw)))
 
-    def _dq(it, slot):
-        h, q0 = _coords(it)
-        for qs in range(2):
-            for dsi in range(D // (16 * nw)):
-                col_d = b.add(d_w, b.const_i32(16 * dsi))
-                acc = b.zero_vec_f32(4)
-                for ks in range(bn // 32):
-                    a_op = _mfma_bwd_tr8_at(b, ds_lds, [slot], b.const_i32(32 * ks), b.const_i32(16 * qs), g, m16, dt, nat)
-                    b_op = _mfma_bwd_tr8_at(b, k_lds, [], b.const_i32(32 * ks), col_d, g, m16, dt, nat)
-                    acc = b.mma(op, a_op, b_op, acc)
-                for r in range(4):
-                    q = b.add(q0, b.add(b.mul(g, b.const_i32(4)), b.const_i32(16 * qs + r)))
-                    idx = b.add(
-                        b.add(b.mul(q, kb.scalar("stride_dq_token")), b.mul(h, kb.stride_head("q"))),
-                        b.add(col_d, m16),
-                    )
-                    b.global_atomic_add_f32(kb.ptr("dQ"), idx, b.fmul(b.vec_extract(acc, r), scale_inv_f))
-    iter_args = []
-    for i in range(kpw):
-        iter_args += [(f"dk{i}_{n}", b.zero_vec_f32(4)) for n in range(n_d)]
-        iter_args += [(f"dv{i}_{n}", b.zero_vec_f32(4)) for n in range(n_d)]
-    n_acc = len(iter_args)
-    n_pf = len(stg.rows) * 2
-    if swp:
-        # MFMA software pipeline: iteration ``it`` runs tile it's dV / dK
-        # chain and tile it+1's S / dP chain (independent MFMA streams), with
-        # P / dS carried across the back-edge. Three LDS buffers: tile it,
-        # tile it+1 (read) and tile it+2 (written).
-        stg.store(_load(b.const_i32(1)), b.const_i32(1))
-        b.sync()
-        pds0 = _sdp(b.const_i32(0), b.const_i32(0), _stats(b.const_i32(0)))
-        iter_args += [(f"pd{j}", v) for j, v in enumerate(pds0)]
-        iter_args += [(f"pf{j}", v) for j, v in enumerate(stg.flat(_load(b.const_i32(2))))]
-        iter_args += [(f"st{j}", v) for j, v in enumerate(_stats(_clamp(b.const_i32(1))))]
-    elif pipe:
-        # Load pipeline: tile it+1's Q / dO loads and tile it's stats are
-        # issued one iteration ahead and carried across the back-edge, so the
-        # LDS stores at the end of an iteration never wait on fresh loads.
-        iter_args += [(f"pf{j}", v) for j, v in enumerate(stg.flat(_load(b.const_i32(1))))]
-        iter_args += [(f"st{j}", v) for j, v in enumerate(_stats(b.const_i32(0)))]
-        b.sync()
-    else:
-        b.sync()
-    loop = b.scf_for_iter(
-        b.const_i32(0), total, b.const_i32(1), iter_args=iter_args, iv_name="it",
-        elide_trailing_barrier=False,
-    )
-    with loop as (it, state):
-        dk = [list(state[2 * n_d * i : 2 * n_d * i + n_d]) for i in range(kpw)]
-        dv = [list(state[2 * n_d * i + n_d : 2 * n_d * (i + 1)]) for i in range(kpw)]
-        buf = b.mod(it, b.const_i32(nbuf))
-        if swp:
-            n_pd = 2 * kpw
-            pds = list(state[n_acc : n_acc + n_pd])
-            pre = stg.unflat(state[n_acc + n_pd : n_acc + n_pd + n_pf])
-            st = list(state[n_acc + n_pd + n_pf :])
-            nxt = b.add(it, b.const_i32(1))
-            _grads(buf, pds, dk, dv)
-            pds_next = _sdp(_clamp(nxt), b.mod(nxt, b.const_i32(nbuf)), st)
-            stg.store(pre, b.mod(b.add(it, b.const_i32(2)), b.const_i32(nbuf)))
-            carry = pds_next + stg.flat(_load(b.add(it, b.const_i32(3)))) + _stats(_clamp(b.add(it, b.const_i32(2))))
-        else:
-            if pipe:
-                pre = stg.unflat(state[n_acc : n_acc + n_pf])
-                st = list(state[n_acc + n_pf :])
+        # Register-resident B operands: lane (g, m16) holds K / V[n + m16, 32a + 8g + 0..7].
+        def _kv_b(src, name, i):
+            row = kb.row_base(name, b.add(n_wave, b.add(b.const_i32(16 * i), m16)), kvh)
+            return [
+                b.global_load_vN(src, b.add(row, b.add(b.const_i32(32 * a), b.mul(g, b.const_i32(8)))), dt, 8,
+                                 align=16)
+                for a in range(n_a)
+            ]
+
+        k_b = [_kv_b(K, "k", i) for i in range(kpw)]
+        v_b = [_kv_b(V, "v", i) for i in range(kpw)]
+        nqt = b.div(seqlen_q, b.const_i32(BM))
+        qt_lo = b.div(n_cta, b.const_i32(BM)) if causal else b.const_i32(0)
+        nq_eff = b.sub(nqt, qt_lo)
+        total = b.mul(nq_eff, b.const_i32(G))
+        n_diag = G * ndg if split else 0
+        last = b.sub(total, b.const_i32(1))
+
+        def _coords(it):
+            if G == 1:
+                return kvh, b.mul(b.add(qt_lo, it), b.const_i32(BM))
+            if split:
+                # Diagonal tiles of every head first, then the rest.
+                in_diag = b.cmp_lt(it, b.const_i32(n_diag))
+                jj = b.select(in_diag, it, b.sub(it, b.const_i32(n_diag)))
+                per = b.select(in_diag, b.const_i32(ndg), b.sub(nq_eff, b.const_i32(ndg)))
+                off = b.select(in_diag, b.const_i32(0), b.const_i32(ndg))
+                hg, qt = b.div(jj, per), b.add(b.add(qt_lo, off), b.mod(jj, per))
             else:
-                pre = _load(b.add(it, b.const_i32(1)))
-                st = _stats(it)
-            pds = _sdp(it, buf, st)
-            if fused:
-                slot = b.mod(it, b.const_i32(2))
-                _ds_write(slot, pds)
-                with b.scf_if(b.cmp_gt(it, b.const_i32(0))):
-                    _dq(b.sub(it, b.const_i32(1)), b.sub(b.const_i32(1), slot))
-            _grads(buf, pds, dk, dv)
-            stg.store(pre, b.sub(b.const_i32(1), buf))
-            carry = []
-            if pipe:
-                carry = stg.flat(_load(b.add(it, b.const_i32(2)))) + _stats(_clamp(b.add(it, b.const_i32(1))))
-        b.sync()
-        b.scf_yield(*[x for i in range(kpw) for x in dk[i] + dv[i]], *carry)
+                hg, qt = b.div(it, nq_eff), b.add(qt_lo, b.mod(it, nq_eff))
+            return b.add(b.mul(kvh, b.const_i32(G)), hg), b.mul(qt, b.const_i32(BM))
 
-    if fused:
-        # The last tile's dS was written before the final iteration barrier.
-        _dq(last, b.mod(last, b.const_i32(2)))
-    # C fragment of dV^T / dK^T: lane (g, m16) slot r = [d = 16n + 4g + r, key = m16].
-    scale_inv = kb.scalar("scale_inv")
-    res = loop.results
-    for i in range(kpw):
-        key = b.add(n_wave, b.add(b.const_i32(16 * i), m16))
-        dk_row = b.add(b.mul(key, kb.scalar("stride_dk_token")), b.mul(kvh, kb.stride_head("k")))
-        dv_row = b.add(b.mul(key, kb.scalar("stride_dv_token")), b.mul(kvh, kb.stride_head("v")))
-        for n in range(n_d):
-            d = b.add(b.const_i32(16 * n), b.mul(g, b.const_i32(4)))
-            dk_acc = res[2 * n_d * i + n]
-            dk_out = b.zero_vec_f32(4)
-            for r in range(4):
-                dk_out = b.vec_insert(dk_out, b.fmul(b.vec_extract(dk_acc, r), scale_inv), r)
-            b.global_store_vN(kb.ptr("dK"), b.add(dk_row, d), dk_out, 4, align=16)
-            b.global_store_vN(kb.ptr("dV"), b.add(dv_row, d), res[2 * n_d * i + n_d + n], 4, align=16)
+        def _stats(it):
+            # Per-lane log-sum-exp / Dsum of the query rows this lane's C slots cover.
+            h, q0 = _coords(it)
+            ws = b.add(b.add(b.mul(h, seqlen_q), q0), row_base)
+            return [
+                b.global_load_vN(ptr, b.add(ws, b.const_i32(t_stride * t)), F32, 4, align=16)
+                for ptr in (Lse2, Dsum)
+                for t in range(2)
+            ]
+
+        def _load(it):
+            h, q0 = _coords(b.select(b.cmp_lt(it, total), it, last))
+            return stg.load(q0, h)
+
+        def _sdp(it, buf, st, masked):
+            """S = Q.K^T, dP = dO.V^T for tile ``it``; returns packed (P, dS) per key tile."""
+            lse, dsum = st[:2], st[2:]
+            _, q0 = _coords(it)
+            q_a, do_a = [
+                [
+                    [b.smem_load_vN(lds, buf, _mfma_bwd_perm_row(b, m16, t, nat),
+                                    b.add(b.const_i32(32 * a), b.mul(g, b.const_i32(8))), dtype=dt, n=8)
+                     for a in range(n_a)]
+                    for t in range(2)
+                ]
+                for lds in (q_lds, do_lds)
+            ]
+            q_lane = b.add(q0, row_base)  # slot (t, r) -> query q_lane + t_stride * t + r
+            out = []
+            for i in range(kpw):
+                key = b.add(n_wave, b.add(b.const_i32(16 * i), m16))
+                ps, dss = [], []
+                for t in range(2):
+                    s_acc = b.zero_vec_f32(4)
+                    dp_acc = b.zero_vec_f32(4)
+                    for a in range(n_a):
+                        s_acc = b.mma(op, q_a[t][a], k_b[i][a], s_acc)
+                    for a in range(n_a):
+                        dp_acc = b.mma(op, do_a[t][a], v_b[i][a], dp_acc)
+                    for r in range(4):
+                        p_ = _mfma_bwd_exp2(
+                            b, spec, b.fsub(b.fmul(b.vec_extract(s_acc, r), scale_log2), b.vec_extract(lse[t], r))
+                        )
+                        if masked:
+                            qpos = b.add(q_lane, b.const_i32(t_stride * t + r))
+                            p_ = b.select(b.cmp_le(key, qpos), p_, b.const_f32(0.0))
+                        ps.append(p_)
+                        dss.append(b.fmul(p_, b.fsub(b.vec_extract(dp_acc, r), b.vec_extract(dsum[t], r))))
+                out += [_mfma_bwd_pack(b, ps, dt), _mfma_bwd_pack(b, dss, dt)]
+            return out
+
+        def _grads(buf, pds, dk, dv):
+            """dV^T += dO^T.P, dK^T += Q^T.dS for the tile in ``buf``."""
+            for n in range(n_d):
+                do_t = _mfma_bwd_tr8(b, do_lds, buf, g, m16, n, dt, nat)
+                for i in range(kpw):
+                    dv[i][n] = b.mma(op, do_t, pds[2 * i], dv[i][n])
+                q_t = _mfma_bwd_tr8(b, q_lds, buf, g, m16, n, dt, nat)
+                for i in range(kpw):
+                    dk[i][n] = b.mma(op, q_t, pds[2 * i + 1], dk[i][n])
+
+        def _ds_write(slot, pds):
+            for i in range(kpw):
+                n_local = b.add(b.mul(wave, b.const_i32(16 * kpw)), b.add(b.const_i32(16 * i), m16))
+                for t in range(2):
+                    v4 = b.zero_vec(dt, 4)
+                    for r in range(4):
+                        v4 = b.vec_insert(v4, b.vec_extract(pds[2 * i + 1], 4 * t + r), r)
+                    b.smem_store_vN(ds_lds, [slot, n_local, b.add(row_base, b.const_i32(t_stride * t))], v4, 4)
+
+        def _dq(it, slot):
+            h, q0 = _coords(it)
+            acc = [[b.zero_vec_f32(4) for _ in range(ndw)] for _ in range(2)]
+            for ks in range(BN // 32):
+                a_ops = [_mfma_bwd_tr8_at(b, ds_lds, [slot], b.const_i32(32 * ks), b.const_i32(16 * qs), g, m16,
+                                          dt, nat) for qs in range(2)]
+                b_ops = [_mfma_bwd_tr8_at(b, k_lds, [], b.const_i32(32 * ks), b.add(d_w, b.const_i32(16 * j)), g,
+                                          m16, dt, nat) for j in range(ndw)]
+                for qs in range(2):
+                    for j in range(ndw):
+                        acc[qs][j] = b.mma(op, a_ops[qs], b_ops[j], acc[qs][j])
+            head = b.mul(h, kb.stride_head("q"))
+            for qs in range(2):
+                for j in range(ndw):
+                    col = b.add(b.add(d_w, b.const_i32(16 * j)), m16)
+                    for r in range(4):
+                        q = b.add(q0, b.add(b.mul(g, b.const_i32(4)), b.const_i32(16 * qs + r)))
+                        idx = b.add(b.add(b.mul(q, kb.scalar("stride_dq_token")), head), col)
+                        b.global_atomic_add_f32(kb.ptr("dQ"), idx, b.fmul(b.vec_extract(acc[qs][j], r), scale_inv))
+
+        stg.store(_load(b.const_i32(0)), b.const_i32(0))
+        if fused:
+            for rp in range(BN // rows_per_pass):
+                row = b.add(st_row, b.const_i32(rp * rows_per_pass))
+                kv = b.global_load_vN(K, b.add(kb.row_base("k", b.add(n_cta, row), kvh), st_col), dt, 8, align=16)
+                b.smem_store_vN(k_lds, [row, st_col], kv, 8)
+        b.sync()
+        state = []
+        for i in range(kpw):
+            state += [b.zero_vec_f32(4) for _ in range(2 * n_d)]
+        # Diagonal tiles (masked) and the rest (unmasked) as two loops when split.
+        segs = [(b.const_i32(0), b.const_i32(n_diag), True), (b.const_i32(n_diag), total, False)] if split else [
+            (b.const_i32(0), total, causal)]
+        for si, (lo, hi, masked) in enumerate(segs):
+            pre_ = f"p{p}s{si}_"
+            loop = b.scf_for_iter(
+                lo, hi, b.const_i32(1), iter_args=[(f"{pre_}acc{j}", v) for j, v in enumerate(state)],
+                iv_name=f"{pre_}it", elide_trailing_barrier=False,
+            )
+            with loop as (it, cur):
+                dk = [list(cur[2 * n_d * i : 2 * n_d * i + n_d]) for i in range(kpw)]
+                dv = [list(cur[2 * n_d * i + n_d : 2 * n_d * (i + 1)]) for i in range(kpw)]
+                buf = b.mod(it, b.const_i32(2))
+                nxt = _load(b.add(it, b.const_i32(1)))
+                pds = _sdp(it, buf, _stats(it), masked)
+                if fused:
+                    _ds_write(buf, pds)
+                    with b.scf_if(b.cmp_gt(it, b.const_i32(0))):
+                        _dq(b.sub(it, b.const_i32(1)), b.sub(b.const_i32(1), buf))
+                _grads(buf, pds, dk, dv)
+                stg.store(nxt, b.sub(b.const_i32(1), buf))
+                b.sync()
+                b.scf_yield(*[x for i in range(kpw) for x in dk[i] + dv[i]])
+            state = list(loop.results)
+        if fused:
+            # The last tile's dS was written before the final iteration barrier.
+            _dq(last, b.mod(last, b.const_i32(2)))
+        # C fragment of dV^T / dK^T: lane (g, m16) slot r = [d = 16n + 4g + r, key = m16].
+        for i in range(kpw):
+            key = b.add(n_wave, b.add(b.const_i32(16 * i), m16))
+            dk_row = b.add(b.mul(key, kb.scalar("stride_dk_token")), b.mul(kvh, kb.stride_head("k")))
+            dv_row = b.add(b.mul(key, kb.scalar("stride_dv_token")), b.mul(kvh, kb.stride_head("v")))
+            for n in range(n_d):
+                d = b.add(b.const_i32(16 * n), b.mul(g, b.const_i32(4)))
+                dk_acc = state[2 * n_d * i + n]
+                dk_out = b.zero_vec_f32(4)
+                for r in range(4):
+                    dk_out = b.vec_insert(dk_out, b.fmul(b.vec_extract(dk_acc, r), scale_inv), r)
+                b.global_store_vN(kb.ptr("dK"), b.add(dk_row, d), dk_out, 4, align=16)
+                b.global_store_vN(kb.ptr("dV"), b.add(dv_row, d), state[2 * n_d * i + n_d + n], 4, align=16)
+
+    for p, (kblk, kvh) in enumerate(_mfma_bwd_ctas(b, spec, spec.seqlen_k // BN, s.shape.num_kv_heads, True)):
+        if p:
+            b.sync()  # the previous pass's last dQ reads LDS this pass overwrites
+        _pass(p, kblk, kvh)
     b.ret()
     return kb.kernel
 
@@ -1160,6 +1132,7 @@ def _build_mfma_dq(spec: FmhaBwdSpec, arch: str) -> KernelDef:
     G = s.shape.num_queries_per_kv
     nw, qpw = spec.mfma_dq_waves, spec.mfma_dq_qtiles
     causal = s.mask_mode == "causal"
+    split = causal and spec.mfma_causal_split
     nat = spec.mfma_natural_rows
     BK = _MFMA_BWD_STEP
     BQ = 16 * qpw * nw
@@ -1168,372 +1141,125 @@ def _build_mfma_dq(spec: FmhaBwdSpec, arch: str) -> KernelDef:
     b = kb.builder
     Q, K, V, dO = kb.tensor("Q"), kb.tensor("K"), kb.tensor("V"), kb.tensor("dO")
     scale_log2, seqlen_q = kb.scalar("scale_log2"), kb.scalar("seqlen_q")
-    bid = b.block_id_x()
-    if causal and spec.mfma_causal_balance:
-        # Causal dQ work grows with the Q tile index: launch the heavy tiles first.
-        bid = b.sub(b.sub(b.div(seqlen_q, b.const_i32(BQ)), b.const_i32(1)), bid)
-    q_cta = b.to_sgpr_u32(b.mul(bid, b.const_i32(BQ)))
-    h = b.to_sgpr_u32(b.block_id_y())
-    kvh = b.to_sgpr_u32(b.div(h, b.const_i32(G))) if G > 1 else h
+    scale_inv = kb.scalar("scale_inv")
     tid, _, wave, m16, g = _mfma_bwd_lane(b, nw)
-    q_wave = b.add(q_cta, b.mul(wave, b.const_i32(16 * qpw)))
     d_lane = b.mul(g, b.const_i32(8))
-
-    # Register-resident B operands: lane (g, m16) holds Q / dO[q + m16, 32a + 8g + 0..7].
-    q_b, do_b, lse, dsum, q_pos = [], [], [], [], []
-    for i in range(qpw):
-        q = b.add(q_wave, b.add(b.const_i32(16 * i), m16))
-        q_pos.append(q)
-        qr, dr = kb.row_base("q", q, h), kb.row_base("do", q, h)
-        q_b.append([b.global_load_vN(Q, b.add(qr, b.add(b.const_i32(32 * a), d_lane)), dt, 8, align=16)
-                    for a in range(n_a)])
-        do_b.append([b.global_load_vN(dO, b.add(dr, b.add(b.const_i32(32 * a), d_lane)), dt, 8, align=16)
-                     for a in range(n_a)])
-        ws = b.add(b.mul(h, seqlen_q), q)
-        lse.append(b.global_load_f32(kb.ptr("Lse2"), ws))
-        dsum.append(b.global_load_f32(kb.ptr("Dsum"), ws))
-
-    swp = spec.mfma_sw_pipe
-    pipe = spec.mfma_pipeline or swp
-    stg = _MfmaBwdStager(
-        b, tid, nw, D, dt, spec.mfma_lds_pad,
-        [(K, lambda r: kb.row_base("k", r, kvh)), (V, lambda r: kb.row_base("v", r, kvh))],
-        nbuf=3 if swp else 2,
-    )
-    k_lds, v_lds = stg.lds
-    nbuf = stg.nbuf
-    nkt = b.div(kb.scalar("seqlen_k"), b.const_i32(BK))
-    if causal:
-        need = b.add(b.div(b.add(q_cta, b.const_i32(BQ - 1)), b.const_i32(BK)), b.const_i32(1))
-        nkt = b.select(b.cmp_lt(need, nkt), need, nkt)
-    last = b.sub(nkt, b.const_i32(1))
     row_base, t_stride = _mfma_bwd_slot_rows(b, g, nat)
-
-    def _clamp(x):
-        return b.select(b.cmp_lt(x, nkt), x, last)
-
-    def _load(kt):
-        return stg.load(b.mul(_clamp(kt), b.const_i32(BK)))
-
-    def _sdp(kt, buf):
-        """S^T = K.Q^T, dP^T = V.dO^T for K tile ``kt``; returns packed dS^T per Q tile."""
-        k_a, v_a = [
-            [
-                [b.smem_load_vN(lds, buf, _mfma_bwd_perm_row(b, m16, t, nat),
-                                b.add(b.const_i32(32 * a), d_lane), dtype=dt, n=8)
-                 for a in range(n_a)]
-                for t in range(2)
-            ]
-            for lds in (k_lds, v_lds)
-        ]
-        k_lane = b.add(b.mul(kt, b.const_i32(BK)), row_base)  # slot (t, r) -> key k_lane + t_stride * t + r
-        ds_vec = []
-        for i in range(qpw):
-            dss = []
-            for t in range(2):
-                s_acc = b.zero_vec_f32(4)
-                dp_acc = b.zero_vec_f32(4)
-                for a in range(n_a):
-                    s_acc = b.mma(op, k_a[t][a], q_b[i][a], s_acc)
-                for a in range(n_a):
-                    dp_acc = b.mma(op, v_a[t][a], do_b[i][a], dp_acc)
-                for r in range(4):
-                    p = _mfma_bwd_exp2(b, spec, b.fsub(b.fmul(b.vec_extract(s_acc, r), scale_log2), lse[i]))
-                    if causal:
-                        key = b.add(k_lane, b.const_i32(t_stride * t + r))
-                        p = b.select(b.cmp_le(key, q_pos[i]), p, b.const_f32(0.0))
-                    dss.append(b.fmul(p, b.fsub(b.vec_extract(dp_acc, r), dsum[i])))
-            ds_vec.append(_mfma_bwd_pack(b, dss, dt))
-        return ds_vec
-
-    def _grads(buf, ds_vec, dq):
-        """dQ^T += K^T.dS^T for the K tile in ``buf``."""
-        for n in range(n_d):
-            k_t = _mfma_bwd_tr8(b, k_lds, buf, g, m16, n, dt, nat)
-            for i in range(qpw):
-                dq[i][n] = b.mma(op, k_t, ds_vec[i], dq[i][n])
-
-    stg.store(_load(b.const_i32(0)), b.const_i32(0))
-    iter_args = [(f"dq{i}_{n}", b.zero_vec_f32(4)) for i in range(qpw) for n in range(n_d)]
-    n_acc = len(iter_args)
-    if swp:
-        # MFMA software pipeline (see dK/dV): tile kt's dQ chain runs next to
-        # tile kt+1's S / dP chain; dS is carried across the back-edge.
-        stg.store(_load(b.const_i32(1)), b.const_i32(1))
-        b.sync()
-        iter_args += [(f"ds{j}", v) for j, v in enumerate(_sdp(b.const_i32(0), b.const_i32(0)))]
-        iter_args += [(f"pf{j}", v) for j, v in enumerate(stg.flat(_load(b.const_i32(2))))]
-    elif pipe:
-        # Tile kt+1's K / V loads are issued one iteration ahead (see dK/dV).
-        iter_args += [(f"pf{j}", v) for j, v in enumerate(stg.flat(_load(b.const_i32(1))))]
-        b.sync()
-    else:
-        b.sync()
-    loop = b.scf_for_iter(
-        b.const_i32(0), nkt, b.const_i32(1), iter_args=iter_args, iv_name="kt",
-        elide_trailing_barrier=False,
-    )
-    with loop as (kt, state):
-        dq = [list(state[n_d * i : n_d * (i + 1)]) for i in range(qpw)]
-        buf = b.mod(kt, b.const_i32(nbuf))
-        if swp:
-            dsv = list(state[n_acc : n_acc + qpw])
-            pre = stg.unflat(state[n_acc + qpw :])
-            nxt = b.add(kt, b.const_i32(1))
-            _grads(buf, dsv, dq)
-            ds_next = _sdp(_clamp(nxt), b.mod(nxt, b.const_i32(nbuf)))
-            stg.store(pre, b.mod(b.add(kt, b.const_i32(2)), b.const_i32(nbuf)))
-            carry = ds_next + stg.flat(_load(b.add(kt, b.const_i32(3))))
-        else:
-            pre = stg.unflat(state[n_acc:]) if pipe else _load(b.add(kt, b.const_i32(1)))
-            _grads(buf, _sdp(kt, buf), dq)
-            stg.store(pre, b.sub(b.const_i32(1), buf))
-            carry = stg.flat(_load(b.add(kt, b.const_i32(2)))) if pipe else []
-        b.sync()
-        b.scf_yield(*[x for i in range(qpw) for x in dq[i]], *carry)
-
-    # C fragment of dQ^T: lane (g, m16) slot r = [d = 16n + 4g + r, query = m16].
-    scale_inv = kb.scalar("scale_inv")
-    for i in range(qpw):
-        row = b.add(b.mul(q_pos[i], kb.scalar("stride_dq_token")), b.mul(h, kb.stride_head("q")))
-        for n in range(n_d):
-            acc = loop.results[n_d * i + n]
-            out = b.zero_vec_f32(4)
-            for r in range(4):
-                out = b.vec_insert(out, b.fmul(b.vec_extract(acc, r), scale_inv), r)
-            b.global_store_vN(
-                kb.ptr("dQ"), b.add(row, b.add(b.const_i32(16 * n), b.mul(g, b.const_i32(4)))), out, 4, align=16
-            )
-    b.ret()
-    return kb.kernel
-
-
-# ---- 32x32x16 atom variant (``mfma_atom32``) ---------------------------
-#
-# One wave owns 32 rows. Lane ``(h, c) = (lane / 32, lane % 32)``: A / B
-# operands hold row / column ``c`` and the 8 K slots ``8h + 0..7`` of a
-# 16-wide K chunk; C slot ``r`` is row ``8 (r / 4) + 4h + r % 4``, column
-# ``c``. The second GEMM of each chain takes the first GEMM's C fragment as
-# its B operand directly: slots ``8u + 0..7`` cover the 16 contiguous-K
-# chunk ``u``, so no row permutation is needed, and the A operand (dO^T,
-# Q^T, K^T) is two ``ds_read_b64_tr_b16`` reads per chunk.
-
-
-def _a32_row(b, h, r: int):
-    return b.add(b.mul(h, b.const_i32(4)), b.const_i32(8 * (r // 4) + r % 4))
-
-
-def _a32_tr8(b, lds, buf, h, c, u: int, dtile: int, dt):
-    """Lane ``(h, c)``: ``lds[buf, 16u + 4h + {0..3, 8..11}, 32 dtile + c]``."""
-    m = b.mod(c, b.const_i32(16))
-    col = b.add(
-        b.const_i32(32 * dtile),
-        b.add(b.mul(b.div(c, b.const_i32(16)), b.const_i32(16)), b.mul(b.mod(m, b.const_i32(4)), b.const_i32(4))),
-    )
-    r0 = b.add(b.const_i32(16 * u), b.add(b.mul(h, b.const_i32(4)), b.div(m, b.const_i32(4))))
-    lo = b.ds_read_tr16_b64(lds, buf, r0, col, dtype=dt)
-    hi = b.ds_read_tr16_b64(lds, buf, b.add(r0, b.const_i32(8)), col, dtype=dt)
-    return b.vec_concat(lo, hi)
-
-
-def _a32_lane(b, nw: int):
-    tid = b.thread_id_x()
-    lane = b.mod(tid, b.const_i32(64)) if nw > 1 else tid
-    wave = b.to_sgpr_u32(b.div(tid, b.const_i32(64))) if nw > 1 else b.const_i32(0)
-    return tid, wave, b.div(lane, b.const_i32(32)), b.mod(lane, b.const_i32(32))
-
-
-def _a32_store(b, ptr, row, acc, h, dtile: int, scale=None):
-    """Store C slots of a ``[32 d, 32 rows]`` fragment as 4 contiguous-d f32x4 per lane."""
-    for grp in range(4):
-        out = b.zero_vec_f32(4)
-        for j in range(4):
-            x = b.vec_extract(acc, 4 * grp + j)
-            out = b.vec_insert(out, b.fmul(x, scale) if scale is not None else x, j)
-        d = b.add(b.const_i32(32 * dtile + 8 * grp), b.mul(h, b.const_i32(4)))
-        b.global_store_vN(ptr, b.add(row, d), out, 4, align=16)
-
-
-def _build_mfma_dkdv32(spec: FmhaBwdSpec, arch: str) -> KernelDef:
-    s = spec.common
-    _, dt = _mfma_bwd_setup(spec, arch)
-    op = _mfma_bwd_op32(spec, arch)
-    D = s.shape.head_size
-    G = s.shape.num_queries_per_kv
-    nw = spec.mfma_dkdv_waves
-    causal = s.mask_mode == "causal"
-    BM = _MFMA_BWD_STEP
-    n_a, n_dt = D // 16, D // 32
-    kb = _mfma_bwd_kb(spec, "dkdv", nw, _declare_mfma_dkdv_params)
-    b = kb.builder
-    Q, K, V, dO = kb.tensor("Q"), kb.tensor("K"), kb.tensor("V"), kb.tensor("dO")
-    Lse2, Dsum = kb.ptr("Lse2"), kb.ptr("Dsum")
-    scale_log2, seqlen_q = kb.scalar("scale_log2"), kb.scalar("seqlen_q")
-    n_cta = b.to_sgpr_u32(b.mul(b.block_id_x(), b.const_i32(32 * nw)))
-    kvh = b.to_sgpr_u32(b.block_id_y())
-    tid, wave, h8, c = _a32_lane(b, nw)
-    n_wave = b.add(n_cta, b.mul(wave, b.const_i32(32)))
-    key = b.add(n_wave, c)
-    d_lane = b.mul(h8, b.const_i32(8))
-
-    def _kv_b(src, name):
-        row = kb.row_base(name, key, kvh)
-        return [
-            b.global_load_vN(src, b.add(row, b.add(b.const_i32(16 * a), d_lane)), dt, 8, align=16)
-            for a in range(n_a)
-        ]
-
-    k_b, v_b = _kv_b(K, "k"), _kv_b(V, "v")
+    kvh_cur = []  # KV head of the current pass (read by the stager's row functions)
     stg = _MfmaBwdStager(
         b, tid, nw, D, dt, spec.mfma_lds_pad,
-        [(Q, lambda r, hh: kb.row_base("q", r, hh)), (dO, lambda r, hh: kb.row_base("do", r, hh))],
-    )
-    q_lds, do_lds = stg.lds
-    nqt = b.div(seqlen_q, b.const_i32(BM))
-    qt_lo = b.div(n_cta, b.const_i32(BM)) if causal else b.const_i32(0)
-    nq_eff = b.sub(nqt, qt_lo)
-    total = b.mul(nq_eff, b.const_i32(G))
-
-    def _coords(it):
-        if G == 1:
-            return kvh, b.mul(b.add(qt_lo, it), b.const_i32(BM))
-        hh = b.add(b.mul(kvh, b.const_i32(G)), b.div(it, nq_eff))
-        return hh, b.mul(b.add(qt_lo, b.mod(it, nq_eff)), b.const_i32(BM))
-
-    h0, q00 = _coords(b.const_i32(0))
-    stg.store(stg.load(q00, h0), b.const_i32(0))
-    b.sync()
-    iter_args = [(f"dk{n}", b.zero_vec_f32(16)) for n in range(n_dt)]
-    iter_args += [(f"dv{n}", b.zero_vec_f32(16)) for n in range(n_dt)]
-    last = b.sub(total, b.const_i32(1))
-    loop = b.scf_for_iter(
-        b.const_i32(0), total, b.const_i32(1), iter_args=iter_args, iv_name="it",
-        elide_trailing_barrier=False,
-    )
-    with loop as (it, state):
-        dk, dv = list(state[:n_dt]), list(state[n_dt:])
-        buf = b.mod(it, b.const_i32(2))
-        nxt = b.add(it, b.const_i32(1))
-        nxt = b.select(b.cmp_lt(nxt, total), nxt, last)
-        hn, qn = _coords(nxt)
-        pre = stg.load(qn, hn)
-        hh, q0 = _coords(it)
-        s_acc = b.zero_vec_f32(16)
-        dp_acc = b.zero_vec_f32(16)
-        for a in range(n_a):
-            qa = b.smem_load_vN(q_lds, buf, c, b.add(b.const_i32(16 * a), d_lane), dtype=dt, n=8)
-            s_acc = b.mma(op, qa, k_b[a], s_acc)
-        for a in range(n_a):
-            da = b.smem_load_vN(do_lds, buf, c, b.add(b.const_i32(16 * a), d_lane), dtype=dt, n=8)
-            dp_acc = b.mma(op, da, v_b[a], dp_acc)
-        ws = b.add(b.add(b.mul(hh, seqlen_q), q0), b.mul(h8, b.const_i32(4)))
-        lse = [b.global_load_vN(Lse2, b.add(ws, b.const_i32(8 * g)), F32, 4, align=16) for g in range(4)]
-        dsum = [b.global_load_vN(Dsum, b.add(ws, b.const_i32(8 * g)), F32, 4, align=16) for g in range(4)]
-        ps, dss = [], []
-        for r in range(16):
-            p = _mfma_bwd_exp2(
-                b, spec, b.fsub(b.fmul(b.vec_extract(s_acc, r), scale_log2), b.vec_extract(lse[r // 4], r % 4))
-            )
-            if causal:
-                p = b.select(b.cmp_le(key, b.add(q0, _a32_row(b, h8, r))), p, b.const_f32(0.0))
-            ps.append(p)
-            dss.append(b.fmul(p, b.fsub(b.vec_extract(dp_acc, r), b.vec_extract(dsum[r // 4], r % 4))))
-        p_vec = [_mfma_bwd_pack(b, ps[8 * u : 8 * u + 8], dt) for u in range(2)]
-        ds_vec = [_mfma_bwd_pack(b, dss[8 * u : 8 * u + 8], dt) for u in range(2)]
-        for n in range(n_dt):
-            for u in range(2):
-                dv[n] = b.mma(op, _a32_tr8(b, do_lds, buf, h8, c, u, n, dt), p_vec[u], dv[n])
-            for u in range(2):
-                dk[n] = b.mma(op, _a32_tr8(b, q_lds, buf, h8, c, u, n, dt), ds_vec[u], dk[n])
-        stg.store(pre, b.sub(b.const_i32(1), buf))
-        b.sync()
-        b.scf_yield(*dk, *dv)
-
-    scale_inv = kb.scalar("scale_inv")
-    dk_row = b.add(b.mul(key, kb.scalar("stride_dk_token")), b.mul(kvh, kb.stride_head("k")))
-    dv_row = b.add(b.mul(key, kb.scalar("stride_dv_token")), b.mul(kvh, kb.stride_head("v")))
-    for n in range(n_dt):
-        _a32_store(b, kb.ptr("dK"), dk_row, loop.results[n], h8, n, scale_inv)
-        _a32_store(b, kb.ptr("dV"), dv_row, loop.results[n_dt + n], h8, n)
-    b.ret()
-    return kb.kernel
-
-
-def _build_mfma_dq32(spec: FmhaBwdSpec, arch: str) -> KernelDef:
-    s = spec.common
-    _, dt = _mfma_bwd_setup(spec, arch)
-    op = _mfma_bwd_op32(spec, arch)
-    D = s.shape.head_size
-    G = s.shape.num_queries_per_kv
-    nw = spec.mfma_dq_waves
-    causal = s.mask_mode == "causal"
-    BK = _MFMA_BWD_STEP
-    BQ = 32 * nw
-    n_a, n_dt = D // 16, D // 32
-    kb = _mfma_bwd_kb(spec, "dq", nw, _declare_mfma_dq_params)
-    b = kb.builder
-    Q, K, V, dO = kb.tensor("Q"), kb.tensor("K"), kb.tensor("V"), kb.tensor("dO")
-    scale_log2, seqlen_q = kb.scalar("scale_log2"), kb.scalar("seqlen_q")
-    q_cta = b.to_sgpr_u32(b.mul(b.block_id_x(), b.const_i32(BQ)))
-    hq = b.to_sgpr_u32(b.block_id_y())
-    kvh = b.to_sgpr_u32(b.div(hq, b.const_i32(G))) if G > 1 else hq
-    tid, wave, h8, c = _a32_lane(b, nw)
-    q = b.add(b.add(q_cta, b.mul(wave, b.const_i32(32))), c)
-    d_lane = b.mul(h8, b.const_i32(8))
-    qr, dr = kb.row_base("q", q, hq), kb.row_base("do", q, hq)
-    q_b = [b.global_load_vN(Q, b.add(qr, b.add(b.const_i32(16 * a), d_lane)), dt, 8, align=16) for a in range(n_a)]
-    do_b = [b.global_load_vN(dO, b.add(dr, b.add(b.const_i32(16 * a), d_lane)), dt, 8, align=16) for a in range(n_a)]
-    ws = b.add(b.mul(hq, seqlen_q), q)
-    lse = b.global_load_f32(kb.ptr("Lse2"), ws)
-    dsum = b.global_load_f32(kb.ptr("Dsum"), ws)
-    stg = _MfmaBwdStager(
-        b, tid, nw, D, dt, spec.mfma_lds_pad,
-        [(K, lambda r: kb.row_base("k", r, kvh)), (V, lambda r: kb.row_base("v", r, kvh))],
+        [(K, lambda r: kb.row_base("k", r, kvh_cur[0])), (V, lambda r: kb.row_base("v", r, kvh_cur[0]))],
     )
     k_lds, v_lds = stg.lds
-    nkt = b.div(kb.scalar("seqlen_k"), b.const_i32(BK))
-    if causal:
-        need = b.add(b.div(b.add(q_cta, b.const_i32(BQ - 1)), b.const_i32(BK)), b.const_i32(1))
-        nkt = b.select(b.cmp_lt(need, nkt), need, nkt)
-    stg.store(stg.load(b.const_i32(0)), b.const_i32(0))
-    b.sync()
-    last = b.sub(nkt, b.const_i32(1))
-    loop = b.scf_for_iter(
-        b.const_i32(0), nkt, b.const_i32(1), iter_args=[(f"dq{n}", b.zero_vec_f32(16)) for n in range(n_dt)],
-        iv_name="kt", elide_trailing_barrier=False,
-    )
-    with loop as (kt, state):
-        dq = list(state)
-        buf = b.mod(kt, b.const_i32(2))
-        nxt = b.add(kt, b.const_i32(1))
-        nxt = b.select(b.cmp_lt(nxt, nkt), nxt, last)
-        pre = stg.load(b.mul(nxt, b.const_i32(BK)))
-        k0 = b.mul(kt, b.const_i32(BK))
-        s_acc = b.zero_vec_f32(16)
-        dp_acc = b.zero_vec_f32(16)
-        for a in range(n_a):
-            ka = b.smem_load_vN(k_lds, buf, c, b.add(b.const_i32(16 * a), d_lane), dtype=dt, n=8)
-            s_acc = b.mma(op, ka, q_b[a], s_acc)
-        for a in range(n_a):
-            va = b.smem_load_vN(v_lds, buf, c, b.add(b.const_i32(16 * a), d_lane), dtype=dt, n=8)
-            dp_acc = b.mma(op, va, do_b[a], dp_acc)
-        dss = []
-        for r in range(16):
-            p = _mfma_bwd_exp2(b, spec, b.fsub(b.fmul(b.vec_extract(s_acc, r), scale_log2), lse))
-            if causal:
-                p = b.select(b.cmp_le(b.add(k0, _a32_row(b, h8, r)), q), p, b.const_f32(0.0))
-            dss.append(b.fmul(p, b.fsub(b.vec_extract(dp_acc, r), dsum)))
-        ds_vec = [_mfma_bwd_pack(b, dss[8 * u : 8 * u + 8], dt) for u in range(2)]
-        for n in range(n_dt):
-            for u in range(2):
-                dq[n] = b.mma(op, _a32_tr8(b, k_lds, buf, h8, c, u, n, dt), ds_vec[u], dq[n])
-        stg.store(pre, b.sub(b.const_i32(1), buf))
-        b.sync()
-        b.scf_yield(*dq)
 
-    row = b.add(b.mul(q, kb.scalar("stride_dq_token")), b.mul(hq, kb.stride_head("q")))
-    for n in range(n_dt):
-        _a32_store(b, kb.ptr("dQ"), row, loop.results[n], h8, n, kb.scalar("scale_inv"))
+    def _pass(p, qblk, h):
+        q_cta = b.to_sgpr_u32(b.mul(qblk, b.const_i32(BQ)))
+        h = b.to_sgpr_u32(h)
+        kvh_cur[:] = [b.to_sgpr_u32(b.div(h, b.const_i32(G))) if G > 1 else h]
+        q_wave = b.add(q_cta, b.mul(wave, b.const_i32(16 * qpw)))
+
+        # Register-resident B operands: lane (g, m16) holds Q / dO[q + m16, 32a + 8g + 0..7].
+        q_b, do_b, lse, dsum, q_pos = [], [], [], [], []
+        for i in range(qpw):
+            q = b.add(q_wave, b.add(b.const_i32(16 * i), m16))
+            q_pos.append(q)
+            qr, dr = kb.row_base("q", q, h), kb.row_base("do", q, h)
+            q_b.append([b.global_load_vN(Q, b.add(qr, b.add(b.const_i32(32 * a), d_lane)), dt, 8, align=16)
+                        for a in range(n_a)])
+            do_b.append([b.global_load_vN(dO, b.add(dr, b.add(b.const_i32(32 * a), d_lane)), dt, 8, align=16)
+                         for a in range(n_a)])
+            ws = b.add(b.mul(h, seqlen_q), q)
+            lse.append(b.global_load_f32(kb.ptr("Lse2"), ws))
+            dsum.append(b.global_load_f32(kb.ptr("Dsum"), ws))
+
+        nkt = b.div(kb.scalar("seqlen_k"), b.const_i32(BK))
+        if causal:
+            need = b.add(b.div(b.add(q_cta, b.const_i32(BQ - 1)), b.const_i32(BK)), b.const_i32(1))
+            nkt = b.select(b.cmp_lt(need, nkt), need, nkt)
+        last = b.sub(nkt, b.const_i32(1))
+
+        def _load(kt):
+            return stg.load(b.mul(b.select(b.cmp_lt(kt, nkt), kt, last), b.const_i32(BK)))
+
+        def _sdp(kt, buf, masked):
+            """S^T = K.Q^T, dP^T = V.dO^T for K tile ``kt``; returns packed dS^T per Q tile."""
+            k_a, v_a = [
+                [
+                    [b.smem_load_vN(lds, buf, _mfma_bwd_perm_row(b, m16, t, nat),
+                                    b.add(b.const_i32(32 * a), d_lane), dtype=dt, n=8)
+                     for a in range(n_a)]
+                    for t in range(2)
+                ]
+                for lds in (k_lds, v_lds)
+            ]
+            k_lane = b.add(b.mul(kt, b.const_i32(BK)), row_base)  # slot (t, r) -> key k_lane + t_stride * t + r
+            ds_vec = []
+            for i in range(qpw):
+                dss = []
+                for t in range(2):
+                    s_acc = b.zero_vec_f32(4)
+                    dp_acc = b.zero_vec_f32(4)
+                    for a in range(n_a):
+                        s_acc = b.mma(op, k_a[t][a], q_b[i][a], s_acc)
+                    for a in range(n_a):
+                        dp_acc = b.mma(op, v_a[t][a], do_b[i][a], dp_acc)
+                    for r in range(4):
+                        p_ = _mfma_bwd_exp2(b, spec, b.fsub(b.fmul(b.vec_extract(s_acc, r), scale_log2), lse[i]))
+                        if masked:
+                            key = b.add(k_lane, b.const_i32(t_stride * t + r))
+                            p_ = b.select(b.cmp_le(key, q_pos[i]), p_, b.const_f32(0.0))
+                        dss.append(b.fmul(p_, b.fsub(b.vec_extract(dp_acc, r), dsum[i])))
+                ds_vec.append(_mfma_bwd_pack(b, dss, dt))
+            return ds_vec
+
+        def _grads(buf, ds_vec, dq):
+            """dQ^T += K^T.dS^T for the K tile in ``buf``."""
+            for n in range(n_d):
+                k_t = _mfma_bwd_tr8(b, k_lds, buf, g, m16, n, dt, nat)
+                for i in range(qpw):
+                    dq[i][n] = b.mma(op, k_t, ds_vec[i], dq[i][n])
+
+        stg.store(_load(b.const_i32(0)), b.const_i32(0))
+        b.sync()
+        state = [b.zero_vec_f32(4) for _ in range(qpw * n_d)]
+        if split:
+            # K tiles below every query of the CTA need no mask; the rest do.
+            kd = b.div(q_cta, b.const_i32(BK))
+            segs = [(b.const_i32(0), kd, False), (kd, nkt, True)]
+        else:
+            segs = [(b.const_i32(0), nkt, causal)]
+        for si, (lo, hi, masked) in enumerate(segs):
+            pre_ = f"p{p}s{si}_"
+            loop = b.scf_for_iter(
+                lo, hi, b.const_i32(1), iter_args=[(f"{pre_}dq{j}", v) for j, v in enumerate(state)],
+                iv_name=f"{pre_}kt", elide_trailing_barrier=False,
+            )
+            with loop as (kt, cur):
+                dq = [list(cur[n_d * i : n_d * (i + 1)]) for i in range(qpw)]
+                buf = b.mod(kt, b.const_i32(2))
+                nxt = _load(b.add(kt, b.const_i32(1)))
+                _grads(buf, _sdp(kt, buf, masked), dq)
+                stg.store(nxt, b.sub(b.const_i32(1), buf))
+                b.sync()
+                b.scf_yield(*[x for i in range(qpw) for x in dq[i]])
+            state = list(loop.results)
+
+        # C fragment of dQ^T: lane (g, m16) slot r = [d = 16n + 4g + r, query = m16].
+        for i in range(qpw):
+            row = b.add(b.mul(q_pos[i], kb.scalar("stride_dq_token")), b.mul(h, kb.stride_head("q")))
+            for n in range(n_d):
+                acc = state[n_d * i + n]
+                out = b.zero_vec_f32(4)
+                for r in range(4):
+                    out = b.vec_insert(out, b.fmul(b.vec_extract(acc, r), scale_inv), r)
+                b.global_store_vN(
+                    kb.ptr("dQ"), b.add(row, b.add(b.const_i32(16 * n), b.mul(g, b.const_i32(4)))), out, 4, align=16
+                )
+
+    for p, (qblk, h) in enumerate(_mfma_bwd_ctas(b, spec, spec.seqlen_q // BQ, s.shape.num_query_heads, False)):
+        if p:
+            b.sync()  # the next pass's prologue overwrites LDS buffer 0
+        _pass(p, qblk, h)
     b.ret()
     return kb.kernel
 
@@ -1551,29 +1277,32 @@ def build_fmha_bwd_mfma(spec: FmhaBwdSpec, arch: str = "gfx950"):
     s = spec.common
     D = s.shape.head_size
     HQ, HK = s.shape.num_query_heads, s.shape.num_kv_heads
-    bn = 16 * spec.mfma_dkdv_waves * (2 if spec.mfma_atom32 else spec.mfma_dkdv_ktiles)
-    bq = 16 * spec.mfma_dq_waves * (2 if spec.mfma_atom32 else spec.mfma_dq_qtiles)
+    bn = 16 * spec.mfma_dkdv_waves * spec.mfma_dkdv_ktiles
+    bq = 16 * spec.mfma_dq_waves * spec.mfma_dq_qtiles
     rows_pre = _MFMA_PRE_THREADS // (D // 8)
     if D % 32 or spec.seqlen_k % bn or spec.seqlen_q % bq or spec.seqlen_q % _MFMA_BWD_STEP:
         raise ValueError(
             f"fmha_bwd mfma: head_size % 32, seqlen_k % {bn}, seqlen_q % {max(bq, 32)} must be 0"
         )
-    if s.mask_mode not in ("none", "causal") or spec.seqlen_q != spec.seqlen_k and s.mask_mode == "causal":
+    causal = s.mask_mode == "causal"
+    if s.mask_mode not in ("none", "causal") or spec.seqlen_q != spec.seqlen_k and causal:
         raise ValueError("fmha_bwd mfma: mask_mode none, or causal with seqlen_q == seqlen_k")
+    if spec.mfma_causal_order not in ("none", "lpt", "pair"):
+        raise ValueError(f"fmha_bwd mfma_causal_order: none | lpt | pair (got {spec.mfma_causal_order!r})")
     fused = spec.mfma_fused_dq
-    if fused and spec.mfma_atom32:
-        raise ValueError("fmha_bwd mfma_fused_dq needs the 16x16x32 path")
+    pair = causal and spec.mfma_causal_order == "pair"
+    nkb, nqb = spec.seqlen_k // bn, spec.seqlen_q // bq
+    if pair and (nkb % 2 or (nqb % 2 and not fused)):
+        raise ValueError("fmha_bwd mfma_causal_order='pair' needs an even number of K (and Q) blocks")
+    div = 2 if pair else 1
     stages = [
         ("pre", _build_mfma_pre, lambda k: _declare_mfma_pre_params(k, fused),
          (spec.seqlen_q // rows_pre, HQ, 1), _MFMA_PRE_THREADS),
-        ("dkdv", _build_mfma_dkdv32 if spec.mfma_atom32 else _build_mfma_dkdv,
-         lambda k: _declare_mfma_dkdv_params(k, fused), (spec.seqlen_k // bn, HK, 1), 64 * spec.mfma_dkdv_waves),
+        ("dkdv", _build_mfma_dkdv, lambda k: _declare_mfma_dkdv_params(k, fused),
+         (nkb // div, HK, 1), 64 * spec.mfma_dkdv_waves),
     ]
     if not fused:
-        stages.append(
-            ("dq", _build_mfma_dq32 if spec.mfma_atom32 else _build_mfma_dq, _declare_mfma_dq_params,
-             (spec.seqlen_q // bq, HQ, 1), 64 * spec.mfma_dq_waves)
-        )
+        stages.append(("dq", _build_mfma_dq, _declare_mfma_dq_params, (nqb // div, HQ, 1), 64 * spec.mfma_dq_waves))
     out = []
     for which, build, declare, grid, block in stages:
         k = build(spec, arch)
