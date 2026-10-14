@@ -120,6 +120,19 @@ class PoolingProblem:
         )
 
 
+def default_pooling_vec(c: int) -> int:
+    """Widest C-axis pack in ``{4, 2, 1}`` that divides ``c``.
+
+    ``vec=4`` (one 8-byte buffer load per window cell) is the measured
+    sweet spot on gfx950; ``vec=8`` adds no further bandwidth and narrows
+    the grid.
+    """
+    for v in (4, 2):
+        if c % v == 0:
+            return v
+    return 1
+
+
 @dataclass(frozen=True)
 class Pooling2DSpec:
     """One concrete pooling kernel configuration.
@@ -127,14 +140,16 @@ class Pooling2DSpec:
     ``vec`` is the number of C-axis elements packed per thread; setting
     it > 1 turns each thread's ``Y * X`` window iteration into a chain
     of ``buffer_load_vN_f16`` instead of ``vec`` separate scalar loads.
-    ``C`` must be divisible by ``vec`` (validated at spec time).
+    ``C`` must be divisible by ``vec`` (validated at spec time). The
+    default ``vec=0`` resolves to the widest of ``{4, 2, 1}`` that divides
+    ``C`` (see :func:`default_pooling_vec`).
     """
 
     problem: PoolingProblem
     dtype: DType = "f16"
     op: PoolOp = "max"
     block_size: int = 256
-    vec: int = 1
+    vec: int = 0
     name: str = "rocke_pooling2d"
     # P81: when > 1, each thread owns one (c, ho) tile of multiple wo
     # outputs instead of just one wo. Lets the descriptor reuse
@@ -149,6 +164,10 @@ class Pooling2DSpec:
     # ``use_warp_xor_reduce=True`` opts into the wave butterfly when
     # ``tile_n`` widens lane work-per-output.
     use_warp_xor_reduce: bool = False
+
+    def __post_init__(self) -> None:
+        if self.vec == 0:
+            object.__setattr__(self, "vec", default_pooling_vec(self.problem.C))
 
     def kernel_name(self) -> str:
         return kernel_name_join(
