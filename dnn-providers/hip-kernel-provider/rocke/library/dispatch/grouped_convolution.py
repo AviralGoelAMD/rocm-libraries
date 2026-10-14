@@ -665,6 +665,12 @@ _MAX_WGRAD_WS_BYTES = (1 << 31) - 4  # 2 GiB - 4
 # groups*split_k on z, which is the only rocke launch that can reach it.
 _MAX_GRID_DIM_Z = 65535
 
+# gfx950 wgrad split-K degree from which the f32 two-stage scratch replaces the
+# packed 16-bit dW atomic even where that atomic is available: each K-slice of
+# the packed path rounds its partial sum to the dW dtype, so its error grows
+# with the degree, while the scratch accumulates in f32 and rounds once.
+_WGRAD_TWO_STAGE_MIN_SPLIT_K = 4
+
 
 def _resolve_wgrad_split_k(
     spec: ConvGroupedSpec, p: "ConvProblem"
@@ -771,6 +777,17 @@ def _resolve_wgrad_split_k(
     if two_stage and ws_bytes > _MAX_WGRAD_WS_BYTES:
         two_stage = False
         split_k = 1
+    elif (
+        not two_stage
+        and spec.arch == "gfx950"
+        and split_k >= _WGRAD_TWO_STAGE_MIN_SPLIT_K
+        and ws_bytes <= _MAX_WGRAD_WS_BYTES
+    ):
+        # Deep split-K through the packed 16-bit atomic rounds every partial
+        # sum to the dW dtype once per K-slice, so the error grows with the
+        # degree; the f32 scratch accumulates exactly and folds once. Taken
+        # only where the scratch fits -- otherwise the packed atomic stays.
+        two_stage = True
     return split_k, two_stage, requested
 
 
