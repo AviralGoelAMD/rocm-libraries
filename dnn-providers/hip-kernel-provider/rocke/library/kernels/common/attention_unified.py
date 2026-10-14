@@ -713,15 +713,20 @@ def _enable_k_single_buffer(problem: UnifiedAttentionProblem) -> bool:
 
 
 def _d256_gfx950_cohort(problem: "UnifiedAttentionProblem") -> bool:
-    """Arch-agnostic cohort for the gfx950 bf16 D256 prefill fast path.
+    """Arch-agnostic cohort for the gfx950 bf16/fp16 D256 prefill fast path.
 
     The arch gate is applied by callers (``_d256_gfx950_fast`` uses the resolved
     device arch; the ``dispatch.attention`` candidate uses the request arch), so
     this stays CPU-pure and is the single source of truth for the cohort shape.
+
+    fp16 shares the bf16 body (the 32x32 atom, transpose reads and softmax are
+    dtype-generic). Without it fp16 D256 falls to the narrow single-warp
+    geometry, whose double-buffered T=4*block_size K/V tile exceeds the gfx950
+    LDS cap at block_size=64 and fails to compile.
     """
     return (
         problem.head_size == 256
-        and problem.dtype == "bf16"
+        and problem.dtype in ("bf16", "fp16")
         and not problem.use_fp8
         and problem.sliding_window == 0
         and problem.softcap == 0
