@@ -132,6 +132,8 @@ class BlockScaleGemmSpec:
     # Tiled LDS body only: double-buffered direct global->LDS panel copies.
     lds_dma: bool = False
     lds_stages: int = 2
+    # lds_dma only: scoped-noalias tags between the LDS copies and fragment reads.
+    lds_alias: bool = False
 
     @property
     def tiled(self) -> bool:
@@ -172,6 +174,7 @@ class BlockScaleGemmSpec:
             lds_swizzle=self.lds_swizzle,
             lds_dma=self.lds_dma,
             lds_stages=self.lds_stages,
+            lds_alias=self.lds_alias,
         )
 
     @property
@@ -221,7 +224,7 @@ class BlockScaleGemmSpec:
                 f"k{self.k_atom}s{self.split_k}{'pf' if self.prefetch else ''}u{self.k_unroll}"
                 f"{'lds' if self.lds else ''}{'' if self.out_dtype == 'f32' else self.out_dtype}"
                 f"{f'sw{self.tile_swizzle}' if self.tile_swizzle else ''}{'lx' if self.lds_swizzle else ''}"
-                f"{f'dma{self.lds_stages}' if self.lds_dma else ''}"
+                f"{f'dma{self.lds_stages}' if self.lds_dma else ''}{'la' if self.lds_alias else ''}"
             )
         return kernel_name_join(self.name, *parts, flags={"psb": self.preshuffle_b})
 

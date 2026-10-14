@@ -66,6 +66,10 @@ class TiledScaledGemmConfig:
     lds_dma: bool = False
     # lds_dma only: LDS buffers in the ring (stages - 1 K steps in flight).
     lds_stages: int = 2
+    # lds_dma only: tag the copies and the fragment reads with disjoint
+    # scoped-noalias metadata so the backend does not drain every in-flight
+    # copy (vmcnt(0)) before the reads; the loop's explicit wait orders them.
+    lds_alias: bool = False
 
     @property
     def tile_m(self) -> int:
@@ -146,6 +150,13 @@ def validate_tiled(cfg: TiledScaledGemmConfig) -> Tuple[bool, str]:
             return False, "lds_stages must be >= 2 (exactly 2 with per-K-group block scales)"
         if cfg.lds_stages * (cfg.tile_m + cfg.tile_n) * 128 > 160 * 1024:
             return False, f"lds_stages={cfg.lds_stages} panels exceed the 160 KiB LDS"
+        per_step = (cfg.tile_m + cfg.tile_n) * 8 // cfg.block_size
+        if cfg.scaled_mfma:
+            per_step += (128 // cfg.atom.k) * (cfg.mfma_m + cfg.mfma_n)
+        if (cfg.lds_stages - 2) * per_step > 63:
+            return False, f"lds_stages={cfg.lds_stages} keeps more copies in flight than vmcnt can count"
+    if cfg.lds_alias and not cfg.lds_dma:
+        return False, "lds_alias needs lds_dma=True"
     return True, "ok"
 
 
@@ -415,6 +426,7 @@ def _lds_mainloop(
     row_bytes = loop_k if swz else loop_k + _LDS_PAD
     chunks = loop_k // 16
     nbuf = cfg.lds_stages if dma else 1
+    read_alias = "read" if cfg.lds_alias else None
     A_s = b.smem_alloc(dtype, [nbuf * TM, row_bytes], name_hint="A_s")
     B_s = b.smem_alloc(dtype, [nbuf * TN, row_bytes], name_hint="B_s")
 
@@ -488,11 +500,13 @@ def _lds_mainloop(
     def read_frag(smem, row, t):
         if atom.k == 128:
             c0 = b.mul(k_blk, b.const_i32(16))
-            lo = b.smem_load_vN(smem, row, lds_col(row, c0), dtype=dtype, n=16)
-            hi = b.smem_load_vN(smem, row, lds_col(row, b.add(c0, b.const_i32(64))), dtype=dtype, n=16)
+            lo = b.smem_load_vN(smem, row, lds_col(row, c0), dtype=dtype, n=16, lds_alias=read_alias)
+            hi = b.smem_load_vN(
+                smem, row, lds_col(row, b.add(c0, b.const_i32(64))), dtype=dtype, n=16, lds_alias=read_alias
+            )
             return b.vec_concat(lo, hi)
         c0 = b.add(b.const_i32(t * atom.k), b.mul(k_blk, b.const_i32(atom.a_per_lane)))
-        return b.smem_load_vN(smem, row, lds_col(row, c0), dtype=dtype, n=atom.a_per_lane)
+        return b.smem_load_vN(smem, row, lds_col(row, c0), dtype=dtype, n=atom.a_per_lane, lds_alias=read_alias)
 
     def frags_from_lds(scales, a_row0=None, b_row0=None):
         flat = []
@@ -583,7 +597,7 @@ def _lds_dma_loop(
             buf_off = b.mul(buf, b.const_i32(rows * row_bytes))
             for src, off in slots:
                 dst = b.smem_ptr_add(base, b.sext(b.add(buf_off, off), I64))
-                b.global_load_lds(ptr, b.add(src, k0), dst, 16)
+                b.global_load_lds(ptr, b.add(src, k0), dst, 16, lds_alias="dma" if cfg.lds_alias else None)
 
     def next_scales(tr):
         if cfg.scaled_mfma:
@@ -607,8 +621,14 @@ def _lds_dma_loop(
     with loop as (tr, carried):
         carried = list(carried)
         accs, scales = carried[:n_acc], carried[n_acc:]
-        b.s_waitcnt(vmcnt=(S - 2) * per_step)  # step tr's copy has landed
-        b.sync()  # ... in every wave; and every wave is done with step tr - 1
+        if S == 2:
+            b.s_waitcnt(vmcnt=0)  # step tr's copy has landed
+            b.sync()  # ... in every wave; and every wave is done with step tr - 1
+        else:
+            # sync() would drain vmcnt(0) and collapse the ring to two stages:
+            # wait only for step tr's copies, then a bare barrier.
+            b.s_waitcnt(vmcnt=(S - 2) * per_step, lgkmcnt=0)
+            b.s_barrier_bare()
         cur = b.mod(b.sub(tr, tr_lo), b.const_i32(S))
         now = scales[:n_sc]
         frags = frags_from_lds(

@@ -1592,6 +1592,9 @@ class _Lowerer:
         self._needs_av_scope_md: bool = False
         # ``!5 = !{i32 1}`` referenced by ``!nontemporal`` loads/stores.
         self._needs_nontemporal_md: bool = False
+        # Scoped-noalias LDS metadata (``!9000``..``!9004``) referenced by
+        # LDS DMA writes and LDS reads carrying an ``lds_alias`` attr.
+        self._needs_lds_alias_md: bool = False
         # Off unless the kernel was built with source-location capture (see
         # IRBuilder's ``capture_loc`` / ROCKE_DEBUG_LOC). When off, not one byte
         # of the emitted .ll changes, so the byte-identity gate and the IR
@@ -3458,8 +3461,27 @@ class _Lowerer:
         else:
             self._current().emit(
                 f"  {op.result.name} = load {volatile}<{vec} x {elem_ty}>, ptr addrspace(3) {base}, "
-                f"align {align}"
+                f"align {align}{self._lds_alias_md(op)}"
             )
+
+    def _lds_alias_md(self, op: Op) -> str:
+        """Scoped-noalias metadata suffix for an op tagged ``lds_alias``.
+
+        Two scopes in one domain: ``dma`` (direct-to-LDS writes) and ``read``
+        (LDS operand reads), each ``noalias`` with the other, so the waitcnt
+        pass does not place a conservative ``vmcnt(0)`` before every LDS read
+        that follows an in-flight LDS DMA. The emitter tags only accesses to
+        disjoint LDS buffers and orders the rest with explicit waits.
+        """
+        tag = op.attrs.get("lds_alias")
+        if tag is None:
+            return ""
+        self._needs_lds_alias_md = True
+        if tag == "dma":
+            return ", !alias.scope !9003, !noalias !9004"
+        if tag == "read":
+            return ", !alias.scope !9004, !noalias !9003"
+        raise ValueError(f"unknown lds_alias tag {tag!r}")
 
     def _op_tile_wmma_f32_16x16x16_f16(self, op: Op) -> None:
         # RDNA WMMA: emission is arch-specific, so it routes through the ISA
@@ -5706,7 +5728,7 @@ class _Lowerer:
             f"ptr addrspace(3) {ptr_name}, "
             f"i32 {size_bytes}, "
             f"i32 0, "
-            f"i32 {aux})"
+            f"i32 {aux}){self._lds_alias_md(op)}"
         )
 
     # ----- f32 LDS ops (cshuffle epilogue) -----
@@ -6594,6 +6616,13 @@ class _Lowerer:
             out.append("")
         if self._needs_nontemporal_md:
             out.append("!5 = !{i32 1}")
+            out.append("")
+        if self._needs_lds_alias_md:
+            out.append('!9000 = distinct !{!9000, !"rocke.lds"}')
+            out.append('!9001 = distinct !{!9001, !9000, !"rocke.lds.dma"}')
+            out.append('!9002 = distinct !{!9002, !9000, !"rocke.lds.read"}')
+            out.append("!9003 = !{!9001}")
+            out.append("!9004 = !{!9002}")
             out.append("")
         if self._debug is not None:
             out.extend(self._debug.render())
