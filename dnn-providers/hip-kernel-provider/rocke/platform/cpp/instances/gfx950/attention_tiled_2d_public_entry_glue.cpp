@@ -593,6 +593,10 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
                                 ROCKE_ERR_VALUE,
                                 "use_kv_block_id_prefetch needs 512/head_size <= block_size");
         }
+        if(spec->use_softmax_scale_fold && !transposed32)
+            rocke_g950_fail(b,
+                            ROCKE_ERR_VALUE,
+                            "use_softmax_scale_fold requires the transposed 32x32 path");
     }
     /* K single-buffer IS ported in the gfx950 C twin (it shares the
      * depth-2 V-single `else` schedule). Mirror Python __post_init__ guards so
@@ -673,6 +677,10 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
     ctx->USE_SOFTMAX_INTERLEAVE = spec->use_softmax_mfma_interleave;
     ctx->SOFTMAX_INTERLEAVE_MODE = spec->softmax_interleave_mode;
     ctx->V_DOUBLE_BUF = spec->use_v_double_buffer;
+    /* use_softmax_scale_fold only rewrites the plain causal softmax; softcap /
+     * ALiBi / QQ-bias are defined on the scaled score. */
+    ctx->SOFTMAX_SCALE_FOLD = spec->use_softmax_scale_fold
+                              && !(spec->has_softcap || spec->use_alibi || spec->use_qq_bias);
     ctx->K_LDS_SWZ = spec->use_k_lds_xor_swizzle;
     ctx->V_LDS_SWZ = spec->use_v_lds_xor_swizzle;
     ctx->LDS_DMA_OVERLAP = spec->use_lds_dma_overlap;
@@ -1240,6 +1248,7 @@ static rocke_status_t rocke_g950_attn2d_kernel_name(const rocke_attention_tiled_
             s->use_reverse_q_block_order ? "rqb" : "",
             s->use_k_lds_xor_swizzle ? "kswz" : "",
             s->use_v_lds_xor_swizzle ? "vswz" : "",
+            s->use_softmax_scale_fold ? "smfold" : "",
             s->use_lds_dma_overlap ? "dmaov" : "",
             s->use_kv_block_id_prefetch ? "bidpf" : "",
         };

@@ -846,7 +846,10 @@ void rocke_gfx950_attn2d_emit_kv_body(rocke_gfx950_attn2d_build_ctx_t* ctx)
                         }
                     } /* end non-MASK_LIMIT mask path */
                     rocke_value_t* s_raw = rocke_b_vec_extract(b, st_regs[n], reg);
-                    rocke_value_t* s_scaled = rocke_b_fmul(b, s_raw, qk_scale);
+                    /* use_softmax_scale_fold: keep the raw score; only the
+                     * reduced max is scaled and the scale folds into the exp2 FMA. */
+                    rocke_value_t* s_scaled
+                        = ctx->SOFTMAX_SCALE_FOLD ? s_raw : rocke_b_fmul(b, s_raw, qk_scale);
                     if(ctx->USE_SOFTCAP)
                     {
                         s_scaled = rocke_b_fmul(b, fh_apply_softcap(ctx, s_scaled), rcp_ln2);
@@ -896,11 +899,18 @@ void rocke_gfx950_attn2d_emit_kv_body(rocke_gfx950_attn2d_build_ctx_t* ctx)
         }
         rocke_value_t* st_remote_max = rocke_b_warp_shuffle_xor(b, st_local_max, 32);
         rocke_value_t* st_tile_max = rocke_b_fmax(b, st_local_max, st_remote_max);
+        if(ctx->SOFTMAX_SCALE_FOLD)
+            /* Scores are still raw; the scale is positive, so scaling the reduced
+             * max equals reducing the scaled tile. */
+            st_tile_max = rocke_b_fmul(b, st_tile_max, qk_scale);
         rocke_value_t* st_m_raw = rocke_b_fmax(b, ctx->m_cur[0], st_tile_max);
         rocke_value_t* st_ok = rocke_b_fcmp(b, "ogt", st_m_raw, neg_inf);
         rocke_value_t* st_m_new = rocke_b_select(b, st_ok, st_m_raw, zero_f);
 
+        /* Row sum as ONE serial fadd chain (no pairable form for the backend). */
         rocke_value_t* st_l_local = zero_f;
+        rocke_value_t* st_neg_m
+            = ctx->SOFTMAX_SCALE_FOLD ? rocke_b_fsub(b, zero_f, st_m_new) : NULL;
         for(int group_idx = 0; group_idx < n_groups; ++group_idx)
         {
             rocke_value_t** pt32 = (group_idx == 0) ? pt32_g0 : pt32_g1;
@@ -910,7 +920,11 @@ void rocke_gfx950_attn2d_emit_kv_body(rocke_gfx950_attn2d_build_ctx_t* ctx)
                 {
                     rocke_value_t* score
                         = (group_idx == 0) ? st_scores0[n][reg] : st_scores1[n][reg];
-                    rocke_value_t* p_t = rocke_b_exp2(b, rocke_b_fsub(b, score, st_m_new));
+                    /* scale fold: one FMA per score, s * scale - m_new. */
+                    rocke_value_t* p_t
+                        = ctx->SOFTMAX_SCALE_FOLD
+                              ? rocke_b_exp2(b, rocke_b_fma(b, score, qk_scale, st_neg_m))
+                              : rocke_b_exp2(b, rocke_b_fsub(b, score, st_m_new));
                     pt32[n * 16 + reg] = p_t;
                     st_l_local = rocke_b_fadd(b, st_l_local, p_t);
                 }
