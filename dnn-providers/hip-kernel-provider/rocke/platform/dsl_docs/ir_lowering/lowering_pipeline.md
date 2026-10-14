@@ -169,7 +169,12 @@ amd_comgr_action_data_get_data(EXECUTABLE)           # extract bytes
 Libraries are loaded from the default ROCm library locations or the dynamic
 linker search path. The HSACO bytes returned are ready for `hipModuleLoadData`.
 
-`ComgrTimings(bc, relocatable, executable)` returns per-stage seconds; `compile_kernel` converts to ms in the artifact.
+On gfx950 the executable then passes the packed-f32 guard (in-process
+disassembly, one rebuild with `"target-features"="-packed-fp32-ops"` when an
+invalid `v_pk_*_f32` form shares the code object with an MFMA); see
+[`../runtime/comgr_and_hipmodule.md`](../runtime/comgr_and_hipmodule.md).
+
+`ComgrTimings(bc, relocatable, executable, pkf32_guard)` returns per-stage seconds; `compile_kernel` converts to ms in the artifact.
 
 ## HIP Debug Lowering
 

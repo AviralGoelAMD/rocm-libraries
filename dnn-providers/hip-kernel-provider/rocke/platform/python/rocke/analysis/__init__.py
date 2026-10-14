@@ -20,6 +20,8 @@ from .isa import (
     IsaStats,
     ResourceInfo,
     analyze_hsaco,
+    has_matrix_ops,
+    invalid_pk_f32_op_sel,
     parse_isa,
     parse_resources,
 )
@@ -34,6 +36,8 @@ __all__ = [
     "analyze_hsaco",
     "analyze_llvm_ir",
     "compare_variant_reports",
+    "has_matrix_ops",
+    "invalid_pk_f32_op_sel",
     "parse_isa",
     "parse_resources",
 ]

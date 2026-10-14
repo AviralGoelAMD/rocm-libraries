@@ -70,7 +70,7 @@ passes the IR text through
 `COMPILE_SOURCE_TO_BC -> CODEGEN_BC_TO_RELOCATABLE -> LINK_RELOCATABLE_TO_EXECUTABLE`;
 and extracts the executable bytes.
 
-`ComgrTimings(bc, relocatable, executable)` returns per-stage seconds. `compile_kernel` converts to milliseconds for `KernelArtifact.timings`.
+`ComgrTimings(bc, relocatable, executable, pkf32_guard)` returns per-stage seconds (`pkf32_guard` is the gfx950 packed-f32 guard; see `comgr_and_hipmodule.md`). `compile_kernel` converts to milliseconds for `KernelArtifact.timings`.
 
 ## HIP Runtime Layer
 

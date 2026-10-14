@@ -24,11 +24,12 @@ from __future__ import annotations
 import ctypes
 import os
 import re
+import struct
 import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from ._ctypes_bind import _LazyFn
 from .runtime_coexistence import (
@@ -532,10 +533,12 @@ class ComgrTimings:
     bc: float = 0.0
     relocatable: float = 0.0
     executable: float = 0.0
+    # gfx950 packed-f32 guard: disassembly scan plus any rebuild.
+    pkf32_guard: float = 0.0
 
     @property
     def total(self) -> float:
-        return self.bc + self.relocatable + self.executable
+        return self.bc + self.relocatable + self.executable + self.pkf32_guard
 
 
 def _extract_first(data_set: _DataSet, kind: int) -> bytes:
@@ -642,6 +645,10 @@ def build_hsaco_from_llvm_ir(
 
     Returns the (hsaco_bytes, timings) tuple. `hsaco_bytes` can be passed
     directly to `hipModuleLoadData`.
+
+    For gfx950 the code object then passes the packed-f32 guard
+    (:func:`_guard_pk_f32_op_sel`), which may rebuild it once with packed f32
+    VALU ops disabled.
     """
     options = list(options or ["-O3"])
 
@@ -650,7 +657,14 @@ def build_hsaco_from_llvm_ir(
     # and raises a catchable error instead.
     _resolve_lib()
     _assert_ir_flavor_matches_lib(ir_text)
+    hsaco, timings = _compile_llvm_ir(ir_text, isa, options)
+    return _guard_pk_f32_op_sel(ir_text, isa, options, hsaco, timings)
 
+
+def _compile_llvm_ir(
+    ir_text: str, isa: str, options: List[str]
+) -> Tuple[bytes, ComgrTimings]:
+    """IR text -> BC -> relocatable -> executable through COMGR."""
     # Handles are created lazily below; declare them up front so the
     # ``finally`` block can release whatever was successfully created even
     # when an intermediate ``_check`` raises (the common case during a
@@ -742,4 +756,332 @@ def build_hsaco_from_llvm_ir(
         if in_set is not None:
             _destroy_data_set(in_set)
 
+    return hsaco, timings
+
+
+_DisReadFn = ctypes.CFUNCTYPE(
+    ctypes.c_uint64, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p
+)
+_DisPrintFn = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
+_DisAnnotateFn = ctypes.CFUNCTYPE(None, ctypes.c_uint64, ctypes.c_void_p)
+_create_disassembly_info = _bind(
+    "amd_comgr_create_disassembly_info",
+    ctypes.c_int,
+    ctypes.c_char_p,
+    _DisReadFn,
+    _DisPrintFn,
+    _DisAnnotateFn,
+    ctypes.POINTER(_Handle),
+)
+_destroy_disassembly_info = _bind(
+    "amd_comgr_destroy_disassembly_info", ctypes.c_int, _Handle
+)
+_disassemble_instruction = _bind(
+    "amd_comgr_disassemble_instruction",
+    ctypes.c_int,
+    _Handle,
+    ctypes.c_uint64,
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_uint64),
+)
+
+
+def _exec_sections(elf: bytes) -> List[Tuple[int, int]]:
+    """``(file offset, size)`` of each SHF_EXECINSTR section of an ELF64."""
+    (shoff,) = struct.unpack_from("<Q", elf, 0x28)
+    shentsize, shnum = struct.unpack_from("<HH", elf, 0x3A)
+    out = []
+    for i in range(shnum):
+        flags, _, offset, size = struct.unpack_from(
+            "<QQQQ", elf, shoff + i * shentsize + 8
+        )
+        if flags & 0x4:
+            out.append((offset, size))
+    return out
+
+
+def disassemble_hsaco(hsaco: bytes, *, isa: str = "amdgcn-amd-amdhsa--gfx950") -> str:
+    """Disassemble the code sections of one code-object ELF, in-process.
+
+    Uses COMGR's instruction-level disassembler and returns one tab-indented
+    instruction per line. A dword COMGR cannot decode is emitted as
+    ``.long`` and skipped.
+    """
+    _resolve_lib()
+    buf = ctypes.create_string_buffer(hsaco, len(hsaco))
+    lines: List[bytes] = []
+
+    @_DisReadFn
+    def read(src, dst, size, _user):
+        n = max(0, min(size, len(hsaco) - src))
+        ctypes.memmove(dst, ctypes.addressof(buf) + src, n)
+        return n
+
+    @_DisPrintFn
+    def emit(text, _user):
+        lines.append(text)
+
+    @_DisAnnotateFn
+    def annotate(_address, _user):
+        pass
+
+    info = _Handle()
+    _check(
+        _create_disassembly_info(
+            isa.encode("utf-8"), read, emit, annotate, ctypes.byref(info)
+        ),
+        "create_disassembly_info",
+    )
+    try:
+        size = ctypes.c_uint64()
+        for offset, length in _exec_sections(hsaco):
+            address, end = offset, offset + length
+            while address < end:
+                status = _disassemble_instruction(
+                    info, address, None, ctypes.byref(size)
+                )
+                if status != AMD_COMGR_STATUS_SUCCESS or size.value == 0:
+                    lines.append(b".long undecodable")
+                    address += 4
+                else:
+                    address += size.value
+    finally:
+        _destroy_disassembly_info(info)
+    return "".join(f"\t{line.decode('utf-8', 'replace')}\n" for line in lines)
+
+
+# gfx950 packed-f32 op_sel guard.
+#
+# gfx950 computes v_pk_{add,mul}_f32 with op_sel:[0,1] and v_pk_fma_f32 with
+# op_sel bit 1 or 2 wrongly when the instruction issues between MFMAs (see
+# ``rocke.analysis.isa.invalid_pk_f32_op_sel``). LLVM 4f792b8a893f
+# (GCNHazardRecognizer::fixPkF32InvalidOpSel, SIInstrInfo::decomposePkFMAF32)
+# stops emitting those forms; older compilers emit them. Until the loaded
+# compiler carries that fix, a gfx950 code object holding such a form and any
+# MFMA is rebuilt once with "target-features"="-packed-fp32-ops" on every
+# defined function. Code objects without MFMA are left untouched.
+_PKF32_FEATURE = "-packed-fp32-ops"
+# Part of binary-cache keys (kernel_cache.comgr_input_key): binaries built
+# before the guard, or by a different guard rule, must not be reused.
+PKF32_GUARD_ID = "gfx950-pkf32-guard-v1"
+
+# A probe the unfixed compiler lowers to v_pk_mul_f32 ... op_sel:[0,1]
+# (a * splat(b.hi)); a fixed compiler emits the commuted legal form.
+_PKF32_PROBE_IR = """\
+target triple = "amdgcn-amd-amdhsa"
+
+define amdgpu_kernel void @rocke_pkf32_probe(ptr addrspace(1) %a, ptr addrspace(1) %b) {
+  %va = load <2 x float>, ptr addrspace(1) %a, align 8
+  %vb = load <2 x float>, ptr addrspace(1) %b, align 8
+  %hi = shufflevector <2 x float> %vb, <2 x float> poison, <2 x i32> <i32 1, i32 1>
+  %m = fmul <2 x float> %va, %hi
+  store <2 x float> %m, ptr addrspace(1) %a, align 8
+  ret void
+}
+"""
+
+_pkf32_probe_lib: ctypes.CDLL | None = None
+_pkf32_compiler_needs_guard = True
+_PKF32_REBUILT: List[str] = []
+_PKF32_WARNED: set = set()
+
+
+def pk_f32_guard_rebuilds() -> List[str]:
+    """Kernel names the gfx950 packed-f32 guard rebuilt in this process."""
+    return list(_PKF32_REBUILT)
+
+
+def _is_gfx950(isa: str) -> bool:
+    from ..core.arch import arch_from_isa
+
+    try:
+        return arch_from_isa(isa) == "gfx950"
+    except ValueError:
+        return False
+
+
+def _compiler_needs_pk_f32_guard() -> bool:
+    """Whether the loaded compiler still emits the invalid forms (probed once).
+
+    Only a probe that compiles to a legal ``v_pk_mul_f32`` turns the guard
+    off; any other outcome, including a failed probe, keeps it on.
+    """
+    global _pkf32_probe_lib, _pkf32_compiler_needs_guard
+    from ..analysis.isa import invalid_pk_f32_op_sel
+
+    with _lib_lock:
+        lib = _resolve_lib()
+        if _pkf32_probe_lib is lib:
+            return _pkf32_compiler_needs_guard
+        needs = True
+        isa = "amdgcn-amd-amdhsa--gfx950"
+        try:
+            probe, _ = _compile_llvm_ir(_PKF32_PROBE_IR, isa, ["-O3"])
+            text = disassemble_hsaco(probe, isa=isa)
+            needs = bool(invalid_pk_f32_op_sel(text)) or "v_pk_mul_f32" not in text
+        except ComgrError:
+            pass
+        _pkf32_probe_lib, _pkf32_compiler_needs_guard = lib, needs
+        return needs
+
+
+def _with_target_feature(ir_text: str, feature: str) -> str:
+    """Add ``feature`` to the ``"target-features"`` of every defined function."""
+    groups = set()
+    for line in ir_text.splitlines():
+        if line.startswith("define "):
+            refs = re.findall(r"#(\d+)", line[line.rfind(")") :])
+            if not refs:
+                raise ComgrError(
+                    "packed-f32 guard: a defined function has no attribute "
+                    f"group to carry {feature!r}: {line.strip()}"
+                )
+            groups.update(refs)
+    patched = set()
+
+    def patch(m: re.Match) -> str:
+        if m.group(1) not in groups:
+            return m.group(0)
+        patched.add(m.group(1))
+        body = m.group(2)
+        current = re.search(r'"target-features"="([^"]*)"', body)
+        if current is None:
+            body = f'{body.rstrip()} "target-features"="{feature}" '
+        else:
+            joined = f"{current.group(1)},{feature}" if current.group(1) else feature
+            body = body[: current.start(1)] + joined + body[current.end(1) :]
+        return f"attributes #{m.group(1)} = {{{body}}}"
+
+    out = re.sub(r"^attributes #(\d+) = \{(.*)\}[ \t]*$", patch, ir_text, flags=re.M)
+    if patched != groups:
+        raise ComgrError(
+            "packed-f32 guard: attribute group(s) "
+            f"{sorted(groups - patched)} not found in the IR"
+        )
+    return out
+
+
+_OFFLOAD_BUNDLE_MAGIC = b"__CLANG_OFFLOAD_BUNDLE__"
+
+
+def _amdgpu_code_objects(blob: bytes) -> List[bytes]:
+    """The AMDGPU ELF(s) in ``blob``: a bare ELF or an uncompressed offload bundle."""
+    if blob[:4] == b"\x7fELF":
+        return [blob]
+    if not blob.startswith(_OFFLOAD_BUNDLE_MAGIC):
+        raise ComgrError(
+            "packed-f32 guard: cannot inspect this code object (neither an ELF "
+            "nor an uncompressed clang offload bundle)"
+        )
+    (count,) = struct.unpack_from("<Q", blob, len(_OFFLOAD_BUNDLE_MAGIC))
+    pos = len(_OFFLOAD_BUNDLE_MAGIC) + 8
+    out = []
+    for _ in range(count):
+        offset, size, id_len = struct.unpack_from("<QQQ", blob, pos)
+        ident = blob[pos + 24 : pos + 24 + id_len]
+        pos += 24 + id_len
+        entry = blob[offset : offset + size]
+        if b"amdgcn" in ident and entry[:4] == b"\x7fELF":
+            out.append(entry)
+    return out
+
+
+# Little-endian bytes 2-3 of a VOP3P dword 0 (encoding 0b110100111 in bits
+# 31:23) for opcodes 0x30 v_pk_fma_f32, 0x31 v_pk_mul_f32, 0x32 v_pk_add_f32.
+_PK_F32_OPCODE_BYTES = re.compile(rb"[\xb0-\xb2]\xd3")
+
+
+def _may_hold_invalid_pk_f32(elf: bytes) -> bool:
+    """Byte-level prefilter for :func:`invalid_pk_f32_op_sel` on one ELF.
+
+    Every instruction starts on a 4-byte boundary of an executable section,
+    so scanning those dwords cannot miss an invalid form (op_sel bits 13:11
+    of dword 0; src0/src1 in bits 8:0 / 17:9 of dword 1). A second dword or
+    literal that happens to match is settled by the disassembly.
+    """
+    for offset, size in _exec_sections(elf):
+        end = offset + size
+        for m in _PK_F32_OPCODE_BYTES.finditer(elf, offset, end):
+            pos = m.start() - 2
+            if (pos - offset) % 4 or pos + 8 > end:
+                continue
+            d0, d1 = struct.unpack_from("<II", elf, pos)
+            sel = (d0 >> 11) & 7
+            if (d0 >> 16) & 0x7F == 0x30:
+                if sel & 6:
+                    return True
+            elif sel & 3 == 2 and d1 & 0x1FF != (d1 >> 9) & 0x1FF:
+                return True
+    return False
+
+
+def guard_pk_f32_code_object(
+    blob: bytes, *, isa: str, names: List[str], rebuild: Callable[[], bytes]
+) -> bytes:
+    """Return ``blob``, or ``rebuild()`` if it pairs invalid packed-f32 with MFMA.
+
+    ``blob`` is a gfx950 code object (bare ELF or offload bundle) holding the
+    kernels ``names``; ``rebuild`` compiles the same source with packed f32
+    VALU ops disabled. The rebuilt object must hold no invalid form.
+    """
+    from ..analysis.isa import has_matrix_ops, invalid_pk_f32_op_sel
+
+    bad: List[str] = []
+    for elf in _amdgpu_code_objects(blob):
+        if not _may_hold_invalid_pk_f32(elf):
+            continue
+        text = disassemble_hsaco(elf, isa=isa)
+        found = invalid_pk_f32_op_sel(text)
+        if found and has_matrix_ops(text):
+            bad.extend(found)
+    if not bad:
+        return blob
+    label = ", ".join(names) or "<unnamed>"
+    if label not in _PKF32_WARNED:
+        _PKF32_WARNED.add(label)
+        print(
+            f"[rocke] gfx950 packed-f32 guard: {label} has {len(bad)} v_pk_*_f32 "
+            f"with an op_sel gfx950 computes wrongly next to MFMA (first: "
+            f"{bad[0]}); rebuilding with packed f32 ops disabled "
+            f"({_PKF32_FEATURE})",
+            file=sys.stderr,
+            flush=True,
+        )
+    blob = rebuild()
+    still = [
+        line
+        for elf in _amdgpu_code_objects(blob)
+        for line in invalid_pk_f32_op_sel(disassemble_hsaco(elf, isa=isa))
+    ]
+    if still:
+        raise ComgrError(
+            f"packed-f32 guard: {label} still has {len(still)} invalid v_pk_*_f32 "
+            f"with {_PKF32_FEATURE} (first: {still[0]})"
+        )
+    _PKF32_REBUILT.extend(names or ["<unnamed>"])
+    return blob
+
+
+def _guard_pk_f32_op_sel(
+    ir_text: str,
+    isa: str,
+    options: List[str],
+    hsaco: bytes,
+    timings: ComgrTimings,
+) -> Tuple[bytes, ComgrTimings]:
+    """The COMGR path's guard: rebuild with the feature on every defined function."""
+    if not _is_gfx950(isa) or not _compiler_needs_pk_f32_guard():
+        return hsaco, timings
+    t0 = time.perf_counter()
+    hsaco = guard_pk_f32_code_object(
+        hsaco,
+        isa=isa,
+        names=re.findall(
+            r'^define [^@\n]*amdgpu_kernel[^@\n]*@"?([^"(\s]+)', ir_text, re.M
+        ),
+        rebuild=lambda: _compile_llvm_ir(
+            _with_target_feature(ir_text, _PKF32_FEATURE), isa, options
+        )[0],
+    )
+    timings.pkf32_guard = time.perf_counter() - t0
     return hsaco, timings

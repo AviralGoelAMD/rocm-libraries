@@ -15,7 +15,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-from typing import Dict, Mapping, Optional
+from typing import Dict, List, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -222,6 +222,51 @@ def _extract_mnemonic(line: str) -> str:
         if tok.startswith(("v_", "s_", "ds_", "buffer_", "flat_", "global_")):
             return tok
     return tokens[0] if tokens else ""
+
+
+# gfx950 computes some packed-f32 VALU forms wrongly when they issue between
+# MFMAs (lanes 48-63 read src1.hi as 0 for the low result). LLVM rejects the
+# same forms in AMDGPUAsmParser::validateOpSel and, from 4f792b8a893f, stops
+# emitting them. An instruction is listed when it is
+#   - v_pk_add_f32 / v_pk_mul_f32 with op_sel:[0,1] (src0 low half, src1 high
+#     half) and src0 != src1; the src0 == src1 horizontal form computes
+#     correctly, or
+#   - v_pk_fma_f32 with op_sel bit 1 or bit 2 set.
+_PK_F32_RE = re.compile(r"(?<![\w.])v_pk_(add|mul|fma)_f32[ \t]+([^\n]*)")
+_OP_SEL_RE = re.compile(r"(?<![\w])op_sel:\[([01](?:,[01])*)\]")
+_MATRIX_OP_RE = re.compile(r"(?<![\w.])v_(?:mfma|smfmac)_")
+
+
+def invalid_pk_f32_op_sel(text: str) -> List[str]:
+    """Return the gfx950-invalid packed-f32 instructions in ISA ``text``.
+
+    ``text`` is disassembly or assembly. Each returned entry is one
+    instruction with any trailing ``//`` or ``;`` comment removed.
+    """
+
+    bad: List[str] = []
+    for m in _PK_F32_RE.finditer(text):
+        op = m.group(1)
+        rest = m.group(2).split("//", 1)[0].split(";", 1)[0].strip()
+        sel = _OP_SEL_RE.search(rest)
+        bits = [int(b) for b in sel.group(1).split(",")] if sel else []
+        bits += [0] * (3 - len(bits))
+        if op == "fma":
+            invalid = bits[1] == 1 or bits[2] == 1
+        else:
+            operands = [part.strip() for part in rest.split(",")]
+            src0 = operands[1] if len(operands) > 1 else ""
+            src1 = operands[2].split()[0] if len(operands) > 2 and operands[2] else ""
+            invalid = bits[0] == 0 and bits[1] == 1 and src0 != src1
+        if invalid:
+            bad.append(f"v_pk_{op}_f32 {rest}")
+    return bad
+
+
+def has_matrix_ops(text: str) -> bool:
+    """True when ISA ``text`` contains an MFMA (``v_mfma_*``, ``v_smfmac_*``)."""
+
+    return _MATRIX_OP_RE.search(text) is not None
 
 
 def parse_resources(text: str) -> ResourceInfo:

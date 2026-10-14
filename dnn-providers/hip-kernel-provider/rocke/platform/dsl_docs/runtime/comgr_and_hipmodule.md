@@ -103,9 +103,38 @@ hsaco, timings = build_hsaco_from_llvm_ir(
 )
 ```
 
-Returns `(bytes, ComgrTimings)`. `ComgrTimings(bc, relocatable, executable)` carries per-stage seconds; `.total` is the sum.
+Returns `(bytes, ComgrTimings)`. `ComgrTimings(bc, relocatable, executable, pkf32_guard)` carries per-stage seconds; `.total` is the sum.
 
 Errors from any stage raise `ComgrError(f"{where}: status={s} ({status_string(s)})")`. The actual error message comes from `amd_comgr_status_string`.
+
+### gfx950 packed-f32 guard
+
+gfx950 computes `v_pk_add_f32` / `v_pk_mul_f32` with `op_sel:[0,1]` (two
+different sources) and `v_pk_fma_f32` with `op_sel` bit 1 or 2 set wrongly
+when the instruction issues between MFMAs: lanes 48-63 compute the low
+result as if `src1.hi` were 0. LLVM `4f792b8a893f` stops emitting these
+forms; older compilers, including the ROCm 7.13 one, emit them.
+
+For a gfx950 ISA, `build_hsaco_from_llvm_ir` therefore:
+
+1. compiles a tiny probe once per loaded COMGR. If the probe compiles to a
+   legal `v_pk_mul_f32`, the compiler has the fix and the guard is off;
+2. otherwise scans the code sections' dwords for a `v_pk_{fma,mul,add}_f32`
+   encoding with an invalid `op_sel`. Most code objects stop here. On a hit
+   it disassembles the object in-process (`disassemble_hsaco`, COMGR's
+   instruction-level disassembler; no subprocess) and classifies it with
+   `rocke.analysis.isa.invalid_pk_f32_op_sel` / `has_matrix_ops`;
+3. if it holds an invalid form **and** an MFMA, rebuilds once with
+   `"target-features"="-packed-fp32-ops"` added to every defined function,
+   logs one `[rocke] gfx950 packed-f32 guard: ...` line to stderr, and raises
+   `ComgrError` if the rebuild still holds an invalid form.
+
+Code objects without MFMA are returned unchanged. `pk_f32_guard_rebuilds()`
+lists the kernels rebuilt in this process. `compile_kernel_via_hipcc` applies
+the same check to hipcc's offload bundle and rebuilds with
+`-Xclang -target-feature -Xclang -packed-fp32-ops`. A kernel can opt out of
+packed f32 up front with the `target_features` kernel attribute, which both
+LLVM lowerers emit verbatim as the `"target-features"` function attribute.
 
 ## What `-O3` Does
 

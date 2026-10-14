@@ -15,7 +15,8 @@ takes a `KernelDef` produced by an instance builder and returns a
   - `timings`       : per-stage `time.perf_counter()` measurements in
                       milliseconds (`ir_build`, `ir_lower_llvm`,
                       `comgr_bc`, `comgr_relocatable`, `comgr_executable`,
-                      `total`)
+                      `comgr_pkf32_guard` (gfx950 packed-f32 guard scan and
+                      any rebuild, see `runtime/comgr.py`), `total`)
 
 Use `compile_kernel(...)` from a kernel-author script when:
 
@@ -76,7 +77,10 @@ from ..core.ir_print import print_ir
 from ..core.lower_hip import lower_kernel_to_hip
 from ..core.lower_llvm import _lower_kernel_to_llvm_python
 from ..core.passes import PassStats, optimize_kernel
-from ..runtime.comgr import build_hsaco_from_llvm_ir
+from ..runtime.comgr import build_hsaco_from_llvm_ir, guard_pk_f32_code_object
+
+# hipcc spelling of "target-features"="-packed-fp32-ops" for the device compile.
+_HIPCC_NO_PACKED_FP32 = ["-Xclang", "-target-feature", "-Xclang", "-packed-fp32-ops"]
 
 
 @dataclass
@@ -168,6 +172,7 @@ def compile_kernel(
     timings["comgr_bc"] = comgr_t.bc * 1000.0
     timings["comgr_relocatable"] = comgr_t.relocatable * 1000.0
     timings["comgr_executable"] = comgr_t.executable * 1000.0
+    timings["comgr_pkf32_guard"] = comgr_t.pkf32_guard * 1000.0
     timings["total"] = (t3 - t0) * 1000.0
 
     return KernelArtifact(
@@ -337,6 +342,10 @@ def compile_kernel_via_hipcc(
 
     Returns a :class:`KernelArtifact` with hipcc's output in ``hsaco``, an
     empty ``llvm_text``, and timings for HIP lowering and compilation.
+
+    For gfx950 the output passes the same packed-f32 guard as the COMGR path
+    (``runtime.comgr.guard_pk_f32_code_object``); a rebuild adds
+    ``-Xclang -target-feature -Xclang -packed-fp32-ops``.
     """
     policy = codegen_policy_for_kernel(kernel)
     if policy.scheduler_strategy is not None:
@@ -356,38 +365,51 @@ def compile_kernel_via_hipcc(
     flags = ["-O3"]
     if extra_flags:
         flags.extend(extra_flags)
+    isa = f"amdgcn-amd-amdhsa--{compiler_target}"
     with tempfile.TemporaryDirectory() as td:
         stem = kernel.name.replace(".", "_")[:80] or "kernel"
         src_path = Path(td) / f"{stem}.hip"
         hsaco_path = Path(td) / f"{stem}.hsaco"
         src_path.write_text(hip_src, encoding="utf-8")
-        proc = subprocess.run(
-            [
-                "hipcc",
-                f"--offload-arch={compiler_target}",
-                "--genco",
-                *flags,
-                str(src_path),
-                "-o",
-                str(hsaco_path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"hipcc failed for kernel '{kernel.name}' (arch={arch}):\n"
-                f"--- stdout ---\n{proc.stdout[-2000:]}\n"
-                f"--- stderr ---\n{proc.stderr[-2000:]}"
+
+        def hipcc(hipcc_flags: List[str]) -> bytes:
+            proc = subprocess.run(
+                [
+                    "hipcc",
+                    f"--offload-arch={compiler_target}",
+                    "--genco",
+                    *hipcc_flags,
+                    str(src_path),
+                    "-o",
+                    str(hsaco_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
             )
-        hsaco = hsaco_path.read_bytes()
-    t3 = time.perf_counter()
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"hipcc failed for kernel '{kernel.name}' (arch={arch}):\n"
+                    f"--- stdout ---\n{proc.stdout[-2000:]}\n"
+                    f"--- stderr ---\n{proc.stderr[-2000:]}"
+                )
+            return hsaco_path.read_bytes()
+
+        hsaco = hipcc(flags)
+        t3 = time.perf_counter()
+        if lower_arch == "gfx950":
+            hsaco = guard_pk_f32_code_object(
+                hsaco,
+                isa=isa,
+                names=[kernel.name],
+                rebuild=lambda: hipcc(flags + _HIPCC_NO_PACKED_FP32),
+            )
+    t4 = time.perf_counter()
     timings["ir_build"] = (t1 - t0) * 1000.0
     timings["ir_lower_hip"] = (t2 - t1) * 1000.0
     timings["hipcc"] = (t3 - t2) * 1000.0
-    timings["total"] = (t3 - t0) * 1000.0
-    isa = f"amdgcn-amd-amdhsa--{compiler_target}"
+    timings["pkf32_guard"] = (t4 - t3) * 1000.0
+    timings["total"] = (t4 - t0) * 1000.0
     return KernelArtifact(
         kernel=kernel,
         ir_text=ir_text,

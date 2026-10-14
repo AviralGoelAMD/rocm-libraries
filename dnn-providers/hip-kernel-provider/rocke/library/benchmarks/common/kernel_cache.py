@@ -122,15 +122,23 @@ def comgr_input_key(comgr_input) -> str:
     """Content key of the binary a :class:`rocke.helpers.compile.ComgrInput`
     compiles to.
 
-    The HSACO is a function of the LLVM IR, the ISA, the COMGR options and the
-    COMGR library. The kernel's own name is normalised out of the IR, so two
+    The HSACO is a function of the LLVM IR, the ISA, the COMGR options, the
+    COMGR library and the gfx950 packed-f32 guard that may rebuild it. The
+    kernel's own name is normalised out of the IR, so two
     identities whose code differs only in its name (an alias pipeline, a
     split-K degree that rides a kernarg) share one binary -- each keeps its
     own entry, which records the symbol to launch.
     """
+    from rocke.runtime.comgr import PKF32_GUARD_ID
+
     h = hashlib.sha256()
     h.update(comgr_input.llvm_text.replace(comgr_input.kernel_name, "@K@").encode())
-    for part in (comgr_input.isa, *comgr_input.options, current_comgr_id()):
+    for part in (
+        comgr_input.isa,
+        *comgr_input.options,
+        current_comgr_id(),
+        PKF32_GUARD_ID,
+    ):
         h.update(b"\0")
         h.update(str(part).encode())
     return h.hexdigest()
