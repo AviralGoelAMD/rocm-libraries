@@ -219,6 +219,11 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # and combine the two halves once before the epilogue, instead of a
     # cross-half exchange per KV tile.
     defer_row_sum: bool = field(default=True, kw_only=True)
+    # Grid body only: one KV tile of software skew inside each wave. QK(j+1)
+    # runs while the exp2 of tile j is computed, and PV(j) runs while the row
+    # max of tile j+1 is computed, so both MFMA runs have independent VALU
+    # work. One barrier per KV tile; every K/V refill gets a whole iteration.
+    qk_lookahead: bool = field(default=False, kw_only=True)
     # Combine the two 32-lane halves of the row max (and, under qk_lookahead,
     # the row sum) with v_permlane32_swap_b32 instead of a ds_bpermute shuffle.
     permlane32_reduce: bool = field(default=False, kw_only=True)
@@ -416,6 +421,18 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
             raise ValueError(
                 f"grid_order must be 'default' or 'lpt', got {self.grid_order!r}"
             )
+        if self.qk_lookahead:
+            if self.persistent:
+                raise ValueError("qk_lookahead is implemented on the grid body only")
+            if self.sliding_window > 0 or self.paged or self.ragged:
+                raise ValueError(
+                    "qk_lookahead does not support sliding_window, paged or ragged"
+                )
+            if self.resolved_pv_sched_group_template():
+                raise ValueError(
+                    "qk_lookahead owns the softmax schedule; disable "
+                    "pv_sched_group_template"
+                )
 
     @property
     def resolved_persist_decode(self) -> str:
@@ -554,6 +571,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "o_store_width",
             "grid_order",
             "defer_row_sum",
+            "qk_lookahead",
             "permlane32_reduce",
             "lds_dma_manual_wait",
         )
@@ -1116,11 +1134,15 @@ def build_attention_dense(
 
     # ---- per-tile compute closures ----
 
-    def do_qk(kbuf):
+    def do_qk(kbuf, after_mfma=None, accs=None):
         """QK MFMA: S^T = K@Q^T. mfma(a=K, bv=Q) => key on the 16 per-lane accumulator
         regs (+lane^32), query on lane%32 -- the layout that keeps softmax a cheap
         in-lane reduce + one lane^32 exchange, and lets CK-1's transposed PV consume P
-        with no relayout shuffle."""
+        with no relayout shuffle.
+
+        ``after_mfma`` (optional) is called after every MFMA so a caller can place
+        independent softmax work in program order between them; ``accs`` (optional
+        list) receives each nsub's raw accumulator vector."""
         s_reg = []
         for nsub in range(N_SUB):
             acc = b.zero_vec_f32(16)
@@ -1150,17 +1172,23 @@ def build_attention_dense(
                         n=8,
                     )
                     acc = mfma_32x32x16_for_dtype(b, dtype, k_pack, q_packs[ks], acc)
+                    if after_mfma is not None:
+                        after_mfma()
                     continue
                 col = b.add(b.const_i32(ks * 16), d_base)
                 if K_GROUP > 1:
                     col = b.add(k_sub_col, col)
                 k_pack = b.smem_load_vN(K_lds, kbuf, krow, col, dtype=dtype, n=8)
                 acc = mfma_32x32x16_for_dtype(b, dtype, k_pack, q_packs[ks], acc)
+                if after_mfma is not None:
+                    after_mfma()
             # Raw (unscaled) scores. qk_scale is folded into softmax_max (one
             # multiply on the row max) and into the exp2 argument as one FMA,
             # so the scale adds no per-score instruction. Needs qk_scale > 0
             # (max commutes with the scale); the runner enforces the
             # [_MIN_SCALE, _MAX_SCALE] range.
+            if accs is not None:
+                accs.append(acc)
             s_reg.append([b.vec_extract(acc, i) for i in range(16)])
         return s_reg
 
@@ -1204,6 +1232,13 @@ def build_attention_dense(
                     b.cmp_lt(ktok, b.const_i32(Skv)), s_reg[nsub][i], neg_inf
                 )
 
+    def softmax_max(s_reg, m_i):
+        local_max = neg_inf
+        for nsub in range(N_SUB):
+            for i in range(16):
+                local_max = b.fmax(local_max, s_reg[nsub][i])
+        return _softmax_max_from_local(local_max, m_i)
+
     def half_combine(x, op):
         """op(x, x from lane ^ 32). ``permlane32_reduce``: one VALU
         v_permlane32_swap_b32 (both halves of the result carry the other half's
@@ -1214,11 +1249,8 @@ def build_attention_dense(
         lo, hi = b.permlane32_swap(xi, xi)
         return op(b.bitcast(lo, F32), b.bitcast(hi, F32))
 
-    def softmax_max(s_reg, m_i):
-        local_max = neg_inf
-        for nsub in range(N_SUB):
-            for i in range(16):
-                local_max = b.fmax(local_max, s_reg[nsub][i])
+    def _softmax_max_from_local(local_max, m_i):
+        """Finish the running max from this lane's partial row max."""
         tile_max_raw = half_combine(local_max, b.fmax)
         # Into the log2 domain the running max, threshold, and sinks use.
         tile_max = b.fmul(tile_max_raw, qk_scale)
@@ -1295,12 +1327,14 @@ def build_attention_dense(
             dtype=dtype,
         )
 
-    def do_pv(o_acc_in, p_packs, vbuf):
+    def do_pv(o_acc_in, p_packs, vbuf, after_mfma=None):
         out = list(o_acc_in)
         for dt, kk_step in PV_STEPS:
             out[dt] = mfma_32x32x16_for_dtype(
                 b, dtype, read_v(dt, kk_step, vbuf), p_packs[kk_step], out[dt]
             )
+            if after_mfma is not None:
+                after_mfma()
         return out
 
     def rescale_o(o_acc, alpha):
@@ -1387,6 +1421,299 @@ def build_attention_dense(
         start_tile = b.const_i32(0)
     start_buf = b.mod(start_tile, b.const_i32(NBUF))
     start_buf1 = b.mod(b.add(start_tile, b.const_i32(1)), b.const_i32(NBUF))
+
+    def _emit_lookahead_main():
+        """QK-lookahead KV loop (``qk_lookahead``): one tile of software skew
+        inside the wave so every MFMA run has independent softmax VALU work.
+
+        Iteration j holds the raw scores S_j and the running max m_j (which
+        already includes tile j), and O / l scaled to m_j:
+          phase A: S_{j+1} = QK(j+1)  ||  P_j = exp2(S_j*qk_scale - m_j), l += sum(P_j)
+          phase B: O += P_j V_j        ||  mask + row max of S_{j+1} -> m_{j+1}
+          then O, l *= exp2(m_j - m_{j+1}) (lazy: skipped when the max stays).
+        LDS: tile t lives in buffer t % 2. One barrier per iteration: at the top
+        of iteration j every wave has finished QK(j) and PV(j-1), so K(j+2)
+        refills K buffer j % 2 and V(j+1) refills V buffer (j+1) % 2; both have a
+        whole iteration to land before the next top-of-loop wait.
+        Returns (m, l, o_acc) for the shared epilogue."""
+        sb = start_buf
+        sb1 = start_buf1
+        tk_s = b.mul(start_tile, b.const_i32(BN))
+        async_load_k(K_lds_addr, sb, tk_s)
+        async_load_v(V_lds_addr, sb, tk_s)
+        async_load_k(
+            K_lds_addr, sb1, b.mul(b.add(start_tile, b.const_i32(1)), b.const_i32(BN))
+        )
+        b.s_waitcnt(vmcnt=0)
+        b.s_barrier_bare()
+        acc0 = []
+        s0 = do_qk(sb, accs=acc0)
+        do_mask(s0, start_tile)
+        if use_sinks:
+            sink_h = b.global_load(sinks, hq, dtype, align=2)
+            m_init = b.fmul(b.cast_to_f32(sink_h), rcp_ln2)
+        else:
+            m_init = neg_inf
+        m0, alpha0, _skip0 = softmax_max(s0, m_init)
+        if use_sinks:
+            # The sink's exp(sink - m_init) = 1 contribution, rescaled to m0.
+            l0 = b.fmul(one_f, alpha0)
+            if spec.defer_row_sum:
+                l0 = b.select(b.cmp_eq(lane_h, b.const_i32(0)), l0, b.const_f32(0.0))
+        else:
+            l0 = b.const_f32(0.0)
+        o0 = [b.zero_vec_f32(16) for _ in range(D_TILES)]
+        if causal:
+            s0v = [b.vec_pack(s0[n], F32) for n in range(N_SUB)]
+        else:
+            s0v = acc0
+        la_args = (
+            [("m", m0), ("l", l0)]
+            + [(f"o{dt}", o0[dt]) for dt in range(D_TILES)]
+            + [(f"s{n}", s0v[n]) for n in range(N_SUB)]
+        )
+        exp_per_qk = -(-(N_SUB * 16) // (N_SUB * K_STEPS))
+        max_per_pv = -(-(N_SUB * 16) // len(PV_STEPS))
+        la_rs_ctr = [0]
+        # (nsub, reg) feeding each PV B-operand pack, in relayout_p's order.
+        _P_ORDER = []
+        for kk_step in range(KK_STEPS):
+            row = []
+            for kk in range(8):
+                key_idx = kk_step * 16 + (kk // 4) * 8 + kk % 4
+                rs = key_idx % 32
+                row.append((key_idx // 32, (rs // 8) * 4 + rs % 4))
+            _P_ORDER.append(row)
+
+        def la_body(j, carry, mask_next):
+            if IGLP != _IGLP_OFF:
+                b.iglp_opt(IGLP)
+            m_j = carry[0]
+            l_i = carry[1]
+            o_acc = list(carry[2 : 2 + D_TILES])
+            s_j = [
+                [b.vec_extract(carry[2 + D_TILES + n], i) for i in range(16)]
+                for n in range(N_SUB)
+            ]
+            j1 = b.add(j, b.const_i32(1))
+            buf_j = b.mod(j, b.const_i32(NBUF))
+            buf_j1 = b.mod(j1, b.const_i32(NBUF))
+            b.s_waitcnt(vmcnt=0)
+            b.s_barrier_bare()
+            async_load_k(
+                K_lds_addr, buf_j, b.mul(b.add(j, b.const_i32(2)), b.const_i32(BN))
+            )
+            async_load_v(V_lds_addr, buf_j1, b.mul(j1, b.const_i32(BN)))
+
+            # Phase A: QK(j+1) with the exp2 of tile j in its shadow. The exps
+            # run in PV-operand order so each bf16 P pack, and the two partial
+            # row sums, are emitted as soon as their inputs exist instead of as
+            # a serial tail after the last MFMA.
+            neg_m = b.fneg(m_j)
+            slots = iter(
+                [
+                    (kk, e, n, i)
+                    for kk, row in enumerate(_P_ORDER)
+                    for e, (n, i) in enumerate(row)
+                ]
+            )
+            pk_elems = [[None] * 8 for _ in range(KK_STEPS)]
+            p_packs = [None] * KK_STEPS
+            lsum = [None, None]
+
+            def emit_exp(kk, e, n, i):
+                p = _exp2(b.fma(s_j[n][i], qk_scale, neg_m))
+                h = e % 2
+                lsum[h] = p if lsum[h] is None else b.fadd(lsum[h], p)
+                pk_elems[kk][e] = b.cast_f32_to(p, dtype)
+                if e == 7:
+                    p_packs[kk] = b.vec_pack(pk_elems[kk], dtype)
+
+            def exp_hook():
+                for _ in range(exp_per_qk):
+                    slot = next(slots, None)
+                    if slot is None:
+                        return
+                    emit_exp(*slot)
+
+            s_next = do_qk(buf_j1, after_mfma=exp_hook)
+            for slot in slots:
+                emit_exp(*slot)
+            l_local = b.fadd(lsum[0], lsum[1])
+            if not spec.defer_row_sum:
+                l_local = half_combine(l_local, b.fadd)
+            l_acc = b.fadd(l_i, l_local)
+
+            # Phase B: PV(j) with the mask + row max of tile j+1 in its shadow.
+            if mask_next:
+                do_mask(s_next, j1)
+            maxes = [neg_inf]
+            mslots = iter([(n, i) for n in range(N_SUB) for i in range(16)])
+
+            def max_hook():
+                for _ in range(max_per_pv):
+                    slot = next(mslots, None)
+                    if slot is None:
+                        return
+                    n, i = slot
+                    maxes[0] = b.fmax(maxes[0], s_next[n][i])
+
+            if PV_PRIORITY:
+                b.s_setprio(PV_PRIORITY)
+            o_acc = do_pv(o_acc, p_packs, buf_j, after_mfma=max_hook)
+            if PV_PRIORITY:
+                b.s_setprio(0)
+            for n, i in mslots:
+                maxes[0] = b.fmax(maxes[0], s_next[n][i])
+            m_new, alpha, skip = _softmax_max_from_local(maxes[0], m_j)
+            if LAZY_RESCALE:
+                la_rs_ctr[0] += 1
+                tg = la_rs_ctr[0]
+                trips = b.select(skip, b.const_i32(0), b.const_i32(1))
+                rs_args = [(f"lo{dt}_{tg}", o_acc[dt]) for dt in range(D_TILES)]
+                rs_args.append((f"ll_{tg}", l_acc))
+                rs = b.scf_for_iter(
+                    b.const_i32(0), trips, b.const_i32(1), rs_args, iv_name=f"lrs{tg}"
+                )
+                with rs as (_iv, rc):
+                    o_sc = rescale_o(list(rc[:D_TILES]), alpha)
+                    b.scf_yield(*o_sc, b.fmul(rc[D_TILES], alpha))
+                o_acc = list(rs.results[:D_TILES])
+                l_new = rs.results[D_TILES]
+            else:
+                o_acc = rescale_o(o_acc, alpha)
+                l_new = b.fmul(l_acc, alpha)
+            s_next_v = [b.vec_pack(s_next[n], F32) for n in range(N_SUB)]
+            return [m_new, l_new, *o_acc, *s_next_v]
+
+        def la_loop(lo, hi, args, mask_next, tag):
+            """KV loop over [lo, hi)."""
+            lp = b.scf_for_iter(lo, hi, b.const_i32(1), args, iv_name=tag)
+            with lp as (j, carry):
+                b.scf_yield(*la_body(j, carry, mask_next))
+            return lp
+
+        last = b.sub(n_upper, b.const_i32(1))
+        if causal and spec.causal_diag_split:
+            # Tile j+1 needs the causal mask once it reaches the diagonal.
+            diag_start = b.mul(qb, b.const_i32(n_per))
+            if DIAG_TILES:
+                diag_start = b.add(diag_start, b.const_i32(DIAG_TILES))
+            body_hi = b.sub(diag_start, b.const_i32(1))
+            body_hi = b.select(b.cmp_lt(body_hi, last), body_hi, last)
+            body_hi = b.select(b.cmp_lt(body_hi, start_tile), start_tile, body_hi)
+            body = la_loop(start_tile, body_hi, la_args, False, "lab")
+            tail_args = [
+                (name + "_t", val) for (name, _), val in zip(la_args, body.results)
+            ]
+            loop = la_loop(body_hi, last, tail_args, True, "lat")
+        else:
+            loop = la_loop(start_tile, last, la_args, causal, "lak")
+        res = loop.results
+        m_fin = res[0]
+        l_i = res[1]
+        o_acc = list(res[2 : 2 + D_TILES])
+        s_last = [
+            [b.vec_extract(res[2 + D_TILES + n], i) for i in range(16)]
+            for n in range(N_SUB)
+        ]
+        neg_m = b.fneg(m_fin)
+        p_last = [
+            [_exp2(b.fma(s_last[n][i], qk_scale, neg_m)) for i in range(16)]
+            for n in range(N_SUB)
+        ]
+        l_local = b.const_f32(0.0)
+        for n in range(N_SUB):
+            for i in range(16):
+                l_local = b.fadd(l_local, p_last[n][i])
+        if not spec.defer_row_sum:
+            l_local = half_combine(l_local, b.fadd)
+        l_i = b.fadd(l_i, l_local)
+        if spec.defer_row_sum:
+            l_i = half_combine(l_i, b.fadd)
+        # V(last) was issued at the top of the final iteration (or the prologue).
+        b.s_waitcnt(vmcnt=0)
+        b.s_barrier_bare()
+        o_acc = do_pv(o_acc, relayout_p(p_last), b.mod(last, b.const_i32(NBUF)))
+        return m_fin, l_i, o_acc
+
+    def _emit_epilogue(m_fin, l_i, o_acc):
+        """O = (P@V) / l, vectorized store (plus LSE when requested)."""
+        if spec.emit_lse:
+            positive_l = b.fcmp("ogt", l_i, b.const_f32(0.0))
+            rcp_l = b.rcp(b.select(positive_l, l_i, b.const_f32(1.0)))
+        else:
+            rcp_l = b.rcp(l_i)
+        if varlen:
+            o_base = b.add(
+                b.mul(q_seq0, b.const_i32(stride_q_tok)), b.mul(hq, b.const_i32(D))
+            )
+        else:
+            o_base = b.add(
+                b.mul(b.mul(bt, seqlen_q_p), b.const_i32(stride_q_tok)),
+                b.mul(hq, b.const_i32(D)),
+            )
+        qtok = b.add(q_tok0, _mfma_32x32_c_col(b, lane, 0))
+        q_row_byte = b.add(o_base, b.mul(qtok, b.const_i32(stride_q_tok)))
+        d_half = b.mul(lane_h, b.const_i32(4))
+        if spec.emit_lse:
+            row_has_key = dense_row_has_key(
+                b,
+                qtok,
+                seqlen_kv_b if varlen else seqlen_kv_p,
+                causal=causal,
+                diagonal=DIAG_OFF,
+                window=W,
+            )
+            if varlen:
+                lse_index = b.add(b.mul(b.add(q_seq0, qtok), b.const_i32(Hq)), hq)
+                row_exists = b.cmp_lt(qtok, seqlen_q_b)
+            else:
+                lse_index = b.add(
+                    b.mul(b.add(b.mul(bt, b.const_i32(Hq)), hq), seqlen_q_p),
+                    qtok,
+                )
+                row_exists = b.cmp_lt(qtok, seqlen_q_p)
+            _dense_lse_output(
+                b,
+                lse,
+                lse_index,
+                m_fin,
+                l_i,
+                row_exists,
+                row_has_key,
+                lane_h,
+                sinks=sinks if use_sinks else None,
+                head=hq,
+                dtype=dtype,
+            )
+        # ragged: drop padded query rows (qtok >= seqlen_q) via a per-lane guard so
+        # they never write (and never clobber a neighbouring batch's real rows). A
+        # buffer store's OOB-drop only protects the last batch's overflow, so use an
+        # explicit predicate that is correct for any batch.
+        o_store_ctx = (
+            b.scf_if(b.cmp_lt(qtok, b.const_i32(Sq))) if RAGGED else _nullcontext()
+        )
+        if spec.emit_lse and varlen:
+            o_store_ctx = b.scf_if(row_exists)
+        with o_store_ctx:
+            _emit_o_store(
+                b,
+                o,
+                q_row_byte,
+                d_half,
+                o_acc,
+                rcp_l,
+                dtype,
+                D_TILES,
+                spec.o_store_width,
+                row_has_key=row_has_key if spec.emit_lse else None,
+            )
+        b.ret()
+
+    if spec.qk_lookahead:
+        _emit_epilogue(*_emit_lookahead_main())
+        return b.kernel
 
     # Prologue: prime the K/V double buffer and compute the first (start) tile.
     load_tile(start_buf, start_tile)
@@ -1573,78 +1900,7 @@ def build_attention_dense(
     last_vbuf = b.mod(b.add(n_upper, b.const_i32(NBUF - 1)), b.const_i32(NBUF))
     o_acc = do_pv(o_acc, p_prev, last_vbuf)
 
-    # Epilogue: O = (P@V) / l, vectorized bf16 store.
-    if spec.emit_lse:
-        positive_l = b.fcmp("ogt", l_i, b.const_f32(0.0))
-        rcp_l = b.rcp(b.select(positive_l, l_i, b.const_f32(1.0)))
-    else:
-        rcp_l = b.rcp(l_i)
-    if varlen:
-        o_base = b.add(
-            b.mul(q_seq0, b.const_i32(stride_q_tok)), b.mul(hq, b.const_i32(D))
-        )
-    else:
-        o_base = b.add(
-            b.mul(b.mul(bt, seqlen_q_p), b.const_i32(stride_q_tok)),
-            b.mul(hq, b.const_i32(D)),
-        )
-    qtok = b.add(q_tok0, _mfma_32x32_c_col(b, lane, 0))
-    q_row_byte = b.add(o_base, b.mul(qtok, b.const_i32(stride_q_tok)))
-    d_half = b.mul(lane_h, b.const_i32(4))
-    if spec.emit_lse:
-        row_has_key = dense_row_has_key(
-            b,
-            qtok,
-            seqlen_kv_b if varlen else seqlen_kv_p,
-            causal=causal,
-            diagonal=DIAG_OFF,
-            window=W,
-        )
-        if varlen:
-            lse_index = b.add(b.mul(b.add(q_seq0, qtok), b.const_i32(Hq)), hq)
-            row_exists = b.cmp_lt(qtok, seqlen_q_b)
-        else:
-            lse_index = b.add(
-                b.mul(b.add(b.mul(bt, b.const_i32(Hq)), hq), seqlen_q_p),
-                qtok,
-            )
-            row_exists = b.cmp_lt(qtok, seqlen_q_p)
-        _dense_lse_output(
-            b,
-            lse,
-            lse_index,
-            res[0],
-            l_i,
-            row_exists,
-            row_has_key,
-            lane_h,
-            sinks=sinks if use_sinks else None,
-            head=hq,
-            dtype=dtype,
-        )
-    # ragged: drop padded query rows (qtok >= seqlen_q) via a per-lane guard so
-    # they never write (and never clobber a neighbouring batch's real rows). A
-    # buffer store's OOB-drop only protects the last batch's overflow, so use an
-    # explicit predicate that is correct for any batch.
-    o_store_ctx = (
-        b.scf_if(b.cmp_lt(qtok, b.const_i32(Sq))) if RAGGED else _nullcontext()
-    )
-    if spec.emit_lse and varlen:
-        o_store_ctx = b.scf_if(row_exists)
-    with o_store_ctx:
-        _emit_o_store(
-            b,
-            o,
-            q_row_byte,
-            d_half,
-            o_acc,
-            rcp_l,
-            dtype,
-            D_TILES,
-            spec.o_store_width,
-            row_has_key=row_has_key if spec.emit_lse else None,
-        )
-    b.ret()
+    _emit_epilogue(res[0], l_i, o_acc)
     return b.kernel
 
 
