@@ -995,8 +995,17 @@ def _build_mfma_dkdv(spec: FmhaBwdSpec, arch: str) -> KernelDef:
                 for a in range(n_a)
             ]
 
-        k_b = [_kv_b(K, "k", i) for i in range(kpw)]
+        # Fused dQ already stages the CTA's K tile in LDS: S reads its B operand
+        # from there instead of holding K in registers.
+        k_b = None if fused else [_kv_b(K, "k", i) for i in range(kpw)]
         v_b = [_kv_b(V, "v", i) for i in range(kpw)]
+
+        def _k_op(i, a):
+            if k_b is not None:
+                return k_b[i][a]
+            row = b.add(b.mul(wave, b.const_i32(16 * kpw)), b.add(b.const_i32(16 * i), m16))
+            return b.smem_load_vN(k_lds, row, b.add(b.const_i32(32 * a), b.mul(g, b.const_i32(8))), dtype=dt, n=8)
+
         nqt = b.div(seqlen_q, b.const_i32(BM))
         qt_lo = b.div(n_cta, b.const_i32(BM)) if causal else b.const_i32(0)
         nq_eff = b.sub(nqt, qt_lo)
@@ -1054,7 +1063,7 @@ def _build_mfma_dkdv(spec: FmhaBwdSpec, arch: str) -> KernelDef:
                     s_acc = b.zero_vec_f32(4)
                     dp_acc = b.zero_vec_f32(4)
                     for a in range(n_a):
-                        s_acc = b.mma(op, q_a[t][a], k_b[i][a], s_acc)
+                        s_acc = b.mma(op, q_a[t][a], _k_op(i, a), s_acc)
                     for a in range(n_a):
                         dp_acc = b.mma(op, do_a[t][a], v_b[i][a], dp_acc)
                     for r in range(4):
