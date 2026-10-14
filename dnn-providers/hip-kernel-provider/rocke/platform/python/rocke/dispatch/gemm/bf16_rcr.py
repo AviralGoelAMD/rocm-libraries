@@ -51,6 +51,7 @@ from .common import (
     GemmRequest,
     apply_split_k,
     apply_split_k_decode,
+    apply_split_k_fill,
     rcr_request_errors,
 )
 from .support import (
@@ -211,14 +212,25 @@ def _spec_cdna_decode(req: GemmRequest, name: str) -> UniversalGemmSpec:
 # gfx950 (CDNA4) direct-to-LDS ping-pong candidates. Async buffer_load_lds
 # into a double-buffered LDS tile with the alias-scoped prefetch, st_16x32
 # swizzle, and (large grids) the chiplet L2 remap. 256x256 needs enough
-# output tiles to occupy the device (one 512-thread CTA per CU); smaller
-# grids take the 128x128 tile.
-_DTL256_MIN_TILES = 128
+# output tiles to occupy the device (one 512-thread CTA per CU); mid-size
+# grids take 128x256 (depth-2 ring), small grids the 128x128 tile.
+_DTL256_MIN_TILES = 160
+# Below _DTL256_MIN_TILES a deep-K shape still takes 256x256 with K split in
+# two when the doubled grid reaches the tile floor: the per-CU rate of the big
+# tile outweighs one extra atomic partial per output.
+_DTL256_SPLIT_MIN_K = 16384
 _DTL_CHIPLET_MIN_TILES = 2048
 # At <= one 128x128 tile per CU the kernel is latency-bound; the 3-buffer
 # depth-2 ring keeps two K-tiles of loads in flight. Larger grids keep the
 # 2-buffer ping-pong (the third buffer would cost a resident CTA per CU).
 _DTL128_DEPTH2_MAX_TILES = 256
+# 128x256 (2x4 warps, depth-2 ring) covers grids of roughly 0.6-1.2 tiles per
+# CU, where 256x256 leaves CUs idle and 128x128 under-uses each CU.
+_DTL128X256_MIN_TILES = 150
+_DTL128X256_MAX_TILES = 300
+# Split-K slices of the 128x128 tile run tile_k=128: twice the K work per
+# barrier/wait, which the shallow (few K-tile) slices need.
+_DTL128_SPLIT_TILE_K = 128
 
 
 def _dtl_trait(tiles: int, depth: int = 1) -> TraitSpec:
@@ -235,6 +247,21 @@ def _dtl_trait(tiles: int, depth: int = 1) -> TraitSpec:
     )
 
 
+def _dtl256_split(req: GemmRequest) -> int:
+    """Split degree for the 256x256 candidate, or 0 when it should not run."""
+    tiles = (req.M // 256) * (req.N // 256)
+    if tiles >= _DTL256_MIN_TILES:
+        return 1
+    if (
+        req.K >= _DTL256_SPLIT_MIN_K
+        and 2 * tiles >= _DTL256_MIN_TILES
+        and (req.K // 2) % 64 == 0
+        and req.K % 2 == 0
+    ):
+        return 2
+    return 0
+
+
 def _spec_cdna4_dtl256(req: GemmRequest, name: str) -> UniversalGemmSpec:
     tiles = (req.M // 256) * (req.N // 256)
     return _make_spec(
@@ -243,6 +270,44 @@ def _spec_cdna4_dtl256(req: GemmRequest, name: str) -> UniversalGemmSpec:
         tile=TileSpec(256, 256, 64, 2, 4, 1, 16, 16, 32),
         trait=_dtl_trait(tiles),
     )
+
+
+def _split_dtl256(req: GemmRequest, spec: UniversalGemmSpec) -> UniversalGemmSpec:
+    sk = _dtl256_split(req)
+    if sk <= 1:
+        return spec
+    return replace(spec, trait=replace(spec.trait, split_k=sk))
+
+
+def _gate_dtl256(req: GemmRequest) -> Tuple[bool, str]:
+    if _dtl256_split(req) == 0:
+        tiles = (req.M // 256) * (req.N // 256)
+        return False, f"{tiles} 256x256 tiles < {_DTL256_MIN_TILES} (no deep-K split)"
+    return True, "ok"
+
+
+def _spec_cdna4_dtl128x256(req: GemmRequest, name: str) -> UniversalGemmSpec:
+    tiles = (req.M // 128) * (req.N // 256)
+    return _make_spec(
+        name=name,
+        arch=req.arch,
+        tile=TileSpec(128, 256, 64, 2, 4, 1, 16, 16, 32),
+        trait=_dtl_trait(tiles, depth=2),
+    )
+
+
+def _gate_dtl128x256(req: GemmRequest) -> Tuple[bool, str]:
+    tiles = (req.M // 128) * (req.N // 256)
+    if not _DTL128X256_MIN_TILES <= tiles <= _DTL128X256_MAX_TILES:
+        return False, (
+            f"{tiles} 128x256 tiles outside "
+            f"[{_DTL128X256_MIN_TILES}, {_DTL128X256_MAX_TILES}]"
+        )
+    return True, "ok"
+
+
+def _no_split(req: GemmRequest, spec: UniversalGemmSpec) -> UniversalGemmSpec:
+    return spec
 
 
 def _spec_cdna4_dtl128(req: GemmRequest, name: str) -> UniversalGemmSpec:
@@ -257,19 +322,16 @@ def _spec_cdna4_dtl128(req: GemmRequest, name: str) -> UniversalGemmSpec:
 
 
 def _split_dtl128(req: GemmRequest, spec: UniversalGemmSpec) -> UniversalGemmSpec:
-    # A split-K slice is only a few K-tiles deep; the depth-2 ring's longer
-    # prologue does not pay there, so split specs keep the ping-pong.
-    spec = apply_split_k(req, spec)
-    if spec.trait.split_k > 1 and spec.trait.dtl_prefetch_depth > 1:
-        spec = replace(spec, trait=replace(spec.trait, dtl_prefetch_depth=1))
-    return spec
-
-
-def _gate_dtl256(req: GemmRequest) -> Tuple[bool, str]:
-    tiles = (req.M // 256) * (req.N // 256)
-    if tiles < _DTL256_MIN_TILES:
-        return False, f"{tiles} 256x256 tiles < {_DTL256_MIN_TILES}"
-    return True, "ok"
+    # A grid that leaves the device mostly idle splits K to fill it about
+    # once; the slices run tile_k=128 with the ping-pong (the depth-2 ring's
+    # longer prologue does not pay on a few-K-tile slice).
+    deep = replace(
+        spec,
+        tile=replace(spec.tile, tile_k=_DTL128_SPLIT_TILE_K),
+        trait=replace(spec.trait, dtl_prefetch_depth=1),
+    )
+    split = apply_split_k_fill(req, deep)
+    return split if split.trait.split_k > 1 else spec
 
 
 def _make_candidate(
@@ -368,11 +430,21 @@ GEMM_BF16_REGISTRY.extend(
             spec_fn=_spec_cdna4_dtl256,
             arches=_CDNA4_DTL_BF16,
             gate=_gate_dtl256,
+            split=_split_dtl256,
+        ),
+        _make_candidate(
+            name="universal_gemm_bf16_cdna4_dtl128x256",
+            spec_id="cdna4_dtl_128x256",
+            priority=5,
+            spec_fn=_spec_cdna4_dtl128x256,
+            arches=_CDNA4_DTL_BF16,
+            gate=_gate_dtl128x256,
+            split=_no_split,
         ),
         _make_candidate(
             name="universal_gemm_bf16_cdna4_dtl128",
             spec_id="cdna4_dtl_128x128",
-            priority=5,
+            priority=6,
             spec_fn=_spec_cdna4_dtl128,
             arches=_CDNA4_DTL_BF16,
             split=_split_dtl128,

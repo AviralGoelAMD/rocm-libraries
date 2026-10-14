@@ -309,6 +309,59 @@ def select_split_k_decode(
     )
 
 
+# Compute-bound skinny GEMMs (M ~ one or two tiles, deep K): the atomic
+# partial traffic grows with the split degree, so the degree is sized to fill
+# the device about once (one CTA per CU) rather than to a fixed slice depth,
+# and each slice keeps at least FILL_MIN_SLICE_K of K so the DTL pipeline
+# prologue/epilogue stays amortised.
+FILL_MIN_SLICE_K = 1024
+
+
+def select_split_k_fill(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    target_ctas: int = GFX950_TARGET_CTAS,
+    min_slice_k: int = FILL_MIN_SLICE_K,
+    env: dict | None = None,
+) -> SplitKDecision:
+    """Split-K degree that fills the device once.
+
+    ``split_k = largest valid factor <= min(target_ctas // base_grid,
+    K // min_slice_k)``, engaged only when ``base_grid < target_ctas / 2``
+    (the :func:`select_split_k` gate). ``ROCKE_GEMM_SPLIT_K`` overrides it
+    exactly as for :func:`select_split_k`.
+    """
+    env = os.environ if env is None else env
+    mode, forced = _parse_env_override(env)
+    base_grid = _ceil_div(M, tile_m) * _ceil_div(N, tile_n)
+    max_split = max(1, K // tile_k)
+    if mode == "off":
+        return SplitKDecision(1, base_grid, target_ctas, "env override: off")
+    if mode == "force":
+        assert forced is not None
+        chosen = _largest_valid_split_k(K, tile_k, min(int(forced), max_split))
+        return SplitKDecision(
+            chosen, base_grid, target_ctas, f"env override: forced {forced} -> valid {chosen}"
+        )
+    if base_grid >= target_ctas // 2:
+        return SplitKDecision(
+            1, base_grid, target_ctas, f"grid {base_grid} already fills device"
+        )
+    raw = max(1, min(target_ctas // max(1, base_grid), K // min_slice_k, max_split))
+    chosen = _largest_valid_split_k(K, tile_k, raw)
+    return SplitKDecision(
+        chosen,
+        base_grid,
+        target_ctas,
+        f"grid {base_grid} -> fill split_k {chosen} (slice K={K // chosen})",
+    )
+
+
 
 def select_split_k_wgrad(
     *,
