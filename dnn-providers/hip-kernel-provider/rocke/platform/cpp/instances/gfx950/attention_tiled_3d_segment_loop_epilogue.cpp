@@ -492,6 +492,39 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
             rocke_b_sync(b);
         }
 
+        /* Keys >= seq_len in the sequence's last tile hold whatever the cache
+         * has in the page slack (or a clamped page). Their P is 0, but
+         * 0 * NaN = NaN inside the PV MFMA, so zero those V rows in LDS before
+         * PV. Uniform branch, taken only on the tile that crosses seq_len. */
+        {
+            rocke_value_t* tail_end = rocke_b_add(b, tile_off, rocke_b_const_i32(b, cfg->T));
+            rocke_if_t tail = rocke_b_scf_if(b, rocke_b_cmp_gt(b, tail_end, ctx->seq_len));
+            int v_vecs_per_row = cfg->HD / 8;
+            int li;
+            rocke_b_region_enter(b, tail.then_region);
+            for(li = 0; li < (cfg->T * cfg->HD / 8) / cfg->THREADS; li++)
+            {
+                rocke_value_t* v_vid
+                    = rocke_b_add(b, rocke_b_const_i32(b, li * cfg->THREADS), ctx->tid);
+                rocke_value_t* v_row
+                    = rocke_b_div(b, v_vid, rocke_b_const_i32(b, v_vecs_per_row));
+                rocke_value_t* v_mod
+                    = rocke_b_mod(b, v_vid, rocke_b_const_i32(b, v_vecs_per_row));
+                rocke_value_t* v_col = rocke_b_mul(b, v_mod, rocke_b_const_i32(b, 8));
+                rocke_value_t* key = rocke_b_add(b, tile_off, v_row);
+                rocke_if_t dead = rocke_b_scf_if(b, rocke_b_cmp_ge(b, key, ctx->seq_len));
+                rocke_value_t* v_idx[3];
+                rocke_b_region_enter(b, dead.then_region);
+                v_idx[0] = cur_buf;
+                v_idx[1] = v_row;
+                v_idx[2] = v_col;
+                rocke_b_smem_store_vN(b, ctx->V_lds, v_idx, 3, ctx->z8, 8);
+                rocke_b_region_leave(b);
+            }
+            rocke_b_sync_lds_only(b);
+            rocke_b_region_leave(b);
+        }
+
         /* ---------------- PV (wide 16x16x32 or narrow 16x16x16 via ds_read_tr) -- */
         for(n = 0; n < cfg->PV_N_TILES; n++)
         {
