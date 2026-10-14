@@ -12,7 +12,6 @@
 
 #include "rocke/ir_internal.h" /* rocke_i_set_err */
 
-#include <stdio.h> /* snprintf */
 #include <string.h> /* strcmp */
 
 /* ============================================================================
@@ -186,50 +185,11 @@ static bool ctl_is_bf16(const rocke_coalesced_tile_loader_t* self)
            && strcmp(self->elem_dtype->name, "bf16") == 0;
 }
 
-/* Python b.buffer_load_vN(rsrc, off, c0, dtype, n): the dtype-generic
- * "tile.buffer_load_vN" op (attrs dwords, elem_type; hint bl{n}). Not the
- * bf16-suffixed op, whose lowering names its temporaries differently. */
-static rocke_value_t* ctl_buffer_load_vN_generic(rocke_ir_builder_t* b,
-                                                 const rocke_type_t* dtype,
-                                                 int n,
-                                                 rocke_value_t* rsrc,
-                                                 rocke_value_t* off,
-                                                 rocke_value_t* c0)
-{
-    rocke_value_t* ops[3];
-    rocke_attr_map_t attrs;
-    char hint[16];
-    const int dwords = (n * 2) / 4; /* 2-byte elements only */
-    if(!(dwords == 1 || dwords == 2 || dwords == 4))
-    {
-        rocke_i_set_err(b,
-                        ROCKE_ERR_VALUE,
-                        "buffer_load_vN: n=%d dtype=%s -> dwords=%d must be 1, 2, or 4",
-                        n,
-                        dtype->name,
-                        dwords);
-        return NULL;
-    }
-    attrs = rocke_i_attrs(b);
-    rocke_attr_set_int(b, &attrs, "dwords", (int64_t)dwords);
-    rocke_attr_set_str(b, &attrs, "elem_type", dtype->name);
-    snprintf(hint, sizeof(hint), "bl%d", n);
-    ops[0] = rsrc;
-    ops[1] = off;
-    ops[2] = c0;
-    return rocke_i_op1(b,
-                       ROCKE_OP_TILE_BUFFER_LOAD_VN,
-                       ops,
-                       3,
-                       rocke_vector_type(b, dtype, n),
-                       &attrs,
-                       hint);
-}
-
 /* Python b.buffer_load(rsrc, off, c0, elem_dtype) / buffer_load_vN(..., load_vec).
- * The f16 path keeps its historical builder calls (same lowered text). A bf16
- * scalar load would be Python's generic "tile.buffer_load", which this engine
- * has no opcode for, so it is refused rather than emitted differently. */
+ * The f16 path keeps its historical builder calls (same lowered text); bf16
+ * takes the dtype-generic "tile.buffer_load" / "tile.buffer_load_vN" ops Python
+ * emits (not the bf16-suffixed ops, whose lowering names its temporaries
+ * differently). */
 static rocke_value_t* ctl_buffer_load(rocke_ir_builder_t* b,
                                       const rocke_coalesced_tile_loader_t* self,
                                       rocke_value_t* rsrc,
@@ -238,22 +198,16 @@ static rocke_value_t* ctl_buffer_load(rocke_ir_builder_t* b,
 {
     if(ctl_is_bf16(self))
     {
-        if(self->load_vec == 1)
-        {
-            rocke_i_set_err(b,
-                            ROCKE_ERR_VALUE,
-                            "CoalescedTileLoader: scalar (load_vec=1) bf16 buffer loads are "
-                            "not ported");
-            return NULL;
-        }
-        return ctl_buffer_load_vN_generic(b, self->elem_dtype, self->load_vec, rsrc, off, c0);
+        return self->load_vec == 1
+                   ? rocke_b_buffer_load(b, rsrc, off, c0, self->elem_dtype)
+                   : rocke_b_buffer_load_vN(b, rsrc, off, c0, self->elem_dtype, self->load_vec);
     }
     return self->load_vec == 1 ? rocke_b_buffer_load_f16(b, rsrc, off, c0)
                                : rocke_b_buffer_load_vN_f16(b, rsrc, off, c0, self->load_vec / 2);
 }
 
 /* Python b.global_load(ptr, off, elem_dtype) / global_load_vN(..., load_vec).
- * Only the f16 form is ported. */
+ * The f16 path keeps its historical builder calls; bf16 takes the typed ones. */
 static rocke_value_t* ctl_global_load(rocke_ir_builder_t* b,
                                       const rocke_coalesced_tile_loader_t* self,
                                       rocke_value_t* ptr,
@@ -261,10 +215,9 @@ static rocke_value_t* ctl_global_load(rocke_ir_builder_t* b,
 {
     if(ctl_is_bf16(self))
     {
-        rocke_i_set_err(b,
-                        ROCKE_ERR_VALUE,
-                        "CoalescedTileLoader: bf16 global (non-buffer) loads are not ported");
-        return NULL;
+        return self->load_vec == 1
+                   ? rocke_b_global_load(b, ptr, off_elems, self->elem_dtype, 0)
+                   : rocke_b_global_load_vN(b, ptr, off_elems, self->elem_dtype, self->load_vec, 0);
     }
     return self->load_vec == 1 ? rocke_b_global_load_f16(b, ptr, off_elems, 0)
                                : rocke_b_global_load_vN_f16(b, ptr, off_elems, self->load_vec, 0);

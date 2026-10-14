@@ -18,7 +18,8 @@
  *   * rocke_conv_choose_load_vec -- the load-side module helper (Python
  *     _choose_load_vec, lines 722-727): thin adapter over rocke_choose_load_vec.
  *   * rocke_conv_emit_smem_load -- the load-side module helper (Python
- *     _emit_smem_load, lines 641-644): f16 n==4 fast path else smem_load_vN_f16.
+ *     _emit_smem_load): typed smem_load_vN for a non-f16 smem_dtype, else the
+ *     f16 n==4 fast path / smem_load_vN_f16.
  *
  * Peers (the descriptor builders, the prologue populate, the compute/MFMA
  * phases, the K-loop drivers, and the epilogue) are CALLED via
@@ -110,28 +111,40 @@ int rocke_conv_default_load_vec_b(const rocke_implicit_gemm_conv_spec_t* spec)
 }
 
 /* ===================================================================== *
- *  _emit_smem_load -- one fp16 LDS read (v4 fast path else vN).
+ *  _emit_smem_load -- one LDS operand read.
  *
- *  Python span: conv_implicit_gemm.py lines 641-644:
- *      def _emit_smem_load(b, smem, row, col, n):
+ *  Python (_conv_implicit_gemm_common.py):
+ *      def _emit_smem_load(b, smem, row, col, n, *, smem_dtype=None):
+ *          if smem_dtype is not None and smem_dtype is not F16:
+ *              vec = b.smem_load_vN(smem, row, col, dtype=smem_dtype, n=n)
+ *              return b.vec_extract(vec, 0) if (smem_dtype is F32 and n == 1) else vec
  *          if n == 4:
  *              return b.smem_load_v4_f16(smem, row, col)
  *          return b.smem_load_vN_f16(smem, row, col, n=n)
  *
- *  The C smem_load_vN_f16 takes an explicit (row, col) index pair as an indices
- *  array of length 2, matching the Python (smem, row, col) call.
+ *  smem_dtype NULL is Python's None. The C smem_load_vN[_f16] take an explicit
+ *  (row, col) index pair as an indices array of length 2.
  * ===================================================================== */
-rocke_value_t* rocke_conv_emit_smem_load(
-    rocke_ir_builder_t* b, rocke_value_t* smem, rocke_value_t* row, rocke_value_t* col, int n)
+rocke_value_t* rocke_conv_emit_smem_load(rocke_ir_builder_t* b,
+                                         rocke_value_t* smem,
+                                         rocke_value_t* row,
+                                         rocke_value_t* col,
+                                         int n,
+                                         const rocke_type_t* smem_dtype)
 {
+    rocke_value_t* idx[2];
+    idx[0] = row;
+    idx[1] = col;
+    if(smem_dtype != NULL && strcmp(smem_dtype->name, "f16") != 0)
+    {
+        rocke_value_t* vec = rocke_b_smem_load_vN(b, smem, idx, 2, smem_dtype, n);
+        if(strcmp(smem_dtype->name, "f32") == 0 && n == 1)
+            return rocke_b_vec_extract(b, vec, 0);
+        return vec;
+    }
     if(n == 4)
         return rocke_b_smem_load_v4_f16(b, smem, row, col);
-    {
-        rocke_value_t* idx[2];
-        idx[0] = row;
-        idx[1] = col;
-        return rocke_b_smem_load_vN_f16(b, smem, idx, 2, n);
-    }
+    return rocke_b_smem_load_vN_f16(b, smem, idx, 2, n);
 }
 
 /* ===================================================================== *

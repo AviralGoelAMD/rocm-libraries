@@ -344,6 +344,7 @@ typedef enum rocke_opcode
     ROCKE_OP_TILE_BUFFER_LOAD_F16,
     ROCKE_OP_TILE_BUFFER_LOAD_VN_F16,
     ROCKE_OP_TILE_BUFFER_LOAD_VN,
+    ROCKE_OP_TILE_BUFFER_LOAD,
     ROCKE_OP_TILE_BUFFER_STORE_F16,
     ROCKE_OP_TILE_BUFFER_STORE_VN_F16,
     ROCKE_OP_TILE_BUFFER_LOAD_BF16,
@@ -1396,6 +1397,20 @@ rocke_value_t* rocke_b_buffer_load_f16(rocke_ir_builder_t* b,
                                        rocke_value_t* rsrc,
                                        rocke_value_t* voffset,
                                        rocke_value_t* soffset);
+/* Dtype-generic buffer loads (Python IRBuilder.buffer_load_vN / buffer_load).
+ * dtype: f16 / bf16 (n in {2,4,8}) or f32 / i32 (n in {1,2,4}); the vector
+ * form loads n elements (dwords = n * elem_bytes / 4), the scalar form one. */
+rocke_value_t* rocke_b_buffer_load_vN(rocke_ir_builder_t* b,
+                                      rocke_value_t* rsrc,
+                                      rocke_value_t* voffset,
+                                      rocke_value_t* soffset,
+                                      const rocke_type_t* dtype,
+                                      int n);
+rocke_value_t* rocke_b_buffer_load(rocke_ir_builder_t* b,
+                                   rocke_value_t* rsrc,
+                                   rocke_value_t* voffset,
+                                   rocke_value_t* soffset,
+                                   const rocke_type_t* dtype);
 void rocke_b_buffer_store_vN_f16(rocke_ir_builder_t* b,
                                  rocke_value_t* rsrc,
                                  rocke_value_t* voffset,

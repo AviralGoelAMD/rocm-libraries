@@ -203,12 +203,13 @@ bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
         rocke_attr_set_int(b, &b->kernel->attrs, "waves_per_eu", spec->waves_per_eu);
     }
 
-    /* ---- params (A/B/D + extra_params + *_bytes) ---- (797-803) */
+    /* ---- params (A/B/D + extra_params + *_bytes) ---- (797-803)
+     * Python: ir_dtype_{a,b,d} = _ir_dtype(spec.data.dtype_{a,b,d}) type the
+     * three global pointers. */
     {
         rocke_param_opts_t a_opts;
         rocke_param_opts_t bp_opts;
         rocke_param_opts_t d_opts;
-        const rocke_type_t* f16_global = rocke_ptr_type(b, rocke_f16(), "global");
 
         memset(&a_opts, 0, sizeof(a_opts));
         a_opts.noalias = true;
@@ -217,7 +218,8 @@ bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
         a_opts.readonly_set = true;
         a_opts.align = 16;
         a_opts.align_set = true;
-        ctx->A = rocke_b_param(b, "A", f16_global, &a_opts);
+        ctx->A = rocke_b_param(
+            b, "A", rocke_ptr_type(b, rocke_conv_tr_elem_dtype(spec->dtype_a), "global"), &a_opts);
 
         memset(&bp_opts, 0, sizeof(bp_opts));
         bp_opts.noalias = true;
@@ -226,7 +228,8 @@ bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
         bp_opts.readonly_set = true;
         bp_opts.align = 16;
         bp_opts.align_set = true;
-        ctx->Bp = rocke_b_param(b, "B", f16_global, &bp_opts);
+        ctx->Bp = rocke_b_param(
+            b, "B", rocke_ptr_type(b, rocke_conv_tr_elem_dtype(spec->dtype_b), "global"), &bp_opts);
 
         memset(&d_opts, 0, sizeof(d_opts));
         d_opts.noalias = true;
@@ -235,7 +238,8 @@ bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
         d_opts.writeonly_set = true;
         d_opts.align = 16;
         d_opts.align_set = true;
-        ctx->D = rocke_b_param(b, "D", f16_global, &d_opts);
+        ctx->D = rocke_b_param(
+            b, "D", rocke_ptr_type(b, rocke_conv_tr_elem_dtype(spec->dtype_d), "global"), &d_opts);
 
         /* extra_context = extra_params(b) if extra_params is not None else None */
         if(overrides != NULL && overrides->extra_params != NULL)
@@ -336,16 +340,29 @@ bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
     /* atom = spec.atom if op.family == "mma" else None.
      *
      * Python: ``ImplicitGemmConvSpec.atom`` is
-     *     mfma_atom("f16", warp_tile_m, warp_tile_n, warp_tile_k)
+     *     mfma_atom(spec.data.dtype_a, warp_tile_m, warp_tile_n, warp_tile_k)
      * and ``build_implicit_gemm_conv`` keeps it only on the MFMA path
-     * (``atom = spec.atom if op.family == "mma" else None``). ``rocke_mfma_atom``
+     * (``atom = spec.atom if op.family == "mma" else None``). ``rocke_b_mfma_atom``
      * returns a pointer into the same immutable static catalog the epilogues
-     * use, so the lookup is byte-identical to ``spec.atom``. NULL stays correct
-     * on the WMMA family. */
-    ctx->atom
-        = ctx->is_wmma
-              ? NULL
-              : rocke_mfma_atom("f16", spec->warp_tile_m, spec->warp_tile_n, spec->warp_tile_k);
+     * use (recording Python's ValueError on a miss), so the lookup is
+     * byte-identical to ``spec.atom``. NULL stays correct on the WMMA family. */
+    if(ctx->is_wmma)
+    {
+        ctx->atom = NULL;
+    }
+    else
+    {
+        ctx->atom = rocke_b_mfma_atom(b,
+                                      spec->dtype_a ? spec->dtype_a : "fp16",
+                                      spec->warp_tile_m,
+                                      spec->warp_tile_n,
+                                      spec->warp_tile_k);
+        if(ctx->atom == NULL)
+            return false;
+    }
+    /* _smem_dtype = BF16 if op.a_dtype == "bf16" else F32 if op.a_dtype == "fp32"
+     * else None (F16 here) -- the LDS operand element type. Type selection only. */
+    ctx->tr_dtype = rocke_conv_tr_elem_dtype(spec->dtype_a);
 
     ctx->a_per_lane = ctx->op->a_frag_len;
     ctx->b_per_lane = ctx->op->b_frag_len;
@@ -553,8 +570,11 @@ bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
         a_shape[1] = ctx->lds_layout.row_stride;
         b_shape[0] = ctx->block_n;
         b_shape[1] = ctx->lds_layout.row_stride;
-        ctx->A_smem = rocke_b_smem_alloc(b, rocke_f16(), a_shape, 2, "A_smem");
-        ctx->B_smem = rocke_b_smem_alloc(b, rocke_f16(), b_shape, 2, "B_smem");
+        /* Python: b.smem_alloc(ir_dtype_{a,b}, lds_layout.storage_shape(rows), ...) */
+        ctx->A_smem
+            = rocke_b_smem_alloc(b, rocke_conv_tr_elem_dtype(spec->dtype_a), a_shape, 2, "A_smem");
+        ctx->B_smem
+            = rocke_b_smem_alloc(b, rocke_conv_tr_elem_dtype(spec->dtype_b), b_shape, 2, "B_smem");
 
         /* Only async_dma and unroll_k reach a K-loop that alternates buffers:
          * async_dma takes the SoftwarePipeline branch and unroll_k hand-rolls a
@@ -565,8 +585,10 @@ bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
         ctx->double_buffer = spec->async_dma || spec->unroll_k;
         if(ctx->double_buffer)
         {
-            ctx->A_smem2 = rocke_b_smem_alloc(b, rocke_f16(), a_shape, 2, "A_smem2");
-            ctx->B_smem2 = rocke_b_smem_alloc(b, rocke_f16(), b_shape, 2, "B_smem2");
+            ctx->A_smem2 = rocke_b_smem_alloc(
+                b, rocke_conv_tr_elem_dtype(spec->dtype_a), a_shape, 2, "A_smem2");
+            ctx->B_smem2 = rocke_b_smem_alloc(
+                b, rocke_conv_tr_elem_dtype(spec->dtype_b), b_shape, 2, "B_smem2");
         }
         else
         {
@@ -742,6 +764,9 @@ bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
             rocke_i_set_err(b, ROCKE_ERR_VALUE, "conv: wavelet tile loader from_tile failed");
             return false;
         }
+        /* Python build_wavelet_loaders(..., ir_dtype_a=, ir_dtype_b=) */
+        ctx->a_wavelet_loader.elem_dtype = rocke_conv_tr_elem_dtype(spec->dtype_a);
+        ctx->b_wavelet_loader.elem_dtype = rocke_conv_tr_elem_dtype(spec->dtype_b);
         ctx->have_wavelet_loaders = true;
 
         /* Wavelet local state: load_tid, is_math, K_iters, epi_barriers. */
@@ -784,6 +809,9 @@ bool rocke_conv_build_ctx_init(rocke_conv_build_ctx_t* ctx,
             rocke_i_set_err(b, ROCKE_ERR_VALUE, "conv: coalesced tile loader from_tile failed");
             return false;
         }
+        /* Python CoalescedTileLoader(..., elem_dtype=ir_dtype_{a,b}) */
+        ctx->a_sync_loader.elem_dtype = rocke_conv_tr_elem_dtype(spec->dtype_a);
+        ctx->b_sync_loader.elem_dtype = rocke_conv_tr_elem_dtype(spec->dtype_b);
         ctx->have_sync_loaders = true;
     }
 

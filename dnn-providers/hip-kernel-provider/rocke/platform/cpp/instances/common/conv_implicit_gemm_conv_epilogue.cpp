@@ -185,7 +185,11 @@ void rocke_conv_emit_direct_epilogue(rocke_ir_builder_t* b,
      * untouched and dense. */
     rocke_direct_epilogue_t epi;
 
-    epi.atom = rocke_mfma_atom("f16", spec->warp_tile_m, spec->warp_tile_n, spec->warp_tile_k);
+    /* spec.atom = mfma_atom(spec.data.dtype_a, warp_tile_m, warp_tile_n, warp_tile_k) */
+    epi.atom = rocke_mfma_atom(spec->dtype_a ? spec->dtype_a : "fp16",
+                               spec->warp_tile_m,
+                               spec->warp_tile_n,
+                               spec->warp_tile_k);
     epi.grid = *grid;
     epi.out_dtype = spec->dtype_d;
 
@@ -449,8 +453,11 @@ void rocke_conv_emit_cshuffle_epilogue(rocke_ir_builder_t* b,
     }
     else
     {
-        const rocke_mfma_atom_t* atom
-            = rocke_mfma_atom("f16", spec->warp_tile_m, spec->warp_tile_n, spec->warp_tile_k);
+        /* spec.atom = mfma_atom(spec.data.dtype_a, warp_tile_m, warp_tile_n, warp_tile_k) */
+        const rocke_mfma_atom_t* atom = rocke_mfma_atom(spec->dtype_a ? spec->dtype_a : "fp16",
+                                                        spec->warp_tile_m,
+                                                        spec->warp_tile_n,
+                                                        spec->warp_tile_k);
         epi = rocke_cshuffle_epilogue_from_grid(atom, grid, max_store_vec);
     }
     epi.out_dtype = spec->dtype_d;

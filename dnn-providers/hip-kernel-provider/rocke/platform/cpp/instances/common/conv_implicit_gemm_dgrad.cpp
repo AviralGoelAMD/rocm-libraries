@@ -2811,8 +2811,14 @@ static rocke_kernel_def_t*
             {
                 rocke_value_t* atom_row
                     = rocke_b_add(b, warp_m_off, rocke_b_const_i32(b, mi * spec->warp_tile_m));
-                a_rows[mi] = rocke_conv_emit_frag_smem_load(
-                    b, A_src, a_row_in_atom, a_k_in_atom, atom_row, k_tile_base, a_per_lane);
+                a_rows[mi] = rocke_conv_emit_frag_smem_load(b,
+                                                            A_src,
+                                                            a_row_in_atom,
+                                                            a_k_in_atom,
+                                                            atom_row,
+                                                            k_tile_base,
+                                                            a_per_lane,
+                                                            tr_dtype);
             }
             for(int ni = 0; ni < mfmas_n; ni++)
             {
@@ -2839,8 +2845,14 @@ static rocke_kernel_def_t*
                                                         tr_dtype);
                     continue;
                 }
-                b_wma_cols[ni] = rocke_conv_emit_frag_smem_load(
-                    b, B_src, b_col_in_atom, b_k_in_atom, atom_row, k_tile_base, b_per_lane);
+                b_wma_cols[ni] = rocke_conv_emit_frag_smem_load(b,
+                                                                B_src,
+                                                                b_col_in_atom,
+                                                                b_k_in_atom,
+                                                                atom_row,
+                                                                k_tile_base,
+                                                                b_per_lane,
+                                                                tr_dtype);
             }
             int flat2 = 0;
             for(int mi = 0; mi < mfmas_m; mi++)
@@ -3128,7 +3140,8 @@ static rocke_kernel_def_t*
                         b,
                         warp_m_off,
                         rocke_b_add(b, rocke_b_const_i32(b, mi * spec->warp_tile_m), m_in_atom));
-                    a_rows[mi] = rocke_conv_emit_smem_load(b, A_smem, a_row, col_base, a_per_lane);
+                    a_rows[mi] = rocke_conv_emit_smem_load(
+                        b, A_smem, a_row, col_base, a_per_lane, tr_dtype);
                 }
 
                 rocke_value_t* b_cols[ROCKE_CONV_MAX_ACCS];
@@ -3160,7 +3173,8 @@ static rocke_kernel_def_t*
                         b,
                         warp_n_off,
                         rocke_b_add(b, rocke_b_const_i32(b, ni * spec->warp_tile_n), n_in_atom));
-                    b_cols[ni] = rocke_conv_emit_smem_load(b, B_smem, b_row, col_base, b_per_lane);
+                    b_cols[ni] = rocke_conv_emit_smem_load(
+                        b, B_smem, b_row, col_base, b_per_lane, tr_dtype);
                 }
 
                 int flat = 0;
