@@ -2039,6 +2039,31 @@ def _grouped_direct_tile(p: DirectConvProblem) -> Tuple[int, int, int]:
     return (16, 4 if p.cpg <= 8 else 2, 1)
 
 
+# Depthwise dgrad CTA-count thresholds (CTAs at the default 4-wide strip).
+# Below one CTA per CU the launch is latency-bound and a 1-wide strip, with
+# four times the CTAs, wins; up to _DW_DGRAD_WIDE_CTAS a 2-wide strip helps
+# when the map is wide next to the filter, so the extra halo stays cheap.
+_DW_DGRAD_TINY_CTAS = 256
+_DW_DGRAD_WIDE_CTAS = 1024
+
+
+def _dw_dgrad_tile(p: DirectConvProblem) -> Tuple[int, int]:
+    """(block_w, block_waves) for the streaming depthwise dgrad kernel.
+
+    The kernel streams every dY row inside one CTA, so its parallelism is
+    only ``ceil(W / block_w) * ceil(C / 64) * N`` CTAs of one wave each.
+    Counters on the 4-wide strip show low occupancy and an idle memory unit,
+    i.e. too few waves in flight rather than too little bandwidth; the strip
+    width is the knob that adds CTAs.
+    """
+    ctas4 = -(-p.W // 4) * -(-p.groups // 64) * p.N
+    if ctas4 < _DW_DGRAD_TINY_CTAS:
+        return (1, 1)
+    if ctas4 < _DW_DGRAD_WIDE_CTAS and p.W >= 8 * p.KW:
+        return (2, 1)
+    return (4, 1)
+
+
 def _grouped_dgrad_tile(p: DirectConvProblem) -> Tuple[int, int, int]:
     """(block_q, block_groups, block_h) for grouped dgrad as the forward direct
     kernel over (dY, W^T): 8-row H tiles, a 32-wide Q strip and 4 groups per
@@ -2071,7 +2096,7 @@ def _make_gfx950_direct_candidate(kind: str) -> KernelCandidate:
         if kind == "dw_tiled":
             return _dw_tiled_tile(p)
         if kind == "dw_dgrad_stream":
-            return (4, 1)
+            return _dw_dgrad_tile(p)
         if kind == "grouped_dgrad":
             return _grouped_dgrad_tile(p)
         return _grouped_direct_tile(p)
