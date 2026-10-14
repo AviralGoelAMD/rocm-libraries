@@ -565,6 +565,45 @@ bool rocke_direct_depthwise_dgrad_is_valid_spec(const rocke_direct_depthwise_dgr
                                                 size_t reason_cap);
 
 /* ===================================================================== *
+ *  DirectDepthwiseDgradStreamSpec  (ho-streaming depthwise dgrad, any stride)
+ *
+ *  @dataclass(frozen=True)
+ *  class DirectDepthwiseDgradStreamSpec:
+ *      problem: DirectConvProblem
+ *      name: str = "direct_depthwise_dgrad_stream"
+ *      block_w: int = 8
+ *      block_waves: int = 1
+ *      wave_size: int = 64
+ *
+ *  Grid: (ceil(Wi / block_w), ceil(groups / block_ch), N)
+ *  Block: (block_waves * wave_size, 1, 1)
+ * ===================================================================== */
+typedef struct rocke_direct_depthwise_dgrad_stream_spec
+{
+    rocke_direct_conv_problem_t problem;
+    const char* name; /* default "direct_depthwise_dgrad_stream" */
+    int block_w; /* default 8  */
+    int block_waves; /* default 1  */
+    int wave_size; /* default 64 */
+} rocke_direct_depthwise_dgrad_stream_spec_t;
+
+rocke_direct_depthwise_dgrad_stream_spec_t rocke_direct_depthwise_dgrad_stream_spec_default(void);
+int rocke_direct_depthwise_dgrad_stream_threads_per_block(
+    const rocke_direct_depthwise_dgrad_stream_spec_t* spec);
+int rocke_direct_depthwise_dgrad_stream_block_ch(
+    const rocke_direct_depthwise_dgrad_stream_spec_t* spec);
+rocke_status_t rocke_direct_depthwise_dgrad_stream_kernel_name(
+    const rocke_direct_depthwise_dgrad_stream_spec_t* spec, char* out, size_t out_cap);
+rocke_status_t rocke_direct_depthwise_dgrad_stream_validate(
+    const rocke_direct_depthwise_dgrad_stream_spec_t* spec, char* reason, size_t reason_cap);
+/* is_valid_depthwise_dgrad_stream_spec(spec, arch) */
+bool rocke_direct_depthwise_dgrad_stream_is_valid_spec(
+    const rocke_direct_depthwise_dgrad_stream_spec_t* spec,
+    const char* arch,
+    char* reason,
+    size_t reason_cap);
+
+/* ===================================================================== *
  *  DirectConvWgradSpec  (backward-weights, dW = dY^T * X)
  *
  *  @dataclass(frozen=True)
@@ -764,6 +803,12 @@ rocke_kernel_def_t* rocke_build_direct_depthwise_dgrad(
     rocke_ir_builder_t* b, const rocke_direct_depthwise_dgrad_spec_t* spec, const char* arch);
 rocke_kernel_def_t* rocke_build_direct_depthwise_dgrad_new(
     rocke_ir_builder_t* b, const rocke_direct_depthwise_dgrad_spec_t* spec, const char* arch);
+/* build_direct_depthwise_dgrad_streaming(spec, arch). Ho-streaming depthwise
+ * dgrad (cpg=kpg=1, any stride): circular dX accumulator slots, W in registers. */
+rocke_kernel_def_t* rocke_build_direct_depthwise_dgrad_stream(
+    rocke_ir_builder_t* b, const rocke_direct_depthwise_dgrad_stream_spec_t* spec, const char* arch);
+rocke_kernel_def_t* rocke_build_direct_depthwise_dgrad_stream_new(
+    rocke_ir_builder_t* b, const rocke_direct_depthwise_dgrad_stream_spec_t* spec, const char* arch);
 
 /* build_direct_conv_wgrad(spec, arch). Same contract as the 16c entry for the
  * backward-weights kernel (delta register ring + S-row strip, fp32 atomic dW). */
@@ -958,6 +1003,13 @@ rocke_status_t
                                                char** out_ll,
                                                char* err,
                                                size_t err_cap);
+rocke_status_t rocke_direct_depthwise_dgrad_stream_lower_to_llvm(
+    const rocke_direct_depthwise_dgrad_stream_spec_t* spec,
+    const char* arch,
+    rocke_llvm_flavor_t flavor,
+    char** out_ll,
+    char* err,
+    size_t err_cap);
 
 rocke_status_t rocke_direct_conv_wgrad_lower_to_llvm(const rocke_direct_conv_wgrad_spec_t* spec,
                                                      const char* arch,

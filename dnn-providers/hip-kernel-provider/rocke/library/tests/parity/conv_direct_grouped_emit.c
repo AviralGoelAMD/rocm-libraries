@@ -45,7 +45,8 @@ enum
     KIND_DW_TILED = 11,
     KIND_GENERIC = 12,
     KIND_TRANSPOSE = 13,
-    KIND_REORG = 14
+    KIND_REORG = 14,
+    KIND_DW_DGRAD_STREAM = 15
 };
 
 #define NONGROUPED_CFG_BASE 42
@@ -59,6 +60,8 @@ enum
  * 5 must-reject ones; the parametric DirectConvSpec + dgrad weight-transform
  * configs follow them. */
 #define GENERIC_CFG_BASE 75
+/* Streaming depthwise dgrad configs follow the 20 parametric / transform ones. */
+#define DW_DGRAD_STREAM_CFG_BASE 95
 
 static rocke_direct_conv_problem_t
     mk_dw_problem(int N, int H, int W, int groups, int KH, int PAD, int stride, const char* dtype)
@@ -96,6 +99,42 @@ static rocke_direct_conv_problem_t
     p.stride = 1;
     p.dtype = dtype;
     return p;
+}
+
+/* DirectDepthwiseDgradStreamSpec configs, emitted as DW_DGRAD_STREAM_CFG_BASE
+ * + idx (mirrors Python _dw_dgrad_stream_spec). Returns 0 on success, -1 past
+ * the last one. */
+static int
+    make_dw_dgrad_stream_cfg(int idx, rocke_direct_depthwise_dgrad_stream_spec_t* s, const char** arch)
+{
+    /* N, H, W, groups, KH, PAD, stride, bf16, cpg, block_w, block_waves, gfx942 */
+    static const int t[][12] = {
+        {2, 14, 14, 128, 3, 1, 1, 0, 1, 4, 1, 0},
+        {2, 14, 14, 128, 3, 1, 1, 1, 1, 4, 1, 0},
+        {2, 28, 28, 256, 3, 1, 2, 0, 1, 4, 1, 0},
+        {1, 28, 28, 192, 5, 2, 1, 1, 1, 2, 1, 0},
+        {2, 28, 28, 96, 5, 2, 2, 0, 1, 2, 1, 0},
+        {1, 7, 7, 512, 7, 3, 1, 0, 1, 1, 1, 0},
+        {1, 14, 14, 384, 7, 3, 2, 1, 1, 1, 1, 0},
+        {2, 16, 16, 64, 3, 0, 1, 0, 1, 8, 1, 0},
+        {2, 14, 14, 128, 3, 1, 1, 1, 1, 4, 2, 1},
+        {2, 20, 20, 64, 5, 1, 2, 0, 1, 4, 1, 0},
+        {1, 28, 28, 96, 7, 3, 1, 1, 1, 2, 1, 0},
+        /* Grouped (cpg = kpg = 2): both engines reject. */
+        {2, 14, 14, 64, 3, 1, 1, 0, 2, 4, 1, 0},
+    };
+    const int* r;
+    if(idx < 0 || idx >= (int)(sizeof t / sizeof t[0]))
+        return -1;
+    r = t[idx];
+    *s = rocke_direct_depthwise_dgrad_stream_spec_default();
+    s->problem = mk_dw_problem(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7] ? "bf16" : "fp16");
+    s->problem.cpg = r[8];
+    s->problem.kpg = r[8];
+    s->block_w = r[9];
+    s->block_waves = r[10];
+    *arch = r[11] ? "gfx942" : "gfx950";
+    return 0;
 }
 
 /* Parametric DirectConvSpec + MFMA dgrad weight-transform configs, emitted as
@@ -1364,11 +1403,21 @@ int main(int argc, char** argv)
     rocke_direct_conv_wgrad_spec_t swg;
     rocke_direct_conv_nongrouped_spec_t snongrouped;
     rocke_direct_depthwise_tiled_spec_t stiled;
+    rocke_direct_depthwise_dgrad_stream_spec_t sdgs;
     rocke_direct_conv_spec_t sgen;
     rocke_direct_transpose_weights_dgrad_spec_t stp;
     rocke_direct_reorganize_weights_spec_t sreorg;
     const char* arch = "gfx950";
-    if(idx >= GENERIC_CFG_BASE
+    if(idx >= DW_DGRAD_STREAM_CFG_BASE)
+    {
+        if(make_dw_dgrad_stream_cfg(idx - DW_DGRAD_STREAM_CFG_BASE, &sdgs, &arch) != 0)
+        {
+            fprintf(stderr, "unknown config index %d\n", idx);
+            return 2;
+        }
+        kind = KIND_DW_DGRAD_STREAM;
+    }
+    else if(idx >= GENERIC_CFG_BASE
        && make_generic_cfg(idx - GENERIC_CFG_BASE, &kind, &sgen, &stp, &sreorg) == 0)
     {
         /* selected above */
@@ -1424,6 +1473,8 @@ int main(int argc, char** argv)
         kernel = rocke_build_direct_reorganize_weights_new(&b, &sreorg, arch);
     else if(kind == KIND_DW_TILED)
         kernel = rocke_build_direct_depthwise_tiled_new(&b, &stiled, arch);
+    else if(kind == KIND_DW_DGRAD_STREAM)
+        kernel = rocke_build_direct_depthwise_dgrad_stream_new(&b, &sdgs, arch);
     else
         kernel = rocke_build_direct_depthwise_new(&b, &sdw, arch);
     if(kernel == NULL)

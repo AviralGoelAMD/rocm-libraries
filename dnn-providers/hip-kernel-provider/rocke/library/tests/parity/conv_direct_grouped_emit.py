@@ -33,6 +33,7 @@ from kernels.common.conv_direct_grouped import (
     DirectConvDgradSpec,
     DirectConvSpec,
     DirectDepthwiseDgradSpec,
+    DirectDepthwiseDgradStreamSpec,
     DirectReorganizeWeightsSpec,
     DirectTransposeWeightsDgradSpec,
     build_direct_conv,
@@ -47,6 +48,7 @@ from kernels.common.conv_direct_grouped import (
     build_direct_depthwise_tiled,
     build_direct_conv_dgrad,
     build_direct_depthwise_dgrad,
+    build_direct_depthwise_dgrad_streaming,
     build_direct_reorganize_weights,
     build_direct_transpose_weights_dgrad,
 )
@@ -90,6 +92,58 @@ _REJECT_CFG_BASE = 66
 # transpose / reorganize transforms baked and with runtime channels.
 # ---------------------------------------------------------------------------
 _GENERIC_CFG_BASE = 75
+# Ho-streaming depthwise dgrad (DirectDepthwiseDgradStreamSpec) configs follow
+# the 20 parametric / transform ones.
+_DW_DGRAD_STREAM_CFG_BASE = 95
+
+
+def _dw_dgrad_stream_spec(idx: int):
+    """Return (spec, arch) for streaming depthwise dgrad config ``idx``
+    (emitted as ``_DW_DGRAD_STREAM_CFG_BASE + idx``), or None past the last
+    one. Covers the dispatcher's strips (1/2/4, plus 8), stride 1/2, 3/5/7
+    filters, fp16/bf16, same and non-same padding, two waves, and a cpg != 1
+    spec both engines reject."""
+
+    def prob(N, H, W, groups, KH, PAD, stride=1, dtype="fp16", cpg=1):
+        return DirectConvProblem(
+            N=N,
+            H=H,
+            W=W,
+            groups=groups,
+            cpg=cpg,
+            kpg=cpg,
+            KH=KH,
+            KW=KH,
+            PAD=PAD,
+            stride=stride,
+            dtype=dtype,
+        )
+
+    table = {
+        0: (prob(2, 14, 14, 128, 3, 1), 4, 1, "gfx950"),
+        1: (prob(2, 14, 14, 128, 3, 1, dtype="bf16"), 4, 1, "gfx950"),
+        2: (prob(2, 28, 28, 256, 3, 1, stride=2), 4, 1, "gfx950"),
+        3: (prob(1, 28, 28, 192, 5, 2, dtype="bf16"), 2, 1, "gfx950"),
+        4: (prob(2, 28, 28, 96, 5, 2, stride=2), 2, 1, "gfx950"),
+        5: (prob(1, 7, 7, 512, 7, 3), 1, 1, "gfx950"),
+        6: (prob(1, 14, 14, 384, 7, 3, stride=2, dtype="bf16"), 1, 1, "gfx950"),
+        7: (prob(2, 16, 16, 64, 3, 0), 8, 1, "gfx950"),
+        8: (prob(2, 14, 14, 128, 3, 1, dtype="bf16"), 4, 2, "gfx942"),
+        9: (prob(2, 20, 20, 64, 5, 1, stride=2), 4, 1, "gfx950"),
+        10: (prob(1, 28, 28, 96, 7, 3, dtype="bf16"), 2, 1, "gfx950"),
+        # Grouped (cpg = kpg = 2): both engines reject.
+        11: (prob(2, 14, 14, 64, 3, 1, cpg=2), 4, 1, "gfx950"),
+    }
+    if idx not in table:
+        return None
+    p, block_w, block_waves, arch = table[idx]
+    return (
+        DirectDepthwiseDgradStreamSpec(
+            problem=p, block_w=block_w, block_waves=block_waves
+        ),
+        arch,
+    )
+
 
 
 def _gp(groups, cpg, kpg, *, N=2, H=20, W=24, KH=3, PAD=1, dtype="fp16"):
@@ -589,6 +643,11 @@ def _nongrouped_spec(idx: int):
 
 def _spec(idx: int):
     """Return (kind, spec, arch) for config index `idx`."""
+    if idx >= _DW_DGRAD_STREAM_CFG_BASE:
+        sel = _dw_dgrad_stream_spec(idx - _DW_DGRAD_STREAM_CFG_BASE)
+        if sel is not None:
+            return ("dw_dgrad_stream", *sel)
+        raise SystemExit(f"unknown config index {idx}")
     if idx == 0:
         p = DirectConvProblem(
             N=32, H=200, W=200, groups=16, cpg=16, kpg=16, KH=3, KW=3, PAD=1, stride=1
@@ -1250,6 +1309,8 @@ def main() -> int:
         kernel = build_direct_reorganize_weights(spec, arch=arch)
     elif kind == "dw_tiled":
         kernel = build_direct_depthwise_tiled(spec, arch=arch)
+    elif kind == "dw_dgrad_stream":
+        kernel = build_direct_depthwise_dgrad_streaming(spec, arch=arch)
     else:
         kernel = build_direct_depthwise(spec, arch=arch)
     if mode == "ll":
