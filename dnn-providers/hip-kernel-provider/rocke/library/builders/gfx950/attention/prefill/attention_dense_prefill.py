@@ -26,6 +26,7 @@ import json
 import math
 import os
 import sys
+from dataclasses import replace
 from typing import Any
 
 _HERE = os.path.dirname(__file__)
@@ -133,17 +134,16 @@ def _auto_wide_lds_dma(shape: dict[str, Any]) -> bool:
 
 def _dense_spec_id(shape: dict[str, Any]) -> str:
     """The gfx950 dense candidate the shape names: the grid or persistent body,
-    and wide DMA under persistent. A shape without ``wide_lds_dma`` gets the
-    shipped choice."""
+    and wide DMA under persistent. A persistent shape without ``wide_lds_dma``
+    gets the shipped choice; the grid body's wide DMA is its own default (see
+    :func:`make_spec_from_shape`)."""
     persistent = bool(shape.get("persistent", False))
+    if not persistent:
+        return "gfx950_dense_grid"
     if "wide_lds_dma" in shape:
         wide = bool(shape["wide_lds_dma"])
     else:
         wide = _auto_wide_lds_dma(shape)
-    if wide and not persistent:
-        raise ValueError("wide_lds_dma runs only on the persistent body (--persistent)")
-    if not persistent:
-        return "gfx950_dense_grid"
     return "gfx950_dense_persist_widedma" if wide else "gfx950_dense_persist"
 
 
@@ -154,6 +154,8 @@ def make_spec_from_shape(shape: dict[str, Any]) -> Gfx950AttentionDenseSpec:
     Persist and wide DMA pick the candidate (``spec_id``); every other field in
     the shape, the tile included, is a knob of it, applied through
     :func:`dispatch.attention.tuning_spec_with_knobs` so the kernel validates it.
+    The grid candidate already takes wide DMA wherever it is legal; a true
+    ``wide_lds_dma`` asks for it on the grid body explicitly.
     """
     req = AttentionRequest(
         batch=int(shape.get("batch", 1)),
@@ -182,7 +184,10 @@ def make_spec_from_shape(shape: dict[str, Any]) -> Gfx950AttentionDenseSpec:
     knobs = {
         name: coerce(shape[name]) for name, coerce in coercers.items() if name in shape
     }
-    return tuning_spec_with_knobs(req, _dense_spec_id(shape), knobs).kernel_spec
+    spec = tuning_spec_with_knobs(req, _dense_spec_id(shape), knobs).kernel_spec
+    if not spec.persistent and shape.get("wide_lds_dma") and not spec.wide_lds_dma:
+        spec = replace(spec, wide_lds_dma=True)
+    return spec
 
 
 def run_benchmark(

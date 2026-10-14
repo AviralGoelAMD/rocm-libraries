@@ -55,11 +55,17 @@ def _shape(builder, **kw):
 
 
 def test_cli_shapes_build(builder):
-    for kw in ({}, {"persistent": True}, {"persistent": True, "wide_lds_dma": True}):
+    # (flags, expected wide DMA): the grid body takes wide DMA by default on
+    # this aligned D128/BN64 shape; the persistent body only when asked.
+    for kw, wide in (
+        ({}, True),
+        ({"persistent": True}, False),
+        ({"persistent": True, "wide_lds_dma": True}, True),
+    ):
         shape = _shape(builder, **kw)
         spec = builder.make_spec_from_shape(shape)
         assert spec.persistent == kw.get("persistent", False)
-        assert spec.wide_lds_dma == kw.get("wide_lds_dma", False)
+        assert spec.wide_lds_dma == wide
         assert spec.block_n == shape["block_n"]
 
 
@@ -73,12 +79,14 @@ def test_the_tile_is_a_knob(builder):
             assert (spec.block_m, spec.block_n) == (block_m, block_n)
 
 
-def test_wide_lds_dma_needs_the_persistent_body_and_block_n_64(builder):
+def test_wide_lds_dma_needs_block_n_64(builder):
     shape = _shape(builder, wide_lds_dma=True)
-    with pytest.raises(ValueError, match="persistent"):
-        builder.make_spec_from_shape(shape)
-    with pytest.raises(ValueError):
-        builder.make_spec_from_shape({**shape, "persistent": True, "block_n": 128})
+    assert builder.make_spec_from_shape(shape).wide_lds_dma
+    for persistent in (False, True):
+        with pytest.raises(ValueError):
+            builder.make_spec_from_shape(
+                {**shape, "persistent": persistent, "block_n": 128}
+            )
     spec = builder.make_spec_from_shape({**shape, "persistent": True, "block_m": 128})
     assert spec.wide_lds_dma and spec.block_m == 128
 
@@ -88,5 +96,7 @@ def test_an_unset_wide_lds_dma_takes_the_shipped_choice(builder):
     del shape["wide_lds_dma"]
     assert builder.make_spec_from_shape(shape).wide_lds_dma
     assert not builder.make_spec_from_shape({**shape, "use_sinks": True}).wide_lds_dma
-    assert not builder.make_spec_from_shape({**shape, "persistent": False}).wide_lds_dma
+    assert builder.make_spec_from_shape({**shape, "persistent": False}).wide_lds_dma
     assert not builder.make_spec_from_shape({**shape, "block_n": 128}).wide_lds_dma
+    grid_bn128 = {**shape, "persistent": False, "block_n": 128}
+    assert not builder.make_spec_from_shape(grid_bn128).wide_lds_dma

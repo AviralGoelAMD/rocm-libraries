@@ -7,8 +7,9 @@ Unified-kernel candidates for gfx950 live in :mod:`.gfx950_unified`.
 
 The grid and persistent bodies are separate algorithms because they serve
 different requests: only the grid body runs a moving bottom-right causal
-diagonal. Wide DMA is a variant of the persistent algorithm (it requires the
-persistent body). Each candidate is identified the same way as a unified
+diagonal. Wide DMA is a variant of the persistent algorithm; the grid body
+takes it by default wherever it is legal (D128, the 64-key tile, aligned
+lengths, fixed diagonal). Each candidate is identified the same way as a unified
 tuning geometry: ``spec_id`` names it and ``tuning_id`` names one
 configuration from its knob space -- the tile (``block_m`` / ``block_n``)
 included -- with ``auto`` being the candidate's default spec. The candidates
@@ -107,9 +108,18 @@ def _ragged_self_attention(
     )
 
 
+def _grid_wide_lds_dma(
+    head_size: int, block_n: int, ragged: bool, moving_bottom_right: bool
+) -> bool:
+    """The grid body takes wide DMA wherever the slab layout is legal: D128,
+    the 64-key tile, aligned lengths, and the fixed (top-left) diagonal."""
+    return head_size == 128 and block_n == 64 and not ragged and not moving_bottom_right
+
+
 def _derived(base, knobs: Mapping[str, object]) -> Mapping[str, object]:
     """``ragged`` for the tile the knobs choose: non-tile-multiple
-    self-attention lengths take the on-chip ragged path."""
+    self-attention lengths take the on-chip ragged path. The grid body's wide
+    DMA follows the same tile."""
     block_m = int(knobs.get("block_m", base.block_m))
     block_n = int(knobs.get("block_n", base.block_n))
     ragged = _ragged_self_attention(
@@ -119,7 +129,12 @@ def _derived(base, knobs: Mapping[str, object]) -> Mapping[str, object]:
         block_n,
         moving_bottom_right=bool(base.causal_bottom_right),
     )
-    return {"ragged": ragged}
+    if base.persistent:
+        return {"ragged": ragged}
+    wide = _grid_wide_lds_dma(
+        int(base.head_size), block_n, ragged, bool(base.causal_bottom_right)
+    )
+    return {"ragged": ragged, "wide_lds_dma": wide}
 
 
 def _base_spec(req: AttentionRequest, variant: Gfx950DenseVariant):
@@ -185,7 +200,11 @@ def _base_spec(req: AttentionRequest, variant: Gfx950DenseVariant):
         ragged=ragged,
         sliding_window=int(req.sliding_window),
         use_sinks=bool(req.use_sinks),
-        wide_lds_dma=variant.wide_lds_dma,
+        wide_lds_dma=variant.wide_lds_dma
+        or (
+            not variant.persistent
+            and _grid_wide_lds_dma(int(req.hdim_q), bn, ragged, moving_bottom_right)
+        ),
         causal_bottom_right=moving_bottom_right,
         emit_lse=bool(req.emit_lse),
     )

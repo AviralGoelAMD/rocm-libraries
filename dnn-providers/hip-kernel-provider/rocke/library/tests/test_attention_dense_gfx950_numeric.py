@@ -888,9 +888,11 @@ class TestDenseBottomRightNumeric:
 
 
 # The wide-DMA candidate admits every mask the persistent body implements, not
-# only the causal no-sinks no-SWA shapes the cohort above routes to it.
+# only the causal no-sinks no-SWA shapes the cohort above routes to it. The grid
+# candidate takes wide DMA by default on these aligned D128/BN64 shapes.
 _WIDE_DMA_MASKS = [
     # (name, causal, sliding_window, use_sinks)
+    ("causal", True, 0, False),
     ("non_causal", False, 0, False),
     ("causal_sinks", True, 0, True),
     ("causal_swa", True, 128, False),
@@ -902,11 +904,14 @@ _WIDE_DMA_MASKS = [
 class TestWideDmaFeatures:
     @requires_gfx950_gpu
     @pytest.mark.gpu
+    @pytest.mark.parametrize(
+        "spec_id", ("gfx950_dense_persist_widedma", "gfx950_dense_grid")
+    )
     @pytest.mark.parametrize("dtype", ("bf16", "fp16"))
     @pytest.mark.parametrize("block_m", (256, 128))
     @pytest.mark.parametrize("_name,causal,sliding_window,use_sinks", _WIDE_DMA_MASKS)
     def test_wide_dma_numeric(
-        self, _name, causal, sliding_window, use_sinks, block_m, dtype
+        self, _name, causal, sliding_window, use_sinks, block_m, dtype, spec_id
     ):
         import torch
 
@@ -928,11 +933,12 @@ class TestWideDmaFeatures:
                 use_sinks=use_sinks,
                 sliding_window=sliding_window,
             ),
-            "gfx950_dense_persist_widedma",
+            spec_id,
             {"block_m": block_m},
         ).kernel_spec
         assert spec.wide_lds_dma
         assert spec.block_m == block_m
+        assert spec.persistent == (spec_id != "gfx950_dense_grid")
 
         tdt = getattr(torch, _TORCH_DT[dtype])
         torch.manual_seed(0)

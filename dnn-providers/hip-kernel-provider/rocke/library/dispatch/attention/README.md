@@ -136,10 +136,12 @@ catalogs live in the arch modules.
 
 The gfx950 grid and persistent bodies are separate algorithms because they
 serve different requests (only the grid body runs a moving bottom-right causal
-diagonal), and wide DMA exists only on the persistent body. Wide DMA has no
-ragged path, so where the 256×64 tile would be ragged its default starts at
-128×64; it records `block_m` in every id so one id names one tile on every
-problem.
+diagonal). Wide DMA is a persistent variant, and the grid candidate takes it
+by default wherever it is legal (D128, 64-key tile, aligned lengths, fixed
+diagonal; it follows the swept tile like `ragged`). Wide DMA has no ragged
+path, so where the 256×64 tile would be ragged the persistent wide variant's
+default starts at 128×64; it records `block_m` in every id so one id names one
+tile on every problem.
 
 Unified variant names are `attention_{arch}_u{path}_{variant_id}`, for example
 `attention_gfx950_u2d_narrow_nw1_mw16_t1xb_llvm` (the `spec_id` drops the

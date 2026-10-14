@@ -724,8 +724,10 @@ class TestGfx950DenseTuningSpace(unittest.TestCase):
         for knobs, inert in inert_partner:
             with self.subTest(**knobs):
                 self.assertNotIn(inert, canonical(**knobs))
+        # The grid default (wide DMA) resolves k_major; d_major is a real knob.
+        self.assertTrue(base.wide_lds_dma)
         self.assertEqual(
-            canonical(pv_loop_order="k_major"), {"pv_loop_order": "k_major"}
+            canonical(pv_loop_order="d_major"), {"pv_loop_order": "d_major"}
         )
         self.assertEqual(canonical(lazy_rescale=False), {"lazy_rescale": False})
 

@@ -939,6 +939,24 @@ class TestGfx950DenseCandidates(unittest.TestCase):
         self.assertFalse(_spec(req, _GRID).ragged)
         self.assertTrue(_spec(req, _GRID, block_m=256).ragged)
 
+    def test_grid_takes_wide_dma_where_legal(self):
+        """The grid default is wide DMA for aligned D128/BN64 with a fixed
+        diagonal, and the per-row DMA wherever the slab layout is illegal."""
+        d128 = dict(hdim_q=128, hdim_v=128, nhead_q=32, nhead_k=8)
+        aligned = _gfx950_dense_req(**d128, seqlen_q=2048, seqlen_k=2048)
+        self.assertTrue(_spec(aligned, _GRID).wide_lds_dma)
+        self.assertFalse(_spec(aligned, _GRID, block_n=128).wide_lds_dma)
+        self.assertFalse(_spec(_gfx950_dense_req(), _GRID).wide_lds_dma)
+        ragged = _gfx950_dense_req(**d128, seqlen_q=500, seqlen_k=500)
+        self.assertFalse(_spec(ragged, _GRID).wide_lds_dma)
+        moving = _gfx950_dense_req(**d128, seqlen_q=512, seqlen_k=1024, mask_type=2)
+        self.assertFalse(_spec(moving, _GRID).wide_lds_dma)
+        # A tile knob that makes the problem ragged drops wide DMA with it.
+        short = _gfx950_dense_req(**d128, seqlen_q=384, seqlen_k=384)
+        self.assertTrue(_spec(short, _GRID).wide_lds_dma)
+        self.assertFalse(_spec(short, _GRID, block_m=256).wide_lds_dma)
+        self.assertFalse(_spec(aligned, _PERSIST).wide_lds_dma)
+
     def test_wide_dma_starts_at_a_non_ragged_tile(self):
         """Wide DMA has no ragged path: where 256x64 is ragged its default is
         the 128x64 tile, and the same knob setting keeps one tuning_id across

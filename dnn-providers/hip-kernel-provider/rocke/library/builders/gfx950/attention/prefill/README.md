@@ -82,7 +82,8 @@ Hq64/Hkv8 S2048 dashboard shapes at NP=256.
 
 ### Wide LDS DMA
 
-`wide_lds_dma=True` is the gfx950 D128/BN64 persistent fast path. It changes the
+`wide_lds_dma=True` is the gfx950 D128/BN64 fast path, on both the grid and the
+persistent body. It changes the
 per-row 32-bit DMA layout into FlyDSL-compatible slabs:
 
 - K: `8 × 2 × 520` half elements per tile (`+8` padding per 512-half slab);
@@ -94,7 +95,10 @@ per-row 32-bit DMA layout into FlyDSL-compatible slabs:
 The dispatcher enables it for aligned persistent causal D128/BN64 fp16 and bf16
 shapes without sliding windows, sinks, or ragged lengths. GQA-pair selection is
 independent: MHA and GQA shapes whose pair equations do not hold still use wide
-DMA with qb-major or hkv-major work ordering.
+DMA with qb-major or hkv-major work ordering. The grid candidate
+(`gfx950_dense_grid`) takes wide DMA by default for D128/BN64 shapes with
+aligned lengths and a fixed (top-left) diagonal; D64, the 128-key tile, ragged
+lengths, and the moving bottom-right diagonal keep the per-row DMA.
 
 ## Measured (MI355X, bf16, D=128, Hq=128, Hkv=8, causal, Sq=8192)
 
