@@ -232,6 +232,9 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # K/V DMA (vmcnt(0)) before the first LDS read after it. The body's own
     # s_waitcnt + s_barrier already order each DMA before its reads.
     lds_dma_manual_wait: bool = field(default=False, kw_only=True)
+    # qk_lookahead only: KV tiles per loop trip (1 or 2). Two alternates the
+    # carried score registers instead of copying them at every back edge.
+    qk_lookahead_unroll: int = field(default=1, kw_only=True)
 
     def resolved_exp_per_pv_step(self) -> int:
         if self.exp_per_pv_step is not None:
@@ -433,6 +436,10 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
                     "qk_lookahead owns the softmax schedule; disable "
                     "pv_sched_group_template"
                 )
+        if self.qk_lookahead_unroll not in (1, 2):
+            raise ValueError(
+                f"qk_lookahead_unroll must be 1 or 2, got {self.qk_lookahead_unroll}"
+            )
 
     @property
     def resolved_persist_decode(self) -> str:
@@ -574,6 +581,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "qk_lookahead",
             "permlane32_reduce",
             "lds_dma_manual_wait",
+            "qk_lookahead_unroll",
         )
     }
 )
@@ -704,6 +712,7 @@ def build_attention_dense(
     PV_FENCE = spec.resolved_pv_sched_fence()
     PV_FENCE_MASK = int(spec.pv_sched_fence_mask)
     PV_PRIORITY = int(spec.pv_priority)
+    UNROLL = int(spec.qk_lookahead_unroll)
     IGLP = spec.resolved_iglp_mode()
     gqa = Hq // Hkv
     stride_q_tok = Hq * D
@@ -1587,11 +1596,27 @@ def build_attention_dense(
             return [m_new, l_new, *o_acc, *s_next_v]
 
         def la_loop(lo, hi, args, mask_next, tag):
-            """KV loop over [lo, hi)."""
-            lp = b.scf_for_iter(lo, hi, b.const_i32(1), args, iv_name=tag)
-            with lp as (j, carry):
+            """KV loop over [lo, hi). ``qk_lookahead_unroll=2`` emits two tiles per
+            trip, so the carried scores alternate between two register sets
+            instead of being copied back at every back edge, plus a 0/1-trip
+            remainder loop."""
+            if UNROLL == 1:
+                lp = b.scf_for_iter(lo, hi, b.const_i32(1), args, iv_name=tag)
+                with lp as (j, carry):
+                    b.scf_yield(*la_body(j, carry, mask_next))
+                return lp
+            span = b.sub(hi, lo)
+            span = b.select(b.cmp_lt(span, b.const_i32(0)), b.const_i32(0), span)
+            hi2 = b.add(lo, b.mul(b.div(span, b.const_i32(2)), b.const_i32(2)))
+            lp2 = b.scf_for_iter(lo, hi2, b.const_i32(2), args, iv_name=tag + "2")
+            with lp2 as (j, carry):
+                c1 = la_body(j, carry, mask_next)
+                b.scf_yield(*la_body(b.add(j, b.const_i32(1)), c1, mask_next))
+            rem_args = [(name + "_r", val) for (name, _), val in zip(args, lp2.results)]
+            lp1 = b.scf_for_iter(hi2, hi, b.const_i32(1), rem_args, iv_name=tag + "1")
+            with lp1 as (j, carry):
                 b.scf_yield(*la_body(j, carry, mask_next))
-            return lp
+            return lp1
 
         last = b.sub(n_upper, b.const_i32(1))
         if causal and spec.causal_diag_split:
