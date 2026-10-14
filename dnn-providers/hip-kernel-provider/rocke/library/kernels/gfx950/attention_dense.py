@@ -2106,11 +2106,20 @@ def _build_attention_dense_persistent(spec: AttentionDenseSpec) -> KernelDef:
             for nsub in range(N_SUB):
                 for i in range(16):
                     l_local = b.fadd(l_local, p[nsub][i])
-            l_tile = b.fadd(l_local, b.warp_shuffle_xor(l_local, 32))
+            if spec.defer_row_sum:
+                l_tile = l_local
+            else:
+                l_tile = b.fadd(l_local, b.warp_shuffle_xor(l_local, 32))
             if use_sinks:
                 # Rescale l_i by alpha: when m_new > m_i, multiply by alpha to change
                 # the sink's contribution from exp(sink - m_i) to exp(sink - m_new).
-                l_tile = b.fadd(l_tile, b.fmul(l_i, alpha))
+                sink_l = b.fmul(l_i, alpha)
+                if spec.defer_row_sum:
+                    # Per-half partials: only half 0 carries the sink term.
+                    sink_l = b.select(
+                        b.cmp_eq(lane_h, b.const_i32(0)), sink_l, b.const_f32(0.0)
+                    )
+                l_tile = b.fadd(l_tile, sink_l)
             return m_new, alpha, p, l_tile
 
         def relayout_p(p):
@@ -2221,7 +2230,10 @@ def _build_attention_dense_persistent(spec: AttentionDenseSpec) -> KernelDef:
             for nsub in range(N_SUB):
                 for i in range(16):
                     l_local = b.fadd(l_local, p_vals[nsub][i])
-            l_tile = b.fadd(l_local, b.warp_shuffle_xor(l_local, 32))
+            if spec.defer_row_sum:
+                l_tile = l_local
+            else:
+                l_tile = b.fadd(l_local, b.warp_shuffle_xor(l_local, 32))
             return out, p_vals, l_tile
 
         _rs_ctr = [0]
@@ -2401,6 +2413,8 @@ def _build_attention_dense_persistent(spec: AttentionDenseSpec) -> KernelDef:
 
         res = loop.results
         l_i = res[1]
+        if spec.defer_row_sum:
+            l_i = b.fadd(l_i, b.warp_shuffle_xor(l_i, 32))
         o_acc = list(res[2 : 2 + D_TILES])
         p_prev = list(res[2 + D_TILES : 2 + D_TILES + KK_STEPS])
 
