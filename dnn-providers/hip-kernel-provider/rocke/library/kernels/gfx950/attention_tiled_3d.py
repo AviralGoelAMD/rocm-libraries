@@ -168,6 +168,13 @@ class UnifiedAttention3DTiledSpec:
     # ``UnifiedAttention2DTiledSpec.use_f32_denormal_flush``. Default OFF
     # (golden-safe); the gfx950 dispatcher sets it (_enable_f32_denormal_flush).
     use_f32_denormal_flush: bool = False
+    # All-decode launch contract (every sequence has at most one query token):
+    # the grid's x axis is exactly ``num_seqs`` and CTA x owns sequence x, so
+    # the per-CTA ``cu_q`` binary search (a chain of dependent global loads)
+    # and the over-provisioned ``total_q // BLOCK_Q + num_seqs`` grid are both
+    # dropped. Mirrors AITER's ``ALL_DECODE`` program order. The launcher must
+    # size grid x to ``num_seqs`` when this is set.
+    decode_fast_path: bool = False
 
     def __post_init__(self):
         if type(self.use_f32_denormal_flush) is not bool:
@@ -242,6 +249,7 @@ class UnifiedAttention3DTiledSpec:
             # so it stays the last tag.
             "ftz" if self.use_f32_denormal_flush else "",
             "stridedkv" if self.kv_layout == "strided" else "",
+            "dec" if self.decode_fast_path else "",
         )
 
 
@@ -428,23 +436,32 @@ def build_unified_attention_3d_tiled(
     seg_idx = b.block_id_z()
     tid = b.thread_id_x()
 
-    seq_idx = _binary_search_seq_idx_helper(
-        b,
-        cu_q,
-        q_block_global_idx,
-        num_seqs_p,
-        block_q=BLOCK_Q,
-        iterations=spec.binary_search_iters,
-    )
+    if spec.decode_fast_path:
+        # One CTA row per sequence: no dependent cu_q search, and the
+        # sequence's single query block is always local block 0.
+        seq_idx = q_block_global_idx
+    else:
+        seq_idx = _binary_search_seq_idx_helper(
+            b,
+            cu_q,
+            q_block_global_idx,
+            num_seqs_p,
+            block_q=BLOCK_Q,
+            iterations=spec.binary_search_iters,
+        )
     cu_q_start = b.global_load_i32(cu_q, seq_idx)
     cu_q_stop = b.global_load_i32(cu_q, b.add(seq_idx, b.const_i32(1)))
     cur_batch_q_len = b.sub(cu_q_stop, cu_q_start)
-    q_block_start_idx = b.add(b.div(cu_q_start, b.const_i32(BLOCK_Q)), seq_idx)
-    q_block_local_idx = b.sub(q_block_global_idx, q_block_start_idx)
+    if not spec.decode_fast_path:
+        q_block_start_idx = b.add(b.div(cu_q_start, b.const_i32(BLOCK_Q)), seq_idx)
+        q_block_local_idx = b.sub(q_block_global_idx, q_block_start_idx)
     seq_len = b.global_load_i32(seq_lens, seq_idx)
     context_len = b.sub(seq_len, cur_batch_q_len)
 
-    qb_start_pos = b.mul(q_block_local_idx, b.const_i32(BLOCK_Q))
+    if spec.decode_fast_path:
+        qb_start_pos = b.const_i32(0)
+    else:
+        qb_start_pos = b.mul(q_block_local_idx, b.const_i32(BLOCK_Q))
     with b.scf_if(b.cmp_ge(qb_start_pos, cur_batch_q_len)):
         b.ret()
 
