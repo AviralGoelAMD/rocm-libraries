@@ -353,17 +353,41 @@ def _lds_mainloop(
     a_slots = copy_slots(TM, m_cta)
     b_slots = copy_slots(TN, n_cta)
 
+    def scale_bytes(tr):
+        """E8M0 scale bytes (one per lane per operand row/col) of step ``tr``.
+        Issued together with the step's panel loads so their latency overlaps
+        the panel loads (and, with ``prefetch``, the previous step's MFMAs)
+        instead of stalling the MFMAs after the LDS barrier."""
+        if not cfg.scaled_mfma:
+            return []
+        out = []
+        k_step = b.mul(tr, b.const_i32(loop_k))
+        for t in range(atoms_per_iter):
+            k0 = b.add(k_step, b.const_i32(t * atom.k)) if t else k_step
+            kgrp = b.add(b.div(k0, b.const_i32(32)), k_blk)
+            out += [
+                b.zext(b.global_load_i8(AScale, b.add(b.mul(r, b.const_i32(K // 32)), kgrp)), I32)
+                for r in a_rows
+            ]
+            out += [
+                b.zext(b.global_load_i8(BScale, b.add(b.mul(c, b.const_i32(K // 32)), kgrp)), I32)
+                for c in b_cols
+            ]
+        return out
+
     def gload(tr):
         k0 = b.mul(tr, b.const_i32(loop_k))
         out = [b.global_load_vN(A, b.add(g, k0), dtype, 16) for _, _, g in a_slots]
         out += [b.global_load_vN(Bp, b.add(g, k0), dtype, 16) for _, _, g in b_slots]
-        return out
+        return out + scale_bytes(tr)
+
+    n_panel = len(a_slots) + len(b_slots)
 
     def sstore(vals):
         na = len(a_slots)
         for (r, col, _), v in zip(a_slots, vals[:na]):
             b.smem_store_vN(A_s, [r, col], v, 16)
-        for (r, col, _), v in zip(b_slots, vals[na:]):
+        for (r, col, _), v in zip(b_slots, vals[na:n_panel]):
             b.smem_store_vN(B_s, [r, col], v, 16)
 
     a_lrow = [b.add(b.mul(wm, b.const_i32(16 * cfg.mfma_m)), b.add(b.const_i32(16 * mi), lane16))
@@ -380,23 +404,13 @@ def _lds_mainloop(
         c0 = b.add(b.const_i32(t * atom.k), b.mul(k_blk, b.const_i32(atom.a_per_lane)))
         return b.smem_load_vN(smem, row, c0, dtype=dtype, n=atom.a_per_lane)
 
-    def frags_from_lds(tr):
+    def frags_from_lds(scales):
         flat = []
-        k_step = b.mul(tr, b.const_i32(loop_k))
+        n_sc = cfg.mfma_m + cfg.mfma_n
         for t in range(atoms_per_iter):
             flat += [read_frag(A_s, r, t) for r in a_lrow]
             flat += [read_frag(B_s, r, t) for r in b_lrow]
-            if cfg.scaled_mfma:
-                k0 = b.add(k_step, b.const_i32(t * atom.k)) if t else k_step
-                kgrp = b.add(b.div(k0, b.const_i32(32)), k_blk)
-                flat += [
-                    b.zext(b.global_load_i8(AScale, b.add(b.mul(r, b.const_i32(K // 32)), kgrp)), I32)
-                    for r in a_rows
-                ]
-                flat += [
-                    b.zext(b.global_load_i8(BScale, b.add(b.mul(c, b.const_i32(K // 32)), kgrp)), I32)
-                    for c in b_cols
-                ]
+            flat += scales[t * n_sc : (t + 1) * n_sc]
         return flat
 
     n_acc = cfg.mfma_m * cfg.mfma_n
@@ -417,7 +431,7 @@ def _lds_mainloop(
         if cfg.prefetch:
             tn = b.add(tr, b.const_i32(1))
             nxt = gload(b.select(b.cmp_lt(tn, tr_hi), tn, tr))
-        accs = compute_step(frags_from_lds(tr), tr, accs)
+        accs = compute_step(frags_from_lds(regs[n_panel:]), tr, accs)
         b.scf_yield(*accs, *nxt)
     return list(loop.results)[:n_acc]
 
