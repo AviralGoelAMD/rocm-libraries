@@ -5,7 +5,8 @@
 
 Shared by the gfx942 and gfx950 dense prefill kernels: the IR helpers emit the
 optional LSE store and empty-row output masking; ``validate_dense_lse`` is the
-host-side contract for the caller-owned LSE buffer.
+host-side contract for the caller-owned LSE buffer, and
+``validate_packed_offsets`` the packed varlen ``cu_seqlens`` contract.
 """
 
 from rocke.core.ir import I16, I32, IRBuilder, Value, VectorType
@@ -151,31 +152,54 @@ def validate_dense_lse(
             raise ValueError(f"{name} must be contiguous")
     if q.shape[0] != out.shape[0] or k.shape[0] != v.shape[0]:
         raise ValueError("packed output/value extents must match query/key extents")
-    for name, tensor, extent, tile, maximum, allow_empty in (
-        ("cu_seqlens_q", cu_seqlens_q, q.shape[0], spec.block_m, spec.seqlen_q, True),
-        (
-            "cu_seqlens_kv",
-            cu_seqlens_kv,
-            k.shape[0],
-            spec.block_n,
-            spec.seqlen_kv,
-            False,
-        ),
+    validate_packed_offsets(
+        spec, q, k, cu_seqlens_q, cu_seqlens_kv, every_kv_nonempty=True
+    )
+
+
+def validate_packed_offsets(
+    spec, q, k, cu_seqlens_q, cu_seqlens_kv, *, every_kv_nonempty
+):
+    """Host-check the packed varlen ``cu_seqlens`` contents (a device sync).
+
+    The packed body has no per-sequence tail handling: a q-block that straddles
+    a sequence end reads and writes the next sequence's rows, and the KV loop
+    floors the key count to whole ``block_n`` tiles. Query lengths must therefore
+    be ``block_m`` multiples within ``seqlen_q`` and key lengths ``block_n``
+    multiples within ``seqlen_kv``. A sequence with query rows needs keys (the
+    first KV tile is always computed); ``every_kv_nonempty`` extends that to
+    every sequence. Rejects instead of computing garbage.
+    """
+    import torch
+
+    q_lengths = None
+    for name, tensor, extent, tile, maximum in (
+        ("cu_seqlens_q", cu_seqlens_q, q.shape[0], spec.block_m, spec.seqlen_q),
+        ("cu_seqlens_kv", cu_seqlens_kv, k.shape[0], spec.block_n, spec.seqlen_kv),
     ):
         if tensor.dtype != torch.int32 or tuple(tensor.shape) != (spec.batch + 1,):
             raise ValueError(f"{name} must be int32 [batch+1]")
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
-        # The existing packed body has no per-sequence load-tail handling.
-        # This enabled-path content check synchronizes device offsets to host.
+        if not tensor.is_cuda or tensor.device != q.device:
+            raise ValueError(f"{name} must be on q's GPU device")
         offsets = tensor.tolist()
         if offsets[0] != 0 or offsets[-1] != extent:
             raise ValueError(f"{name} endpoints must span its packed tensor")
-        for start, stop in zip(offsets, offsets[1:]):
-            length = stop - start
+        lengths = [stop - start for start, stop in zip(offsets, offsets[1:])]
+        for seq, length in enumerate(lengths):
             if length < 0 or length > maximum or length % tile:
                 raise ValueError(
-                    f"{name} lengths must be monotone, tile-aligned, and within spec"
+                    f"{name} lengths must be monotone, tile-aligned, and within "
+                    f"spec: sequence {seq} has length {length} (tile {tile}, "
+                    f"max {maximum})"
                 )
-            if not allow_empty and length == 0:
-                raise ValueError("LSE-enabled packed KV sequences must be nonempty")
+            if length == 0 and q_lengths is not None:
+                if every_kv_nonempty:
+                    raise ValueError("LSE-enabled packed KV sequences must be nonempty")
+                if q_lengths[seq]:
+                    raise ValueError(
+                        f"packed sequence {seq} has {q_lengths[seq]} query rows "
+                        "but no keys"
+                    )
+        q_lengths = lengths

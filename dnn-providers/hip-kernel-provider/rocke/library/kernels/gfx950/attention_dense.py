@@ -92,6 +92,7 @@ from kernels.gfx950.attention_tiled_2d import _mfma_32x32_c_row, _mfma_32x32_c_c
 from kernels.common._lse_store import (
     dense_row_has_key,
     lse_store,
+    validate_packed_offsets,
     validate_dense_lse,
     zero_keyless_row,
 )
@@ -2556,6 +2557,7 @@ def run_attention_dense_torch(
     sinks=None,
     validate_paged: bool = True,
     lse=None,
+    validate_varlen: bool = True,
 ):
     """High-level framework entry: compile (cached) + launch the dense prefill
     kernel on torch tensors. ``q``/``k``/``v``/``out`` are dense contiguous
@@ -2575,9 +2577,14 @@ def run_attention_dense_torch(
     Fully masked real rows write O=0 and LSE=-inf; with a finite attention sink,
     those rows instead write the sink logit as LSE. Invalid padded rows do not
     write. Supplying ``lse`` with ``emit_lse=False`` is an error.
-    The enabled varlen path checks cumulative offsets on the host (a device
-    sync): Q lengths must be block_m multiples, KV lengths positive block_n
-    multiples, and both must be within their spec maxima.
+    Varlen offsets are host-checked (a device sync): Q lengths must be block_m
+    multiples, KV lengths block_n multiples, both within their spec maxima, and
+    a sequence with query rows must have keys. The packed body has no
+    per-sequence tail handling, so other lengths are rejected rather than
+    computed (they would read and write neighbouring sequences). With
+    ``emit_lse`` the check always runs and every KV length must be positive;
+    otherwise ``validate_varlen=False`` skips it on the hot / graph-captured
+    path and the contract becomes the caller's responsibility.
 
     Arbitrary (non-256-multiple) sequence lengths are served WITHOUT host
     padding by the in-kernel ragged path: build ``spec`` with ``ragged=True``
@@ -2628,6 +2635,10 @@ def run_attention_dense_torch(
         )
     if not spec.varlen and (cu_seqlens_q is not None or cu_seqlens_kv is not None):
         raise ValueError("cu_seqlens_* provided but spec.varlen is False")
+    if spec.varlen and validate_varlen and not spec.emit_lse:
+        validate_packed_offsets(
+            spec, q, k, cu_seqlens_q, cu_seqlens_kv, every_kv_nonempty=False
+        )
     if spec.paged and (block_tables is None or kv_lens is None):
         raise ValueError("paged=True requires block_tables and kv_lens")
     if not spec.paged and (block_tables is not None or kv_lens is not None):

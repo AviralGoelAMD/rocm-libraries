@@ -1792,5 +1792,118 @@ class TestDenseLseNumeric:
                     _DENSE_LAUNCHER_CACHE[key] = entry
 
 
+@requires_gfx950_gpu
+@pytest.mark.gpu
+class TestDensePackedVarlenContract:
+    """Packed varlen without LSE: per-sequence lengths the packed body cannot
+    serve are rejected before launch; served lengths stay correct and
+    deterministic."""
+
+    @staticmethod
+    def _spec(batch, seqlen):
+        return Gfx950AttentionDenseSpec(
+            batch=batch,
+            seqlen_q=seqlen,
+            seqlen_kv=seqlen,
+            num_query_heads=4,
+            num_kv_heads=1,
+            head_size=128,
+            dtype="bf16",
+            varlen=True,
+            block_m=128,
+        )
+
+    @pytest.mark.parametrize(
+        "seqlen, q_offsets, k_offsets",
+        [
+            # Partial q-blocks and a 1-token sequence: before the host check
+            # these launched, read and wrote neighbouring sequences' rows, and
+            # returned wrong and launch-to-launch varying output.
+            (896, [0, 300, 301, 1100], [0, 300, 301, 1100]),
+            (512, [0, 257, 768], [0, 256, 768]),
+            (512, [0, 256, 768], [0, 257, 768]),
+            # Query rows with no keys: the first KV tile is always computed.
+            (512, [0, 256, 768], [0, 0, 512]),
+            # Longer than the spec maximum: the grid has too few q-blocks.
+            (256, [0, 0, 512], [0, 256, 512]),
+        ],
+        ids=[
+            "unaligned-300-1-799",
+            "q-tail",
+            "kv-tail",
+            "q-without-keys",
+            "q-above-max",
+        ],
+    )
+    def test_unservable_lengths_rejected_before_launch(
+        self, seqlen, q_offsets, k_offsets
+    ):
+        spec = self._spec(len(q_offsets) - 1, seqlen)
+        q = torch.randn(q_offsets[-1], 4, 128, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(k_offsets[-1], 1, 128, device=q.device, dtype=q.dtype)
+        v = torch.randn_like(k)
+        out = torch.full_like(q, float("nan"))
+        cu_q = torch.tensor(q_offsets, device=q.device, dtype=torch.int32)
+        cu_k = torch.tensor(k_offsets, device=q.device, dtype=torch.int32)
+        with pytest.raises(ValueError, match="cu_seqlens|no keys"):
+            run_attention_dense_torch(
+                spec=spec,
+                q=q,
+                k=k,
+                v=v,
+                out=out,
+                scale=0.5,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_kv=cu_k,
+            )
+        torch.cuda.synchronize()
+        assert bool(torch.isnan(out).all())
+
+    def test_servable_lengths_correct_and_deterministic(self):
+        # Different aligned lengths, a fully empty sequence, and an empty query
+        # with keys (both early-exit) stay accepted.
+        q_offsets = [0, 256, 256, 256, 384, 1152]
+        k_offsets = [0, 256, 256, 384, 512, 1280]
+        spec = self._spec(5, 768)
+        torch.manual_seed(31)
+        q = torch.randn(q_offsets[-1], 4, 128, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(k_offsets[-1], 1, 128, device=q.device, dtype=q.dtype)
+        v = torch.randn_like(k)
+        cu_q = torch.tensor(q_offsets, device=q.device, dtype=torch.int32)
+        cu_k = torch.tensor(k_offsets, device=q.device, dtype=torch.int32)
+        scale = 1.0 / math.sqrt(128)
+        outs = []
+        for validate in (True, False):
+            out = torch.full_like(q, float("nan"))
+            run_attention_dense_torch(
+                spec=spec,
+                q=q,
+                k=k,
+                v=v,
+                out=out,
+                scale=scale,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_kv=cu_k,
+                validate_varlen=validate,
+            )
+            torch.cuda.synchronize()
+            outs.append(out)
+        for seq in range(5):
+            q0, q1 = q_offsets[seq : seq + 2]
+            k0, k1 = k_offsets[seq : seq + 2]
+            if q0 == q1:
+                continue
+            ref, _ = _lse_reference(
+                q[q0:q1].unsqueeze(0),
+                k[k0:k1].unsqueeze(0),
+                v[k0:k1].unsqueeze(0),
+                scale,
+                causal=True,
+            )
+            err = (outs[0][q0:q1].float() - ref[0]).abs().max().item()
+            assert err < _tolerance("bf16"), (seq, err)
+        assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
