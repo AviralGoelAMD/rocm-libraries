@@ -141,8 +141,10 @@ typedef struct rocke_gfx950_attn2d_build_ctx
      * during iteration i; PV reads V[i] from cur_buf. */
     bool V_DOUBLE_BUF;
     /* Pipeline levers (Python locals of the same names). */
-    bool K_LDS_SWZ, V_LDS_SWZ;
+    bool K_LDS_SWZ, V_LDS_SWZ, LDS_DMA_OVERLAP;
     int SWZ_CPR, SWZ_RPP_SHIFT, SWZ_HD_SHIFT;
+    const char* LDS_DMA_TAG; /* "dma" under LDS_DMA_OVERLAP, else NULL  */
+    const char* LDS_READ_TAG; /* "read" under LDS_DMA_OVERLAP, else NULL */
     /* fp8 K/V cache predicates */
     bool KV_FP8, FP8_MFMA_QK, FP8_MFMA_PV;
     bool REGISTER_PV, USE_MFMA_32X32, TRANSPOSED_QK_32X32;
@@ -457,6 +459,8 @@ rocke_value_t* rocke_gfx950_attn2d_k_swz_halves(rocke_gfx950_attn2d_build_ctx_t*
                                                 rocke_value_t* row);
 rocke_value_t* rocke_gfx950_attn2d_v_swz_halves(rocke_gfx950_attn2d_build_ctx_t* ctx,
                                                 rocke_value_t* row);
+/* _kv_publish_sync: b.sync(), or sync_lds_only under use_lds_dma_overlap. */
+void rocke_gfx950_attn2d_kv_publish_sync(rocke_gfx950_attn2d_build_ctx_t* ctx);
 
 /* ----- fp8 K/V cache loaders (lines 1798-2182) ----- */
 /* fp8 async-loader CTA-invariant scalars, emitted once in the preloop

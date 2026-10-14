@@ -353,12 +353,13 @@ rocke_value_t* rocke_b_smem_load_v4_f16(rocke_ir_builder_t* b,
     return rocke_i_op1(b, ROCKE_OP_TILE_SMEM_LOAD_V4, ops, 3, vt, &attrs, "a");
 }
 
-rocke_value_t* rocke_b_smem_load_vN(rocke_ir_builder_t* b,
-                                    rocke_value_t* smem,
-                                    rocke_value_t* const* indices,
-                                    int num_indices,
-                                    const rocke_type_t* dtype,
-                                    int n)
+rocke_value_t* rocke_b_smem_load_vN_scoped(rocke_ir_builder_t* b,
+                                           rocke_value_t* smem,
+                                           rocke_value_t* const* indices,
+                                           int num_indices,
+                                           const rocke_type_t* dtype,
+                                           int n,
+                                           const char* lds_dma_scope)
 {
     rocke_value_t** ops;
     int nops = 0;
@@ -433,8 +434,22 @@ rocke_value_t* rocke_b_smem_load_vN(rocke_ir_builder_t* b,
     rocke_attr_set_str(b, &attrs, "elem_type", dn);
     rocke_attr_set_int(b, &attrs, "vec", (int64_t)n);
     rocke_attr_set_int(b, &attrs, "rank", (int64_t)num_indices);
+    if(!rocke_i_set_lds_dma_scope(b, &attrs, lds_dma_scope, "smem_load_vN"))
+    {
+        return NULL;
+    }
     snprintf(hint, sizeof(hint), "av%d", n);
     return rocke_i_op1(b, ROCKE_OP_TILE_SMEM_LOAD_VN, ops, nops, vt, &attrs, hint);
+}
+
+rocke_value_t* rocke_b_smem_load_vN(rocke_ir_builder_t* b,
+                                    rocke_value_t* smem,
+                                    rocke_value_t* const* indices,
+                                    int num_indices,
+                                    const rocke_type_t* dtype,
+                                    int n)
+{
+    return rocke_b_smem_load_vN_scoped(b, smem, indices, num_indices, dtype, n, NULL);
 }
 
 rocke_value_t* rocke_b_smem_load_vN_f16(rocke_ir_builder_t* b,

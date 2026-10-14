@@ -188,6 +188,7 @@ typedef struct rocke_attention_tiled_2d_spec
     bool use_reverse_q_block_order; /* False */
     bool use_k_lds_xor_swizzle; /* False */
     bool use_v_lds_xor_swizzle; /* False */
+    bool use_lds_dma_overlap; /* False */
 } rocke_attention_tiled_2d_spec_t;
 
 /* Materialise every defaulted field (the dataclass defaults). The required

@@ -584,8 +584,29 @@ rocke_value_t* rocke_b_warp_shuffle_xor(rocke_ir_builder_t* b, rocke_value_t* v,
 
 /* ============================ transpose LDS reads ======================= */
 
+bool rocke_i_set_lds_dma_scope(rocke_ir_builder_t* b,
+                               rocke_attr_map_t* attrs,
+                               const char* lds_dma_scope,
+                               const char* what)
+{
+    if(!lds_dma_scope)
+        return true;
+    if(strcmp(lds_dma_scope, "dma") != 0 && strcmp(lds_dma_scope, "read") != 0)
+    {
+        rocke_i_set_err(b,
+                        ROCKE_ERR_VALUE,
+                        "%s: lds_dma_scope must be 'dma' or 'read', got '%s'",
+                        what,
+                        lds_dma_scope);
+        return false;
+    }
+    rocke_attr_set_str(b, attrs, "lds_dma_scope", lds_dma_scope);
+    return true;
+}
+
 /* Shared helper for the three ds_read_tr* ops: [smem, *indices] operands,
- * <count x dtype> result, attrs depend on the variant. */
+ * <count x dtype> result, attrs depend on the variant. `lds_dma_scope` is
+ * only ever non-NULL for ds_read_tr16_b64. */
 static rocke_value_t* rocke_flow_ds_read_tr(rocke_ir_builder_t* b,
                                             rocke_opcode_t opcode,
                                             rocke_value_t* smem,
@@ -594,7 +615,8 @@ static rocke_value_t* rocke_flow_ds_read_tr(rocke_ir_builder_t* b,
                                             const rocke_type_t* dtype,
                                             int vec_count,
                                             const char* hint,
-                                            bool attr_rank_elem)
+                                            bool attr_rank_elem,
+                                            const char* lds_dma_scope)
 {
     rocke_value_t** ops;
     const rocke_type_t* rty;
@@ -620,14 +642,17 @@ static rocke_value_t* rocke_flow_ds_read_tr(rocke_ir_builder_t* b,
     {
         rocke_attr_set_str(b, &attrs, "dtype", dtype->name);
     }
+    if(!rocke_i_set_lds_dma_scope(b, &attrs, lds_dma_scope, "ds_read_tr16_b64"))
+        return NULL;
     return rocke_i_op1(b, opcode, ops, num_indices + 1, rty, &attrs, hint);
 }
 
-rocke_value_t* rocke_b_ds_read_tr16_b64(rocke_ir_builder_t* b,
-                                        rocke_value_t* smem,
-                                        rocke_value_t* const* indices,
-                                        int num_indices,
-                                        const rocke_type_t* dtype)
+rocke_value_t* rocke_b_ds_read_tr16_b64_scoped(rocke_ir_builder_t* b,
+                                               rocke_value_t* smem,
+                                               rocke_value_t* const* indices,
+                                               int num_indices,
+                                               const rocke_type_t* dtype,
+                                               const char* lds_dma_scope)
 {
     if(!rocke_i_live(b))
         return NULL;
@@ -636,8 +661,25 @@ rocke_value_t* rocke_b_ds_read_tr16_b64(rocke_ir_builder_t* b,
             b, ROCKE_ERR_VALUE, "ds_read_tr16_b64 needs at least one index");
     if(!dtype)
         dtype = rocke_f16();
-    return rocke_flow_ds_read_tr(
-        b, ROCKE_OP_TILE_DS_READ_TR16_B64, smem, indices, num_indices, dtype, 4, "dtr16", true);
+    return rocke_flow_ds_read_tr(b,
+                                 ROCKE_OP_TILE_DS_READ_TR16_B64,
+                                 smem,
+                                 indices,
+                                 num_indices,
+                                 dtype,
+                                 4,
+                                 "dtr16",
+                                 true,
+                                 lds_dma_scope);
+}
+
+rocke_value_t* rocke_b_ds_read_tr16_b64(rocke_ir_builder_t* b,
+                                        rocke_value_t* smem,
+                                        rocke_value_t* const* indices,
+                                        int num_indices,
+                                        const rocke_type_t* dtype)
+{
+    return rocke_b_ds_read_tr16_b64_scoped(b, smem, indices, num_indices, dtype, NULL);
 }
 
 rocke_value_t* rocke_b_ds_read_tr16_b128(rocke_ir_builder_t* b,
@@ -653,8 +695,16 @@ rocke_value_t* rocke_b_ds_read_tr16_b128(rocke_ir_builder_t* b,
             b, ROCKE_ERR_VALUE, "ds_read_tr16_b128 needs at least one index");
     if(!dtype)
         dtype = rocke_f16();
-    return rocke_flow_ds_read_tr(
-        b, ROCKE_OP_TILE_DS_READ_TR16_B128, smem, indices, num_indices, dtype, 8, "dtr16w", true);
+    return rocke_flow_ds_read_tr(b,
+                                 ROCKE_OP_TILE_DS_READ_TR16_B128,
+                                 smem,
+                                 indices,
+                                 num_indices,
+                                 dtype,
+                                 8,
+                                 "dtr16w",
+                                 true,
+                                 NULL);
 }
 
 rocke_value_t* rocke_b_ds_read_tr_b8(rocke_ir_builder_t* b,
@@ -675,7 +725,7 @@ rocke_value_t* rocke_b_ds_read_tr_b8(rocke_ir_builder_t* b,
         return (rocke_value_t*)rocke_i_set_err(
             b, ROCKE_ERR_VALUE, "ds_read_tr_b8 needs at least one index");
     return rocke_flow_ds_read_tr(
-        b, ROCKE_OP_TILE_DS_READ_TR_B8, smem, indices, num_indices, dtype, 8, "dtr8", false);
+        b, ROCKE_OP_TILE_DS_READ_TR_B8, smem, indices, num_indices, dtype, 8, "dtr8", false, NULL);
 }
 
 /* ============================ LDS pointer arithmetic ==================== */
@@ -702,13 +752,14 @@ rocke_value_t*
     return rocke_i_op1(b, ROCKE_OP_TILE_SMEM_PTR_ADD, ops, 2, rocke_i64(), NULL, "lds_addr");
 }
 
-void rocke_b_async_buffer_load_lds_addr(rocke_ir_builder_t* b,
-                                        rocke_value_t* rsrc,
-                                        rocke_value_t* lds_addr,
-                                        rocke_value_t* voffset,
-                                        rocke_value_t* soffset,
-                                        int dwords,
-                                        int coherency)
+void rocke_b_async_buffer_load_lds_addr_scoped(rocke_ir_builder_t* b,
+                                               rocke_value_t* rsrc,
+                                               rocke_value_t* lds_addr,
+                                               rocke_value_t* voffset,
+                                               rocke_value_t* soffset,
+                                               int dwords,
+                                               int coherency,
+                                               const char* lds_dma_scope)
 {
     rocke_value_t* ops[4];
     rocke_attr_map_t attrs;
@@ -730,11 +781,25 @@ void rocke_b_async_buffer_load_lds_addr(rocke_ir_builder_t* b,
     attrs = rocke_i_attrs(b);
     rocke_attr_set_int(b, &attrs, "dwords", (int64_t)dwords);
     rocke_attr_set_int(b, &attrs, "aux", (int64_t)coherency);
+    if(!rocke_i_set_lds_dma_scope(b, &attrs, lds_dma_scope, "async_buffer_load_lds_addr"))
+        return;
     ops[0] = rsrc;
     ops[1] = lds_addr;
     ops[2] = voffset;
     ops[3] = soffset;
     rocke_i_op0(b, ROCKE_OP_TILE_ASYNC_BUFFER_LOAD_LDS_ADDR, ops, 4, &attrs);
+}
+
+void rocke_b_async_buffer_load_lds_addr(rocke_ir_builder_t* b,
+                                        rocke_value_t* rsrc,
+                                        rocke_value_t* lds_addr,
+                                        rocke_value_t* voffset,
+                                        rocke_value_t* soffset,
+                                        int dwords,
+                                        int coherency)
+{
+    rocke_b_async_buffer_load_lds_addr_scoped(
+        b, rsrc, lds_addr, voffset, soffset, dwords, coherency, NULL);
 }
 
 void rocke_b_async_buffer_load_lds(rocke_ir_builder_t* b,

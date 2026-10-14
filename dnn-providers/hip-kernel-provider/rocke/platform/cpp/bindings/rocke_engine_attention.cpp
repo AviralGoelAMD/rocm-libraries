@@ -830,6 +830,7 @@ rocke_attention_tiled_2d_spec_t t2d_build(const py::dict& d, Store& st)
         = a_bool(d, "use_reverse_q_block_order", s.use_reverse_q_block_order);
     s.use_k_lds_xor_swizzle = a_bool(d, "use_k_lds_xor_swizzle", s.use_k_lds_xor_swizzle);
     s.use_v_lds_xor_swizzle = a_bool(d, "use_v_lds_xor_swizzle", s.use_v_lds_xor_swizzle);
+    s.use_lds_dma_overlap = a_bool(d, "use_lds_dma_overlap", s.use_lds_dma_overlap);
     std::string v;
     if(a_str(d, "dtype", v))
         s.dtype = st.keep(v);
@@ -1376,6 +1377,7 @@ static py::dict spec_to_dict(const rocke_attention_tiled_2d_spec_t& s)
     d["use_reverse_q_block_order"] = s.use_reverse_q_block_order;
     d["use_k_lds_xor_swizzle"] = s.use_k_lds_xor_swizzle;
     d["use_v_lds_xor_swizzle"] = s.use_v_lds_xor_swizzle;
+    d["use_lds_dma_overlap"] = s.use_lds_dma_overlap;
     return d;
 }
 
