@@ -828,6 +828,8 @@ rocke_attention_tiled_2d_spec_t t2d_build(const py::dict& d, Store& st)
     s.use_mask_phase_split = a_bool(d, "use_mask_phase_split", s.use_mask_phase_split);
     s.use_reverse_q_block_order
         = a_bool(d, "use_reverse_q_block_order", s.use_reverse_q_block_order);
+    s.use_k_lds_xor_swizzle = a_bool(d, "use_k_lds_xor_swizzle", s.use_k_lds_xor_swizzle);
+    s.use_v_lds_xor_swizzle = a_bool(d, "use_v_lds_xor_swizzle", s.use_v_lds_xor_swizzle);
     std::string v;
     if(a_str(d, "dtype", v))
         s.dtype = st.keep(v);
@@ -1372,6 +1374,8 @@ static py::dict spec_to_dict(const rocke_attention_tiled_2d_spec_t& s)
     d["use_fp_contract"] = s.use_fp_contract;
     d["use_mask_phase_split"] = s.use_mask_phase_split;
     d["use_reverse_q_block_order"] = s.use_reverse_q_block_order;
+    d["use_k_lds_xor_swizzle"] = s.use_k_lds_xor_swizzle;
+    d["use_v_lds_xor_swizzle"] = s.use_v_lds_xor_swizzle;
     return d;
 }
 

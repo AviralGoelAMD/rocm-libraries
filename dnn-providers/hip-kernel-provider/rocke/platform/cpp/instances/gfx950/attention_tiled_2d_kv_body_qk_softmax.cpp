@@ -161,13 +161,14 @@ static rocke_value_t* fh_mfma_32x32x16(rocke_gfx950_attn2d_build_ctx_t* ctx,
     return rocke_mfma_attn_mfma_32x32x16_for_dtype(ctx->b, ctx->dtype, a, bv, c);
 }
 
+/* _read_k8_mfma_operand (shared with the loaders TU: the K swizzle and the
+ * fp8-in-LDS dequant live there). */
 static rocke_value_t* fh_read_k8_mfma_operand(rocke_gfx950_attn2d_build_ctx_t* ctx,
                                               rocke_value_t* buf,
                                               rocke_value_t* k_row,
                                               rocke_value_t* k_off)
 {
-    rocke_value_t* idx[3] = {buf, k_row, k_off};
-    return rocke_b_smem_load_vN(ctx->b, ctx->K_lds, idx, 3, ctx->dtype, 8);
+    return rocke_gfx950_attn2d_read_k8_mfma_operand(ctx, buf, k_row, k_off);
 }
 
 /* Post-QK V/K issue (Python 3963-3998; RING3 and the staggered V-double-buffer

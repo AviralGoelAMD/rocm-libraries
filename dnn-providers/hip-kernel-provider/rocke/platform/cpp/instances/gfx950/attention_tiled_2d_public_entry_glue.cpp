@@ -534,6 +534,31 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
                             "use_mask_phase_split requires no sliding window (the peel "
                             "assumes a monotone causal bound)");
     }
+    /* ---- transposed-32x32 pipeline levers (Python __post_init__). The
+     * use_kq_lds_pad exclusion of use_k_lds_xor_swizzle has no C counterpart:
+     * the K_lds slab pad is not carried in the C spec. ---- */
+    {
+        const bool transposed32 = spec->use_mfma_32x32 && spec->use_transposed_qk_32x32;
+        if(spec->use_k_lds_xor_swizzle || spec->use_v_lds_xor_swizzle)
+        {
+            if(!transposed32)
+                rocke_g950_fail(
+                    b, ROCKE_ERR_VALUE, "LDS XOR swizzle requires the transposed 32x32 path");
+            if(spec->kv_storage_dtype != NULL)
+                rocke_g950_fail(b, ROCKE_ERR_VALUE, "LDS XOR swizzle does not support FP8 KV");
+            if(spec->use_fast_paged_kv_desc)
+                rocke_g950_fail(
+                    b, ROCKE_ERR_VALUE, "LDS XOR swizzle does not support fast_paged_kv_desc");
+            if(!(spec->head_size == 64 || spec->head_size == 128 || spec->head_size == 256))
+                rocke_g950_fail(b,
+                                ROCKE_ERR_VALUE,
+                                "LDS XOR swizzle needs a power-of-two head_size >= 64");
+        }
+        if(spec->use_v_lds_xor_swizzle && !spec->use_transposed_half_local_pv)
+            rocke_g950_fail(b,
+                            ROCKE_ERR_VALUE,
+                            "use_v_lds_xor_swizzle requires use_transposed_half_local_pv");
+    }
     /* K single-buffer IS ported in the gfx950 C twin (it shares the
      * depth-2 V-single `else` schedule). Mirror Python __post_init__ guards so
      * incompatible combos reject with matching reasons rather than mis-emit. */
@@ -613,6 +638,21 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
     ctx->USE_SOFTMAX_INTERLEAVE = spec->use_softmax_mfma_interleave;
     ctx->SOFTMAX_INTERLEAVE_MODE = spec->softmax_interleave_mode;
     ctx->V_DOUBLE_BUF = spec->use_v_double_buffer;
+    ctx->K_LDS_SWZ = spec->use_k_lds_xor_swizzle;
+    ctx->V_LDS_SWZ = spec->use_v_lds_xor_swizzle;
+    {
+        /* SWZ_CPR = HD // 8; SWZ_RPP_SHIFT = max(0, (128 // HD).bit_length() - 1);
+         * SWZ_HD_SHIFT = HD.bit_length() - 1. */
+        int rpp = (spec->head_size > 0) ? 128 / spec->head_size : 0;
+        int rpp_bits = 0, hd_bits = 0;
+        for(int v = rpp; v > 0; v >>= 1)
+            ++rpp_bits;
+        for(int v = spec->head_size; v > 0; v >>= 1)
+            ++hd_bits;
+        ctx->SWZ_CPR = spec->head_size / 8;
+        ctx->SWZ_RPP_SHIFT = (rpp_bits - 1 > 0) ? rpp_bits - 1 : 0;
+        ctx->SWZ_HD_SHIFT = hd_bits - 1;
+    }
 
     /* ---- fp8 K/V cache predicates (Py783-797) ---- */
     const bool KV_FP8 = rocke_g950_streq(spec->kv_storage_dtype, "fp8e4m3");
@@ -1159,6 +1199,8 @@ static rocke_status_t rocke_g950_attn2d_kernel_name(const rocke_attention_tiled_
             s->use_f32_denormal_flush ? "ftz" : "",
             s->use_fp_contract ? "fpc" : "",
             s->use_reverse_q_block_order ? "rqb" : "",
+            s->use_k_lds_xor_swizzle ? "kswz" : "",
+            s->use_v_lds_xor_swizzle ? "vswz" : "",
         };
         size_t num_parts = sizeof(parts) / sizeof(parts[0]);
         return rocke_kernel_name_join(

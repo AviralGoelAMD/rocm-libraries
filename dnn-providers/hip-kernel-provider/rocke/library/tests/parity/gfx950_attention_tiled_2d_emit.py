@@ -961,6 +961,8 @@ _CONFIGS = {
     60: dict(_PIPE_D128_T64, use_mask_phase_split=True),
     61: dict(_PIPE_D128_T64, use_v_double_buffer=True, use_early_v_schedule=True),
     62: dict(_PIPE_D128_T64, use_reverse_q_block_order=True),
+    63: dict(_PIPE_D128_T64, use_k_lds_xor_swizzle=True),
+    64: dict(_PIPE_D128_T64, use_v_lds_xor_swizzle=True),
 }
 
 
