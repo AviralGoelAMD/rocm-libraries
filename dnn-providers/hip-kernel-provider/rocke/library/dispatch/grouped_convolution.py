@@ -1439,41 +1439,17 @@ def _wgrad_b_is_scalar(req: "ConvGroupedRequest") -> bool:
     return vec_b == 1
 
 
-def _wgrad_merge_degree(req: "ConvGroupedRequest") -> int:
-    """``group_merge`` for a gfx950 wgrad request: as much as the gate allows.
+# Depthwise wgrad tile ladder: the merge degree a wider tile buys must reach
+# _WGRAD_DW_TARGET_MERGE (or at least _WGRAD_DW_MIN_WIDE_MERGE on the widest
+# rung) before the tile is widened at all; otherwise the shipped 64-wide tile
+# and its own degree stand.
+_WGRAD_DW_TILE_N_LADDER = (64, 128, 256)
+_WGRAD_DW_TARGET_MERGE = 8
+_WGRAD_DW_MIN_WIDE_MERGE = 4
 
-    Depthwise wgrad is the degenerate case of the wgrad GEMM. ``wg_M = kpg = 1``
-    and ``wg_N = Y*X*cpg = Y*X``, so the tile covers a handful of filter taps
-    and the GEMM free axis is one element per group -- every dY/X load is
-    scalar. Merging ``Gm`` groups into one tile makes that run ``Gm`` elements
-    long, which is the whole reason merging helps: ``Gm`` *is* the load vector
-    width.
 
-    The policy is the kernel's own admissibility rule and nothing else, which
-    is worth being explicit about because it is the result of a fit rather than
-    an assumption. Measured across a depthwise wgrad corpus, merging to the
-    maximum admissible degree at the shipped tile was the best degree available
-    at that tile on four shapes in five, and within a couple of percent of the
-    best on all but one of the rest. Three candidate knobs were fitted on top
-    and all three were rejected:
-
-    * **A tile_n ladder.** Widening the tile is the only way a large filter
-      merges at all -- at the shipped 64 a 7x7 stage cannot merge, since
-      ``49 * 2 > 64``. It does raise the typical speedup, but it buys that with
-      a tail of shapes that regress by up to half, concentrated on the widest
-      rung. The exchange is bad for a dispatch default, which has to serve
-      shapes nobody measured: the upside is bounded and the downside is not.
-    * **A vectorisation cap** (stop merging once the run reaches the widest
-      buffer load). It only ever binds together with the ladder, since at a
-      fixed tile the ``spatial * Gm <= tile_n`` bound bites first on nearly
-      every shape.
-    * **A grid-occupancy floor** (refuse to merge past some number of surviving
-      CTAs). Merging divides the group axis of the grid by ``Gm``, but split-K
-      is resolved *after* merging and simply refills it, so the floor mostly
-      declines free speedup.
-
-    What is left needs no tuned constant, and that is the point: the rule is
-    the gate, so it cannot drift away from the gate.
+def _wgrad_merge_degree_at(req: "ConvGroupedRequest", tile_n: int) -> int:
+    """The largest admissible ``group_merge`` at a ``tile_n``-wide tile.
 
     Mirrors the three request-dependent clauses of
     :func:`kernels.common.conv_implicit_gemm_wgrad.wgrad_group_merge_available`
@@ -1500,9 +1476,47 @@ def _wgrad_merge_degree(req: "ConvGroupedRequest") -> int:
     spatial = p.Y * p.X * ((p.Z or 1) if p.is_3d else 1)
     best = 1
     for gm in _GROUP_MERGE_DEGREES:
-        if gm <= groups and groups % gm == 0 and spatial * gm <= _GFX950_TILE_N:
+        if gm <= groups and groups % gm == 0 and spatial * gm <= tile_n:
             best = gm
     return best
+
+
+def _wgrad_dw_tile_n(req: "ConvGroupedRequest") -> int:
+    """``tile_n`` for a gfx950 wgrad request.
+
+    Depthwise wgrad is the degenerate case of the wgrad GEMM. ``wg_M = kpg = 1``
+    and ``wg_N = Y*X*cpg = Y*X``, so the tile covers a handful of filter taps
+    and the GEMM free axis is one element per group -- every dY/X load is
+    scalar. Merging ``Gm`` groups into one tile makes that run ``Gm`` elements
+    long (``Gm`` *is* the load vector width), and ``spatial * Gm <= tile_n``
+    bounds it. At the shipped 64-wide tile a 3x3 filter stops at ``Gm = 4``
+    and a 7x7 one cannot merge at all (``49 * 2 > 64``).
+
+    So the tile is widened -- only for depthwise, and only as far as needed:
+    the narrowest rung of :data:`_WGRAD_DW_TILE_N_LADDER` that fits
+    :data:`_WGRAD_DW_TARGET_MERGE` groups, else the widest rung if that still
+    fits :data:`_WGRAD_DW_MIN_WIDE_MERGE` groups. A wide tile at a low degree
+    is mostly padding, which is how an unconditional ladder regresses; a shape
+    whose divisibility or filter leaves the wide rung below that floor keeps
+    the shipped tile and its degree. Everything that is not depthwise keeps the
+    shipped tile.
+    """
+    p = _problem(req)
+    if p.cpg != 1 or p.kpg != 1 or p.groups <= 1:
+        return _GFX950_TILE_N
+    for tile_n in _WGRAD_DW_TILE_N_LADDER:
+        if _wgrad_merge_degree_at(req, tile_n) >= _WGRAD_DW_TARGET_MERGE:
+            return tile_n
+    widest = _WGRAD_DW_TILE_N_LADDER[-1]
+    if _wgrad_merge_degree_at(req, widest) >= _WGRAD_DW_MIN_WIDE_MERGE:
+        return widest
+    return _GFX950_TILE_N
+
+
+def _wgrad_merge_degree(req: "ConvGroupedRequest") -> int:
+    """``group_merge`` for a gfx950 wgrad request: as much as the gate allows
+    at the tile :func:`_wgrad_dw_tile_n` picks."""
+    return _wgrad_merge_degree_at(req, _wgrad_dw_tile_n(req))
 
 
 def _make_gfx950_wgrad_candidate() -> KernelCandidate:
@@ -1537,7 +1551,7 @@ def _make_gfx950_wgrad_candidate() -> KernelCandidate:
             )
         return (
             _GFX950_TILE_M,
-            _GFX950_TILE_N,
+            _wgrad_dw_tile_n(req),
             _GFX950_TILE_K,
             _GFX950_WARP_M,
             _GFX950_WARP_N,
