@@ -1520,6 +1520,13 @@ def _wgrad_merge_degree(req: "ConvGroupedRequest") -> int:
 
 
 def _make_gfx950_wgrad_candidate() -> KernelCandidate:
+# Below this many reduction rows (N*Ho*Wo) a depthwise wgrad that already
+# merges groups at the shipped tile keeps it: the per-CTA reduction is too
+# short to repay the wider tile, and halving the CTA count on an already
+# small grid costs more than the wider loads save (batch-1 late-stage maps,
+# e.g. 14x14). A filter that cannot merge at all at the shipped tile (7x7)
+# still widens: there the wide tile is what turns scalar loads into vectors.
+_WGRAD_DW_SMALL_REDUCTION = 1024
     """Backward-weight conv for gfx950: 64×64×64, 2×2, 32×32×16 MFMA.
 
     Epilogue derived from vec_size_c (cshuffle when >1, default otherwise).
@@ -1578,6 +1585,11 @@ def _make_gfx950_wgrad_candidate() -> KernelCandidate:
         _ep, _sk = _wgrad_grouped_overrides(req)
         return WgradConvSpec(
             group_merge=_group_merge(req),
+    if (
+        p.N * p.Ho * p.Wo < _WGRAD_DW_SMALL_REDUCTION
+        and _wgrad_merge_degree_at(req, _GFX950_TILE_N) > 1
+    ):
+        return _GFX950_TILE_N
             problem=_problem(req),
             name=name,
             lds_k_outer=_wgrad_lds_k_outer(req, wtmn),
