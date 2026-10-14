@@ -175,6 +175,9 @@ typedef struct rocke_gfx950_attn_tiled_3d_config
     bool DECODE_FAST_PATH; /* spec.decode_fast_path                 */
     int TILE_MULT; /* kv_tile_mult if paged else 1 (build entry) */
     int PAGE_HALVES; /* BS * HD                               */
+    bool PREFETCH; /* spec.kv_prefetch                      */
+    bool PREFETCH_IDS; /* kv_prefetch and paged (build entry)   */
+    bool FP8_REG_PREFETCH; /* PREFETCH and KV_FP8                   */
 
     const rocke_type_t* dtype; /* F16 / BF16                                 */
     const rocke_type_t* kv_io_dtype; /* FP8E4M3 if KV_FP8 else dtype               */
@@ -307,8 +310,13 @@ typedef struct rocke_gfx950_attention_tiled_3d_build_ctx
     rocke_value_t* K_lds; /* [2, T, HD]                                */
     rocke_value_t* V_lds; /* [2, T, HD]                                */
     rocke_value_t* P_lds; /* [BLOCK_M, T]                              */
-    /* ---------- multi-page tiles ---------- */
+    /* ---------- multi-page tiles / block-id prefetch ---------- */
     rocke_value_t* last_page; /* last valid page of the sequence (clamp)    */
+    rocke_tensor_descriptor_t* phys_kv_desc; /* paged_kv_bytes addressed by physical block */
+    /* Extra loop-carried prefetch values (Python prefetch_carry, iter args
+     * kvpf<i>): raw fp8 chunks and/or block ids of the tiles ahead. */
+    rocke_value_t** pf_inits;
+    int n_pf;
 
     /* ---------- async DMA infra (lines 565-585) ---------- */
     rocke_value_t* big_bytes; /* const_i32(0x7FFF0000)                     */
@@ -404,13 +412,34 @@ rocke_value_t* rocke_gfx950_attention_tiled_3d_mfma_16x16_c_row(
 /* The three KV load issuers (closures over the descriptor + LDS bases). Each
  * takes the tile-index + double-buffer-index Values. _issue_k/_issue_v dispatch
  * by KV mode (fp8 sync dequant vs 4-DWORD async). is_value selects K vs V via
- * the ctx K/V handles + the K/V scale (fp8 path). */
+ * the ctx K/V handles + the K/V scale (fp8 path). block_ids (TILE_MULT entries,
+ * or NULL) are the tile's prefetched physical block ids (_tile_block_ids). */
 void rocke_gfx950_attention_tiled_3d_issue_k_load(rocke_gfx950_attention_tiled_3d_build_ctx_t* ctx,
                                                   rocke_value_t* kv_tile_idx,
-                                                  rocke_value_t* buf_idx); /* lines 603-616 */
+                                                  rocke_value_t* buf_idx,
+                                                  rocke_value_t* const* block_ids);
 void rocke_gfx950_attention_tiled_3d_issue_v_load(rocke_gfx950_attention_tiled_3d_build_ctx_t* ctx,
                                                   rocke_value_t* kv_tile_idx,
-                                                  rocke_value_t* buf_idx); /* lines 618-631 */
+                                                  rocke_value_t* buf_idx,
+                                                  rocke_value_t* const* block_ids);
+/* _tile_block_ids(kv_tile_idx): the TILE_MULT physical block ids of a tile
+ * (clamped to the last valid page).
+ * Returns an arena array of TILE_MULT values, or NULL when not PREFETCH_IDS
+ * (Python _ids()). */
+rocke_value_t**
+    rocke_gfx950_attention_tiled_3d_tile_block_ids(rocke_gfx950_attention_tiled_3d_build_ctx_t* ctx,
+                                                   rocke_value_t* kv_tile_idx);
+/* _fp8_raw_tile(kv_tile_idx, block_ids): raw <8 x fp8> K then V chunks of one
+ * tile into out[0 .. 2*fp8_chunks_per_thread). */
+void rocke_gfx950_attention_tiled_3d_fp8_raw_tile(rocke_gfx950_attention_tiled_3d_build_ctx_t* ctx,
+                                                  rocke_value_t* kv_tile_idx,
+                                                  rocke_value_t* const* block_ids,
+                                                  rocke_value_t** out);
+/* _fp8_stage_tile(raw, buf_idx): dequantize a raw tile into K/V LDS buf_idx. */
+void rocke_gfx950_attention_tiled_3d_fp8_stage_tile(
+    rocke_gfx950_attention_tiled_3d_build_ctx_t* ctx,
+    rocke_value_t* const* raw,
+    rocke_value_t* buf_idx);
 /* _issue_fp8_dequant_loads(..., lds_token): is_value selects K/V + scale; sync
  * per-thread fp8 -> cvt_pk_f32_fp8x4 -> *scale (UNFUSED fmul) -> dtype -> LDS
  * via rocke_dequant_fp8x8_to_dtype. */

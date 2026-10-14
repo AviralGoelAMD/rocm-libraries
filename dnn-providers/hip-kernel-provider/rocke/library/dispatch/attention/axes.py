@@ -128,11 +128,12 @@ _GFX950_FP_POLICY_AXES: Tuple[KnobAxis, ...] = (
     _flag("use_f32_denormal_flush"),
     _flag("use_fp_contract"),
 )
-# gfx950 split-KV decode-kernel knobs. The all-decode launch leads as an
-# enabler; the explicit spec builder rejects decode_fast_path for a problem
-# with max_seqlen_q > 1.
+# gfx950 split-KV decode-kernel knobs. The all-decode launch and the prefetch
+# lead as enablers; the explicit spec builder rejects decode_fast_path for a
+# problem with max_seqlen_q > 1.
 _GFX950_3D_AXES: Tuple[KnobAxis, ...] = (
     _flag("decode_fast_path", enabler=True),
+    _flag("kv_prefetch", enabler=True),
     *_3D_AXES,
     _flag("use_f32_denormal_flush"),
 )

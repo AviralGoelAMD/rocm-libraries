@@ -201,6 +201,8 @@ typedef struct rocke_unified_attention_3d_tiled_spec
     bool decode_fast_path; /* False */
     /* KV tile = kv_tile_mult paged blocks (1, 2, 4 or 8). */
     int kv_tile_mult; /* 1 */
+    /* Prefetch the next tile's K and V (and its block-table ids) one tile ahead. */
+    bool kv_prefetch; /* False */
 } rocke_unified_attention_3d_tiled_spec_t;
 
 rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_default(void);

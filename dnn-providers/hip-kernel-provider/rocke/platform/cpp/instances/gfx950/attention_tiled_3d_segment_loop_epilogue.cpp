@@ -95,9 +95,23 @@ static rocke_value_t* rocke__c_row(rocke_gfx950_attention_tiled_3d_build_ctx_t* 
     return rocke_gfx950_attention_tiled_3d_mfma_16x16_c_row(ctx, ctx->tid, reg);
 }
 
+/* Append a block-id list (TILE_MULT entries, or NULL) to a prefetch carry. */
+static void rocke__append_pf(rocke_value_t** dst, int* n, rocke_value_t* const* src, int count)
+{
+    int i;
+    if(src == NULL)
+    {
+        return;
+    }
+    for(i = 0; i < count; i++)
+    {
+        dst[(*n)++] = src[i];
+    }
+}
+
 /* ============================================================ *
  * emit_loop_init: softmax/acc carry inits, async DMA infra, and the first
- * K issue.
+ * K/V issue (incl. the prefetch carry).
  * ============================================================ */
 void rocke_gfx950_attention_tiled_3d_emit_loop_init(
     rocke_gfx950_attention_tiled_3d_build_ctx_t* ctx)
@@ -152,8 +166,62 @@ void rocke_gfx950_attention_tiled_3d_emit_loop_init(
      * single linear build: acc_zero precedes the buffer rsrc / seq_base / desc. */
     rocke_gfx950_attention_tiled_3d_emit_async_infra(ctx);
 
-    /* ---- first K issue ---- */
-    rocke_gfx950_attention_tiled_3d_issue_k(ctx, ctx->tile_start, rocke_b_const_i32(b, 0));
+    /* ---- first K (and V) issue + prefetch carry ---- */
+    ctx->n_pf = 0;
+    ctx->pf_inits = NULL;
+    if(cfg->PREFETCH)
+    {
+        int cap = 2 * cfg->fp8_chunks_per_thread + cfg->TILE_MULT;
+        ctx->pf_inits
+            = (rocke_value_t**)rocke_arena_alloc(&b->arena, (size_t)cap * sizeof(rocke_value_t*));
+        if(ctx->pf_inits == NULL)
+        {
+            return;
+        }
+    }
+    if(cfg->FP8_REG_PREFETCH)
+    {
+        /* tile_start straight into LDS buffer 0; tile_start+1 rides in
+         * registers; block ids run one tile further ahead. */
+        rocke_value_t** raw = (rocke_value_t**)rocke_arena_alloc(
+            &b->arena, (size_t)(2 * cfg->fp8_chunks_per_thread) * sizeof(rocke_value_t*));
+        rocke_value_t** ids0;
+        rocke_value_t** ids1;
+        rocke_value_t** ids2;
+        rocke_value_t* nxt0;
+        rocke_value_t* nxt1;
+        if(raw == NULL)
+        {
+            return;
+        }
+        ids0 = rocke_gfx950_attention_tiled_3d_tile_block_ids(ctx, ctx->tile_start);
+        rocke_gfx950_attention_tiled_3d_fp8_raw_tile(ctx, ctx->tile_start, ids0, raw);
+        rocke_gfx950_attention_tiled_3d_fp8_stage_tile(ctx, raw, rocke_b_const_i32(b, 0));
+        nxt0 = rocke_b_add(b, ctx->tile_start, rocke_b_const_i32(b, 1));
+        ids1 = rocke_gfx950_attention_tiled_3d_tile_block_ids(ctx, nxt0);
+        rocke_gfx950_attention_tiled_3d_fp8_raw_tile(ctx, nxt0, ids1, ctx->pf_inits);
+        ctx->n_pf = 2 * cfg->fp8_chunks_per_thread;
+        nxt1 = rocke_b_add(b, ctx->tile_start, rocke_b_const_i32(b, 2));
+        ids2 = rocke_gfx950_attention_tiled_3d_tile_block_ids(ctx, nxt1);
+        rocke__append_pf(ctx->pf_inits, &ctx->n_pf, ids2, cfg->TILE_MULT);
+    }
+    else if(cfg->PREFETCH)
+    {
+        rocke_value_t** ids0 = rocke_gfx950_attention_tiled_3d_tile_block_ids(ctx, ctx->tile_start);
+        rocke_value_t* nxt;
+        rocke_value_t** ids1;
+        rocke_gfx950_attention_tiled_3d_issue_k_load(
+            ctx, ctx->tile_start, rocke_b_const_i32(b, 0), ids0);
+        rocke_gfx950_attention_tiled_3d_issue_v_load(
+            ctx, ctx->tile_start, rocke_b_const_i32(b, 0), ids0);
+        nxt = rocke_b_add(b, ctx->tile_start, rocke_b_const_i32(b, 1));
+        ids1 = rocke_gfx950_attention_tiled_3d_tile_block_ids(ctx, nxt);
+        rocke__append_pf(ctx->pf_inits, &ctx->n_pf, ids1, cfg->TILE_MULT);
+    }
+    else
+    {
+        rocke_gfx950_attention_tiled_3d_issue_k(ctx, ctx->tile_start, rocke_b_const_i32(b, 0));
+    }
     ctx->cur_buf_init = rocke_b_const_i32(b, 0);
 }
 
@@ -167,10 +235,11 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
     const rocke_gfx950_attn_tiled_3d_config_t* cfg = &ctx->cfg;
     const rocke_type_t* dtype = cfg->dtype;
     const rocke_type_t* f32 = rocke_f32();
+    const int TM = cfg->TILE_MULT;
     int r, n, k, reg;
 
-    /* iter_args: m0,l0..m3,l3, acc0..accN-1, cur_buf */
-    int num_iter = 8 + cfg->PV_N_TILES + 1;
+    /* iter_args: m0,l0..m3,l3, acc0..accN-1, cur_buf, kvpf<i> */
+    int num_iter = 8 + cfg->PV_N_TILES + 1 + ctx->n_pf;
     rocke_iter_arg_t* iter_args
         = (rocke_iter_arg_t*)rocke_arena_alloc(&b->arena, (size_t)num_iter * sizeof(*iter_args));
     if(iter_args == NULL)
@@ -179,6 +248,7 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
     }
     {
         int ai = 0;
+        int i;
         char buf[24];
         for(r = 0; r < 4; r++)
         {
@@ -201,6 +271,13 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
         iter_args[ai].name = rocke_arena_strdup(&b->arena, "cur_buf");
         iter_args[ai].init = ctx->cur_buf_init;
         ai++;
+        for(i = 0; i < ctx->n_pf; i++)
+        {
+            snprintf(buf, sizeof(buf), "kvpf%d", i);
+            iter_args[ai].name = rocke_arena_strdup(&b->arena, buf);
+            iter_args[ai].init = ctx->pf_inits[i];
+            ai++;
+        }
     }
 
     /* LICM hoist: per-row invariants constant across all KV tiles. qp_r, qh_r,
@@ -251,6 +328,7 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
     {
         rocke_value_t* kv_tile_iv = kvloop.iv;
         rocke_value_t** carry = kvloop.iter_vars;
+        const int pf_base = 9 + cfg->PV_N_TILES;
 
         rocke_value_t* m_vals[4];
         rocke_value_t* l_vals[4];
@@ -270,6 +348,8 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
         rocke_value_t* alpha_regs[4];
         rocke_value_t* new_l_vals[4];
         rocke_value_t** new_acc;
+        rocke_value_t** new_pf;
+        int n_new_pf = 0;
 
         /* masked[(n,reg)] indexed n*4+reg; s_local[(reg,n)] indexed reg*N+n */
         rocke_value_t** masked;
@@ -284,7 +364,10 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
                                                  (size_t)cfg->QK_N_TILES * sizeof(rocke_value_t*));
         masked = (rocke_value_t**)rocke_arena_alloc(
             &b->arena, (size_t)(cfg->QK_N_TILES * 4) * sizeof(rocke_value_t*));
-        if(acc_vals == NULL || new_acc == NULL || A_kits == NULL || S_n == NULL || masked == NULL)
+        new_pf = (rocke_value_t**)rocke_arena_alloc(
+            &b->arena, (size_t)(ctx->n_pf + 1) * sizeof(rocke_value_t*));
+        if(acc_vals == NULL || new_acc == NULL || A_kits == NULL || S_n == NULL || masked == NULL
+           || new_pf == NULL)
         {
             rocke_b_region_leave(b);
             return;
@@ -307,8 +390,48 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
         in_range_next = rocke_b_cmp_lt(b, next_tile_iv_raw, ctx->tile_end);
         safe_next_tile = rocke_b_select(b, in_range_next, next_tile_iv_raw, kv_tile_iv);
 
-        rocke_b_s_waitcnt(b, 0, 0, -1);
-        rocke_b_sync(b);
+        if(cfg->FP8_REG_PREFETCH)
+        {
+            /* LDS[cur] was staged last iteration; only LDS needs draining, the
+             * raw fp8 registers for tile+1 stay in flight until staged here. */
+            const int n_raw = 2 * cfg->fp8_chunks_per_thread;
+            rocke_value_t** raw = carry + pf_base;
+            rocke_value_t** ids_n2 = carry + pf_base + n_raw;
+            rocke_value_t* nxt2;
+            rocke_value_t* nxt3;
+            rocke_value_t** ids_n3;
+            rocke_b_sync_lds_only(b);
+            rocke_gfx950_attention_tiled_3d_fp8_stage_tile(ctx, raw, nxt_buf);
+            nxt2 = rocke_b_add(b, kv_tile_iv, rocke_b_const_i32(b, 2));
+            rocke_gfx950_attention_tiled_3d_fp8_raw_tile(ctx, nxt2, ids_n2, new_pf);
+            n_new_pf = n_raw;
+            nxt3 = rocke_b_add(b, kv_tile_iv, rocke_b_const_i32(b, 3));
+            ids_n3 = rocke_gfx950_attention_tiled_3d_tile_block_ids(ctx, nxt3);
+            rocke__append_pf(new_pf, &n_new_pf, ids_n3, TM);
+        }
+        else
+        {
+            rocke_b_s_waitcnt(b, 0, 0, -1);
+            rocke_b_sync(b);
+            if(cfg->PREFETCH)
+            {
+                rocke_value_t** ids_n1 = cfg->PREFETCH_IDS ? carry + pf_base : NULL;
+                rocke_if_t g = rocke_b_scf_if(b, in_range_next);
+                rocke_b_region_enter(b, g.then_region);
+                rocke_gfx950_attention_tiled_3d_issue_k_load(
+                    ctx, next_tile_iv_raw, nxt_buf, ids_n1);
+                rocke_gfx950_attention_tiled_3d_issue_v_load(
+                    ctx, next_tile_iv_raw, nxt_buf, ids_n1);
+                rocke_b_region_leave(b);
+                if(cfg->PREFETCH_IDS)
+                {
+                    rocke_value_t* nxt2 = rocke_b_add(b, kv_tile_iv, rocke_b_const_i32(b, 2));
+                    rocke_value_t** ids_n2
+                        = rocke_gfx950_attention_tiled_3d_tile_block_ids(ctx, nxt2);
+                    rocke__append_pf(new_pf, &n_new_pf, ids_n2, TM);
+                }
+            }
+        }
 
         /* ---------------- QK (wide 16x16x32, K-step 32) ---------------- */
         for(k = 0; k < cfg->QK_K_ITERS; k++)
@@ -341,8 +464,11 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
             S_n[n] = acc_v;
         }
 
-        rocke_gfx950_attention_tiled_3d_issue_v(ctx, kv_tile_iv, cur_buf);
-        rocke_gfx950_attention_tiled_3d_issue_k(ctx, safe_next_tile, nxt_buf);
+        if(!cfg->PREFETCH)
+        {
+            rocke_gfx950_attention_tiled_3d_issue_v(ctx, kv_tile_iv, cur_buf);
+            rocke_gfx950_attention_tiled_3d_issue_k(ctx, safe_next_tile, nxt_buf);
+        }
 
         /* alibi_per_row: use hoisted slopes (NULL when USE_ALIBI is false). */
         for(reg = 0; reg < 4; reg++)
@@ -472,7 +598,13 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
             }
         }
 
-        if(cfg->KV_FP8)
+        if(cfg->PREFETCH)
+        {
+            /* K/V[cur] already landed; only the P tile written above must
+             * be visible. Next tile's loads stay in flight. */
+            rocke_b_sync_lds_only(b);
+        }
+        else if(cfg->KV_FP8)
         {
             /* FP8 sync loader has no in-flight async work. */
             rocke_b_s_waitcnt(b, 0, 0, -1);
@@ -596,6 +728,7 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
             rocke_value_t** yields = (rocke_value_t**)rocke_arena_alloc(
                 &b->arena, (size_t)num_iter * sizeof(rocke_value_t*));
             int yi = 0;
+            int i;
             if(yields == NULL)
             {
                 rocke_b_region_leave(b);
@@ -611,6 +744,10 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
                 yields[yi++] = new_acc[n];
             }
             yields[yi++] = nxt_buf;
+            for(i = 0; i < n_new_pf; i++)
+            {
+                yields[yi++] = new_pf[i];
+            }
             rocke_b_scf_yield(b, yields, yi);
         }
     }

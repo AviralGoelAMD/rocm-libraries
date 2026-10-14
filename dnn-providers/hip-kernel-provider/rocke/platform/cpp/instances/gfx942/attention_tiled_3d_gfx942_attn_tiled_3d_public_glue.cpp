@@ -139,6 +139,7 @@ rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_de
     /* gfx950 decode-path knobs (ignored by the gfx942 builder). */
     s.decode_fast_path = false;
     s.kv_tile_mult = 1;
+    s.kv_prefetch = false;
     return s;
 }
 
