@@ -160,19 +160,22 @@ as described in the notes.
   merged GEMM that does not fit one tile (`Gm > tile_m`, or `Z*Y*X*Gm > tile_n`).
   Forward merged kernels are built into the AOT kernel cache at every
   admissible degree and selected there by timing; the grouped-conv dispatcher
-  does not select a forward merge degree. **Engine coverage differs between the two directions.** Forward is
-  implemented in **both** engines — `group_merge` is a field on the C-ABI spec
+  does not select a forward merge degree. **Both directions are implemented in
+  both engines.** Forward: `group_merge` is a field on the C-ABI spec
   struct (`rocke_implicit_gemm_conv_spec`), is carried across the pybind
   boundary, and the fwd parity emitters build eight depthwise configs
   (`conv_implicit_gemm_emit.{py,c}` indices 21–28: 22–27 merged, 21 and 28 the
   unmerged default/cshuffle controls) spanning both epilogues, the 1-wide
   cshuffle store, `unroll_k`, and degrees with `groups/Gm > 1` as well as
   `Gm == groups` (one merged group; the grouped decode stays engaged). Byte-identity is therefore a
-  real gate on merged emission, not a vacuous one. **wgrad is Python-engine
-  only:** the C++ engine has no merged wgrad configuration to express and its
-  parity emitter builds unmerged configs exclusively, so merged *wgrad* specs
-  carry no structural parity coverage and are verified by on-GPU numerics
-  alone. That gap predates the forward port and is tracked as follow-up work.
+  real gate on merged emission, not a vacuous one. wgrad: `group_merge` is a
+  field on `rocke_implicit_gemm_conv_wgrad_spec` and the wgrad parity emitters
+  (`conv_implicit_gemm_wgrad_emit.{py,c}` indices 49–61) build the gfx950
+  dispatcher's merged depthwise specs (K-outer, two-stage split-K, fp16 and
+  bf16) plus split_k=1 default/cshuffle, M-outer and Gm 2/4/8/16 variants, and
+  one Gm-not-dividing-groups spec both engines reject. The C++ engine still
+  rejects *unmerged* grid-per-group grouped wgrad (groups > 1, Gm 1); that
+  shape reaches it only through stream-K.
 - **GPU-numeric verification on gfx1151** (launched on the Radeon 8060S,
   output compared against a numpy reference). **Verified PASS:**
   `elementwise`, `reduce2d`, `rmsnorm2d`, `layernorm2d`, `transpose2d`,

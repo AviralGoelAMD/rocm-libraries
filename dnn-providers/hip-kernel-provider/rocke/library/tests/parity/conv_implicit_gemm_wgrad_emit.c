@@ -45,6 +45,10 @@
  *  (21-30 carry a CTA pool, but it is a launch parameter and leaves the IR as is.)
  *  31-48  prefetch_addr=true on a base config (pfa_base below); 45-47 pair it
  *         with async_dma / unroll_k / WMMA and must be rejected by both engines
+ *  49-61  group_merge > 1 on depthwise shapes (gm_cfg below, Python _GM_CFGS):
+ *         49-56 the gfx950 dispatcher's K-outer two-stage specs (MBv2, EffB0 dw3,
+ *         ConvNeXt, EffB0 dw5; fp16 then bf16), 57-60 split_k=1 default/cshuffle,
+ *         M-outer, two-stage R=1; 61 Gm not dividing groups (both must reject)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -100,6 +104,89 @@ static int streamk_cfg(int idx, rocke_implicit_gemm_conv_wgrad_spec_t* spec, con
     spec->streamk_reduction = cfgs[i].reduction;
     spec->streamk_ctas = cfgs[i].ctas;
     *arch = cfgs[i].arch;
+    return 0;
+}
+
+/* Group-merged depthwise configs 49-61 (Python _GM_CFGS), field for field. */
+static int gm_cfg(int idx, rocke_implicit_gemm_conv_wgrad_spec_t* spec, const char** arch)
+{
+    enum
+    {
+        MBV2,
+        EFF3,
+        CNXT,
+        EFF5,
+        BAD12
+    };
+    static const struct
+    {
+        int shape;
+        const char* dt;
+        int tile_n, gm, split_k;
+        bool two_stage;
+        const char* epilogue;
+        bool k_outer;
+        int reps;
+    } cfgs[13] = {
+        {MBV2, "fp16", 128, 8, 56, true, "default", true, 8},
+        {EFF3, "fp16", 128, 8, 16, true, "default", true, 8},
+        {CNXT, "fp16", 256, 4, 40, true, "default", true, 8},
+        {EFF5, "fp16", 256, 8, 32, true, "default", true, 8},
+        {MBV2, "bf16", 128, 8, 56, true, "default", true, 8},
+        {EFF3, "bf16", 128, 8, 16, true, "default", true, 8},
+        {CNXT, "bf16", 256, 4, 40, true, "default", true, 8},
+        {EFF5, "bf16", 256, 8, 32, true, "default", true, 8},
+        {MBV2, "fp16", 64, 2, 1, false, "default", false, 8},
+        {EFF3, "bf16", 256, 16, 1, false, "cshuffle", true, 8},
+        {EFF5, "fp16", 128, 4, 4, true, "default", false, 1},
+        {MBV2, "fp16", 128, 8, 1, false, "cshuffle", false, 8},
+        {BAD12, "fp16", 128, 8, 1, false, "default", true, 8},
+    };
+    const int i = idx - 49;
+    rocke_conv_problem_t p;
+    switch(cfgs[i].shape)
+    {
+    case MBV2:
+        p = rocke_conv_problem_default(32, 56, 56, 144, 144, 3, 3);
+        p.sH = p.sW = 2;
+        p.pH = p.pW = 1;
+        p.groups = 144;
+        break;
+    case EFF3:
+        p = rocke_conv_problem_default(32, 14, 14, 480, 480, 3, 3);
+        p.pH = p.pW = 1;
+        p.groups = 480;
+        break;
+    case CNXT:
+        p = rocke_conv_problem_default(1, 56, 56, 96, 96, 7, 7);
+        p.pH = p.pW = 3;
+        p.groups = 96;
+        break;
+    case EFF5:
+        p = rocke_conv_problem_default(32, 28, 28, 240, 240, 5, 5);
+        p.sH = p.sW = 2;
+        p.pH = p.pW = 2;
+        p.groups = 240;
+        break;
+    default:
+        p = rocke_conv_problem_default(8, 28, 28, 12, 12, 3, 3);
+        p.pH = p.pW = 1;
+        p.groups = 12;
+        break;
+    }
+    spec->problem = p;
+    spec->name = "implicit_gemm_conv_wgrad";
+    spec->dtype_a = cfgs[i].dt;
+    spec->dtype_b = cfgs[i].dt;
+    spec->dtype_d = cfgs[i].dt;
+    spec->tile_n = cfgs[i].tile_n;
+    spec->group_merge = cfgs[i].gm;
+    spec->split_k = cfgs[i].split_k;
+    spec->two_stage = cfgs[i].two_stage;
+    spec->epilogue = cfgs[i].epilogue;
+    spec->lds_k_outer = cfgs[i].k_outer;
+    spec->ws_replicas = cfgs[i].reps;
+    *arch = "gfx950";
     return 0;
 }
 
@@ -355,6 +442,8 @@ static int make_base_cfg(int idx, rocke_implicit_gemm_conv_wgrad_spec_t* spec, c
         spec->lds_k_outer = true;
         return 0;
     default:
+        if(idx >= 49 && idx <= 61)
+            return gm_cfg(idx, spec, arch);
         return -1;
     }
 }

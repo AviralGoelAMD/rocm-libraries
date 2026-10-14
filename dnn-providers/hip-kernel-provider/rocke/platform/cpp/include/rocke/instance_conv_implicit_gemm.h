@@ -337,6 +337,12 @@ typedef struct rocke_conv_dyn_desc_opts
     rocke_conv_dyn_magic_t channel_y; /* divisor Y (3-D only)               */
     rocke_conv_dyn_magic_t channel_x; /* divisor X                          */
     rocke_conv_dyn_magic_t channel_c; /* divisor cpg                        */
+    /* > 0: the channel run (the cpg divisor and the group-embed stride) is
+     * this build-time constant, its magic pair materialised as constants at
+     * apply time, instead of the p_cpg kernarg and channel_c. wgrad's
+     * group-merged X load uses it (Python x_params override of p_cpg). 0 keeps
+     * the kernarg path. */
+    int channel_c_const;
 } rocke_conv_dyn_desc_opts_t;
 
 /* Takes a mutable ctx: it emits p_pH_neg / p_pW_neg here, where Python emits

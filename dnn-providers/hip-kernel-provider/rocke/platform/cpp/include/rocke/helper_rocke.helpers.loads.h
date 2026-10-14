@@ -112,6 +112,11 @@ typedef struct rocke_coalesced_tile_loader
      * reads it). has_inner_dim distinguishes None (false) from a set value. */
     bool has_inner_dim;
     int inner_dim;
+    /* Python `elem_dtype: Type = F16`: the element type of the buffer load and
+     * the LDS store. NULL is the F16 default; f16 and bf16 are supported (both
+     * 2-byte, so the byte scaling is unchanged). Every constructor must set it
+     * -- from_tile writes NULL. */
+    const rocke_type_t* elem_dtype;
 } rocke_coalesced_tile_loader_t;
 
 /* CoalescedTileLoader.choose_vec classmethod.
