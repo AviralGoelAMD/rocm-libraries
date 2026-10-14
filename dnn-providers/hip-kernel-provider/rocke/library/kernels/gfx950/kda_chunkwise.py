@@ -1960,7 +1960,7 @@ def is_valid_fused_spec(
 
 
 def _check_scan_partition(
-    atom: MfmaAtom, t: KdaTileSpec, head_k: int, head_v: int
+    atom: MfmaAtom, t: KdaTileSpec, head_k: int, head_v: int, waves: int = None
 ) -> Tuple[bool, str]:
     """Validate the one rule that partitions every product in the scan body.
 
@@ -1969,7 +1969,7 @@ def _check_scan_partition(
     else needs a second partitioning rule for the same accumulator, which is how
     cross-wave reductions creep in.
     """
-    waves = t.num_waves
+    waves = t.num_waves if waves is None else waves
     if head_v != atom.m * waves:
         return False, (
             f"head_v ({head_v}) must equal scan atom.m * waves "
@@ -2079,6 +2079,7 @@ class _ScanCtx:
         v_row_base=0,
         ev_stride=None,
         io=None,
+        wave_split=1,
     ):
         self.b = b
         self.ex2 = ex2
@@ -2130,7 +2131,37 @@ class _ScanCtx:
             b.div(lane, b.const_i32(atom.m)), b.const_i32(atom.a_per_lane)
         )
         # This wave's band of S^T rows.
-        self.wrow = b.mul(b.div(tid, b.const_i32(64)), b.const_i32(atom.m))
+        self.c_base = self.k_base = None
+        if wave_split == 1:
+            self.wrow = b.mul(b.div(tid, b.const_i32(64)), b.const_i32(atom.m))
+        else:
+            # ``wave_split`` waves share one row band. Each takes an equal slice
+            # of the chunk-extent tiles (Z^T, V~^T, O) and of the state's DK
+            # tiles (S^T), so every product splits on an output axis and no
+            # wave ever needs another's partial sum -- the shared operands (the
+            # S^T mirror and V~) already go through LDS. NS / NC_T become the
+            # per-wave counts and ``k_base`` / ``c_base`` this wave's offsets.
+            wave = b.div(tid, b.const_i32(64))
+            part = b.mod(wave, b.const_i32(wave_split))
+            self.NS //= wave_split
+            self.NC_T //= wave_split
+            self.k_base = b.mul(part, b.const_i32(self.NS * atom.n))
+            self.c_base = b.mul(part, b.const_i32(self.NC_T * atom.m))
+            self.wrow = b.mul(
+                b.div(wave, b.const_i32(wave_split)), b.const_i32(atom.m)
+            )
+
+    def _koff(self, base: int):
+        """``base`` along the state's DK extent, shifted to this wave's slice."""
+        if self.k_base is None:
+            return self.b.const_i32(base)
+        return self.b.add(self.k_base, self.b.const_i32(base))
+
+    def _coff(self, base: int):
+        """``base`` along the chunk extent, shifted to this wave's slice."""
+        if self.c_base is None:
+            return self.b.const_i32(base)
+        return self.b.add(self.c_base, self.b.const_i32(base))
 
     def cv_base(self, tile):
         """Flat chunk base for v/o in the chunk-packed layout."""
@@ -2188,8 +2219,8 @@ class _ScanCtx:
         The operand row for tile ``j`` of a product whose output spans the chunk
         extent. ``off`` shifts within the tile for the state's ``DK`` extent.
         """
-        base = j * self.atom.m if off is None else off
-        row = self.b.add(self.b.const_i32(base), self.lane_m)
+        base = self._coff(j * self.atom.m) if off is None else self.b.const_i32(off)
+        row = self.b.add(base, self.lane_m)
         if self.buf_bias is None:
             return row
         return self.b.add(self.buf_bias[0], row)
@@ -2201,7 +2232,7 @@ class _ScanCtx:
         into that extent, so one accessor carries the double-buffer offset for
         both.
         """
-        idx = self.b.add(self.b.const_i32(base), off)
+        idx = self.b.add(self._koff(base), off)
         if self.buf_bias is None:
             return idx
         return self.b.add(self.buf_bias[1], idx)
@@ -2211,7 +2242,7 @@ class _ScanCtx:
         b = self.b
         row, col = self.slot(i)
         ev = b.add(self.wrow, row)
-        dk = b.add(b.const_i32(ti * self.atom.n), col)
+        dk = b.add(self._koff(ti * self.atom.n), col)
         return b.add(base, b.add(b.mul(ev, b.const_i32(self.DK)), dk))
 
     def publish_state(self, state):
@@ -2231,7 +2262,7 @@ class _ScanCtx:
                     b,
                     self.stb_lds,
                     b.add(self.wrow, row),
-                    b.add(b.const_i32(ti * self.atom.n), col),
+                    b.add(self._koff(ti * self.atom.n), col),
                     value=b.cast_f32_to(b.vec_extract(state[ti], i), self.ELEM),
                     n=1,
                 )
@@ -2338,7 +2369,9 @@ def _emit_scan_body(sc: _ScanCtx, state, tile, *, prefetch: "_InputPrefetch" = N
 
     def cidx(jt, col):
         """Global chunk index of ``col`` inside chunk-extent tile ``jt``."""
-        return col if jt == 0 else b.add(b.const_i32(jt * atom.m), col)
+        if sc.c_base is None:
+            return col if jt == 0 else b.add(b.const_i32(jt * atom.m), col)
+        return b.add(sc._coff(jt * atom.m), col)
 
     # ---- Z^T = S^T GK^T, then R^T = V^T - Z^T into the V~ tile ----------
     acc_z = [
@@ -2714,6 +2747,11 @@ class KdaChunkScanSpec:
     # into a double-buffered LDS tile, so the residual reads V from LDS instead
     # of issuing an HBM load in the middle of the recurrence and waiting on it.
     v_prefetch: bool = False
+    # Waves per ``scan_atom.m``-row band of the state. 1 = one wave owns its
+    # band end to end. >1 splits every product of the body across that many
+    # waves on an output axis (chunk tiles for Z^T / V~^T / O, DK tiles for the
+    # state), shortening each wave's MFMA chain without any cross-wave sum.
+    wave_split: int = 1
     name: str = "rocke_kda_chunk_scan"
 
     @property
@@ -2795,6 +2833,8 @@ class KdaChunkScanSpec:
             parts += (f"x{self.xcd_remap}",)
         if self.v_prefetch:
             parts += ("vp",)
+        if self.wave_split != 1:
+            parts += (f"ws{self.wave_split}",)
         return kernel_name_join(self.name, *parts)
 
 
@@ -2824,7 +2864,18 @@ def is_valid_scan_spec(
         return False, (
             f"v slice ({ev_slice}) must divide scan atom n ({spec.scan_atom.n})"
         )
-    num_waves = spec.tile.num_waves
+    P = spec.wave_split
+    if P < 1 or spec.tile.num_waves % P:
+        return False, f"wave_split ({P}) must be >= 1 and divide the wave count"
+    num_waves = spec.tile.num_waves // P
+    if P > 1 and (
+        (spec.tile.chunk // spec.scan_atom.m) % P
+        or (spec.head_k // spec.scan_atom.n) % P
+    ):
+        return False, (
+            f"wave_split ({P}) must divide both the chunk-extent tiles and the "
+            "state's DK tiles"
+        )
     if ev_slice != num_waves * spec.scan_atom.m:
         return False, (
             f"v slice ({ev_slice}) must equal waves ({num_waves}) * scan atom m "
@@ -2839,7 +2890,9 @@ def is_valid_scan_spec(
         )
 
     t = spec.tile
-    ok, why = _check_scan_partition(spec.scan_atom, t, spec.head_k, ev_slice)
+    ok, why = _check_scan_partition(
+        spec.scan_atom, t, spec.head_k, ev_slice, waves=num_waves
+    )
     if not ok:
         return False, why
     # Staging is 128-bit per thread throughout, so both padded row pitches have
@@ -3050,6 +3103,7 @@ def build_kda_chunk_scan(spec: KdaChunkScanSpec, arch: str = "gfx950") -> "Kerne
         ev_stride=EV,
         io=io,
         v_lds=v_lds,
+        wave_split=spec.wave_split,
     )
 
     state_base = b.add(
