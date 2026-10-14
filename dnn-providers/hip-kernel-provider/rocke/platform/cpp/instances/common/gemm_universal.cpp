@@ -1261,8 +1261,10 @@ rocke_kernel_def_t* rocke_build_universal_gemm(rocke_ir_builder_t* b,
         ctx.db = db;
         ctx.two_buf = two_buf;
     }
-    ctx.A_LDS_M = (ctx.two_buf ? 2 : 1) * ctx.block_m;
-    ctx.B_LDS_N = (ctx.two_buf ? 2 : 1) * ctx.block_n;
+    ctx.nbuf = spec->trait.dtl_prefetch_depth > 1 ? spec->trait.dtl_prefetch_depth + 1
+                                                  : (ctx.two_buf ? 2 : 1);
+    ctx.A_LDS_M = ctx.nbuf * ctx.block_m;
+    ctx.B_LDS_N = ctx.nbuf * ctx.block_n;
     ctx.lds_pad = spec->trait.direct_to_lds ? 0 : spec->trait.lds_k_pad;
     ctx.lds_k = ctx.block_k + ctx.lds_pad;
     {
@@ -1272,19 +1274,18 @@ rocke_kernel_def_t* rocke_build_universal_gemm(rocke_ir_builder_t* b,
         ctx.B_smem = rocke_b_smem_alloc(b, ctx.storage_dtype, b_shape, 2, "B_smem");
     }
     /* dtl_lds_alias: each operand buffer is an LDS-DMA ring with one slot per
-     * ping-pong half; every DMA write and MFMA operand read names its slot
-     * through rocke_gemm_ring_slot. */
+     * LDS buffer; every DMA write and MFMA operand read names its slot through
+     * rocke_gemm_ring_slot. */
     ctx.lds_alias = spec->trait.dtl_lds_alias;
     if(ctx.lds_alias)
     {
-        int nbuf = ctx.two_buf ? 2 : 1;
         if(!ctx.prefetch)
         {
             /* "dtl_lds_alias requires dtl_prefetch=True" -- ValueError path. */
             return NULL;
         }
-        ctx.a_lds_ring = rocke_b_lds_alias_ring(b, ctx.A_smem, nbuf);
-        ctx.b_lds_ring = rocke_b_lds_alias_ring(b, ctx.B_smem, nbuf);
+        ctx.a_lds_ring = rocke_b_lds_alias_ring(b, ctx.A_smem, ctx.nbuf);
+        ctx.b_lds_ring = rocke_b_lds_alias_ring(b, ctx.B_smem, ctx.nbuf);
         if(ctx.a_lds_ring < 0 || ctx.b_lds_ring < 0)
             return NULL;
     }

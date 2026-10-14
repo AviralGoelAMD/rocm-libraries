@@ -102,6 +102,10 @@ typedef struct rocke_gemm_trait_spec
      * rings, slot-tagged DMA writes + operand reads, 2x-unrolled K-loop).
      * Requires direct_to_lds + dtl_prefetch. Default false (byte-identical). */
     bool dtl_lds_alias;
+    /* Python dtl_prefetch_depth: 1 = DTL ping-pong (2 LDS slots), 2 = a 3-slot
+     * alias ring with two K-tiles of LDS-DMA in flight. Depth 2 requires
+     * dtl_lds_alias. Default 1 (byte-identical). */
+    int dtl_prefetch_depth;
     bool active_tile_skip;
     int lds_k_pad; /* default 0 */
     bool lds_swizzle;

@@ -169,8 +169,10 @@ typedef struct rocke_gemm_build_ctx
     bool prefetch; /* _prefetch = trait.dtl_prefetch            */
     bool db; /* _db   (compv4 software-pipelined DB)       */
     bool two_buf; /* _two_buf = prefetch || db                 */
-    int A_LDS_M; /* _A_LDS_M = (two_buf?2:1)*block_m          */
-    int B_LDS_N; /* _B_LDS_N = (two_buf?2:1)*block_n          */
+    int nbuf; /* _nbuf = depth+1 (dtl_prefetch_depth > 1)  */
+    /*        else (two_buf ? 2 : 1)                       */
+    int A_LDS_M; /* _A_LDS_M = nbuf*block_m                   */
+    int B_LDS_N; /* _B_LDS_N = nbuf*block_n                   */
     int lds_pad; /* _lds_pad (non-DTL lds_k_pad else 0)       */
     int lds_k; /* _lds_k = block_k + lds_pad                */
     rocke_value_t* A_smem; /* smem_alloc A_smem                         */

@@ -213,8 +213,10 @@ void rocke_gemm_build_populate_ctx(rocke_gemm_build_ctx_t* ctx)
         ctx->db = db;
         ctx->two_buf = spec->trait.dtl_prefetch || db;
     }
-    ctx->A_LDS_M = ctx->two_buf ? 2 * ctx->block_m : ctx->block_m;
-    ctx->B_LDS_N = ctx->two_buf ? 2 * ctx->block_n : ctx->block_n;
+    ctx->nbuf = spec->trait.dtl_prefetch_depth > 1 ? spec->trait.dtl_prefetch_depth + 1
+                                                   : (ctx->two_buf ? 2 : 1);
+    ctx->A_LDS_M = ctx->nbuf * ctx->block_m;
+    ctx->B_LDS_N = ctx->nbuf * ctx->block_n;
     /* _lds_pad = trait.lds_k_pad if not direct_to_lds else 0; _lds_k = block_k + pad */
     ctx->lds_pad = spec->trait.direct_to_lds ? 0 : spec->trait.lds_k_pad;
     ctx->lds_k = ctx->block_k + ctx->lds_pad;

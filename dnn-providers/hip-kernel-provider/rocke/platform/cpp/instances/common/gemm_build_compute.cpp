@@ -359,28 +359,61 @@ void rocke_gemm_emit_kloop_simple(rocke_gemm_build_ctx_t* ctx)
 
 /* ===================================================================== *
  *  _emit_kloop_prefetch_ring: _emit_kloop_prefetch steady state + tail for
- *  dtl_lds_alias. The ping-pong loop is unrolled 2x with static parity so
- *  each copy's A/B ring slot tag is a compile-time fact: a pair iteration
- *  runs tile 2j from slot 0 (DMA fills slot 1) and tile 2j+1 from slot 1
- *  (DMA fills slot 0). A 0/1-trip remainder loop runs an odd last
- *  steady-state tile from slot 0 and carries the final tile's slot, which
- *  the tail reads through any_slot after its full drain. The next DMA is
- *  issued after each barrier, so no LDS-DMA op is in flight at a barrier
- *  (keep_lds_dma=0).
+ *  dtl_lds_alias. A/B are rings of n = ctx->nbuf slots; tile i lives in slot
+ *  i % n. The steady-state loop is unrolled n times so each copy's slot tag
+ *  is a compile-time fact: copy s reads slot s while DMA fills slot
+ *  (s + n - 1) % n with the tile n - 1 ahead. Up to n - 1 leftover tiles run
+ *  in 0/1-trip remainder loops (slots 0 .. n - 2) that carry the final
+ *  tile's slot, which the tail reads through any_slot after a full drain.
+ *  Each barrier keeps the n - 2 newer tiles' LDS-DMA in flight
+ *  (keep_lds_dma); depth > 1 clamps load offsets to the slice's last tile so
+ *  the per-tile DMA count stays static.
  * ===================================================================== */
+static rocke_value_t* gemm_ring_ahead(rocke_gemm_build_ctx_t* ctx,
+                                      rocke_value_t* k,
+                                      rocke_value_t* K_minus_one_tile)
+{
+    return ctx->nbuf == 2 ? k : rocke_b_smin(ctx->b, k, K_minus_one_tile);
+}
+
+static rocke_value_t* gemm_ring_c_tiles(rocke_gemm_build_ctx_t* ctx, int n, rocke_value_t* c_cyc)
+{
+    if(n == 1)
+        return ctx->c_block_k;
+    return n == ctx->nbuf ? c_cyc : rocke_b_const_i32(ctx->b, n * ctx->block_k);
+}
+
 static void gemm_emit_kloop_prefetch_ring(rocke_gemm_build_ctx_t* ctx,
                                           rocke_value_t* K_minus_one_tile)
 {
     rocke_ir_builder_t* b = ctx->b;
-    rocke_value_t* c_pair = rocke_b_const_i32(b, 2 * ctx->block_k);
+    const int nslots = ctx->nbuf;
+    const int keep = (nslots - 2) * (ctx->dtl_a_passes + ctx->dtl_b_passes);
+    rocke_value_t* c_cyc;
     rocke_value_t* trips;
-    rocke_value_t* pair_end;
-    rocke_iter_arg_t pair_args[ROCKE_GEMM_MAX_ACCS];
+    rocke_value_t* cyc_end;
+    rocke_iter_arg_t cyc_args[ROCKE_GEMM_MAX_ACCS];
     rocke_iter_arg_t rem_args[1 + ROCKE_GEMM_MAX_ACCS];
+    char rem_par_name[16];
     char rem_names[ROCKE_GEMM_MAX_ACCS][96];
-    rocke_for_t pair_op;
-    rocke_for_t rem_op;
+    char rem_iv[16];
+    rocke_for_t cyc_op;
+    rocke_value_t* rem_lo;
+    rocke_value_t* rem_par;
+    rocke_value_t* rem_accs[ROCKE_GEMM_MAX_ACCS];
+    int num_rem_accs;
     int i;
+    int j;
+    int r;
+
+    /* Prologue: tile 0 (slot 0) was issued by the caller; tiles 1..n-2. */
+    for(j = 1; j < nslots - 1; ++j)
+    {
+        rocke_value_t* k_j = rocke_b_add(b, ctx->k_lo, rocke_b_const_i32(b, j * ctx->block_k));
+        rocke_gemm_emit_load_phase(
+            ctx, ctx->A_smem, ctx->B_smem, gemm_ring_ahead(ctx, k_j, K_minus_one_tile), j, NULL);
+    }
+    c_cyc = rocke_b_const_i32(b, nslots * ctx->block_k);
 
     {
         rocke_value_t* span = rocke_b_sub(b, K_minus_one_tile, ctx->k_lo);
@@ -388,99 +421,127 @@ static void gemm_emit_kloop_prefetch_ring(rocke_gemm_build_ctx_t* ctx,
         trips = rocke_b_div(b, rocke_b_add(b, span, round), ctx->c_block_k);
     }
     {
-        rocke_value_t* half = rocke_b_div(b, trips, rocke_b_const_i32(b, 2));
-        pair_end = rocke_b_add(b, ctx->k_lo, rocke_b_mul(b, half, c_pair));
+        rocke_value_t* cycles = rocke_b_div(b, trips, rocke_b_const_i32(b, nslots));
+        cyc_end = rocke_b_add(b, ctx->k_lo, rocke_b_mul(b, cycles, c_cyc));
     }
 
     for(i = 0; i < ctx->num_accs; ++i)
     {
-        pair_args[i].name = ctx->acc_names[i];
-        pair_args[i].init = ctx->acc_inits[i];
+        cyc_args[i].name = ctx->acc_names[i];
+        cyc_args[i].init = ctx->acc_inits[i];
     }
-    pair_op = rocke_b_scf_for_iter(b,
-                                   ctx->k_lo,
-                                   pair_end,
-                                   c_pair,
-                                   pair_args,
-                                   ctx->num_accs,
-                                   "k0",
-                                   /*unroll=*/false,
-                                   /*elide_trailing_barrier=*/true);
-    rocke_b_region_enter(b, pair_op.body);
-    {
-        rocke_value_t* acc_a[ROCKE_GEMM_MAX_ACCS];
-        rocke_value_t* acc_b[ROCKE_GEMM_MAX_ACCS];
-        rocke_value_t* const* cur = pair_op.iter_vars;
-        int n = pair_op.num_iter_vars;
-        int s;
-        for(s = 0; s < 2; ++s)
-        {
-            rocke_value_t* k_next;
-            rocke_value_t** out = (s == 0) ? acc_a : acc_b;
-            rocke_b_sync_keep_lds_dma(b, 0);
-            k_next = rocke_b_add(b, pair_op.iv, s == 0 ? ctx->c_block_k : c_pair);
-            rocke_gemm_emit_load_phase(ctx, ctx->A_smem, ctx->B_smem, k_next, 1 - s, NULL);
-            rocke_gemm_emit_mfma_phase(ctx, ctx->A_smem, ctx->B_smem, cur, n, s, NULL, out);
-            cur = out;
-        }
-        rocke_b_scf_yield(b, acc_b, n);
-    }
-    rocke_b_region_leave(b);
-
-    rem_args[0].name = "rpar";
-    rem_args[0].init = ctx->c0;
-    for(i = 0; i < ctx->num_accs; ++i)
-    {
-        snprintf(rem_names[i], sizeof(rem_names[i]), "r_%s", ctx->acc_names[i]);
-        rem_args[1 + i].name = rem_names[i];
-        rem_args[1 + i].init = pair_op.op->results[i];
-    }
-    rem_op = rocke_b_scf_for_iter(b,
-                                  pair_end,
-                                  K_minus_one_tile,
-                                  ctx->c_block_k,
-                                  rem_args,
-                                  1 + ctx->num_accs,
-                                  "k0r",
+    cyc_op = rocke_b_scf_for_iter(b,
+                                  ctx->k_lo,
+                                  cyc_end,
+                                  c_cyc,
+                                  cyc_args,
+                                  ctx->num_accs,
+                                  "k0",
                                   /*unroll=*/false,
                                   /*elide_trailing_barrier=*/true);
-    rocke_b_region_enter(b, rem_op.body);
+    rocke_b_region_enter(b, cyc_op.body);
     {
-        rocke_value_t* new_accs[ROCKE_GEMM_MAX_ACCS];
-        rocke_value_t* yield_vals[1 + ROCKE_GEMM_MAX_ACCS];
-        int n = rem_op.num_iter_vars - 1;
-        rocke_b_sync_keep_lds_dma(b, 0);
-        rocke_gemm_emit_load_phase(ctx,
-                                   ctx->A_smem,
-                                   ctx->B_smem,
-                                   rocke_b_add(b, rem_op.iv, ctx->c_block_k),
-                                   1,
-                                   NULL);
-        rocke_gemm_emit_mfma_phase(
-            ctx, ctx->A_smem, ctx->B_smem, &rem_op.iter_vars[1], n, 0, NULL, new_accs);
-        yield_vals[0] = rocke_b_const_i32(b, 1);
-        for(i = 0; i < n; ++i)
-            yield_vals[1 + i] = new_accs[i];
-        rocke_b_scf_yield(b, yield_vals, 1 + n);
+        rocke_value_t* acc_buf[2][ROCKE_GEMM_MAX_ACCS];
+        rocke_value_t* const* cur = cyc_op.iter_vars;
+        rocke_value_t** last = NULL;
+        int n = cyc_op.num_iter_vars;
+        int s;
+        for(s = 0; s < nslots; ++s)
+        {
+            rocke_value_t* k_next;
+            rocke_value_t** out = acc_buf[s & 1];
+            rocke_b_sync_keep_lds_dma(b, keep);
+            k_next = rocke_b_add(b, cyc_op.iv, gemm_ring_c_tiles(ctx, s + nslots - 1, c_cyc));
+            k_next = gemm_ring_ahead(ctx, k_next, K_minus_one_tile);
+            rocke_gemm_emit_load_phase(
+                ctx, ctx->A_smem, ctx->B_smem, k_next, (s + nslots - 1) % nslots, NULL);
+            rocke_gemm_emit_mfma_phase(ctx, ctx->A_smem, ctx->B_smem, cur, n, s, NULL, out);
+            cur = out;
+            last = out;
+        }
+        rocke_b_scf_yield(b, last, n);
     }
     rocke_b_region_leave(b);
 
-    /* Tail: the last tile sits in slot rem_op.results[0] (run-time). */
+    /* Remainder: loop r runs leftover tile r (slot r) when it exists. */
+    rem_lo = cyc_end;
+    rem_par = ctx->c0;
+    num_rem_accs = ctx->num_accs;
+    for(i = 0; i < num_rem_accs; ++i)
+        rem_accs[i] = cyc_op.op->results[i];
+    for(r = 0; r < nslots - 1; ++r)
+    {
+        rocke_value_t* rem_hi;
+        rocke_for_t rem_op;
+        if(r == nslots - 2)
+            rem_hi = K_minus_one_tile;
+        else
+            rem_hi = rocke_b_smin(b, rocke_b_add(b, rem_lo, ctx->c_block_k), K_minus_one_tile);
+        if(r == 0)
+        {
+            snprintf(rem_par_name, sizeof(rem_par_name), "rpar");
+            snprintf(rem_iv, sizeof(rem_iv), "k0r");
+        }
+        else
+        {
+            snprintf(rem_par_name, sizeof(rem_par_name), "rpar%d", r);
+            snprintf(rem_iv, sizeof(rem_iv), "k0r%d", r);
+        }
+        rem_args[0].name = rem_par_name;
+        rem_args[0].init = rem_par;
+        for(i = 0; i < num_rem_accs; ++i)
+        {
+            if(r == 0)
+                snprintf(rem_names[i], sizeof(rem_names[i]), "r_%s", ctx->acc_names[i]);
+            else
+                snprintf(rem_names[i], sizeof(rem_names[i]), "r%d_%s", r, ctx->acc_names[i]);
+            rem_args[1 + i].name = rem_names[i];
+            rem_args[1 + i].init = rem_accs[i];
+        }
+        rem_op = rocke_b_scf_for_iter(b,
+                                      rem_lo,
+                                      rem_hi,
+                                      ctx->c_block_k,
+                                      rem_args,
+                                      1 + num_rem_accs,
+                                      rem_iv,
+                                      /*unroll=*/false,
+                                      /*elide_trailing_barrier=*/true);
+        rocke_b_region_enter(b, rem_op.body);
+        {
+            rocke_value_t* new_accs[ROCKE_GEMM_MAX_ACCS];
+            rocke_value_t* yield_vals[1 + ROCKE_GEMM_MAX_ACCS];
+            rocke_value_t* k_next;
+            int n = rem_op.num_iter_vars - 1;
+            rocke_b_sync_keep_lds_dma(b, keep);
+            k_next = rocke_b_add(b, rem_op.iv, gemm_ring_c_tiles(ctx, r + nslots - 1, c_cyc));
+            k_next = gemm_ring_ahead(ctx, k_next, K_minus_one_tile);
+            rocke_gemm_emit_load_phase(
+                ctx, ctx->A_smem, ctx->B_smem, k_next, (r + nslots - 1) % nslots, NULL);
+            rocke_gemm_emit_mfma_phase(
+                ctx, ctx->A_smem, ctx->B_smem, &rem_op.iter_vars[1], n, r, NULL, new_accs);
+            yield_vals[0] = rocke_b_const_i32(b, r + 1);
+            for(i = 0; i < n; ++i)
+                yield_vals[1 + i] = new_accs[i];
+            rocke_b_scf_yield(b, yield_vals, 1 + n);
+        }
+        rocke_b_region_leave(b);
+        rem_lo = rem_hi;
+        rem_par = rem_op.op->results[0];
+        num_rem_accs = rem_op.op->num_results - 1;
+        for(i = 0; i < num_rem_accs; ++i)
+            rem_accs[i] = rem_op.op->results[1 + i];
+    }
+
+    /* Tail: the last tile sits in slot rem_par (run-time). */
     {
         rocke_value_t* epi_accs[ROCKE_GEMM_MAX_ACCS];
-        int num_tail = rem_op.op->num_results - 1;
         rocke_b_sync_keep_lds_dma(b, 0);
-        rocke_gemm_emit_mfma_phase(ctx,
-                                   ctx->A_smem,
-                                   ctx->B_smem,
-                                   &rem_op.op->results[1],
-                                   num_tail,
-                                   0,
-                                   rem_op.op->results[0],
-                                   epi_accs);
-        for(i = 0; i < num_tail; ++i)
+        rocke_gemm_emit_mfma_phase(
+            ctx, ctx->A_smem, ctx->B_smem, rem_accs, num_rem_accs, 0, rem_par, epi_accs);
+        for(i = 0; i < num_rem_accs; ++i)
             ctx->for_results[i] = epi_accs[i];
-        ctx->num_for_results = num_tail;
+        ctx->num_for_results = num_rem_accs;
     }
 }
 

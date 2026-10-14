@@ -196,6 +196,7 @@ rocke_gemm_universal_spec_t rocke_gemm_universal_spec_default(void)
     s.trait.dtl_cache_b = 2; /* CACHE_STREAM */
     s.trait.dtl_prefetch = false;
     s.trait.dtl_lds_alias = false;
+    s.trait.dtl_prefetch_depth = 1;
     s.trait.active_tile_skip = false;
     s.trait.lds_k_pad = 0;
     s.trait.lds_swizzle = false;
@@ -244,6 +245,7 @@ void rocke_gemm_universal_spec_finalize(rocke_gemm_universal_spec_t* spec)
  *          flags={"pad": any(pad_*), "pers": persistent, "bat": batched,
  *                 "preb": preshuffle_b, "dtl": direct_to_lds,
  *                 "pref": dtl_prefetch, "lalias": dtl_lds_alias,
+ *                 "pd{dtl_prefetch_depth}": dtl_prefetch_depth > 1,
  *                 "actt": active_tile_skip})
  *
  *  Flag iteration order matters (CPython 3.7+ dict insertion order); we pass the
@@ -258,10 +260,11 @@ rocke_status_t rocke_gemm_universal_kernel_name(const rocke_gemm_universal_spec_
     char part_w[64];
     char part_wt[64];
     char part_pipe[128];
+    char part_pd[32];
     char part_spk[32];
     const char* parts[5];
-    const char* flag_names[10];
-    int flag_on[10];
+    const char* flag_names[11];
+    int flag_on[11];
     const rocke_gemm_tile_spec_t* t;
     const rocke_gemm_trait_spec_t* tr;
 
@@ -293,11 +296,14 @@ rocke_status_t rocke_gemm_universal_kernel_name(const rocke_gemm_universal_spec_
     flag_names[4] = "dtl";
     flag_names[5] = "pref";
     flag_names[6] = "lalias";
-    flag_names[7] = "actt";
+    /* Python flag key f"pd{tr.dtl_prefetch_depth}" (on when depth > 1). */
+    snprintf(part_pd, sizeof(part_pd), "pd%d", tr->dtl_prefetch_depth);
+    flag_names[7] = part_pd;
+    flag_names[8] = "actt";
     /* Python flag key f"spk{tr.split_k}" (dynamic name; on when split_k > 1). */
     snprintf(part_spk, sizeof(part_spk), "spk%d", tr->split_k);
-    flag_names[8] = part_spk;
-    flag_names[9] = "noalc";
+    flag_names[9] = part_spk;
+    flag_names[10] = "noalc";
 
     flag_on[0] = (tr->pad_m || tr->pad_n || tr->pad_k) ? 1 : 0;
     flag_on[1] = tr->persistent ? 1 : 0;
@@ -306,11 +312,12 @@ rocke_status_t rocke_gemm_universal_kernel_name(const rocke_gemm_universal_spec_
     flag_on[4] = tr->direct_to_lds ? 1 : 0;
     flag_on[5] = tr->dtl_prefetch ? 1 : 0;
     flag_on[6] = tr->dtl_lds_alias ? 1 : 0;
-    flag_on[7] = tr->active_tile_skip ? 1 : 0;
-    flag_on[8] = (tr->split_k > 1) ? 1 : 0;
-    flag_on[9] = tr->cshuffle_no_alias ? 1 : 0;
+    flag_on[7] = (tr->dtl_prefetch_depth > 1) ? 1 : 0;
+    flag_on[8] = tr->active_tile_skip ? 1 : 0;
+    flag_on[9] = (tr->split_k > 1) ? 1 : 0;
+    flag_on[10] = tr->cshuffle_no_alias ? 1 : 0;
 
-    return rocke_kernel_name_join(spec->name, parts, 5, flag_names, flag_on, 10, out, out_cap, NULL);
+    return rocke_kernel_name_join(spec->name, parts, 5, flag_names, flag_on, 11, out, out_cap, NULL);
 }
 
 /* ===================================================================== *
@@ -683,7 +690,9 @@ bool rocke_gemm_universal_is_valid_spec(const rocke_gemm_universal_spec_t* spec,
 
     /* LDS budget. */
     ck_gemm_ab_lds_plan(spec, target, &ab_single, NULL, &ab_dbl);
-    ab_bytes = ab_single * (ab_dbl ? 2 : 1);
+    ab_bytes = ab_single
+               * (spec->trait.dtl_prefetch_depth > 1 ? spec->trait.dtl_prefetch_depth + 1
+                                                      : (ab_dbl ? 2 : 1));
     c_bytes = (strcmp(spec->trait.epilogue, "cshuffle") == 0) ? (t->tile_m * t->tile_n * 2) : 0;
     bytes_lds = ab_bytes + c_bytes;
     if(!rocke_archtarget_fits_lds(target, (long)bytes_lds))
@@ -756,6 +765,15 @@ bool rocke_gemm_universal_is_valid_spec(const rocke_gemm_universal_spec_t* spec,
                            alias_halves,
                            spec->block_size);
         }
+    }
+    if(spec->trait.dtl_prefetch_depth != 1 && spec->trait.dtl_prefetch_depth != 2)
+    {
+        CK_GEMM_REJECT("dtl_prefetch_depth must be 1 or 2 (got %d)",
+                       spec->trait.dtl_prefetch_depth);
+    }
+    if(spec->trait.dtl_prefetch_depth > 1 && !spec->trait.dtl_lds_alias)
+    {
+        CK_GEMM_REJECT("dtl_prefetch_depth > 1 requires dtl_lds_alias");
     }
 
     if(reason != NULL && reason_cap > 0)
