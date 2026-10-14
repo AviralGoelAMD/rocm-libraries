@@ -98,6 +98,8 @@ static rocke_status_t rocke__fastkv_gfx950_base_name(const rocke_attention_tiled
             s->use_fp8_mfma_qk ? "fp8mfma" : "",
             s->use_fp8_mfma_pv ? "fp8pv" : "",
             s->use_register_pv ? "regpv" : "",
+            s->use_f32_denormal_flush ? "ftz" : "",
+            s->use_fp_contract ? "fpc" : "",
         };
         size_t num_parts = sizeof(parts) / sizeof(parts[0]);
         return rocke_kernel_name_join(

@@ -205,6 +205,10 @@ void rocke_gfx950_attention_tiled_3d_declare_params(
     {
         rocke_attr_set_int(B, &ctx->kernel->attrs, "waves_per_eu", ctx->spec->waves_per_eu);
     }
+    if(ctx->spec != NULL && ctx->spec->use_f32_denormal_flush)
+    {
+        rocke_attr_set_str(B, &ctx->kernel->attrs, "f32_denormal_mode", "preserve-sign");
+    }
 
     /* segm_output_ptr: F32* noalias writeonly align16 */
     memset(&o, 0, sizeof(o));

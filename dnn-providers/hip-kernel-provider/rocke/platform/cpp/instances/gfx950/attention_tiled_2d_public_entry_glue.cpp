@@ -689,6 +689,11 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
             const int64_t agpr_zero[2] = {0, 0};
             rocke_attr_set_int_list(b, &b->kernel->attrs, "agpr_alloc", agpr_zero, 2);
         }
+        /* Python: apply_codegen_policy(b.kernel, spec.codegen_policy). */
+        if(spec->use_f32_denormal_flush)
+            rocke_attr_set_str(b, &b->kernel->attrs, "f32_denormal_mode", "preserve-sign");
+        if(spec->use_fp_contract)
+            rocke_attr_set_bool(b, &b->kernel->attrs, "fp_contract", true);
     }
 
     /* ---- parameter declarations (Py850-889) ---- */
@@ -1117,6 +1122,8 @@ static rocke_status_t rocke_g950_attn2d_kernel_name(const rocke_attention_tiled_
             s->use_fp8_mfma_qk ? "fp8mfma" : "",
             s->use_fp8_mfma_pv ? "fp8pv" : "",
             s->use_register_pv ? "regpv" : "",
+            s->use_f32_denormal_flush ? "ftz" : "",
+            s->use_fp_contract ? "fpc" : "",
         };
         size_t num_parts = sizeof(parts) / sizeof(parts[0]);
         return rocke_kernel_name_join(

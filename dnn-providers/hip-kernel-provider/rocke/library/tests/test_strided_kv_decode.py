@@ -296,8 +296,18 @@ def test_strided_selection_uses_runtime_policy(arch, block_size, monkeypatch):
     assert segment.waves_per_eu is None
     monkeypatch.setattr(au, "_resolve_attention_arch", lambda: arch)
     paged = au._tiled_3d_spec_from_problem(problem)
+    # The strided path keeps the gfx950 f32 denormal flush off.
+    no_ftz = (
+        {"use_f32_denormal_flush": False}
+        if hasattr(paged, "use_f32_denormal_flush")
+        else {}
+    )
     assert segment == replace(
-        paged, kv_layout="strided", use_wide_kv_load=False, use_i64_kv_addr=False
+        paged,
+        kv_layout="strided",
+        use_wide_kv_load=False,
+        use_i64_kv_addr=False,
+        **no_ftz,
     )
     explicit, explicit_reduce = au._strided_3d_specs_from_problem(
         replace(problem, waves_per_eu=3), arch=arch

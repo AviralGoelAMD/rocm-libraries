@@ -1028,6 +1028,10 @@ rocke_attention_tiled_2d_spec_t
         uint64_t cache_bytes = (uint64_t)p->num_kv_blocks * block_stride;
         s.use_i64_kv_addr = (cache_bytes > 0x80000000ULL);
     }
+    /* f32 denormal flush + FMA contraction: mirror Python _enable_f32_denormal_flush
+     * / _enable_fp_contract, arch-wide on gfx950 (this builder is gfx950-only). */
+    s.use_f32_denormal_flush = true;
+    s.use_fp_contract = true;
 
     /* k_single_buffer: mirrors Python _enable_k_single_buffer -- d128 small-tile
      * cohort AND the geometry invariant block_m <= tile_size, DERIVED from the

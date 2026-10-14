@@ -159,6 +159,10 @@ typedef struct rocke_unified_attention_3d_tiled_spec
      * the per-block byte base into a 64-bit buffer base). Kept byte-identical
      * with the gfx950 header (the two share this struct). */
     bool use_i64_kv_addr; /* False */
+    /* f32 denormal flush (CodegenPolicy f32_denormal_mode=preserve-sign). gfx950
+     * only: the gfx942 builder rejects it. Kept byte-identical with the gfx950
+     * header. */
+    bool use_f32_denormal_flush; /* False */
 } rocke_unified_attention_3d_tiled_spec_t;
 
 /* Materialise every defaulted field. Required fields are zero/NULL-init; the
@@ -209,6 +213,8 @@ typedef struct rocke_unified_attention_reduce_tiled_spec
 
     bool has_waves_per_eu; /* Optional[int] None */
     int waves_per_eu;
+    /* f32 denormal flush (gfx950 only; mirrors the gfx950 header). */
+    bool use_f32_denormal_flush; /* False */
 } rocke_unified_attention_reduce_tiled_spec_t;
 
 rocke_unified_attention_reduce_tiled_spec_t rocke_unified_attention_reduce_tiled_spec_default(void);

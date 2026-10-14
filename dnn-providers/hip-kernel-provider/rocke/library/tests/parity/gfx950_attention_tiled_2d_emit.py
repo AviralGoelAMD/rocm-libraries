@@ -23,6 +23,32 @@ from kernels.gfx950.attention_tiled_2d import (
 from _emit_common import run_emit
 
 
+# gfx950 D128 GQA-4 paged prefill geometry selected by the dispatcher
+# (`_tiled_spec_from_problem`, flags off); base of the fp-policy cases 56-58.
+_SHIP_D128_GQA = dict(
+    head_size=128,
+    block_size=16,
+    num_query_heads=32,
+    num_kv_heads=8,
+    dtype="bf16",
+    use_sinks=False,
+    sliding_window=0,
+    has_softcap=False,
+    num_seqs=1,
+    num_warps=4,
+    waves_per_eu=2,
+    tile_size=32,
+    block_m_per_warp=32,
+    use_mfma_32x32=True,
+    use_transposed_qk_32x32=True,
+    use_transposed_scalar_state=True,
+    use_transposed_mask_once=True,
+    use_transposed_half_local_pv=True,
+    use_mfma32_skip_legacy_qreg=True,
+    use_transposed_mask_limit=True,
+    use_softmax_mfma_interleave=True,
+)
+
 _CONFIGS = {
     # --- idx0-4: minimal dims, block_size=16, head_size {64,128,256}, GQA ratios
     0: dict(
@@ -898,6 +924,13 @@ _CONFIGS = {
         block_m_per_warp=32,
         tile_size=64,
     ),
+    # Backend floating-point policy (use_f32_denormal_flush / use_fp_contract).
+    # idx56 is the dispatcher's gfx950 D128 GQA prefill spec exactly as
+    # `_tiled_spec_from_problem` emits it (both flags on); idx57/58 flip one
+    # flag each on the same geometry so each knob has its own golden.
+    56: dict(_SHIP_D128_GQA, use_f32_denormal_flush=True, use_fp_contract=True),
+    57: dict(_SHIP_D128_GQA, dtype="fp16", use_f32_denormal_flush=True),
+    58: dict(_SHIP_D128_GQA, use_fp_contract=True),
 }
 
 
