@@ -1592,6 +1592,8 @@ class _Lowerer:
         self._needs_av_scope_md: bool = False
         # ``!5 = !{i32 1}`` referenced by ``!nontemporal`` loads/stores.
         self._needs_nontemporal_md: bool = False
+        # Scoped-alias domain for ``lds_dma_alias_scopes`` kernels (!6..!8).
+        self._needs_lds_dma_scope_md: bool = False
         # Off unless the kernel was built with source-location capture (see
         # IRBuilder's ``capture_loc`` / ROCKE_DEBUG_LOC). When off, not one byte
         # of the emitted .ll changes, so the byte-identity gate and the IR
@@ -3384,6 +3386,22 @@ class _Lowerer:
             )
             prev = tmp
 
+    def _lds_dma_md(self, role: str) -> str:
+        """Alias-scope attachment for kernels that order LDS DMA themselves.
+
+        With the ``lds_dma_alias_scopes`` kernel attr, every LDS-DMA write
+        (``role="dma"``) and every LDS vector / transpose read (``"read"``)
+        gets disjoint scopes. SIInsertWaitcnts then stops inserting a full
+        ``vmcnt(0)`` in front of each LDS read that follows an in-flight DMA;
+        the kernel's explicit ``s_waitcnt`` + ``s_barrier`` carry the
+        DMA-to-read ordering instead. Off: no attachment (IR unchanged)."""
+        if not self.kernel.attrs.get("lds_dma_alias_scopes"):
+            return ""
+        self._needs_lds_dma_scope_md = True
+        if role == "dma":
+            return ", !alias.scope !{!7}, !noalias !{!8}"
+        return ", !alias.scope !{!8}, !noalias !{!7}"
+
     def _op_tile_smem_load_vN(self, op: Op) -> None:
         """Vector LDS load. Emits a single naturally-aligned vector
         load; the AMDGPU backend turns aligned `<vec x half>` loads
@@ -3451,6 +3469,7 @@ class _Lowerer:
             scalar = self._fresh("smem.s")
             self._current().emit(
                 f"  {scalar} = load {volatile}{elem_ty}, ptr addrspace(3) {base}, align {align}"
+                f"{self._lds_dma_md('read')}"
             )
             self._current().emit(
                 f"  {op.result.name} = insertelement <1 x {elem_ty}> undef, {elem_ty} {scalar}, i32 0"
@@ -3458,7 +3477,7 @@ class _Lowerer:
         else:
             self._current().emit(
                 f"  {op.result.name} = load {volatile}<{vec} x {elem_ty}>, ptr addrspace(3) {base}, "
-                f"align {align}"
+                f"align {align}{self._lds_dma_md('read')}"
             )
 
     def _op_tile_wmma_f32_16x16x16_f16(self, op: Op) -> None:
@@ -4526,7 +4545,7 @@ class _Lowerer:
         raw = self._fresh("tr.raw")
         self._current().emit(
             f"  {raw} = call <4 x i16> @llvm.amdgcn.ds.read.tr16.b64("
-            f"ptr addrspace(3) {base})"
+            f"ptr addrspace(3) {base}){self._lds_dma_md('read')}"
         )
         elem_ty = _llvm_type(op.result.type.elem)  # type: ignore[attr-defined]
         self._current().emit(
@@ -4562,6 +4581,7 @@ class _Lowerer:
             # ``.v8bf16`` to match the op): no reinterpret needed.
             self._current().emit(
                 f"  {op.result.name} = call {ret_ty} @{intrinsic}(ptr addrspace(3) {base})"
+                f"{self._lds_dma_md('read')}"
             )
         else:
             # gfx950 returns a type-agnostic ``<8 x i16>``; reinterpret the raw
@@ -4569,6 +4589,7 @@ class _Lowerer:
             raw = self._fresh("trw.raw")
             self._current().emit(
                 f"  {raw} = call {ret_ty} @{intrinsic}(ptr addrspace(3) {base})"
+                f"{self._lds_dma_md('read')}"
             )
             self._current().emit(
                 f"  {op.result.name} = bitcast {ret_ty} {raw} to {want_ty}"
@@ -4787,7 +4808,7 @@ class _Lowerer:
             f"i32 {size_bytes}, "
             f"i32 {self._operand(voff)}, "
             f"i32 {self._operand(soff)}, "
-            f"i32 0, i32 {aux})"
+            f"i32 0, i32 {aux}){self._lds_dma_md('dma')}"
         )
 
     def _op_tile_s_wait_asynccnt(self, op: Op) -> None:
@@ -5772,6 +5793,7 @@ class _Lowerer:
             scalar = self._fresh("smem.s")
             self._current().emit(
                 f"  {scalar} = load float, ptr addrspace(3) {base}, align {align}"
+                f"{self._lds_dma_md('read')}"
             )
             self._current().emit(
                 f"  {op.result.name} = insertelement <1 x float> undef, float {scalar}, i32 0"
@@ -5779,6 +5801,7 @@ class _Lowerer:
         else:
             self._current().emit(
                 f"  {op.result.name} = load <{vec} x float>, ptr addrspace(3) {base}, align {align}"
+                f"{self._lds_dma_md('read')}"
             )
 
     # ----- packed f32->f16 + wide global store -----
@@ -6596,6 +6619,11 @@ class _Lowerer:
             out.append("")
         if self._needs_nontemporal_md:
             out.append("!5 = !{i32 1}")
+            out.append("")
+        if self._needs_lds_dma_scope_md:
+            out.append('!6 = distinct !{!6, !"rocke.lds"}')
+            out.append('!7 = distinct !{!7, !6, !"rocke.lds.dma"}')
+            out.append('!8 = distinct !{!8, !6, !"rocke.lds.read"}')
             out.append("")
         if self._debug is not None:
             out.extend(self._debug.render())
