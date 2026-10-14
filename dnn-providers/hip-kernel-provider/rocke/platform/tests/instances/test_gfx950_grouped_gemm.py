@@ -8,8 +8,9 @@ These builders are lowered by the Python engine only (no C++ mirror yet), so
 this file guards the *emitted IR contract* on CPU: each spec builds, lowers to
 AMDGPU LLVM, emits the expected 16x16x32 bf16 MFMA cluster, and is a
 deterministic function of the spec (the invariant the representative-IR golden
-relies on). The on-GPU numeric coverage lives in the example harnesses under
-``examples/gfx950/grouped_gemm/``.
+relies on). ``TestGroupedGemmGfx950Numeric`` adds an fp32-reference gate that
+runs only on a gfx950 GPU with hipcc; the example harnesses under
+``examples/gfx950/grouped_gemm/`` carry the wider on-GPU numeric coverage.
 
 Run:  PYTHONPATH=python python3 tests/instances/test_gfx950_grouped_gemm.py
 """
@@ -88,6 +89,108 @@ class TestGroupedGemmGfx950(unittest.TestCase):
             )[0]
         )
         self.assertIn(_MFMA_BF16, ir)
+
+    def test_operand_wait_is_tied_to_fragments(self):
+        # Inline-asm ds_read results look ready to LLVM immediately, so the
+        # lgkmcnt(0) drain must be an asm that the MFMA operands flow through;
+        # a bare s_waitcnt builtin let the scheduler hoist an MFMA above it.
+        from rocke.instances.gfx950.grouped_gemm import (
+            GroupedGemmSpec,
+            build_grouped_gemm,
+        )
+
+        spec = GroupedGemmSpec(M=8192, N=1024, K=512, E=64)
+        ir = _lower(build_grouped_gemm(spec)[0])
+        n_chunks = (spec.K // spec.TK) * (spec.TK // 32)
+        tied = 'asm sideeffect "s_waitcnt lgkmcnt(0)", "=v,0"'
+        self.assertEqual(ir.count(tied), n_chunks)
+
+
+def _gfx950_gpu_or_skip():
+    import shutil
+
+    try:
+        import torch
+
+        from rocke.runtime.hip_module import get_device_arch
+    except Exception as e:  # torch / HIP runtime missing
+        raise unittest.SkipTest(f"torch/HIP runtime not importable: {e}")
+    if not torch.cuda.is_available() or get_device_arch() != "gfx950":
+        raise unittest.SkipTest("needs a gfx950 GPU")
+    if shutil.which("hipcc") is None:
+        raise unittest.SkipTest("needs hipcc")
+    return torch
+
+
+class TestGroupedGemmGfx950Numeric(unittest.TestCase):
+    """On-GPU fp32-reference gate for the production lever set (epifuse +
+    inline-asm ds_read + deep pipe), which read in-flight LDS fragments before
+    the operand wait was tied to the MFMA inputs."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.torch = _gfx950_gpu_or_skip()
+
+    def _check(self, **kw):
+        torch = self.torch
+        from rocke.helpers.compile import compile_kernel_via_hipcc
+        from rocke.instances.gfx950.grouped_gemm import (
+            GroupedGemmSpec,
+            build_grouped_gemm,
+            grouped_gemm_signature,
+        )
+        from rocke.runtime.launcher import KernelLauncher, LaunchConfig
+
+        spec = GroupedGemmSpec(**kw)
+        kernel, bs, tm, tn = build_grouped_gemm(spec)
+        art = compile_kernel_via_hipcc(kernel, arch="gfx950")
+        launch = KernelLauncher(
+            hsaco=art.hsaco,
+            kernel_name=kernel.name,
+            signature=grouped_gemm_signature(),
+            cache_key=(kernel.name, tuple(sorted(kw.items()))),
+        )
+        E, M, N, K = spec.E, spec.M, spec.N, spec.K
+        g = torch.Generator(device="cuda").manual_seed(0)
+        A = torch.randn(E, M, K, generator=g, device="cuda").to(torch.bfloat16)
+        b_shape = (E, K, N) if spec.b_rrr else (E, N, K)
+        B = torch.randn(*b_shape, generator=g, device="cuda") * 0.05
+        B = B.to(torch.bfloat16)
+        b_ref = B.float() if spec.b_rrr else B.float().transpose(-1, -2)
+        ref = torch.bmm(A.float(), b_ref)
+        C = torch.full((E, M, N), float("nan"), dtype=torch.bfloat16, device="cuda")
+        launch(
+            {
+                "A": A.data_ptr(),
+                "B": B.data_ptr(),
+                "C": C.data_ptr(),
+                "M": M,
+                "N": N,
+                "K": K,
+                "stride_a": M * K,
+                "stride_b": N * K,
+                "stride_c": M * N,
+            },
+            config=LaunchConfig(
+                stream=0,
+                grid=((N + tn - 1) // tn, (M + tm - 1) // tm, E),
+                block=(bs, 1, 1),
+            ),
+        )
+        torch.cuda.synchronize()
+        err = (C.float() - ref).abs()
+        self.assertFalse(bool(torch.isnan(err).any()), "unwritten/NaN outputs")
+        # bf16 output rounding of |C| < 16 is <= 2^-4; accumulation is fp32.
+        self.assertLess(err.max().item(), 0.1)
+
+    def test_default_levers(self):
+        self._check(M=1024, N=1024, K=512, E=4)
+
+    def test_default_levers_deep_k(self):
+        self._check(M=512, N=1024, K=2048, E=2)
+
+    def test_nn_layout(self):
+        self._check(M=1024, N=1024, K=512, E=4, b_rrr=True)
 
 
 class TestRaggedGemmGfx950(unittest.TestCase):

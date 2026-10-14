@@ -1348,10 +1348,10 @@
         },
         "grouped_gemm/gfx950/m8192n1024k512e64": {
           "arch": "gfx950",
-          "bytes": 267299,
+          "bytes": 301844,
           "family": "grouped_gemm",
           "kernel_name": "irhash_grouped_gemm_950",
-          "sha256": "5234f535c1882fc42e7cf473363383f65a069383a31a590d85a0764e2bcc510b",
+          "sha256": "ab0ac4f8b3a7e9e118cfd62ac0b1ade6343a74a0cab5159f2994e60d69110b0d",
           "status": "ok"
         },
         "kda_chunkwise/gfx942/fused_default": {
@@ -2924,10 +2924,10 @@
         },
         "grouped_gemm/gfx950/m8192n1024k512e64": {
           "arch": "gfx950",
-          "bytes": 267395,
+          "bytes": 301940,
           "family": "grouped_gemm",
           "kernel_name": "irhash_grouped_gemm_950",
-          "sha256": "89dc74a06fead91ad0c0a3ac019036dd05989c2619deb64942ed8dff047b69ab",
+          "sha256": "7a001c1da300524c1a08563773fbbd2bab7f588aa623fbf9cbc8839e7b00d8d9",
           "status": "ok"
         },
         "kda_chunkwise/gfx942/fused_default": {
@@ -4532,10 +4532,10 @@
         },
         "grouped_gemm/gfx950/m8192n1024k512e64": {
           "arch": "gfx950",
-          "bytes": 267459,
+          "bytes": 302004,
           "family": "grouped_gemm",
           "kernel_name": "irhash_grouped_gemm_950",
-          "sha256": "e260ef4ca6ae29ae67e152ee7e3da958edc0a2bc3799ed310225b30fb137afe2",
+          "sha256": "e6e5b7c9dfa6b0c125f5fede4beaaaffda31a0221b3ccc3d1d83a1f83882132f",
           "status": "ok"
         },
         "kda_chunkwise/gfx942/fused_default": {

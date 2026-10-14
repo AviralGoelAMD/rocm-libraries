@@ -99,6 +99,30 @@ def grouped_gemm_signature():
     )
 
 
+def lds_wait_tied(b: IRBuilder, frags):
+    """``s_waitcnt lgkmcnt(0)`` that every consumer of ``frags`` depends on.
+
+    LLVM treats an inline-asm ``ds_read`` result as ready as soon as the asm
+    retires, and a bare ``s_waitcnt`` builtin carries no data dependency, so the
+    machine scheduler may hoist an MFMA that reads an in-flight fragment above
+    the wait. Emitting the wait as volatile asm and passing each fragment through
+    a tied ``"=v,0"`` asm after it forces every consumer below the wait without
+    emitting any extra instruction. Returns the fenced fragments, in order.
+    """
+    out = []
+    for i, f in enumerate(frags):
+        raw_ty = VectorType(I32, f.type.count // 2)
+        raw = b.inline_asm(
+            "s_waitcnt lgkmcnt(0)" if i == 0 else "",
+            "=v,0",
+            [b.vec_bitcast(f, raw_ty)],
+            result_type=raw_ty,
+            sideeffect=True,
+        )
+        out.append(b.vec_bitcast(raw, f.type))
+    return out
+
+
 def build_custom_grouped(
     M,
     N,
@@ -451,6 +475,14 @@ def build_custom_grouped(
                         b.sched_group_barrier(SGB_DSREAD, want - ds_done, 0)
                         ds_done = want
 
+    def lds_wait(a_fr, b_fr):
+        # NN (b_rrr) B fragments come from compiler-tracked ds_read_tr
+        # intrinsics, which LLVM already waits for; tie only the asm reads.
+        if b_rrr:
+            return lds_wait_tied(b, a_fr), b_fr
+        fenced = lds_wait_tied(b, [*a_fr, *b_fr])
+        return fenced[: len(a_fr)], fenced[len(a_fr) :]
+
     def compute(ai, bi, acc=None, store_on_last=None):
         if acc is None:
             acc = accs
@@ -474,7 +506,9 @@ def build_custom_grouped(
             for kk in range(kchunks):
                 if burstprio:
                     b.s_setprio(0)  # yield to sibling wave during the read drain
-                b.s_waitcnt(lgkmcnt=0)  # drain current operands (next not yet issued)
+                # Drain current operands (next not yet issued); the tie keeps
+                # this chunk's MFMAs from being scheduled above the wait.
+                a_fr, b_fr = lds_wait(a_fr, b_fr)
                 na = nb = None
                 if kk + 1 < kchunks:
                     na, nb = read_chunk(ai, bi, kk + 1)  # issue next -> overlaps MFMAs
@@ -499,8 +533,8 @@ def build_custom_grouped(
                     nxt = read_chunk(ai, bi, kk + 1)  # prefetch BEFORE current MFMAs
                 if asm_reads:
                     # Opaque inline-asm ds_read: compiler won't auto-insert the
-                    # lgkmcnt wait, so force a full drain before the consuming MFMA.
-                    b.s_waitcnt(lgkmcnt=0)
+                    # lgkmcnt wait, so force a full drain tied to the consuming MFMA.
+                    a_fr, b_fr = lds_wait(a_fr, b_fr)
                 last_chunk = kk == kchunks - 1
                 _mma_block(
                     a_fr, b_fr, acc, store_after=store_on_last if last_chunk else None
