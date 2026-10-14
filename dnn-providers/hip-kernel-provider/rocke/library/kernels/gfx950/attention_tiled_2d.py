@@ -543,8 +543,8 @@ class UnifiedAttention2DTiledSpec:
     use_kv_block_id_prefetch: bool = False
     # Transposed 32x32 softmax VALU diet: reduce the tile max on the raw QK
     # scores and scale only the reduced max (the softmax scale is positive),
-    # fold scale + max-subtract into one FMA feeding exp2, and sum the row
-    # with a balanced tree so the adds can pack. Inactive with softcap /
+    # fold scale + max-subtract into one FMA feeding exp2. The row sum stays a
+    # single serial chain (see the softmax body). Inactive with softcap /
     # ALiBi / QQ-bias, which are defined on the scaled score.
     use_softmax_scale_fold: bool = False
 
@@ -3832,9 +3832,15 @@ def build_unified_attention_2d_tiled(
                     [[None] * 16 for _ in range(QK_N_TILES)]
                     for _ in range(len(st_groups))
                 ]
+                # Row sum as ONE serial fadd chain (both softmax variants). Any
+                # pairable form (a stride-halving tree, explicit <2 x f32> adds,
+                # two interleaved chains) lets the backend emit v_pk_add_f32,
+                # and after it unpacks the adds that sit in an MFMA shadow the
+                # register allocator can hand the repacked add a half-swapped
+                # src1 (``op_sel:[0,1]``), which gfx950 executes wrongly while an
+                # MFMA is in flight. A single dependency chain has nothing to pair.
                 st_l_local = zero_f
                 st_neg_m = b.fsub(zero_f, st_m_new) if SOFTMAX_SCALE_FOLD else None
-                st_p_all = []
                 for group_idx in range(len(st_groups)):
                     for n in range(QK_N_TILES):
                         for reg in range(16):
@@ -3850,22 +3856,7 @@ def build_unified_attention_2d_tiled(
                                     b.fsub(st_scores[(group_idx, n, reg)], st_m_new)
                                 )
                             PT32_groups[group_idx][n][reg] = p_t
-                            if SOFTMAX_SCALE_FOLD:
-                                st_p_all.append(p_t)
-                            else:
-                                st_l_local = b.fadd(st_l_local, p_t)
-                if SOFTMAX_SCALE_FOLD:
-                    # Stride-halving tree: element j pairs with j + len/2, so
-                    # adjacent pairs (j, j+1) of both operands stay register
-                    # neighbours and pack into v_pk_add_f32 without moves (a
-                    # serial chain cannot be packed at all).
-                    while len(st_p_all) > 1:
-                        half = len(st_p_all) // 2
-                        tail = st_p_all[2 * half :]
-                        st_p_all = [
-                            b.fadd(st_p_all[j], st_p_all[j + half]) for j in range(half)
-                        ] + tail
-                    st_l_local = st_p_all[0]
+                            st_l_local = b.fadd(st_l_local, p_t)
                 PT32_n = PT32_groups[0]
                 if GROUPED_KV2:
                     PT32_n_g1 = PT32_groups[1]
