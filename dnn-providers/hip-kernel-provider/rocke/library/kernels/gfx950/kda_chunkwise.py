@@ -2364,7 +2364,10 @@ def _emit_scan_body(sc: _ScanCtx, state, tile, *, prefetch: "_InputPrefetch" = N
             row0, col = sc.slot(4 * grp)
             cg = cidx(jt, col)
             if sc.v_lds is not None:
-                vvec = _ld(b, sc.v_lds, cg, b.add(wrow, row0), dtype=ELEM, n=4)
+                # Split scan with ``v_prefetch``: V was staged into the same
+                # double-buffered half as this chunk's tiles.
+                vr = cg if sc.buf_bias is None else b.add(sc.buf_bias[0], cg)
+                vvec = _ld(b, sc.v_lds, vr, b.add(wrow, row0), dtype=ELEM, n=4)
             else:
                 vvec = b.global_load_vN(
                     sc.v_ptr,
@@ -2715,6 +2718,10 @@ class KdaChunkScanSpec:
     # them misses in its L2. 0 keeps the identity mapping. Needs the token-major
     # ABI, whose ``batch``/``heads`` arguments give the kernel its grid size.
     xcd_remap: int = 0
+    # Stage chunk ``n+1``'s V slice with its tiles (requires ``prefetch_tiles``)
+    # into a double-buffered LDS tile, so the residual reads V from LDS instead
+    # of issuing an HBM load in the middle of the recurrence and waiting on it.
+    v_prefetch: bool = False
     name: str = "rocke_kda_chunk_scan"
 
     @property
@@ -2776,6 +2783,7 @@ class KdaChunkScanSpec:
             + 2 * ev * PDK  # stb_s bf16 mirror of S^T
             + 2 * ev * PCB  # vn_s  bf16 (EV x C)
             + bufs * 4 * DK  # dec_s fp32 (DK)
+            + (2 * 2 * C * (ev + 8) if self.v_prefetch else 0)  # v_s bf16 (2C x ev)
         )
 
     def kernel_name(self) -> str:
@@ -2793,6 +2801,8 @@ class KdaChunkScanSpec:
             parts += ("pf",)
         if self.xcd_remap:
             parts += (f"x{self.xcd_remap}",)
+        if self.v_prefetch:
+            parts += ("vp",)
         return kernel_name_join(self.name, *parts)
 
 
@@ -2805,6 +2815,8 @@ def is_valid_scan_spec(
     if spec.dtype not in _DTYPE_IR:
         return False, f"unsupported dtype {spec.dtype}"
 
+    if spec.v_prefetch and not spec.prefetch_tiles:
+        return False, "v_prefetch rides the prefetch_tiles double buffer"
     if spec.value_splits not in _RAW_VALUE_SPLITS:
         return False, (
             f"value_splits must be one of {_RAW_VALUE_SPLITS}, "
@@ -2996,6 +3008,11 @@ def build_kda_chunk_scan(spec: KdaChunkScanSpec, arch: str = "gfx950") -> "Kerne
     dec_lds = b.smem_alloc(F32, [nbuf * DK], "dec_s")
     stb_lds = b.smem_alloc(ELEM, [ev_slice, PDK], "stb_s")
     vn_lds = b.smem_alloc(ELEM, [ev_slice, PCB], "vn_s")
+    # Padded by 8 elements: keeps the 128-bit staging writes aligned and moves
+    # the residual's per-chunk-row reads off a power-of-two row pitch.
+    v_lds = (
+        b.smem_alloc(ELEM, [2 * C, ev_slice + 8], "v_s") if spec.v_prefetch else None
+    )
 
     tid = b.thread_id_x()
     lane = b.mod(tid, b.const_i32(64))
@@ -3040,6 +3057,7 @@ def build_kda_chunk_scan(spec: KdaChunkScanSpec, arch: str = "gfx950") -> "Kerne
         v_row_base=v_row_base,
         ev_stride=EV,
         io=io,
+        v_lds=v_lds,
     )
 
     state_base = b.add(
@@ -3115,6 +3133,33 @@ def build_kda_chunk_scan(spec: KdaChunkScanSpec, arch: str = "gfx950") -> "Kerne
                     dvalid,
                 )
             )
+            if spec.v_prefetch:
+                # The chunk's C x ev_slice V band, 8 channels per slot; a row
+                # of the band is contiguous in HBM, so one 128-bit load each.
+                n_slot = C * ev_slice // 8
+                for i in range((n_slot + BLOCK - 1) // BLOCK):
+                    vidx = b.add(tid, b.const_i32(i * BLOCK))
+                    valid = None
+                    safe = vidx
+                    if n_slot % BLOCK:
+                        valid = b.cmp_gt(b.const_i32(n_slot), vidx)
+                        safe = b.select(valid, vidx, b.const_i32(n_slot - 1))
+                    off = b.mul(safe, b.const_i32(8))
+                    vrow = b.div(off, b.const_i32(ev_slice))
+                    vcol = b.mod(off, b.const_i32(ev_slice))
+                    got.append(
+                        (
+                            v_lds,
+                            C,
+                            ev_slice,
+                            off,
+                            b.global_load_vN(
+                                v_ptr, sc.v_global(tile_idx, vrow, vcol), ELEM, 8
+                            ),
+                            8,
+                            valid,
+                        )
+                    )
             return got
 
         def commit(got, bias):
@@ -3139,7 +3184,9 @@ def build_kda_chunk_scan(spec: KdaChunkScanSpec, arch: str = "gfx950") -> "Kerne
         class _TilePrefetch:
             """The next chunk's tiles, straddling this chunk's recurrence."""
 
-            issue_after_v = True
+            # With V staged too, nothing in the body loads from HBM, so the
+            # issue can be the body's first instruction.
+            issue_after_v = not spec.v_prefetch
             commit_at_end = True
 
             def __init__(self, tile_idx, bias):
