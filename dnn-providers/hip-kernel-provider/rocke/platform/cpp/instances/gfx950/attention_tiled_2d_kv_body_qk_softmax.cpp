@@ -622,6 +622,19 @@ void rocke_gfx950_attn2d_emit_kv_body(rocke_gfx950_attn2d_build_ctx_t* ctx)
     /* ---- wait for current K + LDS barrier ---- */
     rocke_b_s_waitcnt(b, /*vmcnt=*/0, /*lgkmcnt=*/0, /*expcnt=*/-1);
     rocke_gfx950_attn2d_kv_publish_sync(ctx);
+    if(ctx->BLOCK_ID_PREFETCH)
+    {
+        /* Ids for tile i+2, issued right after the iteration-start wait so they
+         * are the oldest VMEM ops of this iteration (Python 3484-3494). This
+         * iteration's K/V loads of tile i / safe_next_tile take their soffset
+         * from the carried ids. */
+        rocke_value_t* t2_raw = rocke_b_add(b, ctx->kv_tile_iv, rocke_b_const_i32(b, 2));
+        rocke_value_t* t2_ok = rocke_b_cmp_lt(b, t2_raw, ctx->tile_end);
+        rocke_value_t* t2 = rocke_b_select(b, t2_ok, t2_raw, ctx->kv_tile_iv);
+        rocke_gfx950_attn2d_load_block_ids(ctx, t2, ctx->bid_new);
+        ctx->pf_tile_cur = ctx->kv_tile_iv;
+        ctx->pf_tile_nxt = safe_next_tile;
+    }
 
     /* STEP 2 lever (modes 0/1): canned iglp interleave for the whole loop body,
      * placed once after the iter-start K drain (mirrors Python 3093-3094). Level

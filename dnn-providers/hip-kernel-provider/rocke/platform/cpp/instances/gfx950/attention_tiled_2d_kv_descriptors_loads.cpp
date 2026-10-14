@@ -228,6 +228,89 @@ void rocke_gfx950_attn2d_kv_publish_sync(rocke_gfx950_attn2d_build_ctx_t* ctx)
 }
 
 /* ==========================================================================
+ * Paged block-id prefetch (use_kv_block_id_prefetch).
+ * ========================================================================== */
+
+/* _dma_call_coords: per call, the (loop-invariant) block index within the tile
+ * and the within-block byte offset of the lane's chunk. */
+static void rocke__dma_call_coords(rocke_gfx950_attn2d_build_ctx_t* ctx,
+                                   rocke__swz_fn swz,
+                                   rocke_value_t** bwt,
+                                   rocke_value_t** within)
+{
+    rocke_ir_builder_t* b = ctx->b;
+    const int kv_halves_per_call = rocke__kv_halves_per_call(ctx);
+    const int tok_b = ctx->NUM_KV * ctx->HD * ctx->KV_BYTES;
+    const int h_b = ctx->HD * ctx->KV_BYTES;
+    rocke_value_t* lane_half_base = rocke__lane_half_base(ctx);
+    for(int call = 0; call < ctx->kv_calls_per_tile; ++call)
+    {
+        rocke_value_t* lh
+            = rocke_b_add(b, rocke_b_const_i32(b, call * kv_halves_per_call), lane_half_base);
+        rocke_value_t* row = rocke_b_div(b, lh, rocke_b_const_i32(b, ctx->HD));
+        bwt[call] = rocke_b_div(b, row, rocke_b_const_i32(b, ctx->BS));
+        if(swz != NULL)
+            lh = rocke__swizzle_dma_linear_half(ctx, lh, swz);
+        rocke_value_t* tok_row = rocke_b_div(b, lh, rocke_b_const_i32(b, ctx->HD));
+        rocke_value_t* token = rocke_b_mod(b, tok_row, rocke_b_const_i32(b, ctx->BS));
+        rocke_value_t* dim = rocke_b_mod(b, lh, rocke_b_const_i32(b, ctx->HD));
+        rocke_value_t* tok_off = rocke_b_mul(b, token, rocke_b_const_i32(b, tok_b));
+        rocke_value_t* head_off = rocke_b_mul(b, ctx->kv_head_idx, rocke_b_const_i32(b, h_b));
+        rocke_value_t* th = rocke_b_add(b, tok_off, head_off);
+        rocke_value_t* dim_off = rocke_b_mul(b, dim, rocke_b_const_i32(b, ctx->KV_BYTES));
+        within[call] = rocke_b_add(b, th, dim_off);
+    }
+}
+
+void rocke_gfx950_attn2d_load_block_ids(rocke_gfx950_attn2d_build_ctx_t* ctx,
+                                        rocke_value_t* tile_idx,
+                                        rocke_value_t** out_ids)
+{
+    rocke_ir_builder_t* b = ctx->b;
+    rocke_value_t* seq_base = rocke__seq_base(ctx);
+    rocke_value_t* max_idx = rocke__block_table_max_idx(ctx);
+    rocke_value_t* tile_blk
+        = rocke_b_mul(b, tile_idx, rocke_b_const_i32(b, ctx->N_BLOCKS_PER_TILE));
+    rocke_value_t* tile_base = rocke_b_add(b, seq_base, tile_blk);
+    for(int call = 0; call < ctx->kv_calls_per_tile; ++call)
+    {
+        rocke_value_t* idx = rocke_b_add(b, tile_base, ctx->dma_bwt[call]);
+        /* Out-of-table indices clamp to entry 0 before the load. */
+        rocke_value_t* in_table = rocke_b_cmp_lt(b, idx, max_idx);
+        idx = rocke_b_select(b, in_table, idx, rocke_b_const_i32(b, 0));
+        out_ids[call] = rocke_b_global_load(b, ctx->block_tables, idx, rocke_i32(), 4);
+    }
+}
+
+/* _prefetched_ids.get(id(kv_tile_idx)): the carried ids for this tile index,
+ * or NULL when the load must resolve its block through the descriptor. */
+static rocke_value_t* const* rocke__prefetched_ids(rocke_gfx950_attn2d_build_ctx_t* ctx,
+                                                   rocke_value_t* kv_tile_idx)
+{
+    if(!ctx->BLOCK_ID_PREFETCH || kv_tile_idx == NULL)
+        return NULL;
+    if(kv_tile_idx == ctx->pf_tile_cur)
+        return ctx->bid_cur;
+    if(kv_tile_idx == ctx->pf_tile_nxt)
+        return ctx->bid_nxt;
+    return NULL;
+}
+
+/* _block_soffs: scalar soffset = to_sgpr_u32(id) * block stride, per call. */
+static void rocke__block_soffs(rocke_gfx950_attn2d_build_ctx_t* ctx,
+                               rocke_value_t* const* ids,
+                               rocke_value_t** soffs)
+{
+    rocke_ir_builder_t* b = ctx->b;
+    const int blk_b = ctx->BS * ctx->NUM_KV * ctx->HD * ctx->KV_BYTES;
+    for(int call = 0; call < ctx->kv_calls_per_tile; ++call)
+    {
+        rocke_value_t* sid = rocke_b_to_sgpr_u32(b, ids[call]);
+        soffs[call] = rocke_b_mul(b, sid, rocke_b_const_i32(b, blk_b));
+    }
+}
+
+/* ==========================================================================
  * Pre-loop: K/V buffer resources, byte derivation, paged-KV descriptor
  * (Python lines 1163-1630, the K/V-descriptor parts).
  * ========================================================================== */
@@ -248,6 +331,7 @@ void rocke_gfx950_attn2d_emit_preloop(rocke_gfx950_attn2d_build_ctx_t* ctx)
         int kv_halves_per_call = rocke__kv_halves_per_call(ctx);
         /* assert (T * HD) % KV_HALVES_PER_CALL == 0 (1414). */
         (void)((ctx->T * ctx->HD) % kv_halves_per_call);
+        ctx->kv_calls_per_tile = rocke__kv_calls_per_tile(ctx);
     }
 
     /* kv_block_bytes_c (1458): Python creates this one-block-bound const here,
@@ -336,6 +420,21 @@ void rocke_gfx950_attn2d_emit_preloop(rocke_gfx950_attn2d_build_ctx_t* ctx)
         chain[2] = rocke_indirect(
             b, "linear_block_idx", "physical_block", ctx->block_tables, seq_base, max_idx, 0);
         ctx->kv_desc = rocke_tensor_descriptor_transform(b, kv_base, chain, 3);
+    }
+
+    /* Paged block-id prefetch: loop-invariant per-call coordinates for K, then
+     * V (each with its own swizzle; the V pass re-derives the discarded bwt). */
+    if(ctx->BLOCK_ID_PREFETCH)
+    {
+        rocke_value_t* unused_bwt[ROCKE_GFX950_ATTN2D_MAX_KV_CALLS];
+        rocke__dma_call_coords(ctx,
+                               ctx->K_LDS_SWZ ? rocke_gfx950_attn2d_k_swz_halves : NULL,
+                               ctx->dma_bwt,
+                               ctx->k_dma_within);
+        rocke__dma_call_coords(ctx,
+                               ctx->V_LDS_SWZ ? rocke_gfx950_attn2d_v_swz_halves : NULL,
+                               unused_bwt,
+                               ctx->v_dma_within);
     }
 
     /* fp8 async-loader setup (Python 1785-1796), after the paged-KV
@@ -461,12 +560,22 @@ void rocke_gfx950_attn2d_issue_k_load_runtime(rocke_gfx950_attn2d_build_ctx_t* c
     rocke_value_t* fast_block1 = NULL;
     if(ctx->FAST_PAGED_KV_DESC)
         rocke_gfx950_attn2d_fast_paged_kv_blocks(ctx, kv_tile_idx, &fast_block0, &fast_block1);
+    rocke_value_t* const* pf_ids = rocke__prefetched_ids(ctx, kv_tile_idx);
+    rocke_value_t* pf_soffs[ROCKE_GFX950_ATTN2D_MAX_KV_CALLS];
+    if(pf_ids != NULL)
+        rocke__block_soffs(ctx, pf_ids, pf_soffs);
 
     for(int call = 0; call < kv_calls_per_tile; ++call)
     {
         rocke_value_t* k_rsrc = ctx->k_rsrc;
         rocke_value_t* voff = NULL;
-        if(ctx->FAST_PAGED_KV_DESC)
+        rocke_value_t* k_soff = zero_soff;
+        if(pf_ids != NULL)
+        {
+            voff = ctx->k_dma_within[call];
+            k_soff = pf_soffs[call];
+        }
+        else if(ctx->FAST_PAGED_KV_DESC)
         {
             rocke_value_t* base_i64 = NULL;
             rocke__fast_paged_kv_voff_split(ctx, call, fast_block0, fast_block1, &base_i64, &voff);
@@ -516,7 +625,7 @@ void rocke_gfx950_attn2d_issue_k_load_runtime(rocke_gfx950_attn2d_build_ctx_t* c
             b, K_wave_base, rocke_b_const_i64(b, (int64_t)call * bytes_per_call));
         /* CACHE_STREAM (SLC): one-shot streaming load; dwords=4 (1687-1689). */
         rocke_b_async_buffer_load_lds_addr_scoped(
-            b, k_rsrc, k_dst, voff, zero_soff, 4, ROCKE_CACHE_STREAM, ctx->LDS_DMA_TAG);
+            b, k_rsrc, k_dst, voff, k_soff, 4, ROCKE_CACHE_STREAM, ctx->LDS_DMA_TAG);
     }
 }
 
@@ -555,12 +664,22 @@ void rocke_gfx950_attn2d_issue_v_load_runtime(rocke_gfx950_attn2d_build_ctx_t* c
     rocke_value_t* fast_block1 = NULL;
     if(ctx->FAST_PAGED_KV_DESC)
         rocke_gfx950_attn2d_fast_paged_kv_blocks(ctx, kv_tile_idx, &fast_block0, &fast_block1);
+    rocke_value_t* const* pf_ids = rocke__prefetched_ids(ctx, kv_tile_idx);
+    rocke_value_t* pf_soffs[ROCKE_GFX950_ATTN2D_MAX_KV_CALLS];
+    if(pf_ids != NULL)
+        rocke__block_soffs(ctx, pf_ids, pf_soffs);
 
     for(int call = 0; call < kv_calls_per_tile; ++call)
     {
         rocke_value_t* v_rsrc = ctx->v_rsrc;
         rocke_value_t* voff = NULL;
-        if(ctx->FAST_PAGED_KV_DESC)
+        rocke_value_t* v_soff = zero_soff;
+        if(pf_ids != NULL)
+        {
+            voff = ctx->v_dma_within[call];
+            v_soff = pf_soffs[call];
+        }
+        else if(ctx->FAST_PAGED_KV_DESC)
         {
             rocke_value_t* base_i64 = NULL;
             rocke__fast_paged_kv_voff_split(ctx, call, fast_block0, fast_block1, &base_i64, &voff);
@@ -609,7 +728,7 @@ void rocke_gfx950_attn2d_issue_v_load_runtime(rocke_gfx950_attn2d_build_ctx_t* c
             b, V_wave_base, rocke_b_const_i64(b, (int64_t)call * bytes_per_call));
         /* CACHE_STREAM (SLC): V consumed once per iter; dwords=4 (1737-1739). */
         rocke_b_async_buffer_load_lds_addr_scoped(
-            b, v_rsrc, v_dst, voff, zero_soff, 4, ROCKE_CACHE_STREAM, ctx->LDS_DMA_TAG);
+            b, v_rsrc, v_dst, voff, v_soff, 4, ROCKE_CACHE_STREAM, ctx->LDS_DMA_TAG);
     }
 }
 

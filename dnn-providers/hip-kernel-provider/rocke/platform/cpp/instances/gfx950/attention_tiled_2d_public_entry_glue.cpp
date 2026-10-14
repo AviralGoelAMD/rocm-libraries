@@ -576,6 +576,23 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
                                 "use_lds_dma_overlap does not support staggered_iter_wait "
                                 "with early_v_schedule");
         }
+        if(spec->use_kv_block_id_prefetch)
+        {
+            if(spec->kv_storage_dtype != NULL)
+                rocke_g950_fail(
+                    b, ROCKE_ERR_VALUE, "use_kv_block_id_prefetch does not support FP8 KV");
+            if(spec->use_fast_paged_kv_desc || spec->use_i64_kv_addr)
+                rocke_g950_fail(b,
+                                ROCKE_ERR_VALUE,
+                                "use_kv_block_id_prefetch needs the i32 paged descriptor path");
+            if(spec->use_grouped_kv2_softmax)
+                rocke_g950_fail(
+                    b, ROCKE_ERR_VALUE, "use_kv_block_id_prefetch does not support grouped_kv2");
+            if(spec->head_size <= 0 || (512 / spec->head_size) > spec->block_size)
+                rocke_g950_fail(b,
+                                ROCKE_ERR_VALUE,
+                                "use_kv_block_id_prefetch needs 512/head_size <= block_size");
+        }
     }
     /* K single-buffer IS ported in the gfx950 C twin (it shares the
      * depth-2 V-single `else` schedule). Mirror Python __post_init__ guards so
@@ -661,6 +678,7 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
     ctx->LDS_DMA_OVERLAP = spec->use_lds_dma_overlap;
     ctx->LDS_DMA_TAG = spec->use_lds_dma_overlap ? "dma" : NULL;
     ctx->LDS_READ_TAG = spec->use_lds_dma_overlap ? "read" : NULL;
+    ctx->BLOCK_ID_PREFETCH = spec->use_kv_block_id_prefetch;
     {
         /* SWZ_CPR = HD // 8; SWZ_RPP_SHIFT = max(0, (128 // HD).bit_length() - 1);
          * SWZ_HD_SHIFT = HD.bit_length() - 1. */
@@ -1223,6 +1241,7 @@ static rocke_status_t rocke_g950_attn2d_kernel_name(const rocke_attention_tiled_
             s->use_k_lds_xor_swizzle ? "kswz" : "",
             s->use_v_lds_xor_swizzle ? "vswz" : "",
             s->use_lds_dma_overlap ? "dmaov" : "",
+            s->use_kv_block_id_prefetch ? "bidpf" : "",
         };
         size_t num_parts = sizeof(parts) / sizeof(parts[0]);
         return rocke_kernel_name_join(

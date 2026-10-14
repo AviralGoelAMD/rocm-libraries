@@ -1013,6 +1013,10 @@ static int make_spec(int idx, rocke_attention_tiled_2d_spec_t* s)
         pipe_d128_t64(s);
         s->use_lds_dma_overlap = true;
         break;
+    case 67:
+        pipe_d128_t64(s);
+        s->use_kv_block_id_prefetch = true;
+        break;
 
     default:
         return -1;

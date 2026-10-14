@@ -707,6 +707,14 @@ void rocke_gfx950_attn2d_emit_pv_bucket(rocke_gfx950_attn2d_build_ctx_t* ctx,
         for(atom = 0; atom < ctx->ACC_M_ATOMS; ++atom)
             yields[yc++] = new_acc[n * ctx->ACC_M_ATOMS + atom];
     yields[yc++] = ctx->GROUPED_KV2 ? in->cur_buf : ctx->nxt_buf_v;
+    if(ctx->BLOCK_ID_PREFETCH)
+    {
+        /* Carry tile i+1's ids into bid_cur and tile i+2's into bid_nxt. */
+        for(i = 0; i < ctx->kv_calls_per_tile; ++i)
+            yields[yc++] = ctx->bid_nxt[i];
+        for(i = 0; i < ctx->kv_calls_per_tile; ++i)
+            yields[yc++] = ctx->bid_new[i];
+    }
 
     /* Record the rewritten carry for callers that thread phases (the driver's
      * single-phase path reads this back via the loop results). */
@@ -757,6 +765,15 @@ static rocke_for_t rocke__attn2d_kv_phase(rocke_gfx950_attn2d_build_ctx_t* ctx,
     for(i = 0; i < num_accs; ++i)
         ctx->acc_cur[i] = kvloop.iter_vars[ml + i];
     ctx->cur_buf = kvloop.iter_vars[ml + num_accs];
+    if(ctx->BLOCK_ID_PREFETCH)
+    {
+        int bid_base = ml + num_accs + 1;
+        for(i = 0; i < ctx->kv_calls_per_tile; ++i)
+        {
+            ctx->bid_cur[i] = kvloop.iter_vars[bid_base + i];
+            ctx->bid_nxt[i] = kvloop.iter_vars[bid_base + ctx->kv_calls_per_tile + i];
+        }
+    }
     ctx->skip_mask = skip_mask;
 
     rocke_gfx950_attn2d_emit_kv_body(ctx);
