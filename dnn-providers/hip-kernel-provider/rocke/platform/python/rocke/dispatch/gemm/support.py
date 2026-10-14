@@ -127,8 +127,14 @@ def _lds_bytes(q: GemmSupportQuery) -> float:
     return matrix_a + matrix_b
 
 
-def _lds_capacity(q: GemmSupportQuery) -> int:
-    return _LDS_CAPACITY_LIMITS.get(q.pipeline, _LDS_CAPACITY_LIMITS["default"])
+def _lds_capacity(q: GemmSupportQuery, target: ArchTarget) -> int:
+    # The CK table is sized for a 64 KiB LDS (gfx942). Arches with more LDS
+    # (gfx950: 160 KiB) keep the same per-pipeline reserve *fraction*, so a
+    # compv4 tile that stages one A+B K-slice may use proportionally more.
+    cap = _LDS_CAPACITY_LIMITS.get(q.pipeline, _LDS_CAPACITY_LIMITS["default"])
+    hw = target.lds_capacity_bytes
+    base = _LDS_CAPACITY_LIMITS["default"]
+    return cap * hw // base if hw > base else cap
 
 
 def gemm_config_supported(q: GemmSupportQuery) -> Tuple[bool, str]:
@@ -223,7 +229,7 @@ def gemm_config_supported(q: GemmSupportQuery) -> Tuple[bool, str]:
                 return False, f"WMMA path does not support {label} on {q.arch}"
 
     lds_used = _lds_bytes(q)
-    lds_cap = min(_lds_capacity(q), target.lds_capacity_bytes)
+    lds_cap = min(_lds_capacity(q, target), target.lds_capacity_bytes)
     if lds_used > lds_cap:
         return (
             False,

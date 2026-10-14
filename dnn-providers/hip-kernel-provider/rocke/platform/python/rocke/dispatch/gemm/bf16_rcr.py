@@ -50,6 +50,7 @@ from .common import (
     GEMM_DIM_VOCABULARY,
     GemmRequest,
     apply_split_k,
+    apply_split_k_decode,
     rcr_request_errors,
 )
 from .support import (
@@ -176,6 +177,7 @@ _DECODE_M_MAX = 32  # only compete for skinny (decode/GEMV) M
 
 def _spec_cdna_decode(req: GemmRequest, name: str) -> UniversalGemmSpec:
     wt_m, wt_n, wt_k = 16, 16, 32
+    tile_k = 64
     warp_n = max(1, _DECODE_TILE_N // wt_n)
     while warp_n > 1 and (warp_n * 64 > 1024 or _DECODE_TILE_N % (warp_n * wt_n) != 0):
         warp_n //= 2
@@ -185,7 +187,7 @@ def _spec_cdna_decode(req: GemmRequest, name: str) -> UniversalGemmSpec:
         tile=TileSpec(
             tile_m=16,
             tile_n=_DECODE_TILE_N,
-            tile_k=32,
+            tile_k=tile_k,
             warp_m=1,
             warp_n=warp_n,
             warp_k=1,
@@ -197,11 +199,62 @@ def _spec_cdna_decode(req: GemmRequest, name: str) -> UniversalGemmSpec:
             pipeline="compv4",
             scheduler="intrawave",
             epilogue="default",
+            # Pad only the dims that need it: pad_k turns every A/B global
+            # load into masked per-element scalar loads.
             pad_m=True,
-            pad_n=True,
-            pad_k=True,
+            pad_n=req.N % _DECODE_TILE_N != 0,
+            pad_k=req.K % tile_k != 0,
         ),
     )
+
+
+# gfx950 (CDNA4) direct-to-LDS ping-pong candidates. Async buffer_load_lds
+# into a double-buffered LDS tile with the alias-scoped prefetch, st_16x32
+# swizzle, and (large grids) the chiplet L2 remap. 256x256 needs enough
+# output tiles to occupy the device (one 512-thread CTA per CU); smaller
+# grids take the 128x128 tile.
+_DTL256_MIN_TILES = 128
+_DTL_CHIPLET_MIN_TILES = 2048
+
+
+def _dtl_trait(tiles: int) -> TraitSpec:
+    return TraitSpec(
+        pipeline="compv4",
+        scheduler="intrawave",
+        epilogue="default",
+        direct_to_lds=True,
+        dtl_prefetch=True,
+        dtl_lds_alias=True,
+        lds_swizzle=True,
+        chiplet_swizzle=tiles >= _DTL_CHIPLET_MIN_TILES,
+    )
+
+
+def _spec_cdna4_dtl256(req: GemmRequest, name: str) -> UniversalGemmSpec:
+    tiles = (req.M // 256) * (req.N // 256)
+    return _make_spec(
+        name=name,
+        arch=req.arch,
+        tile=TileSpec(256, 256, 64, 2, 4, 1, 16, 16, 32),
+        trait=_dtl_trait(tiles),
+    )
+
+
+def _spec_cdna4_dtl128(req: GemmRequest, name: str) -> UniversalGemmSpec:
+    tiles = (req.M // 128) * (req.N // 128)
+    return _make_spec(
+        name=name,
+        arch=req.arch,
+        tile=TileSpec(128, 128, 64, 2, 2, 1, 16, 16, 32),
+        trait=_dtl_trait(tiles),
+    )
+
+
+def _gate_dtl256(req: GemmRequest) -> Tuple[bool, str]:
+    tiles = (req.M // 256) * (req.N // 256)
+    if tiles < _DTL256_MIN_TILES:
+        return False, f"{tiles} 256x256 tiles < {_DTL256_MIN_TILES}"
+    return True, "ok"
 
 
 def _make_candidate(
@@ -212,6 +265,8 @@ def _make_candidate(
     spec_fn: Callable[[GemmRequest, str], UniversalGemmSpec],
     arches: Tuple[str, ...],
     shapes: Tuple[ShapeRange, ...] = (),
+    split: Callable[[GemmRequest, UniversalGemmSpec], UniversalGemmSpec] = apply_split_k,
+    gate: Callable[[GemmRequest], Tuple[bool, str]] | None = None,
 ) -> KernelCandidate:
     def support(req: OperatorRequest) -> Tuple[bool, str]:
         errors = _request_errors(req)
@@ -221,6 +276,10 @@ def _make_candidate(
         ok, why = selector_matches(req, candidate)
         if not ok:
             return False, why
+        if gate is not None:
+            ok, why = gate(req)
+            if not ok:
+                return False, why
         spec = spec_fn(req, name)
         ok, why = gemm_config_supported(
             support_query_from_universal_spec(spec, arch=req.arch)
@@ -237,7 +296,7 @@ def _make_candidate(
         # Engage split-K for skinny/tall-N decode shapes that leave the device
         # idle; a no-op (returns the spec unchanged) for shapes that already
         # fill the device, keeping the default / square path byte-identical.
-        return apply_split_k(req, spec_fn(req, name))
+        return split(req, spec_fn(req, name))
 
     candidate = KernelCandidate(
         name=name,
@@ -276,6 +335,7 @@ def _grid(spec: UniversalGemmSpec, req: OperatorRequest) -> Tuple[int, int, int]
 _CDNA_MFMA_BF16 = ("gfx90a", "gfx942", "gfx950")
 _CDNA_MEM_BF16 = ("gfx942", "gfx950")
 _CDNA_DECODE_BF16 = ("gfx950",)
+_CDNA4_DTL_BF16 = ("gfx950",)
 _RDNA_WMMA = ("gfx11-generic", "gfx1151", "gfx1201")
 
 GEMM_BF16_REGISTRY = CandidateRegistry(
@@ -286,6 +346,21 @@ GEMM_BF16_REGISTRY = CandidateRegistry(
 )
 GEMM_BF16_REGISTRY.extend(
     (
+        _make_candidate(
+            name="universal_gemm_bf16_cdna4_dtl256",
+            spec_id="cdna4_dtl_256x256",
+            priority=4,
+            spec_fn=_spec_cdna4_dtl256,
+            arches=_CDNA4_DTL_BF16,
+            gate=_gate_dtl256,
+        ),
+        _make_candidate(
+            name="universal_gemm_bf16_cdna4_dtl128",
+            spec_id="cdna4_dtl_128x128",
+            priority=5,
+            spec_fn=_spec_cdna4_dtl128,
+            arches=_CDNA4_DTL_BF16,
+        ),
         _make_candidate(
             name="universal_gemm_bf16_cdna_cshuffle",
             spec_id="cdna_cshuffle_default",
@@ -323,6 +398,7 @@ GEMM_BF16_REGISTRY.extend(
             # Only compete for skinny (decode/GEMV) M. This was an imperative
             # shape gate; as data it is visible to a coverage query.
             shapes=(ShapeRange("M", max=_DECODE_M_MAX),),
+            split=apply_split_k_decode,
         ),
     )
 )
