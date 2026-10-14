@@ -206,6 +206,7 @@ rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_de
     s.kv_tile_mult = 1;
     s.kv_prefetch = false;
     s.transposed_softmax = false;
+    s.kv_split_wait = false;
     return s;
 }
 
@@ -260,6 +261,12 @@ bool rocke_gfx950_unified_attention_3d_tiled_spec_validate(
     if(s->transposed_softmax && (s->use_alibi || s->use_qq_bias))
     {
         rocke_i_set_err(b, ROCKE_ERR_VALUE, "transposed_softmax does not support ALiBi or QQ bias");
+        return false;
+    }
+    if(s->kv_split_wait && (!s->kv_prefetch || s->kv_storage_dtype != NULL))
+    {
+        rocke_i_set_err(
+            b, ROCKE_ERR_VALUE, "kv_split_wait needs kv_prefetch with a bf16/fp16 KV cache");
         return false;
     }
     return true;
@@ -346,7 +353,7 @@ static int rocke_attn3d950_kernel_name(const rocke_unified_attention_3d_tiled_sp
     /* kernel_name_join("rocke_uattn3d_tiled", d.., b.., h..kv.., seg.., dtype,
      *   kv<...> if kv_storage_dtype else "", "i64kv", "sinks", "sw<sw>",
      *   "softcap", "alibi", "qqb", "ftz", "stridedkv", "dec", "t<T>" (kv_tile_mult
-     *   > 1), "pf", "tsm") -- each only when its knob is set.
+     *   > 1), "pf", "tsm", "kvsw") -- each only when its knob is set.
      *
      * Positional parts list (NOT flags=...): empty parts are skipped by
      * kernel_name_join. We materialise each part and feed the non-empty ones in
@@ -434,6 +441,10 @@ static int rocke_attn3d950_kernel_name(const rocke_unified_attention_3d_tiled_sp
     if(s->transposed_softmax)
     {
         parts[np++] = "tsm";
+    }
+    if(s->kv_split_wait)
+    {
+        parts[np++] = "kvsw";
     }
 
     st = rocke_kernel_name_join("", parts, np, NULL, NULL, 0, buf, cap, &out_len);
@@ -771,6 +782,7 @@ bool rocke_gfx950_attn_tiled_3d_config_from_spec(
     out->FP8_REG_PREFETCH = spec->kv_prefetch && out->KV_FP8;
     out->TRANS = spec->transposed_softmax;
     out->NR = out->TRANS ? 1 : 4;
+    out->KV_SPLIT_WAIT = spec->kv_split_wait;
     if(out->QK_K_ITERS > 8)
     {
         rocke_i_set_err(

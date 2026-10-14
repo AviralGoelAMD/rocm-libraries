@@ -169,6 +169,7 @@ typedef struct rocke_unified_attention_3d_tiled_spec
     int kv_tile_mult; /* 1 */
     bool kv_prefetch; /* False */
     bool transposed_softmax; /* False */
+    bool kv_split_wait; /* False */
 } rocke_unified_attention_3d_tiled_spec_t;
 
 /* Materialise every defaulted field. Required fields are zero/NULL-init; the

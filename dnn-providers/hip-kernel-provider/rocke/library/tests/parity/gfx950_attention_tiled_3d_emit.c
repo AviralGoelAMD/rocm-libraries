@@ -338,6 +338,20 @@ static int make_spec(int idx, rocke_unified_attention_3d_tiled_spec_t* s)
         s->transposed_softmax = true;
         s->kv_prefetch = true;
         break;
+    case 22:
+        /* kv_prefetch + kv_split_wait */
+        s->head_size = 128;
+        s->block_size = 16;
+        s->num_query_heads = 32;
+        s->num_kv_heads = 8;
+        s->dtype = "bf16";
+        s->num_segments = 16;
+        s->use_sinks = false;
+        s->sliding_window = 0;
+        s->has_softcap = false;
+        s->kv_prefetch = true;
+        s->kv_split_wait = true;
+        break;
     default:
         return -1;
     }

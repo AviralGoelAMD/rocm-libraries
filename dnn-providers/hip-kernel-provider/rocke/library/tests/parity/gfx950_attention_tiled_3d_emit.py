@@ -336,6 +336,20 @@ _CONFIGS = {
         transposed_softmax=True,
         kv_prefetch=True,
     ),
+    22: dict(
+        # kv_prefetch + kv_split_wait
+        head_size=128,
+        block_size=16,
+        num_query_heads=32,
+        num_kv_heads=8,
+        dtype="bf16",
+        num_segments=16,
+        use_sinks=False,
+        sliding_window=0,
+        has_softcap=False,
+        kv_prefetch=True,
+        kv_split_wait=True,
+    ),
 }
 
 

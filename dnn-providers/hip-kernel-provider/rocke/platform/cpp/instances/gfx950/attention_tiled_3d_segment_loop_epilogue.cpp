@@ -262,6 +262,19 @@ void rocke_gfx950_attention_tiled_3d_emit_loop_init(
         ids2 = rocke_gfx950_attention_tiled_3d_tile_block_ids(ctx, nxt1);
         rocke__append_pf(ctx->pf_inits, &ctx->n_pf, ids2, cfg->TILE_MULT);
     }
+    else if(cfg->PREFETCH && cfg->KV_SPLIT_WAIT)
+    {
+        /* Block ids ahead of the DMAs, so the partial vmcnt waits in the loop
+         * count K/V calls only (VMEM returns in issue order). */
+        rocke_value_t** ids0 = rocke_gfx950_attention_tiled_3d_tile_block_ids(ctx, ctx->tile_start);
+        rocke_value_t* nxt = rocke_b_add(b, ctx->tile_start, rocke_b_const_i32(b, 1));
+        rocke_value_t** ids1 = rocke_gfx950_attention_tiled_3d_tile_block_ids(ctx, nxt);
+        rocke_gfx950_attention_tiled_3d_issue_k_load(
+            ctx, ctx->tile_start, rocke_b_const_i32(b, 0), ids0);
+        rocke_gfx950_attention_tiled_3d_issue_v_load(
+            ctx, ctx->tile_start, rocke_b_const_i32(b, 0), ids0);
+        rocke__append_pf(ctx->pf_inits, &ctx->n_pf, ids1, cfg->TILE_MULT);
+    }
     else if(cfg->PREFETCH)
     {
         rocke_value_t** ids0 = rocke_gfx950_attention_tiled_3d_tile_block_ids(ctx, ctx->tile_start);
@@ -492,6 +505,26 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
             nxt3 = rocke_b_add(b, kv_tile_iv, rocke_b_const_i32(b, 3));
             ids_n3 = rocke_gfx950_attention_tiled_3d_tile_block_ids(ctx, nxt3);
             rocke__append_pf(new_pf, &n_new_pf, ids_n3, TM);
+        }
+        else if(cfg->KV_SPLIT_WAIT)
+        {
+            /* In flight here (issue order): ids[+1], K[cur], V[cur]. Wait for
+             * K[cur] only; V[cur] lands under QK + softmax. */
+            rocke_value_t** ids_n1 = cfg->PREFETCH_IDS ? carry + pf_base : NULL;
+            rocke_if_t g;
+            rocke_b_s_waitcnt(b, cfg->kv_calls_per_tile, 0, -1);
+            rocke_b_s_barrier_bare(b);
+            if(cfg->PREFETCH_IDS)
+            {
+                rocke_value_t* nxt2 = rocke_b_add(b, kv_tile_iv, rocke_b_const_i32(b, 2));
+                rocke_value_t** ids_n2 = rocke_gfx950_attention_tiled_3d_tile_block_ids(ctx, nxt2);
+                rocke__append_pf(new_pf, &n_new_pf, ids_n2, TM);
+            }
+            g = rocke_b_scf_if(b, in_range_next);
+            rocke_b_region_enter(b, g.then_region);
+            rocke_gfx950_attention_tiled_3d_issue_k_load(ctx, next_tile_iv_raw, nxt_buf, ids_n1);
+            rocke_gfx950_attention_tiled_3d_issue_v_load(ctx, next_tile_iv_raw, nxt_buf, ids_n1);
+            rocke_b_region_leave(b);
         }
         else
         {
@@ -782,11 +815,30 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
 
         if(cfg->PREFETCH)
         {
+            if(cfg->KV_SPLIT_WAIT)
+            {
+                /* In flight: V[cur], ids[+2], then K/V[next] when issued.
+                 * Leave the younger loads outstanding; V[cur] must land. */
+                const int n_ids = cfg->PREFETCH_IDS ? TM : 0;
+                rocke_if_t g = rocke_b_scf_if(b, in_range_next);
+                rocke_if_t g_last;
+                rocke_b_region_enter(b, g.then_region);
+                rocke_b_s_waitcnt(b, 2 * cfg->kv_calls_per_tile + n_ids, -1, -1);
+                rocke_b_region_leave(b);
+                g_last = rocke_b_scf_if(b, rocke_b_cmp_ge(b, next_tile_iv_raw, ctx->tile_end));
+                rocke_b_region_enter(b, g_last.then_region);
+                rocke_b_s_waitcnt(b, n_ids, -1, -1);
+                rocke_b_region_leave(b);
+            }
             if(!TRANS)
             {
                 /* K/V[cur] already landed; only the P tile written above must
                  * be visible. Next tile's loads stay in flight. */
                 rocke_b_sync_lds_only(b);
+            }
+            else if(cfg->KV_SPLIT_WAIT)
+            {
+                rocke_b_s_barrier_bare(b);
             }
         }
         else if(cfg->KV_FP8)

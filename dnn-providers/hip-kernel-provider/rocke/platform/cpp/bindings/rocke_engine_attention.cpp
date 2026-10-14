@@ -1071,6 +1071,7 @@ rocke_unified_attention_3d_tiled_spec_t t3d_build(const py::dict& d, Store& st)
     s.kv_tile_mult = a_int(d, "kv_tile_mult", s.kv_tile_mult);
     s.kv_prefetch = a_bool(d, "kv_prefetch", s.kv_prefetch);
     s.transposed_softmax = a_bool(d, "transposed_softmax", s.transposed_softmax);
+    s.kv_split_wait = a_bool(d, "kv_split_wait", s.kv_split_wait);
     if(d.contains("waves_per_eu") && !d["waves_per_eu"].is_none())
     {
         s.has_waves_per_eu = true;
