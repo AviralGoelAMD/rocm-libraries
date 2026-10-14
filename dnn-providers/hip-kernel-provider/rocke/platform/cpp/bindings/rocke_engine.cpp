@@ -276,6 +276,7 @@ void fill_universal_spec(rocke_gemm_universal_spec_t* spec,
                               "dtl_cache_a",
                               "dtl_cache_b",
                               "dtl_prefetch",
+                              "dtl_lds_alias",
                               "active_tile_skip",
                               "lds_k_pad",
                               "lds_swizzle"};
@@ -312,6 +313,7 @@ void fill_universal_spec(rocke_gemm_universal_spec_t* spec,
         spec->trait.dtl_cache_a = dict_int(tr, "dtl_cache_a", spec->trait.dtl_cache_a);
         spec->trait.dtl_cache_b = dict_int(tr, "dtl_cache_b", spec->trait.dtl_cache_b);
         spec->trait.dtl_prefetch = dict_bool(tr, "dtl_prefetch", spec->trait.dtl_prefetch);
+        spec->trait.dtl_lds_alias = dict_bool(tr, "dtl_lds_alias", spec->trait.dtl_lds_alias);
         spec->trait.active_tile_skip
             = dict_bool(tr, "active_tile_skip", spec->trait.active_tile_skip);
         spec->trait.lds_k_pad = dict_int(tr, "lds_k_pad", spec->trait.lds_k_pad);

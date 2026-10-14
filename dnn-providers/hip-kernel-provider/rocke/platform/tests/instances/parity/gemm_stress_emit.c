@@ -321,6 +321,27 @@ static int make_spec(int idx, rocke_gemm_universal_spec_t* spec)
         spec->trait.epilogue = "cshuffle";
         spec->block_size = 1024;
         break;
+    case 38:
+        spec->name = "s38";
+        spec->tile = TILE(256, 256, 64, 2, 4, 1, 16, 16, 32);
+        spec->trait.pipeline = "compv4";
+        spec->trait.epilogue = "default";
+        spec->trait.direct_to_lds = true;
+        spec->trait.dtl_prefetch = true;
+        spec->trait.lds_swizzle = true;
+        spec->trait.dtl_lds_alias = true;
+        spec->block_size = 512;
+        break;
+    case 39:
+        spec->name = "s39";
+        spec->tile = TILE(128, 128, 64, 2, 2, 1, 16, 16, 16);
+        spec->trait.pipeline = "compv4";
+        spec->trait.epilogue = "default";
+        spec->trait.direct_to_lds = true;
+        spec->trait.dtl_prefetch = true;
+        spec->trait.dtl_lds_alias = true;
+        spec->block_size = 256;
+        break;
     default:
         return -1;
     }

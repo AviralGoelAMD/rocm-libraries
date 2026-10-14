@@ -471,13 +471,16 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
             rocke_value_t* off_elems
                 = rocke_b_add(b, ctx->batch_off_a, rocke_b_add(b, a_row_term, a_k_term));
             rocke_value_t* off_bytes = rocke_b_mul(b, off_elems, c2);
-            rocke_b_async_buffer_load_lds_addr(b,
-                                               ctx->dtl_a_rsrc,
-                                               pass_lds_a,
-                                               off_bytes,
-                                               ctx->dtl_zero_soff,
-                                               ctx->dtl_dwords,
-                                               spec->trait.dtl_cache_a);
+            rocke_lds_alias_t a_tag;
+            rocke_b_async_buffer_load_lds_addr_alias(
+                b,
+                ctx->dtl_a_rsrc,
+                pass_lds_a,
+                off_bytes,
+                ctx->dtl_zero_soff,
+                ctx->dtl_dwords,
+                spec->trait.dtl_cache_a,
+                rocke_gemm_ring_slot(ctx, ctx->a_lds_ring, parity_imm, parity_v, &a_tag));
         }
         for(int p = 0; p < ctx->dtl_b_passes; ++p)
         {
@@ -501,13 +504,16 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
             rocke_value_t* off_elems
                 = rocke_b_add(b, ctx->batch_off_b, rocke_b_add(b, b_row_term, b_k_term));
             rocke_value_t* off_bytes = rocke_b_mul(b, off_elems, c2);
-            rocke_b_async_buffer_load_lds_addr(b,
-                                               ctx->dtl_b_rsrc,
-                                               pass_lds_b,
-                                               off_bytes,
-                                               ctx->dtl_zero_soff,
-                                               ctx->dtl_dwords,
-                                               spec->trait.dtl_cache_b);
+            rocke_lds_alias_t b_tag;
+            rocke_b_async_buffer_load_lds_addr_alias(
+                b,
+                ctx->dtl_b_rsrc,
+                pass_lds_b,
+                off_bytes,
+                ctx->dtl_zero_soff,
+                ctx->dtl_dwords,
+                spec->trait.dtl_cache_b,
+                rocke_gemm_ring_slot(ctx, ctx->b_lds_ring, parity_imm, parity_v, &b_tag));
         }
         return;
     }

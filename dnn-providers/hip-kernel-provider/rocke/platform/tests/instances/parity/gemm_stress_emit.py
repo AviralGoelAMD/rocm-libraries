@@ -312,6 +312,32 @@ def _specs():
         TraitSpec(pipeline="compv4", epilogue="cshuffle"),
         block_size=1024,
     )
+    # ---- knob: dtl_lds_alias (ring-tagged DTL ping-pong, 2x-unrolled K loop) ----
+    add(
+        "s38",
+        (256, 256, 64, 2, 4, 1, 16, 16, 32),
+        TraitSpec(
+            pipeline="compv4",
+            epilogue="default",
+            direct_to_lds=True,
+            dtl_prefetch=True,
+            lds_swizzle=True,
+            dtl_lds_alias=True,
+        ),
+        block_size=512,
+    )
+    add(
+        "s39",
+        (128, 128, 64, 2, 2, 1, 16, 16, 16),
+        TraitSpec(
+            pipeline="compv4",
+            epilogue="default",
+            direct_to_lds=True,
+            dtl_prefetch=True,
+            dtl_lds_alias=True,
+        ),
+        block_size=256,
+    )
     return S
 
 

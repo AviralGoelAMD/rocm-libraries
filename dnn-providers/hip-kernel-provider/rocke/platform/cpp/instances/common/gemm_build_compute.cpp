@@ -19,6 +19,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "rocke/instance_gemm_internal.h"
@@ -99,6 +100,14 @@ void rocke_gemm_emit_mfma_phase(rocke_gemm_build_ctx_t* ctx,
         a_row_parity_off = 0;
         b_row_parity_off = 0;
     }
+    /* dtl_lds_alias: the ring slot (ping-pong half) every operand read of this
+     * K-tile touches. */
+    rocke_lds_alias_t a_tag;
+    rocke_lds_alias_t b_tag;
+    const rocke_lds_alias_t* a_alias
+        = rocke_gemm_ring_slot(ctx, ctx->a_lds_ring, parity_imm, parity_v, &a_tag);
+    const rocke_lds_alias_t* b_alias
+        = rocke_gemm_ring_slot(ctx, ctx->b_lds_ring, parity_imm, parity_v, &b_tag);
 
     /* Lane mapping into LDS. M-in-atom = lane % warp_tile_m, K-sub-block =
      * lane / warp_tile_m, N-in-atom = lane % warp_tile_n. */
@@ -136,12 +145,13 @@ void rocke_gemm_emit_mfma_phase(rocke_gemm_build_ctx_t* ctx,
                     b, rocke_b_const_i32(b, mi * t->warp_tile_m + a_row_parity_off), m_in_atom));
             if(a_par_row_v != NULL)
                 a_row = rocke_b_add(b, a_row, a_par_row_v);
-            a_rows[mi] = rocke_gemm_emit_smem_load(b,
-                                                   A_src,
-                                                   a_row,
-                                                   rocke_gemm_swz_col(ctx, col_base, a_row),
-                                                   ctx->a_per_lane,
-                                                   ctx->storage_dtype);
+            a_rows[mi] = rocke_gemm_emit_smem_load_alias(b,
+                                                         A_src,
+                                                         a_row,
+                                                         rocke_gemm_swz_col(ctx, col_base, a_row),
+                                                         ctx->a_per_lane,
+                                                         ctx->storage_dtype,
+                                                         a_alias);
         }
 
         for(ni = 0; ni < mfmas_n; ++ni)
@@ -156,12 +166,13 @@ void rocke_gemm_emit_mfma_phase(rocke_gemm_build_ctx_t* ctx,
                     b, rocke_b_const_i32(b, ni * t->warp_tile_n + b_row_parity_off), n_in_atom));
             if(b_par_row_v != NULL)
                 b_row = rocke_b_add(b, b_row, b_par_row_v);
-            b_cols[ni] = rocke_gemm_emit_smem_load(b,
-                                                   B_src,
-                                                   b_row,
-                                                   rocke_gemm_swz_col(ctx, col_base, b_row),
-                                                   ctx->b_per_lane,
-                                                   ctx->storage_dtype);
+            b_cols[ni] = rocke_gemm_emit_smem_load_alias(b,
+                                                         B_src,
+                                                         b_row,
+                                                         rocke_gemm_swz_col(ctx, col_base, b_row),
+                                                         ctx->b_per_lane,
+                                                         ctx->storage_dtype,
+                                                         b_alias);
         }
 
         /* _mma_cluster(a_rows, b_cols): bracket each m-row's MFMA cluster
@@ -347,6 +358,133 @@ void rocke_gemm_emit_kloop_simple(rocke_gemm_build_ctx_t* ctx)
 }
 
 /* ===================================================================== *
+ *  _emit_kloop_prefetch_ring: _emit_kloop_prefetch steady state + tail for
+ *  dtl_lds_alias. The ping-pong loop is unrolled 2x with static parity so
+ *  each copy's A/B ring slot tag is a compile-time fact: a pair iteration
+ *  runs tile 2j from slot 0 (DMA fills slot 1) and tile 2j+1 from slot 1
+ *  (DMA fills slot 0). A 0/1-trip remainder loop runs an odd last
+ *  steady-state tile from slot 0 and carries the final tile's slot, which
+ *  the tail reads through any_slot after its full drain. The next DMA is
+ *  issued after each barrier, so no LDS-DMA op is in flight at a barrier
+ *  (keep_lds_dma=0).
+ * ===================================================================== */
+static void gemm_emit_kloop_prefetch_ring(rocke_gemm_build_ctx_t* ctx,
+                                          rocke_value_t* K_minus_one_tile)
+{
+    rocke_ir_builder_t* b = ctx->b;
+    rocke_value_t* c_pair = rocke_b_const_i32(b, 2 * ctx->block_k);
+    rocke_value_t* trips;
+    rocke_value_t* pair_end;
+    rocke_iter_arg_t pair_args[ROCKE_GEMM_MAX_ACCS];
+    rocke_iter_arg_t rem_args[1 + ROCKE_GEMM_MAX_ACCS];
+    char rem_names[ROCKE_GEMM_MAX_ACCS][96];
+    rocke_for_t pair_op;
+    rocke_for_t rem_op;
+    int i;
+
+    {
+        rocke_value_t* span = rocke_b_sub(b, K_minus_one_tile, ctx->k_lo);
+        rocke_value_t* round = rocke_b_const_i32(b, ctx->block_k - 1);
+        trips = rocke_b_div(b, rocke_b_add(b, span, round), ctx->c_block_k);
+    }
+    {
+        rocke_value_t* half = rocke_b_div(b, trips, rocke_b_const_i32(b, 2));
+        pair_end = rocke_b_add(b, ctx->k_lo, rocke_b_mul(b, half, c_pair));
+    }
+
+    for(i = 0; i < ctx->num_accs; ++i)
+    {
+        pair_args[i].name = ctx->acc_names[i];
+        pair_args[i].init = ctx->acc_inits[i];
+    }
+    pair_op = rocke_b_scf_for_iter(b,
+                                   ctx->k_lo,
+                                   pair_end,
+                                   c_pair,
+                                   pair_args,
+                                   ctx->num_accs,
+                                   "k0",
+                                   /*unroll=*/false,
+                                   /*elide_trailing_barrier=*/true);
+    rocke_b_region_enter(b, pair_op.body);
+    {
+        rocke_value_t* acc_a[ROCKE_GEMM_MAX_ACCS];
+        rocke_value_t* acc_b[ROCKE_GEMM_MAX_ACCS];
+        rocke_value_t* const* cur = pair_op.iter_vars;
+        int n = pair_op.num_iter_vars;
+        int s;
+        for(s = 0; s < 2; ++s)
+        {
+            rocke_value_t* k_next;
+            rocke_value_t** out = (s == 0) ? acc_a : acc_b;
+            rocke_b_sync_keep_lds_dma(b, 0);
+            k_next = rocke_b_add(b, pair_op.iv, s == 0 ? ctx->c_block_k : c_pair);
+            rocke_gemm_emit_load_phase(ctx, ctx->A_smem, ctx->B_smem, k_next, 1 - s, NULL);
+            rocke_gemm_emit_mfma_phase(ctx, ctx->A_smem, ctx->B_smem, cur, n, s, NULL, out);
+            cur = out;
+        }
+        rocke_b_scf_yield(b, acc_b, n);
+    }
+    rocke_b_region_leave(b);
+
+    rem_args[0].name = "rpar";
+    rem_args[0].init = ctx->c0;
+    for(i = 0; i < ctx->num_accs; ++i)
+    {
+        snprintf(rem_names[i], sizeof(rem_names[i]), "r_%s", ctx->acc_names[i]);
+        rem_args[1 + i].name = rem_names[i];
+        rem_args[1 + i].init = pair_op.op->results[i];
+    }
+    rem_op = rocke_b_scf_for_iter(b,
+                                  pair_end,
+                                  K_minus_one_tile,
+                                  ctx->c_block_k,
+                                  rem_args,
+                                  1 + ctx->num_accs,
+                                  "k0r",
+                                  /*unroll=*/false,
+                                  /*elide_trailing_barrier=*/true);
+    rocke_b_region_enter(b, rem_op.body);
+    {
+        rocke_value_t* new_accs[ROCKE_GEMM_MAX_ACCS];
+        rocke_value_t* yield_vals[1 + ROCKE_GEMM_MAX_ACCS];
+        int n = rem_op.num_iter_vars - 1;
+        rocke_b_sync_keep_lds_dma(b, 0);
+        rocke_gemm_emit_load_phase(ctx,
+                                   ctx->A_smem,
+                                   ctx->B_smem,
+                                   rocke_b_add(b, rem_op.iv, ctx->c_block_k),
+                                   1,
+                                   NULL);
+        rocke_gemm_emit_mfma_phase(
+            ctx, ctx->A_smem, ctx->B_smem, &rem_op.iter_vars[1], n, 0, NULL, new_accs);
+        yield_vals[0] = rocke_b_const_i32(b, 1);
+        for(i = 0; i < n; ++i)
+            yield_vals[1 + i] = new_accs[i];
+        rocke_b_scf_yield(b, yield_vals, 1 + n);
+    }
+    rocke_b_region_leave(b);
+
+    /* Tail: the last tile sits in slot rem_op.results[0] (run-time). */
+    {
+        rocke_value_t* epi_accs[ROCKE_GEMM_MAX_ACCS];
+        int num_tail = rem_op.op->num_results - 1;
+        rocke_b_sync_keep_lds_dma(b, 0);
+        rocke_gemm_emit_mfma_phase(ctx,
+                                   ctx->A_smem,
+                                   ctx->B_smem,
+                                   &rem_op.op->results[1],
+                                   num_tail,
+                                   0,
+                                   rem_op.op->results[0],
+                                   epi_accs);
+        for(i = 0; i < num_tail; ++i)
+            ctx->for_results[i] = epi_accs[i];
+        ctx->num_for_results = num_tail;
+    }
+}
+
+/* ===================================================================== *
  *  _emit_kloop_prefetch: DTLA ping-pong software-pipelined K-loop. Falls
  *  back to _simple when loads_per_tile > 63 (vmcnt is 6 bits on gfx950).
  * ===================================================================== */
@@ -372,6 +510,11 @@ void rocke_gemm_emit_kloop_prefetch(rocke_gemm_build_ctx_t* ctx)
     rocke_gemm_emit_load_phase(ctx, ctx->A_smem, ctx->B_smem, ctx->k_lo, 0, NULL);
 
     K_minus_one_tile = rocke_b_sub(b, ctx->k_upper, ctx->c_block_k);
+    if(ctx->lds_alias)
+    {
+        gemm_emit_kloop_prefetch_ring(ctx, K_minus_one_tile);
+        return;
+    }
     c1_i32 = rocke_b_const_i32(b, 1);
 
     loop_args[0].name = "par";

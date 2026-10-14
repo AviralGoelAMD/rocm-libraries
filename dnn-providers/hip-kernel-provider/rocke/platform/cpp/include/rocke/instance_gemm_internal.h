@@ -173,6 +173,11 @@ typedef struct rocke_gemm_build_ctx
     int lds_k; /* _lds_k = block_k + lds_pad                */
     rocke_value_t* A_smem; /* smem_alloc A_smem                         */
     rocke_value_t* B_smem; /* smem_alloc B_smem                         */
+    /* dtl_lds_alias: A_smem / B_smem LDS-DMA alias ring ids (one slot per
+     * ping-pong half); meaningful only when lds_alias. */
+    bool lds_alias;
+    int a_lds_ring;
+    int b_lds_ring;
 
     /* ---- per-warp MFMA tile counts -- */
     int mfmas_m; /* t.mfmas_per_warp_m                        */
@@ -285,13 +290,31 @@ rocke_value_t* rocke_gemm_emit_zero_acc(rocke_ir_builder_t* b,
 /* _choose_load_vec(spec) -> width. Thin adapter over rocke_choose_load_vec. */
 int rocke_gemm_choose_load_vec(const rocke_gemm_universal_spec_t* spec);
 
-/* _emit_smem_load(b, smem, row, col, n, dtype): f16/n==4 fast path else vN. */
+/* _emit_smem_load(b, smem, row, col, n, dtype, lds_alias=None): f16/n==4 fast
+ * path (untagged only) else vN. `alias` NULL = untagged. */
 rocke_value_t* rocke_gemm_emit_smem_load(rocke_ir_builder_t* b,
                                          rocke_value_t* smem,
                                          rocke_value_t* row,
                                          rocke_value_t* col,
                                          int n,
                                          const rocke_type_t* dtype);
+rocke_value_t* rocke_gemm_emit_smem_load_alias(rocke_ir_builder_t* b,
+                                               rocke_value_t* smem,
+                                               rocke_value_t* row,
+                                               rocke_value_t* col,
+                                               int n,
+                                               const rocke_type_t* dtype,
+                                               const rocke_lds_alias_t* alias);
+
+/* _ring_slot(ring, parity): the lds_alias tag for ping-pong half `parity` of
+ * ring `ring` -- the static slot for a compile-time parity (parity_v NULL),
+ * any_slot for a run-time one. Fills *out and returns it; NULL when
+ * ctx->lds_alias is off (Python ring None). */
+const rocke_lds_alias_t* rocke_gemm_ring_slot(const rocke_gemm_build_ctx_t* ctx,
+                                              int ring,
+                                              int parity_imm,
+                                              rocke_value_t* parity_v,
+                                              rocke_lds_alias_t* out);
 
 /* _swz_col(ctx, col, row): the LDS XOR-swizzle column rewrite. Returns `col`
  * unchanged when ctx->swz is false. (Python inner closure `_swz_col`.) */

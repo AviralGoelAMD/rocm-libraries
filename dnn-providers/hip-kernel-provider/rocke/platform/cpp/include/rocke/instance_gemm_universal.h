@@ -98,6 +98,10 @@ typedef struct rocke_gemm_trait_spec
     int dtl_cache_a; /* default 0 (CACHE_ALL)    */
     int dtl_cache_b; /* default 2 (CACHE_STREAM) */
     bool dtl_prefetch;
+    /* Python dtl_lds_alias: the DTL ping-pong as an LDS-DMA alias ring (A/B
+     * rings, slot-tagged DMA writes + operand reads, 2x-unrolled K-loop).
+     * Requires direct_to_lds + dtl_prefetch. Default false (byte-identical). */
+    bool dtl_lds_alias;
     bool active_tile_skip;
     int lds_k_pad; /* default 0 */
     bool lds_swizzle;

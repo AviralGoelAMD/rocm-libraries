@@ -457,6 +457,7 @@ def universal_gemm_spec_to_dict(spec: Any) -> Dict[str, Any]:
         dtl_cache_a=tr.dtl_cache_a,
         dtl_cache_b=tr.dtl_cache_b,
         dtl_prefetch=tr.dtl_prefetch,
+        dtl_lds_alias=tr.dtl_lds_alias,
         active_tile_skip=tr.active_tile_skip,
         lds_k_pad=tr.lds_k_pad,
         lds_swizzle=tr.lds_swizzle,

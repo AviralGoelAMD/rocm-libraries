@@ -61,6 +61,8 @@ from ...core.ir import (
     I32,
     IRBuilder,
     KernelDef,
+    LdsAliasRing,
+    LdsAliasTag,
     PtrType,
     Type,
     Value,
@@ -187,6 +189,16 @@ class TraitSpec:
     # at typical tile sizes) but hides the global-load latency that
     # otherwise serialises every K-tile.
     dtl_prefetch: bool = False
+    # DTL ping-pong as an LDS-DMA alias ring (``IRBuilder.lds_alias_ring``):
+    # A_smem and B_smem are each declared a ring with one slot per ping-pong
+    # half, every direct-to-LDS write and MFMA operand read is tagged with the
+    # slot it touches, and the K-loop is unrolled 2x so each copy's slot is a
+    # compile-time fact. The backend waitcnt pass then sees that the next
+    # tile's DMA (other slot) cannot alias the current tile's reads and stops
+    # draining it with ``s_waitcnt vmcnt(0)`` before them, so the prefetch
+    # overlaps the MFMAs as intended. Requires ``direct_to_lds`` and
+    # ``dtl_prefetch``; default off (byte-identical).
+    dtl_lds_alias: bool = False
     # MoE active-tile early-exit. When True (only honored in
     # ``batched=True`` mode), the kernel takes two extra args
     # (``SortedTokenIds: ptr<i32>``, ``slot_size: i32``) and at CTA
@@ -320,6 +332,7 @@ class UniversalGemmSpec(WarpTileBlockSizeMixin):
                 "preb": tr.preshuffle_b,
                 "dtl": tr.direct_to_lds,
                 "pref": tr.dtl_prefetch,
+                "lalias": tr.dtl_lds_alias,
                 "actt": tr.active_tile_skip,
                 f"spk{tr.split_k}": tr.split_k > 1,
                 "noalc": tr.cshuffle_no_alias,
@@ -623,6 +636,21 @@ def is_valid_spec(spec: UniversalGemmSpec, arch: str = "gfx950") -> Tuple[bool, 
     if sk > 1 and family != "mma":
         return False, f"split_k > 1 is CDNA-only (got family {family!r} on {arch})"
 
+    # dtl_lds_alias: one ring slot per ping-pong half, so it needs the DTL
+    # ping-pong, and every DMA pass of a K-tile must stay inside its slot (a
+    # slot tag claims exactly that): the per-pass block_size chunks must tile
+    # each operand's half-buffer with no partial last pass.
+    if spec.trait.dtl_lds_alias:
+        if not (spec.trait.direct_to_lds and spec.trait.dtl_prefetch):
+            return False, "dtl_lds_alias requires direct_to_lds and dtl_prefetch"
+        _alias_halves = min(4, target.async_lds_max_dwords) * 2
+        for _nm, _rows in (("tile_m", t.tile_m), ("tile_n", t.tile_n)):
+            if (_rows * t.tile_k // _alias_halves) % spec.block_size:
+                return False, (
+                    f"dtl_lds_alias requires {_nm}*tile_k/{_alias_halves} to be a "
+                    f"multiple of block_size {spec.block_size}"
+                )
+
     return True, "ok"
 
 
@@ -724,11 +752,30 @@ def _choose_load_vec(spec: UniversalGemmSpec) -> int:
 
 
 def _emit_smem_load(
-    b: IRBuilder, smem: Value, row: Value, col: Value, n: int, dtype: Type
+    b: IRBuilder,
+    smem: Value,
+    row: Value,
+    col: Value,
+    n: int,
+    dtype: Type,
+    lds_alias: Optional[LdsAliasTag] = None,
 ) -> Value:
-    if dtype == F16 and n == 4:
+    # A ring-tagged read takes the generic op: only smem_load_vN carries the
+    # lds_alias tag (the f16 v4 op lowers the same load untagged).
+    if dtype == F16 and n == 4 and lds_alias is None:
         return b.smem_load_v4_f16(smem, row, col)
-    return b.smem_load_vN(smem, row, col, dtype=dtype, n=n)
+    return b.smem_load_vN(smem, row, col, dtype=dtype, n=n, lds_alias=lds_alias)
+
+
+def _ring_slot(ring: Optional[LdsAliasRing], parity) -> Optional[LdsAliasTag]:
+    """``lds_alias`` tag for an access to ping-pong half ``parity`` of
+    ``ring``: the static slot for a Python-int parity, ``any_slot`` for a
+    run-time (i32 :class:`Value`) parity, ``None`` when ``ring`` is off."""
+    if ring is None:
+        return None
+    if isinstance(parity, Value):
+        return ring.any_slot
+    return ring.slot(parity)
 
 
 def _hotloop_inst_list(spec: UniversalGemmSpec, load_vec: int):
@@ -1171,6 +1218,17 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
     # buffer pipelines (``mem``, ``compv3``, cshuffle-compv4) use the
     # bottom half only.
 
+    # dtl_lds_alias: each operand buffer is an LDS-DMA ring with one slot per
+    # ping-pong half (see TraitSpec.dtl_lds_alias). Every DMA write and MFMA
+    # operand read below names its slot through ``_ring_slot``.
+    _a_ring: Optional[LdsAliasRing] = None
+    _b_ring: Optional[LdsAliasRing] = None
+    if spec.trait.dtl_lds_alias:
+        if not _prefetch:
+            raise ValueError("dtl_lds_alias requires dtl_prefetch=True")
+        _a_ring = b.lds_alias_ring(A_smem, _nbuf)
+        _b_ring = b.lds_alias_ring(B_smem, _nbuf)
+
     # Per-warp MFMA tile (mfmas_per_warp_m * mfmas_per_warp_n MFMAs per K-step).
     mfmas_m = t.mfmas_per_warp_m
     mfmas_n = t.mfmas_per_warp_n
@@ -1378,6 +1436,7 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                     _dtl_zero_soff,
                     _DTL_DWORDS,
                     coherency=spec.trait.dtl_cache_a,
+                    lds_alias=_ring_slot(_a_ring, lds_parity),
                 )
             for p in range(_dtl_b_passes):
                 pass_off_bytes = p * _dtl_pass_bytes + b_parity_bytes_static
@@ -1407,6 +1466,7 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                     _dtl_zero_soff,
                     _DTL_DWORDS,
                     coherency=spec.trait.dtl_cache_b,
+                    lds_alias=_ring_slot(_b_ring, lds_parity),
                 )
             # The following ``b.sync()`` (in the caller) lowers to
             # ``s_waitcnt vmcnt(0) lgkmcnt(0) ; s_barrier``, which drains
@@ -1761,6 +1821,10 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
             b_par_row_v = None
             a_row_parity_off = 0
             b_row_parity_off = 0
+        # dtl_lds_alias: the ring slot (ping-pong half) every operand read
+        # of this K-tile touches.
+        a_alias = _ring_slot(_a_ring, lds_parity)
+        b_alias = _ring_slot(_b_ring, lds_parity)
         # Lane mapping into LDS: A wants per-lane `a_per_lane` K-elements
         # starting at K = k_blk * a_per_lane. The decode is identical for the
         # 16x16 and 32x32 atoms — both put the M-in-atom in ``lane %
@@ -1806,7 +1870,13 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                 else a_row
             )
             return _emit_smem_load(
-                b, A_src, a_row, _swz_col(col_base, swz_row), a_per_lane, storage_dtype
+                b,
+                A_src,
+                a_row,
+                _swz_col(col_base, swz_row),
+                a_per_lane,
+                storage_dtype,
+                lds_alias=a_alias,
             )
 
         def _read_b(kk: int, ni: int) -> Value:
@@ -1823,7 +1893,13 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                 else b_row
             )
             return _emit_smem_load(
-                b, B_src, b_row, _swz_col(col_base, swz_row), b_per_lane, storage_dtype
+                b,
+                B_src,
+                b_row,
+                _swz_col(col_base, swz_row),
+                b_per_lane,
+                storage_dtype,
+                lds_alias=b_alias,
             )
 
         def _mma_cluster(a_rows, b_cols) -> None:
@@ -2047,6 +2123,9 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
         # is handled by the epilogue (which doesn't need to issue a
         # next-tile load).
         K_minus_one_tile = b.sub(_k_upper, c_block_k)
+        if _a_ring is not None:
+            _emit_kloop_prefetch_ring(K_minus_one_tile)
+            return
         # iter_args: (parity_i32, acc...). parity flips each iter.
         c1_i32 = b.const_i32(1)
         loop_args = [("par", c0)] + list(accs)
@@ -2087,6 +2166,58 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
             A_smem, B_smem, for_op.results[1:], lds_parity=final_parity
         )
         _for_results = epi_accs
+
+    def _emit_kloop_prefetch_ring(K_minus_one_tile: Value) -> None:
+        """``_emit_kloop_prefetch`` steady state + tail for ``dtl_lds_alias``.
+
+        The A/B ring slot tags must be compile-time facts, so the ping-pong
+        loop is unrolled 2x with static parity: each pair iteration runs tile
+        ``2j`` from slot 0 (while DMA fills slot 1) and tile ``2j+1`` from
+        slot 1 (while DMA fills slot 0). A 0/1-trip remainder loop runs an odd
+        last steady-state tile from slot 0; it carries the slot of the final
+        tile, which the tail then reads through ``any_slot`` after its full
+        drain. Same per-tile barrier discipline as the parity loop: the one
+        barrier publishes the current slot (RAW) and releases the other slot
+        for the next DMA (WAR), and the next DMA is issued after it. That DMA
+        is therefore never in flight at a barrier, so each barrier keeps no
+        LDS-DMA op in flight (``keep_lds_dma=0``); the tags remove the
+        backend's drain of the in-flight DMA before the current slot's reads.
+        """
+        nonlocal _for_results
+        c_pair = b.const_i32(2 * block_k)
+        # Steady-state tiles: ceil((K_minus_one_tile - k_lo) / block_k), as
+        # the parity loop iterates; the pair loop covers the even part.
+        trips = b.div(
+            b.add(b.sub(K_minus_one_tile, k_lo), b.const_i32(block_k - 1)), c_block_k
+        )
+        pair_end = b.add(k_lo, b.mul(b.div(trips, b.const_i32(2)), c_pair))
+        pair_op = b.scf_for_iter(k_lo, pair_end, c_pair, accs, iv_name="k0")
+        with pair_op as (k0, iter_vars):
+            acc = list(iter_vars)
+            for s in (0, 1):
+                b.sync(keep_lds_dma=0)
+                k_next = b.add(k0, c_block_k if s == 0 else c_pair)
+                emit_load_phase(A_smem, B_smem, k_next, lds_parity=1 - s)
+                acc = emit_mfma_phase(A_smem, B_smem, acc, lds_parity=s)
+            b.scf_yield(*acc)
+
+        rem_args = [("rpar", c0)] + [
+            (f"r_{nm}", v) for (nm, _init), v in zip(accs, pair_op.results)
+        ]
+        rem_op = b.scf_for_iter(
+            pair_end, K_minus_one_tile, c_block_k, rem_args, iv_name="k0r"
+        )
+        with rem_op as (k0, iter_vars):
+            b.sync(keep_lds_dma=0)
+            emit_load_phase(A_smem, B_smem, b.add(k0, c_block_k), lds_parity=1)
+            acc = emit_mfma_phase(A_smem, B_smem, iter_vars[1:], lds_parity=0)
+            b.scf_yield(b.const_i32(1), *acc)
+
+        # Tail: the last tile sits in slot rem_op.results[0] (run-time).
+        b.sync(keep_lds_dma=0)
+        _for_results = emit_mfma_phase(
+            A_smem, B_smem, rem_op.results[1:], lds_parity=rem_op.results[0]
+        )
 
     _for_results: Sequence[Value] = ()
 

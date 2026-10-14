@@ -195,6 +195,7 @@ rocke_gemm_universal_spec_t rocke_gemm_universal_spec_default(void)
     s.trait.dtl_cache_a = 0; /* CACHE_ALL    */
     s.trait.dtl_cache_b = 2; /* CACHE_STREAM */
     s.trait.dtl_prefetch = false;
+    s.trait.dtl_lds_alias = false;
     s.trait.active_tile_skip = false;
     s.trait.lds_k_pad = 0;
     s.trait.lds_swizzle = false;
@@ -242,7 +243,8 @@ void rocke_gemm_universal_spec_finalize(rocke_gemm_universal_spec_t* spec)
  *          f"{pipeline}_{scheduler}_{epilogue}",
  *          flags={"pad": any(pad_*), "pers": persistent, "bat": batched,
  *                 "preb": preshuffle_b, "dtl": direct_to_lds,
- *                 "pref": dtl_prefetch, "actt": active_tile_skip})
+ *                 "pref": dtl_prefetch, "lalias": dtl_lds_alias,
+ *                 "actt": active_tile_skip})
  *
  *  Flag iteration order matters (CPython 3.7+ dict insertion order); we pass the
  *  same fixed order to rocke_kernel_name_join.
@@ -258,8 +260,8 @@ rocke_status_t rocke_gemm_universal_kernel_name(const rocke_gemm_universal_spec_
     char part_pipe[128];
     char part_spk[32];
     const char* parts[5];
-    const char* flag_names[9];
-    int flag_on[9];
+    const char* flag_names[10];
+    int flag_on[10];
     const rocke_gemm_tile_spec_t* t;
     const rocke_gemm_trait_spec_t* tr;
 
@@ -290,11 +292,12 @@ rocke_status_t rocke_gemm_universal_kernel_name(const rocke_gemm_universal_spec_
     flag_names[3] = "preb";
     flag_names[4] = "dtl";
     flag_names[5] = "pref";
-    flag_names[6] = "actt";
+    flag_names[6] = "lalias";
+    flag_names[7] = "actt";
     /* Python flag key f"spk{tr.split_k}" (dynamic name; on when split_k > 1). */
     snprintf(part_spk, sizeof(part_spk), "spk%d", tr->split_k);
-    flag_names[7] = part_spk;
-    flag_names[8] = "noalc";
+    flag_names[8] = part_spk;
+    flag_names[9] = "noalc";
 
     flag_on[0] = (tr->pad_m || tr->pad_n || tr->pad_k) ? 1 : 0;
     flag_on[1] = tr->persistent ? 1 : 0;
@@ -302,11 +305,12 @@ rocke_status_t rocke_gemm_universal_kernel_name(const rocke_gemm_universal_spec_
     flag_on[3] = tr->preshuffle_b ? 1 : 0;
     flag_on[4] = tr->direct_to_lds ? 1 : 0;
     flag_on[5] = tr->dtl_prefetch ? 1 : 0;
-    flag_on[6] = tr->active_tile_skip ? 1 : 0;
-    flag_on[7] = (tr->split_k > 1) ? 1 : 0;
-    flag_on[8] = tr->cshuffle_no_alias ? 1 : 0;
+    flag_on[6] = tr->dtl_lds_alias ? 1 : 0;
+    flag_on[7] = tr->active_tile_skip ? 1 : 0;
+    flag_on[8] = (tr->split_k > 1) ? 1 : 0;
+    flag_on[9] = tr->cshuffle_no_alias ? 1 : 0;
 
-    return rocke_kernel_name_join(spec->name, parts, 5, flag_names, flag_on, 9, out, out_cap, NULL);
+    return rocke_kernel_name_join(spec->name, parts, 5, flag_names, flag_on, 10, out, out_cap, NULL);
 }
 
 /* ===================================================================== *
@@ -723,6 +727,34 @@ bool rocke_gemm_universal_is_valid_spec(const rocke_gemm_universal_spec_t* spec,
         if(sk > 1 && strcmp(family, "mma") != 0)
         {
             CK_GEMM_REJECT("split_k > 1 is CDNA-only (got family '%s' on %s)", family, arch);
+        }
+    }
+
+    /* dtl_lds_alias: one ring slot per ping-pong half, so it needs the DTL
+     * ping-pong, and every DMA pass of a K-tile must stay inside its slot: the
+     * per-pass block_size chunks must tile each operand's half-buffer. */
+    if(spec->trait.dtl_lds_alias)
+    {
+        int alias_max_dwords = rocke_archtarget_async_lds_max_dwords(target);
+        int alias_halves;
+        if(!(spec->trait.direct_to_lds && spec->trait.dtl_prefetch))
+        {
+            CK_GEMM_REJECT("dtl_lds_alias requires direct_to_lds and dtl_prefetch");
+        }
+        alias_halves = (alias_max_dwords > 4 ? 4 : alias_max_dwords) * 2;
+        if(((t->tile_m * t->tile_k) / alias_halves) % spec->block_size != 0)
+        {
+            CK_GEMM_REJECT("dtl_lds_alias requires tile_m*tile_k/%d to be a multiple of "
+                           "block_size %d",
+                           alias_halves,
+                           spec->block_size);
+        }
+        if(((t->tile_n * t->tile_k) / alias_halves) % spec->block_size != 0)
+        {
+            CK_GEMM_REJECT("dtl_lds_alias requires tile_n*tile_k/%d to be a multiple of "
+                           "block_size %d",
+                           alias_halves,
+                           spec->block_size);
         }
     }
 

@@ -1254,6 +1254,23 @@ rocke_kernel_def_t* rocke_build_universal_gemm(rocke_ir_builder_t* b,
         ctx.A_smem = rocke_b_smem_alloc(b, ctx.storage_dtype, a_shape, 2, "A_smem");
         ctx.B_smem = rocke_b_smem_alloc(b, ctx.storage_dtype, b_shape, 2, "B_smem");
     }
+    /* dtl_lds_alias: each operand buffer is an LDS-DMA ring with one slot per
+     * ping-pong half; every DMA write and MFMA operand read names its slot
+     * through rocke_gemm_ring_slot. */
+    ctx.lds_alias = spec->trait.dtl_lds_alias;
+    if(ctx.lds_alias)
+    {
+        int nbuf = ctx.two_buf ? 2 : 1;
+        if(!ctx.prefetch)
+        {
+            /* "dtl_lds_alias requires dtl_prefetch=True" -- ValueError path. */
+            return NULL;
+        }
+        ctx.a_lds_ring = rocke_b_lds_alias_ring(b, ctx.A_smem, nbuf);
+        ctx.b_lds_ring = rocke_b_lds_alias_ring(b, ctx.B_smem, nbuf);
+        if(ctx.a_lds_ring < 0 || ctx.b_lds_ring < 0)
+            return NULL;
+    }
 
     /* ---- per-warp MFMA tile counts -- */
     ctx.mfmas_m = rocke_gemm_tile_mfmas_per_warp_m(t);

@@ -187,13 +187,33 @@ int rocke_gemm_choose_load_vec(const rocke_gemm_universal_spec_t* spec)
 }
 
 /* ====================================================================== *
- * _emit_smem_load(b, smem, row, col, n, dtype):
- *   if dtype == F16 and n == 4: return b.smem_load_v4_f16(smem, row, col)
- *   return b.smem_load_vN(smem, row, col, dtype=dtype, n=n)
+ * _emit_smem_load(b, smem, row, col, n, dtype, lds_alias=None):
+ *   if dtype == F16 and n == 4 and lds_alias is None:
+ *       return b.smem_load_v4_f16(smem, row, col)
+ *   return b.smem_load_vN(smem, row, col, dtype=dtype, n=n, lds_alias=lds_alias)
  *
  * The C smem_load_vN takes an explicit (row, col) index pair as an indices
- * array of length 2, matching the Python (smem, row, col) call.
+ * array of length 2, matching the Python (smem, row, col) call. Only the
+ * generic op carries the lds_alias tag, so a tagged f16 v4 read takes it.
  * ====================================================================== */
+rocke_value_t* rocke_gemm_emit_smem_load_alias(rocke_ir_builder_t* b,
+                                               rocke_value_t* smem,
+                                               rocke_value_t* row,
+                                               rocke_value_t* col,
+                                               int n,
+                                               const rocke_type_t* dtype,
+                                               const rocke_lds_alias_t* alias)
+{
+    if(dtype == rocke_f16() && n == 4 && alias == NULL)
+        return rocke_b_smem_load_v4_f16(b, smem, row, col);
+    {
+        rocke_value_t* idx[2];
+        idx[0] = row;
+        idx[1] = col;
+        return rocke_b_smem_load_vN_alias(b, smem, idx, 2, dtype, n, alias);
+    }
+}
+
 rocke_value_t* rocke_gemm_emit_smem_load(rocke_ir_builder_t* b,
                                          rocke_value_t* smem,
                                          rocke_value_t* row,
@@ -201,14 +221,24 @@ rocke_value_t* rocke_gemm_emit_smem_load(rocke_ir_builder_t* b,
                                          int n,
                                          const rocke_type_t* dtype)
 {
-    if(dtype == rocke_f16() && n == 4)
-        return rocke_b_smem_load_v4_f16(b, smem, row, col);
-    {
-        rocke_value_t* idx[2];
-        idx[0] = row;
-        idx[1] = col;
-        return rocke_b_smem_load_vN(b, smem, idx, 2, dtype, n);
-    }
+    return rocke_gemm_emit_smem_load_alias(b, smem, row, col, n, dtype, NULL);
+}
+
+/* ====================================================================== *
+ * _ring_slot(ring, parity):
+ *   None if ring is None; ring.any_slot for a Value parity; ring.slot(parity).
+ * ====================================================================== */
+const rocke_lds_alias_t* rocke_gemm_ring_slot(const rocke_gemm_build_ctx_t* ctx,
+                                              int ring,
+                                              int parity_imm,
+                                              rocke_value_t* parity_v,
+                                              rocke_lds_alias_t* out)
+{
+    if(!ctx->lds_alias)
+        return NULL;
+    out->ring = ring;
+    out->slot = (parity_v != NULL) ? ROCKE_LDS_ALIAS_ANY_SLOT : parity_imm;
+    return out;
 }
 
 /* ====================================================================== *
