@@ -2888,6 +2888,8 @@ class TestAttentionDenseGfx950CodegenKnobs(unittest.TestCase):
             ("iglp_mode", 2),
             ("pv_loop_order", "row_major"),
             ("o_store_width", 3),
+            ("pv_window_exp", 2),
+            ("window_fence", True),
         )
         for name, value in bad:
             with self.subTest(**{name: value}):
@@ -2902,6 +2904,27 @@ class TestAttentionDenseGfx950CodegenKnobs(unittest.TestCase):
                     self._spec(fp16, o_store_width=width)
                 self._spec(self._GRID, o_store_width=width)
         self._spec(fp16, o_store_width=4)
+
+    def test_window_knobs_need_their_mfma_windows_body(self):
+        windows = dict(
+            self._GRID,
+            wide_lds_dma=True,
+            lds_dma_manual_wait=True,
+            qk_lookahead=True,
+            block_m=256,
+            lds_read_base=True,
+            wave_group_pingpong=True,
+            mfma_windows=4,
+        )
+        for value in (1, 2, 3):
+            self._spec(windows, pv_window_exp=value)
+        for value in (-1, 4):
+            with self.subTest(pv_window_exp=value):
+                with self.assertRaisesRegex(ValueError, "pv_window_exp"):
+                    self._spec(windows, pv_window_exp=value)
+        with self.assertRaisesRegex(ValueError, "pv_window_exp"):
+            self._spec(windows, pv_window_exp=2, pv_loop_order="d_major")
+        self._spec(windows, window_fence=True, pv_window_exp=2)
 
     def test_wide_output_store_builds_with_lse(self):
         for persistent in (False, True):
@@ -2937,6 +2960,7 @@ class TestAttentionDenseGfx950CodegenKnobs(unittest.TestCase):
             block_m=256,
         )
         win = dict(lds_read_base=True, wave_group_pingpong=True)
+        windows = dict(la, mfma_windows=4, **win)
         cases = (
             (
                 "wide_grid",
@@ -2969,6 +2993,8 @@ class TestAttentionDenseGfx950CodegenKnobs(unittest.TestCase):
                 dict(win, mfma_windows=4, window_priority=1),
                 ("call void @llvm.amdgcn.s.setprio(i16 1)", True),
             ),
+            ("windows", windows, dict(pv_window_exp=2), None),
+            ("windows", windows, dict(window_fence=True), None),
             ("grid", self._GRID, dict(qk_lookahead=True, **no_manual), None),
             ("grid", self._GRID, dict(lazy_rescale_threshold=4.0), None),
             ("grid", self._GRID, dict(use_exp2_fast=False), None),
