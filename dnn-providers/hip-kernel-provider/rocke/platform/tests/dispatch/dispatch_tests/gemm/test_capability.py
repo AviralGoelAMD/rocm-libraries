@@ -18,9 +18,10 @@ from rocke.dispatch.gemm.fp16_rcr import GEMM_FP16_REGISTRY
 
 _REGISTRIES = (("fp16", GEMM_FP16_REGISTRY), ("bf16", GEMM_BF16_REGISTRY))
 
-# Wide enough that every registered tile divides some entry, and skinny enough
-# to reach the decode candidate.
-_DIMS = (1, 2, 16, 32, 64, 128, 256, 512, 1024, 4096)
+# Wide enough that every registered tile divides some entry (2048 x 4096
+# reaches the mid-grid 128x256 tile), and skinny enough to reach the decode
+# candidate.
+_DIMS = (1, 2, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 _SHAPES = tuple((m, n, k) for m in _DIMS for n in _DIMS for k in _DIMS)
 
 

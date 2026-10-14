@@ -28,7 +28,8 @@ class TestBf16RcrDispatch(unittest.TestCase):
             dispatch_gemm_bf16(GemmRequest(M=128, N=128, K=32, arch="gfx950"))  # fp16
 
     def test_cdna_cshuffle_selected_when_tile_divides(self):
-        r = dispatch_gemm_bf16(_bf16(256, 256, 256, "gfx950"))
+        # gfx942: no direct-to-LDS candidates, so the cshuffle tile wins.
+        r = dispatch_gemm_bf16(_bf16(256, 256, 256, "gfx942"))
         self.assertEqual(r.candidate.spec_id, "cdna_cshuffle_default")
         self.assertEqual((r.spec.tile.tile_m, r.spec.tile.tile_n), (128, 128))
         # bf16 CDNA has no 32x32 atom -> 16x16x16 warp tile, 4x4 warp grid.
