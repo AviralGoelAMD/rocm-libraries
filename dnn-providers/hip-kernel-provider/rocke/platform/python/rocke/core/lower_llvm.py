@@ -836,16 +836,6 @@ _INTRINSIC_DECLS: Dict[str, str] = {
         "declare <16 x float> @llvm.amdgcn.mfma.f32.32x32x16.bf16("
         "<8 x bfloat>, <8 x bfloat>, <16 x float>, i32 immarg, i32 immarg, i32 immarg)"
     ),
-    # P15: gfx950 MX MFMA scaled intrinsic. Per-warp E8M0 scales apply
-    # in-instruction (vs the post-hoc scale-apply chain). Operands are
-    # 16-byte packed mantissa vectors; the scale broadcast inside the
-    # instruction is per-output-row (fixes the B_MX1 row-aware
-    # correctness gap that the historical post-hoc chain had).
-    "mfma.scale.f32.16x16x128.f8f6f4": (
-        "declare <4 x float> @llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4("
-        "<8 x i32>, <8 x i32>, <4 x float>, i32 immarg, i32 immarg, "
-        "i32 immarg, i32 immarg, i32, i32 immarg, i32, i32 immarg)"
-    ),
     # P52: fp4 / fp6 MX MFMA atoms (gfx950+). Operand widths follow the
     # OCP MX spec: ``16 x fp4`` packs into i64 per lane, ``16 x fp6``
     # is a 96-bit value modelled here as `<3 x i32>`.
@@ -859,14 +849,13 @@ _INTRINSIC_DECLS: Dict[str, str] = {
     ),
     # L6: UNSCALED fp8 16x16x128 hero atom. gfx950 has no dense plain
     # ``mfma.f32.16x16x128.fp8.fp8``; the dense wide-K f8 MFMA is the
-    # ``f8f6f4`` scale-MFMA, which on LLVM22 (ROCm 7.2) takes the 9-arg
-    # signature below: A/B as ``<8 x i32>`` (32 f8 bytes per lane), then
+    # ``f8f6f4`` scale-MFMA, which takes the 9-arg signature below on every
+    # supported compiler: A/B as ``<8 x i32>`` (32 f8 bytes per lane), then
     # ``cbsz`` / ``blgp`` (format selectors, 0 = fp8e4m3), then the
-    # ``op_sel`` + scale-byte pairs for A and B. We declare it under a
-    # dedicated additive key so the existing 11-arg
-    # ``mfma.scale.f32.16x16x128.f8f6f4`` decl (used by the MX-scaled
-    # path) is untouched; the lowering pins both scale bytes to 0
-    # (E8M0 exponent 0 => factor 1.0) for a true unscaled MFMA.
+    # ``op_sel`` + scale-byte pairs for A and B. The hero lowering pins both
+    # scale bytes to 0 (E8M0 exponent 0 => factor 1.0) for a true unscaled
+    # MFMA; the P15 MX-scaled lowering shares this declaration and passes
+    # its per-warp E8M0 scale bytes in the two non-immarg scale slots.
     "mfma.f32.16x16x128.fp8.hero": (
         "declare <4 x float> @llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4("
         "<8 x i32>, <8 x i32>, <4 x float>, i32 immarg, i32 immarg, "
@@ -1084,11 +1073,6 @@ _INTRINSIC_DECLS_LLVM22_OVERRIDES: Dict[str, str] = {
 # intrinsic's ABI changed again.
 _INTRINSIC_DECLS_LLVM23_OVERRIDES: Dict[str, str] = {
     **_INTRINSIC_DECLS_LLVM22_OVERRIDES,
-    "mfma.scale.f32.16x16x128.f8f6f4": (
-        "declare <4 x float> @llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4("
-        "<8 x i32>, <8 x i32>, <4 x float>, i32 immarg, i32 immarg, "
-        "i32 immarg, i32, i32 immarg, i32)"
-    ),
 }
 
 
@@ -3666,7 +3650,12 @@ class _Lowerer:
         Reference: CK Tile ``BlockGemmMxARegBSmemCRegV1::operator()``.
         """
         a, b, c, a_scale, b_scale = op.operands
-        self._need("mfma.scale.f32.16x16x128.f8f6f4")
+        # The f8f6f4 scale-MFMA takes (A, B, C, cbsz, blgp, opsel_a, scale_a,
+        # opsel_b, scale_b) on every supported compiler, so it shares the hero
+        # atom's declaration. An eleven-argument spelling would put the scale
+        # values in immarg slots; the backend then selects the unscaled
+        # instruction and silently drops the scales.
+        self._need("mfma.f32.16x16x128.fp8.hero")
         # Bitcast a / b to <8 x i32>; they arrive as <16 x byte>-style
         # vectors — we accept both <16 x i8>/<16 x fp8e4m3> and
         # <8 x i32> at the IR-level and normalise here.
@@ -3686,24 +3675,14 @@ class _Lowerer:
             )
         else:
             b_packed = self._operand(b)
-        if self._flavor == LLVM_FLAVOR_LLVM23:
-            self._current().emit(
-                f"  {op.result.name} = call <4 x float> "
-                f"@llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4("
-                f"<8 x i32> {a_packed}, <8 x i32> {b_packed}, "
-                f"<4 x float> {self._operand(c)}, "
-                f"i32 0, i32 0, i32 0, i32 {self._operand(a_scale)}, "
-                f"i32 0, i32 {self._operand(b_scale)})"
-            )
-        else:
-            self._current().emit(
-                f"  {op.result.name} = call <4 x float> "
-                f"@llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4("
-                f"<8 x i32> {a_packed}, <8 x i32> {b_packed}, "
-                f"<4 x float> {self._operand(c)}, "
-                f"i32 0, i32 0, i32 0, i32 0, i32 {self._operand(a_scale)}, "
-                f"i32 0, i32 {self._operand(b_scale)}, i32 0)"
-            )
+        self._current().emit(
+            f"  {op.result.name} = call <4 x float> "
+            f"@llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4("
+            f"<8 x i32> {a_packed}, <8 x i32> {b_packed}, "
+            f"<4 x float> {self._operand(c)}, "
+            f"i32 0, i32 0, i32 0, i32 {self._operand(a_scale)}, "
+            f"i32 0, i32 {self._operand(b_scale)})"
+        )
 
     def _op_tile_mfma_f32_16x16x128_fp4(self, op: Op) -> None:
         a, b, c = op.operands
@@ -3769,18 +3748,16 @@ class _Lowerer:
         intrinsic with the in-instruction scale pinned to the neutral E8M0
         value 0 (exponent 0 => 2^0 == 1.0), making it numerically a plain
         unscaled fp8 MFMA. ``cbsz=0`` / ``blgp=0`` select fp8e4m3 for A and
-        B; ``op_sel`` scale-byte selectors are 0. This is ADDITIVE — it
-        uses a dedicated declaration key for the nine-argument form and pins
-        both scale operands to zero (so no scale registers are loaded).
+        B; ``op_sel`` scale-byte selectors are 0. It pins both scale operands
+        to zero (so no scale registers are loaded).
 
         A / B arrive as ``<32 x fp8e4m3>`` (== ``<32 x i8>``, 32 f8 bytes
         per lane) and are bitcast to the intrinsic's ``<8 x i32>``.
         Output is ``<4 x float>``.
         """
         a, b, c = op.operands
-        # ADDITIVE: a dedicated decl key for the unscaled hero atom (the
-        # 9-arg f8f6f4 scale-MFMA signature). The separate key preserves the
-        # LLVM20/22 MX-scaled declaration, which remains the 11-arg form.
+        # The nine-argument f8f6f4 scale-MFMA declaration, shared with the
+        # MX-scaled lowering above.
         self._need("mfma.f32.16x16x128.fp8.hero")
         a_packed = self._fresh("a_fp8_128")
         b_packed = self._fresh("b_fp8_128")
@@ -3798,7 +3775,7 @@ class _Lowerer:
             )
         else:
             b_packed = self._operand(b)
-        # f8f6f4 scale-MFMA, LLVM22 signature:
+        # f8f6f4 scale-MFMA signature:
         #   (A<8xi32>, B<8xi32>, C<4xf32>,
         #    cbsz immarg, blgp immarg,      ; A/B format selectors (0 = fp8e4m3)
         #    opsel_a immarg, scale_a,        ; A scale (E8M0 byte; 0 => 2^0 == 1.0)

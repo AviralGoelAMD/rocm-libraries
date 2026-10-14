@@ -891,7 +891,12 @@ static void _op_tile_mfma_scale_f32_16x16x128_f8f6f4(rocke_lower_t* L, const roc
     c = op->operands[2];
     a_scale = op->operands[3];
     b_scale = op->operands[4];
-    rocke_ll_need(L, "mfma.scale.f32.16x16x128.f8f6f4");
+    /* The f8f6f4 scale-MFMA takes (A, B, C, cbsz, blgp, opsel_a, scale_a,
+     * opsel_b, scale_b) on every supported compiler, so it shares the hero
+     * atom's declaration. An eleven-argument spelling would put the scale
+     * values in immarg slots; the backend then selects the unscaled
+     * instruction and silently drops the scales. */
+    rocke_ll_need(L, "mfma.f32.16x16x128.fp8.hero");
 
     /* Normalise A / B to <8 x i32> (accept either packed or byte-vector). */
     a_packed = rocke_ll_fresh(L, "mxa");
@@ -916,34 +921,17 @@ static void _op_tile_mfma_scale_f32_16x16x128_f8f6f4(rocke_lower_t* L, const roc
     {
         b_packed = rocke_ll_operand(L, b);
     }
-    if(L->flavor == ROCKE_LLVM_FLAVOR_LLVM23)
-    {
-        rocke_ll_emitf(L,
-                       "  %s = call <4 x float> "
-                       "@llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4("
-                       "<8 x i32> %s, <8 x i32> %s, <4 x float> %s, "
-                       "i32 0, i32 0, i32 0, i32 %s, i32 0, i32 %s)",
-                       mma_result_name(L, op),
-                       a_packed,
-                       b_packed,
-                       rocke_ll_operand(L, c),
-                       rocke_ll_operand(L, a_scale),
-                       rocke_ll_operand(L, b_scale));
-    }
-    else
-    {
-        rocke_ll_emitf(L,
-                       "  %s = call <4 x float> "
-                       "@llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4("
-                       "<8 x i32> %s, <8 x i32> %s, <4 x float> %s, "
-                       "i32 0, i32 0, i32 0, i32 0, i32 %s, i32 0, i32 %s, i32 0)",
-                       mma_result_name(L, op),
-                       a_packed,
-                       b_packed,
-                       rocke_ll_operand(L, c),
-                       rocke_ll_operand(L, a_scale),
-                       rocke_ll_operand(L, b_scale));
-    }
+    rocke_ll_emitf(L,
+                   "  %s = call <4 x float> "
+                   "@llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4("
+                   "<8 x i32> %s, <8 x i32> %s, <4 x float> %s, "
+                   "i32 0, i32 0, i32 0, i32 %s, i32 0, i32 %s)",
+                   mma_result_name(L, op),
+                   a_packed,
+                   b_packed,
+                   rocke_ll_operand(L, c),
+                   rocke_ll_operand(L, a_scale),
+                   rocke_ll_operand(L, b_scale));
 }
 
 static void _op_tile_mfma_f32_16x16x128_fp4(rocke_lower_t* L, const rocke_op_t* op)
@@ -1049,8 +1037,8 @@ static void _op_tile_mfma_f32_16x16x128_fp8(rocke_lower_t* L, const rocke_op_t* 
 {
     /* UNSCALED fp8 16x16x128 hero atom (L6): reuse the f8f6f4 scaled intrinsic
      * with both E8M0 scales pinned to 0 (2^0 == 1.0) so it is numerically a
-     * plain unscaled fp8 MFMA. Its dedicated 9-arg decl key preserves the
-     * LLVM20/22 MX-scaled declaration, which remains the 11-arg form. */
+     * plain unscaled fp8 MFMA. Its 9-arg decl key is shared with the MX-scaled
+     * lowering above. */
     const rocke_value_t *a, *b, *c;
     const char *a_packed, *b_packed;
     const char *a_ty, *b_ty;
