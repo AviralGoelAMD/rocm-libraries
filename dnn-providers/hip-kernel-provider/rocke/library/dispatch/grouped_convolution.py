@@ -499,6 +499,8 @@ class ConvGroupedSpec:
     split_k: int = 1  # wgrad only
     lds_k_outer: bool = False  # wgrad only
     group_merge: int = 1  # wgrad only, depthwise only
+    uniform_k_decode: bool = False  # dgrad only
+    reg_prefetch: bool = False  # dgrad only
     name: str = "rocke_conv_grouped"
 
     def kernel_name(self) -> str:
@@ -526,6 +528,12 @@ class ConvGroupedSpec:
             parts.append("kouter")
         if self.direction == "wgrad" and self.group_merge > 1:
             parts.append(f"gm{self.group_merge}")
+        # Problem-derived K-loop rewrites (see _dgrad_kloop_flags): the name is
+        # problem-free, so the flags themselves have to be in it.
+        if self.direction == "dgrad" and self.uniform_k_decode:
+            parts.append("ukd")
+        if self.direction == "dgrad" and self.reg_prefetch:
+            parts.append("rpf")
         return kernel_name_join(self.name, *parts)
 
     def to_fwd_spec(self, problem: "ConvProblem") -> "ImplicitGemmConvSpec":
@@ -638,7 +646,36 @@ class ConvGroupedSpec:
             pipeline=self.pipeline,
             epilogue=self.epilogue,
             split_k=self.split_k,
+            uniform_k_decode=self.uniform_k_decode,
+            reg_prefetch=self.reg_prefetch,
         )
+
+
+# gfx950 dgrad K-loop routing thresholds on the per-group reduction length
+# Y*X*kpg (the K loop trip count times tile_k). Below the first the loop is
+# short and the prologue/epilogue dominate; the per-tile decode
+# (uniform_k_decode) only pays once the loop is long, and is a loss on the
+# pointwise problems whose plain loop already uses the flat-offset fast path.
+_DGRAD_REG_PREFETCH_MIN_KRED = 2048
+_DGRAD_UNIFORM_K_DECODE_MIN_KRED = 4096
+
+
+def _dgrad_kloop_flags(arch: str, wave_size: int, pipeline: str, p: "ConvProblem") -> dict:
+    """``uniform_k_decode`` / ``reg_prefetch`` for a gfx950 dgrad spec.
+
+    Both rewrite the sync K loop, so both stay off where it is not run
+    (non-gfx950, wave32, wavelet) and on pointwise problems.
+    """
+    if arch != "gfx950" or wave_size != 64 or pipeline == "wavelet" or p.is_pointwise:
+        return {"uniform_k_decode": False, "reg_prefetch": False}
+    k_red = (p.Z if p.is_3d else 1) * p.Y * p.X * p.kpg
+    return {
+        "uniform_k_decode": k_red >= _DGRAD_UNIFORM_K_DECODE_MIN_KRED
+        and DgradConvSpec.default_uniform_k_decode(
+            arch=arch, wave_size=wave_size, pipeline=pipeline
+        ),
+        "reg_prefetch": k_red >= _DGRAD_REG_PREFETCH_MIN_KRED,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1628,6 +1665,9 @@ def _make_gfx950_dgrad_candidate() -> KernelCandidate:
             pipeline=_PIPELINE,
             epilogue=_epilogue_for(req),
             split_k=1,
+            **_dgrad_kloop_flags(
+                req.arch, ArchTarget.from_gfx(req.arch).wave_size, _PIPELINE, _problem(req)
+            ),
         )
 
     def support(req: OperatorRequest) -> Tuple[bool, str]:
@@ -1669,6 +1709,9 @@ def _make_gfx950_dgrad_candidate() -> KernelCandidate:
             arch=req.arch,
             split_k=1,
             name=name,
+            **_dgrad_kloop_flags(
+                req.arch, ArchTarget.from_gfx(req.arch).wave_size, _PIPELINE, _problem(req)
+            ),
         )
 
     candidate = KernelCandidate(
