@@ -180,7 +180,6 @@ typedef struct rocke_gfx950_attn_tiled_3d_config
     bool FP8_REG_PREFETCH; /* PREFETCH and KV_FP8                   */
     bool TRANS; /* spec.transposed_softmax               */
     int NR; /* softmax state rows per lane: 1 if TRANS else 4 */
-    bool KV_SPLIT_WAIT; /* spec.kv_split_wait                    */
 
     const rocke_type_t* dtype; /* F16 / BF16                                 */
     const rocke_type_t* kv_io_dtype; /* FP8E4M3 if KV_FP8 else dtype               */

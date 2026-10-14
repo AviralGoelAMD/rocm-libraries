@@ -205,8 +205,6 @@ typedef struct rocke_unified_attention_3d_tiled_spec
     bool kv_prefetch; /* False */
     /* Transposed QK/PV: one query row per lane, P stays in registers. */
     bool transposed_softmax; /* False */
-    /* kv_prefetch (bf16/fp16 only): wait for K before QK and V before PV. */
-    bool kv_split_wait; /* False */
 } rocke_unified_attention_3d_tiled_spec_t;
 
 rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_default(void);

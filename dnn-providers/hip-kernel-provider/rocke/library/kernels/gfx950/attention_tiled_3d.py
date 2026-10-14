@@ -194,10 +194,6 @@ class UnifiedAttention3DTiledSpec:
     # in a permuted order so a lane's P values are consecutive keys, which is
     # the V transpose-read order.
     transposed_softmax: bool = False
-    # kv_prefetch only: wait for the current K before QK and for the current
-    # V before PV (two partial vmcnt waits) instead of draining both at the
-    # loop top, so the V DMA overlaps QK and softmax.
-    kv_split_wait: bool = False
 
     def __post_init__(self):
         if type(self.use_f32_denormal_flush) is not bool:
@@ -230,8 +226,6 @@ class UnifiedAttention3DTiledSpec:
             )
         if self.transposed_softmax and (self.use_alibi or self.use_qq_bias):
             raise ValueError("transposed_softmax does not support ALiBi or QQ bias")
-        if self.kv_split_wait and (not self.kv_prefetch or self.kv_storage_dtype is not None):
-            raise ValueError("kv_split_wait needs kv_prefetch with a bf16/fp16 KV cache")
 
     @property
     def num_queries_per_kv(self) -> int:
@@ -289,7 +283,6 @@ class UnifiedAttention3DTiledSpec:
             f"t{self.tile_size}" if self.kv_tile_mult > 1 else "",
             "pf" if self.kv_prefetch else "",
             "tsm" if self.transposed_softmax else "",
-            "kvsw" if self.kv_split_wait else "",
         )
 
 
@@ -1012,14 +1005,6 @@ def build_unified_attention_3d_tiled(
         prefetch_carry = _fp8_raw_tile(nxt0, _ids(nxt0)) + list(
             _ids(b.add(tile_start, b.const_i32(2)))
         )
-    elif PREFETCH and spec.kv_split_wait:
-        # Block ids ahead of the DMAs, so the partial vmcnt waits in the loop
-        # count K/V calls only (VMEM returns in issue order).
-        ids0 = _ids(tile_start)
-        ids1 = _ids(b.add(tile_start, b.const_i32(1)))
-        _issue_k_load(tile_start, b.const_i32(0), ids0)
-        _issue_v_load(tile_start, b.const_i32(0), ids0)
-        prefetch_carry = list(ids1) if ids1 is not None else []
     elif PREFETCH:
         ids0 = _ids(tile_start)
         _issue_k_load(tile_start, b.const_i32(0), ids0)
@@ -1138,17 +1123,6 @@ def build_unified_attention_3d_tiled(
             new_pf = _fp8_raw_tile(nxt2, ids_n2) + list(
                 _ids(b.add(kv_tile_iv, b.const_i32(3)))
             )
-        elif spec.kv_split_wait:
-            # In flight here (issue order): ids[+1], K[cur], V[cur]. Wait for
-            # K[cur] only; V[cur] lands under QK + softmax.
-            b.s_waitcnt(vmcnt=kv_calls_per_tile, lgkmcnt=0)
-            b.s_barrier_bare()
-            ids_n1 = carry[pf_base : pf_base + TILE_MULT] if PREFETCH_IDS else None
-            if PREFETCH_IDS:
-                new_pf = list(_ids(b.add(kv_tile_iv, b.const_i32(2))))
-            with b.scf_if(in_range_next):
-                _issue_k_load(next_tile_iv_raw, nxt_buf, ids_n1)
-                _issue_v_load(next_tile_iv_raw, nxt_buf, ids_n1)
         else:
             b.s_waitcnt(vmcnt=0, lgkmcnt=0)
             b.sync()
@@ -1312,20 +1286,10 @@ def build_unified_attention_3d_tiled(
                 b.fadd(b.fmul(l_vals[r], alpha_regs[r]), l_local[r]) for r in range(4)
             ]
         if PREFETCH:
-            if spec.kv_split_wait:
-                # In flight: V[cur], ids[+2], then K/V[next] when issued.
-                # Leave the younger loads outstanding; V[cur] must land.
-                n_ids = TILE_MULT if PREFETCH_IDS else 0
-                with b.scf_if(in_range_next):
-                    b.s_waitcnt(vmcnt=2 * kv_calls_per_tile + n_ids)
-                with b.scf_if(b.cmp_ge(next_tile_iv_raw, tile_end)):
-                    b.s_waitcnt(vmcnt=n_ids)
             if not TRANS:
                 # K/V[cur] already landed; only the P tile written above must
                 # be visible. Next tile's loads stay in flight.
                 b.sync_lds_only()
-            elif spec.kv_split_wait:
-                b.s_barrier_bare()
         elif KV_FP8:
             # FP8 sync loader has no in-flight async work.
             b.s_waitcnt(vmcnt=0, lgkmcnt=0)
