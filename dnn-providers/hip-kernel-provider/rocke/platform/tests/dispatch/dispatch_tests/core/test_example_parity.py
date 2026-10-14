@@ -50,10 +50,16 @@ NORM_SHAPE = dict(rows=4096, cols=4096)
 # the bf16 decode candidate caps M at 32, and b1024_v8 spans 8192 columns.
 GEMM_DECODE_MNK = (16, 4096, 4096)
 NORM_WIDE_SHAPE = dict(rows=4096, cols=8192)
+# A one-block M=64 projection: the gfx950 bf16 64x128 DTL candidate caps M at 64.
+GEMM_M64_MNK = (64, 4096, 4096)
+# examples/gfx950/gemm_perf_square_warpspec (S=8192): the 256x256 DTL tile.
+GEMM_SQUARE_MNK = (8192, 8192, 8192)
+# A Llama-70B o-proj prefill chunk: the mid-grid 128x256 DTL tile.
+GEMM_MID_MNK = (1024, 8192, 8192)
 
 
 def _gemm_reqs(arch, spec_id, dtype):
-    for m, n, k in (GEMM_MNK, GEMM_DECODE_MNK):
+    for m, n, k in (GEMM_MNK, GEMM_DECODE_MNK, GEMM_M64_MNK, GEMM_SQUARE_MNK, GEMM_MID_MNK):
         yield GemmRequest(M=m, N=n, K=k, arch=arch, dtype=dtype, spec_id=spec_id)
 
 

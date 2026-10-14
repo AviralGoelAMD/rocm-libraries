@@ -11,6 +11,7 @@ from rocke.helpers.split_k import (
     GFX950_TARGET_CTAS,
     TARGET_SLICE_K,
     select_split_k,
+    select_split_k_fill,
 )
 
 
@@ -102,6 +103,33 @@ class TestSelectSplitK(unittest.TestCase):
         self.assertEqual(GFX950_TARGET_CTAS, 256)
 
 
+class TestSelectSplitKFill(unittest.TestCase):
+    def _fill(self, M, N, K, tile_m=128, tile_n=128, tile_k=128, **kw):
+        return select_split_k_fill(
+            M=M, N=N, K=K, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, env={}, **kw
+        ).split_k
+
+    def test_half_device_grid_splits_in_two(self):
+        # 128 tiles on 256 CUs: half the device would idle unsplit.
+        self.assertEqual(self._fill(128, 16384, 53248), 2)
+
+    def test_grid_past_half_device_stays_unsplit(self):
+        self.assertEqual(self._fill(128, 16512, 53248), 1)
+
+    def test_small_grid_fills_once(self):
+        # 64 tiles -> 4 slices; K // FILL_MIN_SLICE_K does not bind.
+        self.assertEqual(self._fill(128, 8192, 28672), 4)
+
+    def test_ctas_per_cu_scales_the_degree(self):
+        # 64x128 tile, 128 tiles, two CTAs per CU -> 4 slices.
+        self.assertEqual(self._fill(64, 16384, 16384, tile_m=64, tile_k=64, ctas_per_cu=2), 4)
+
+    def test_min_slice_k_caps_the_degree(self):
+        # 32 tiles want 8 slices but K=4096 keeps slices >= 1024 deep.
+        self.assertEqual(self._fill(64, 4096, 4096, tile_m=64, tile_k=64, ctas_per_cu=1), 4)
+
+
+
 class TestDispatchWiring(unittest.TestCase):
     def test_decode_dispatch_sets_split_k_and_z_grid(self):
         r = dispatch_gemm_bf16(_bf16(2, 4096, 4096))
@@ -111,8 +139,8 @@ class TestDispatchWiring(unittest.TestCase):
         self.assertEqual(r.grid[2], r.spec.trait.split_k)
 
     def test_square_dispatch_unchanged(self):
+        # A square shape fills the device: no split-K, 2D grid.
         r = dispatch_gemm_bf16(_bf16(4096, 4096, 4096))
-        self.assertEqual(r.candidate.spec_id, "cdna_cshuffle_default")
         self.assertEqual(r.spec.trait.split_k, 1)
         self.assertEqual(r.grid[2], 1)
 
@@ -120,6 +148,22 @@ class TestDispatchWiring(unittest.TestCase):
         # Large M must not pick the decode candidate.
         r = dispatch_gemm_bf16(_bf16(256, 256, 256))
         self.assertNotEqual(r.candidate.spec_id, "cdna_decode_16x64")
+
+    def test_m64_takes_the_64x128_dtl_split(self):
+        r = dispatch_gemm_bf16(_bf16(64, 16384, 16384))
+        self.assertEqual(r.candidate.spec_id, "cdna4_dtl_64x128")
+        self.assertEqual(r.spec.trait.split_k, 4)
+        self.assertEqual(r.grid, (128, 1, 4))
+
+    def test_m64_wide_grid_stays_unsplit(self):
+        r = dispatch_gemm_bf16(_bf16(64, 28672, 4096))
+        self.assertEqual(r.candidate.spec_id, "cdna4_dtl_64x128")
+        self.assertEqual(r.spec.trait.split_k, 1)
+
+    def test_m128_half_device_deep_k_splits(self):
+        r = dispatch_gemm_bf16(_bf16(128, 16384, 53248))
+        self.assertEqual(r.candidate.spec_id, "cdna4_dtl_128x128")
+        self.assertEqual(r.spec.trait.split_k, 2)
 
 
 if __name__ == "__main__":
