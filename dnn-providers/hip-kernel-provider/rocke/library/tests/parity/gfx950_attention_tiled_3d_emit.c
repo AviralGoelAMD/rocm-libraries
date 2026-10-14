@@ -393,6 +393,35 @@ static int make_spec(int idx, rocke_unified_attention_3d_tiled_spec_t* s)
         s->kv_load_aux = 2;
         s->kv_prefetch = true;
         break;
+    case 26:
+        /* kv_prefetch + scalar_block_ids */
+        s->head_size = 128;
+        s->block_size = 16;
+        s->num_query_heads = 32;
+        s->num_kv_heads = 8;
+        s->dtype = "bf16";
+        s->num_segments = 16;
+        s->use_sinks = false;
+        s->sliding_window = 0;
+        s->has_softcap = false;
+        s->kv_prefetch = true;
+        s->scalar_block_ids = true;
+        break;
+    case 27:
+        /* kv_prefetch + kv_split_wait + scalar_block_ids */
+        s->head_size = 128;
+        s->block_size = 16;
+        s->num_query_heads = 32;
+        s->num_kv_heads = 8;
+        s->dtype = "bf16";
+        s->num_segments = 16;
+        s->use_sinks = false;
+        s->sliding_window = 0;
+        s->has_softcap = false;
+        s->kv_prefetch = true;
+        s->kv_split_wait = true;
+        s->scalar_block_ids = true;
+        break;
     default:
         return -1;
     }

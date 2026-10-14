@@ -204,6 +204,10 @@ class UnifiedAttention3DTiledSpec:
     # Buffer-load AUX cache-policy bits of the K/V DMAs (0 default, 1 GLC,
     # 2 SLC, 3 GLC|SLC).
     kv_load_aux: int = 0
+    # kv_prefetch block-table reads as invariant loads, so the uniform address
+    # selects a scalar s_load: the ids then never sit in the vmcnt queue ahead
+    # of (or behind) the K/V DMAs.
+    scalar_block_ids: bool = False
 
     def __post_init__(self):
         if type(self.use_f32_denormal_flush) is not bool:
@@ -302,6 +306,7 @@ class UnifiedAttention3DTiledSpec:
             "kvsw" if self.kv_split_wait else "",
             "fks" if self.fold_kv_scale else "",
             f"aux{self.kv_load_aux}" if self.kv_load_aux else "",
+            "sbt" if self.scalar_block_ids else "",
         )
 
 
@@ -814,7 +819,11 @@ def build_unified_attention_3d_tiled(
         for p in range(TILE_MULT):
             page = b.add(b.mul(kv_tile_idx, b.const_i32(TILE_MULT)), b.const_i32(p))
             page = b.select(b.cmp_lt(page, last_page), page, last_page)
-            ids.append(b.global_load_i32(block_tables, b.add(seq_base, page)))
+            ids.append(
+                b.global_load_i32(
+                    block_tables, b.add(seq_base, page), invariant=spec.scalar_block_ids
+                )
+            )
         return ids
 
     def _paged_coords(kv_tile_idx: Value, first_half: int, lane_half: Value):
@@ -1347,7 +1356,7 @@ def build_unified_attention_3d_tiled(
             if spec.kv_split_wait:
                 # In flight: V[cur], ids[+2], then K/V[next] when issued.
                 # Leave the younger loads outstanding; V[cur] must land.
-                n_ids = TILE_MULT if PREFETCH_IDS else 0
+                n_ids = TILE_MULT if PREFETCH_IDS and not spec.scalar_block_ids else 0
                 with b.scf_if(in_range_next):
                     b.s_waitcnt(vmcnt=2 * kv_calls_per_tile + n_ids)
                 with b.scf_if(b.cmp_ge(next_tile_iv_raw, tile_end)):

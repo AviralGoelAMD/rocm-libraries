@@ -819,7 +819,7 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
             {
                 /* In flight: V[cur], ids[+2], then K/V[next] when issued.
                  * Leave the younger loads outstanding; V[cur] must land. */
-                const int n_ids = cfg->PREFETCH_IDS ? TM : 0;
+                const int n_ids = (cfg->PREFETCH_IDS && !cfg->SCALAR_BLOCK_IDS) ? TM : 0;
                 rocke_if_t g = rocke_b_scf_if(b, in_range_next);
                 rocke_if_t g_last;
                 rocke_b_region_enter(b, g.then_region);

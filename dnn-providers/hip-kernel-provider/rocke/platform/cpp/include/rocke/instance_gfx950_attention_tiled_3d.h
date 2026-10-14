@@ -211,6 +211,8 @@ typedef struct rocke_unified_attention_3d_tiled_spec
     bool fold_kv_scale; /* False */
     /* Buffer-load AUX cache-policy bits of the K/V DMAs (0..3). */
     int kv_load_aux; /* 0 */
+    /* kv_prefetch block-table reads as invariant (scalar) loads. */
+    bool scalar_block_ids; /* False */
 } rocke_unified_attention_3d_tiled_spec_t;
 
 rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_default(void);

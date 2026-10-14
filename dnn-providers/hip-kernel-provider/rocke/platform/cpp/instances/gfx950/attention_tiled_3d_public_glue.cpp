@@ -209,6 +209,7 @@ rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_de
     s.kv_split_wait = false;
     s.fold_kv_scale = false;
     s.kv_load_aux = 0;
+    s.scalar_block_ids = false;
     return s;
 }
 
@@ -365,8 +366,8 @@ static int rocke_attn3d950_kernel_name(const rocke_unified_attention_3d_tiled_sp
     /* kernel_name_join("rocke_uattn3d_tiled", d.., b.., h..kv.., seg.., dtype,
      *   kv<...> if kv_storage_dtype else "", "i64kv", "sinks", "sw<sw>",
      *   "softcap", "alibi", "qqb", "ftz", "stridedkv", "dec", "t<T>" (kv_tile_mult
-     *   > 1), "pf", "tsm", "kvsw", "fks", "aux<N>" (kv_load_aux != 0) -- each only
-     *   when its knob is set.
+     *   > 1), "pf", "tsm", "kvsw", "fks", "aux<N>" (kv_load_aux != 0), "sbt")
+     *   -- each only when its knob is set.
      *
      * Positional parts list (NOT flags=...): empty parts are skipped by
      * kernel_name_join. We materialise each part and feed the non-empty ones in
@@ -468,6 +469,10 @@ static int rocke_attn3d950_kernel_name(const rocke_unified_attention_3d_tiled_sp
     {
         snprintf(aux_part, sizeof(aux_part), "aux%d", s->kv_load_aux);
         parts[np++] = aux_part;
+    }
+    if(s->scalar_block_ids)
+    {
+        parts[np++] = "sbt";
     }
 
     st = rocke_kernel_name_join("", parts, np, NULL, NULL, 0, buf, cap, &out_len);
@@ -807,6 +812,7 @@ bool rocke_gfx950_attn_tiled_3d_config_from_spec(
     out->FOLD_SCALE = spec->fold_kv_scale && out->KV_FP8;
     out->NR = out->TRANS ? 1 : 4;
     out->KV_SPLIT_WAIT = spec->kv_split_wait;
+    out->SCALAR_BLOCK_IDS = spec->scalar_block_ids;
     out->KV_LOAD_AUX = spec->kv_load_aux;
     if(out->QK_K_ITERS > 8)
     {
