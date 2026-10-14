@@ -73,6 +73,24 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_bf16_spec_t* spec)
         spec->save_residual = true;
         spec->wave_size = 64;
         break;
+    case 6: /* N8192 b256 v8 bf16 sr streaming */
+        spec->n_per_block = 8192;
+        spec->block_size = 256;
+        spec->vec = 8;
+        spec->dtype = "bf16";
+        spec->save_residual = true;
+        spec->wave_size = 64;
+        spec->streaming = true;
+        break;
+    case 7: /* N4096 b512 v8 f16 streaming, no residual store */
+        spec->n_per_block = 4096;
+        spec->block_size = 512;
+        spec->vec = 8;
+        spec->dtype = "f16";
+        spec->save_residual = false;
+        spec->wave_size = 64;
+        spec->streaming = true;
+        break;
     default:
         return -1;
     }

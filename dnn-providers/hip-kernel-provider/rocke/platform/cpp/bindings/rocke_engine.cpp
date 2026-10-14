@@ -1970,6 +1970,7 @@ rocke_rmsnorm2d_spec_t rms_build_spec(const py::dict& d, std::deque<std::string>
     s.block_size = dict_int(d, "block_size", s.block_size);
     s.vec = dict_int(d, "vec", s.vec);
     s.save_inv_rms = dict_bool(d, "save_inv_rms", s.save_inv_rms);
+    s.streaming = dict_bool(d, "streaming", s.streaming);
     {
         std::string v;
         if(dict_str(d, "dtype", v))
@@ -2032,6 +2033,7 @@ rocke_add_rmsnorm2d_bf16_spec_t arb_build_spec(const py::dict& d, std::deque<std
     s.vec = dict_int(d, "vec", s.vec);
     s.save_residual = dict_bool(d, "save_residual", s.save_residual);
     s.wave_size = dict_int(d, "wave_size", s.wave_size);
+    s.streaming = dict_bool(d, "streaming", s.streaming);
     {
         std::string v;
         if(dict_str(d, "dtype", v))

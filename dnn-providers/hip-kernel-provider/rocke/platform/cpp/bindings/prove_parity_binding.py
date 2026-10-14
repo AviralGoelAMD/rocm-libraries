@@ -144,31 +144,44 @@ def cfgs_layernorm2d():
 
 def cfgs_rmsnorm2d():
     rows = [
-        (1024, 256, 4, "f16", False),
-        (2048, 256, 4, "bf16", False),
-        (4096, 256, 4, "f16", False),
-        (8192, 256, 8, "bf16", False),
-        (16384, 256, 8, "f16", True),
-        (131072, 256, 4, "f16", False),
+        (1024, 256, 4, "f16", False, False),
+        (2048, 256, 4, "bf16", False, False),
+        (4096, 256, 4, "f16", False, False),
+        (8192, 256, 8, "bf16", False, False),
+        (16384, 256, 8, "f16", True, False),
+        (131072, 256, 4, "f16", False, False),
+        (8192, 256, 8, "bf16", False, True),
+        (131072, 256, 4, "f16", False, True),
+        (4096, 512, 8, "f16", True, True),
     ]
     return [
-        dict(n_per_block=n, block_size=b, vec=v, dtype=d, save_inv_rms=s)
-        for (n, b, v, d, s) in rows
+        dict(n_per_block=n, block_size=b, vec=v, dtype=d, save_inv_rms=s, streaming=nt)
+        for (n, b, v, d, s, nt) in rows
     ]
 
 
 def cfgs_add_rmsnorm2d_bf16():
     rows = [
-        (1024, 256, 4, "bf16", True, 64),
-        (2048, 256, 4, "bf16", True, 64),
-        (4096, 256, 4, "bf16", True, 64),
-        (8192, 256, 4, "bf16", True, 64),
-        (1024, 256, 2, "f16", False, 64),
-        (2048, 128, 4, "bf16", True, 64),
+        (1024, 256, 4, "bf16", True, 64, False),
+        (2048, 256, 4, "bf16", True, 64, False),
+        (4096, 256, 4, "bf16", True, 64, False),
+        (8192, 256, 4, "bf16", True, 64, False),
+        (1024, 256, 2, "f16", False, 64, False),
+        (2048, 128, 4, "bf16", True, 64, False),
+        (8192, 256, 8, "bf16", True, 64, True),
+        (4096, 512, 8, "f16", False, 64, True),
     ]
     return [
-        dict(n_per_block=n, block_size=b, vec=v, dtype=d, save_residual=s, wave_size=w)
-        for (n, b, v, d, s, w) in rows
+        dict(
+            n_per_block=n,
+            block_size=b,
+            vec=v,
+            dtype=d,
+            save_residual=s,
+            wave_size=w,
+            streaming=nt,
+        )
+        for (n, b, v, d, s, w, nt) in rows
     ]
 
 

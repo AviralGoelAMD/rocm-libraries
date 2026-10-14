@@ -55,6 +55,7 @@ rocke_rmsnorm2d_spec_t rocke_rmsnorm2d_spec_default(void)
     s.save_inv_rms = false;
     s.wave_size = 64;
     s.name = "rocke_rmsnorm2d_fwd";
+    s.streaming = false;
     return s;
 }
 
@@ -72,13 +73,13 @@ rocke_status_t
     rocke_rmsnorm2d_kernel_name(const rocke_rmsnorm2d_spec_t* spec, char* out, size_t out_cap)
 {
     /* kernel_name_join(name, dtype, f"N{n_per_block}", f"b{block_size}",
-     *                  f"v{vec}", flags={"sr": save_inv_rms}) */
+     *                  f"v{vec}", flags={"sr": save_inv_rms, "nt": streaming}) */
     char part_n[32];
     char part_b[32];
     char part_v[32];
     const char* parts[4];
-    const char* flag_names[1];
-    int flag_on[1];
+    const char* flag_names[2];
+    int flag_on[2];
 
     if(spec == NULL)
     {
@@ -96,8 +97,10 @@ rocke_status_t
 
     flag_names[0] = "sr";
     flag_on[0] = spec->save_inv_rms ? 1 : 0;
+    flag_names[1] = "nt";
+    flag_on[1] = spec->streaming ? 1 : 0;
 
-    return rocke_kernel_name_join(spec->name, parts, 4, flag_names, flag_on, 1, out, out_cap, NULL);
+    return rocke_kernel_name_join(spec->name, parts, 4, flag_names, flag_on, 2, out, out_cap, NULL);
 }
 
 /* ===================================================================== *
@@ -264,7 +267,8 @@ static void rocke_rms_pass1_body(rocke_ir_builder_t* b,
 
 /* pass2_body(n_off, _k, x_scalars):
  *     if two_pass:
- *         x_scalars = x_tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=VEC)
+ *         x_scalars = x_tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=VEC,
+ *                                            temporal_hint=stream)
  *     gv = g_view.load_vec_as_f32(b, [n_off], n=VEC)
  *     return [b.fmul(x_scalars[i], b.fmul(inv_rms, gv[i])) for i in range(VEC)] */
 typedef struct rocke_rms_pass2_ctx
@@ -274,6 +278,7 @@ typedef struct rocke_rms_pass2_ctx
     const rocke_tensor_view_t* g_view;
     rocke_value_t* inv_rms;
     int vec;
+    const rocke_mem_opts_t* stream; /* spec.streaming hint */
 } rocke_rms_pass2_ctx_t;
 
 static void rocke_rms_pass2_body(rocke_ir_builder_t* b,
@@ -297,14 +302,16 @@ static void rocke_rms_pass2_body(rocke_ir_builder_t* b,
 
     if(ctx->two_pass)
     {
-        /* x_scalars = x_tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=VEC) */
+        /* x_scalars = x_tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=VEC,
+         *                                    temporal_hint=stream) */
         rocke_value_t* local_indices[2];
         xs_local = (rocke_value_t**)rocke_arena_alloc(
             &b->arena, (size_t)(vec > 0 ? vec : 1) * sizeof(rocke_value_t*));
         zero = rocke_b_const_i32(b, 0);
         local_indices[0] = zero;
         local_indices[1] = n_off;
-        rocke_tile_window_load_vec_as_f32(b, ctx->x_tile, local_indices, 2, vec, xs_local);
+        rocke_tile_window_load_vec_as_f32_ex(
+            b, ctx->x_tile, local_indices, 2, vec, xs_local, ctx->stream);
         xs = xs_local;
     }
     else
@@ -514,23 +521,33 @@ rocke_kernel_def_t* rocke_build_rmsnorm2d(rocke_ir_builder_t* b,
                        ? 1
                        : 0;
 
+        /* stream = TemporalHint.STREAMING if spec.streaming else DEFAULT
+         * The two-pass path re-reads X in pass 2, so its pass-1 loads stay
+         * default: x_hint = DEFAULT if two_pass else stream. */
+        rocke_mem_opts_t stream = ROCKE_MEM_OPTS_INIT;
+        stream.temporal_hint = spec->streaming ? ROCKE_TEMPORAL_STREAMING : ROCKE_TEMPORAL_DEFAULT;
+        rocke_mem_opts_t x_hint = ROCKE_MEM_OPTS_INIT;
+        x_hint.temporal_hint = two_pass ? ROCKE_TEMPORAL_DEFAULT : stream.temporal_hint;
+
         /* s2 = b.const_f32(0.0) */
         s2 = rocke_b_const_f32(b, 0.0);
 
         /* sweep_res = sweep_row_chunks(b, x_tile, tid, BS, VEC, elems_per_thread,
-         *                              body=pass1_body, cache=not two_pass)
+         *                              body=pass1_body, cache=not two_pass,
+         *                              temporal_hint=x_hint)
          *   (row defaults to None: the x_tile already carries the row origin). */
         p1ctx.s2 = &s2;
-        sweep_res = rocke_sweep_row_chunks(b,
-                                           &x_tile,
-                                           tid,
-                                           BS,
-                                           VEC,
-                                           elems_per_thread,
-                                           /*row=*/NULL,
-                                           rocke_rms_pass1_body,
-                                           &p1ctx,
-                                           /*cache=*/two_pass ? false : true);
+        sweep_res = rocke_sweep_row_chunks_ex(b,
+                                              &x_tile,
+                                              tid,
+                                              BS,
+                                              VEC,
+                                              elems_per_thread,
+                                              /*row=*/NULL,
+                                              rocke_rms_pass1_body,
+                                              &p1ctx,
+                                              /*cache=*/two_pass ? false : true,
+                                              &x_hint);
 
         /* Cross-thread reduction. */
         if(spec->wave_size != 0 && (BS % spec->wave_size) == 0)
@@ -562,23 +579,26 @@ rocke_kernel_def_t* rocke_build_rmsnorm2d(rocke_ir_builder_t* b,
         }
 
         /* Pass 2: pass2_row_chunks(b, y_tile, tid, BS, VEC, elems_per_thread,
-         *                          body=pass2_body, cached_f32=sweep_res.cached) */
+         *                          body=pass2_body, cached_f32=sweep_res.cached,
+         *                          temporal_hint=stream) */
         p2ctx.two_pass = two_pass ? true : false;
         p2ctx.x_tile = &x_tile;
         p2ctx.g_view = &g_view;
         p2ctx.inv_rms = inv_rms;
         p2ctx.vec = VEC;
-        rocke_pass2_row_chunks(b,
-                               &y_tile,
-                               tid,
-                               BS,
-                               VEC,
-                               elems_per_thread,
-                               /*row=*/NULL,
-                               rocke_rms_pass2_body,
-                               &p2ctx,
-                               sweep_res.cached,
-                               sweep_res.num_cached);
+        p2ctx.stream = &stream;
+        rocke_pass2_row_chunks_ex(b,
+                                  &y_tile,
+                                  tid,
+                                  BS,
+                                  VEC,
+                                  elems_per_thread,
+                                  /*row=*/NULL,
+                                  rocke_rms_pass2_body,
+                                  &p2ctx,
+                                  sweep_res.cached,
+                                  sweep_res.num_cached,
+                                  &stream);
 
         return b->kernel;
     });

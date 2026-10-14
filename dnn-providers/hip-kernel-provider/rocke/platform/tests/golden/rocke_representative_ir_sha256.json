@@ -2,6 +2,30 @@
   "flavors": {
     "llvm20": {
       "cases": {
+        "add_rmsnorm2d_bf16/gfx950/default_n8192": {
+          "arch": "gfx950",
+          "bytes": 39879,
+          "family": "add_rmsnorm2d_bf16",
+          "kernel_name": "rocke_add_rmsnorm2d_bf16_bf16_N8192_b256_v4_sr",
+          "sha256": "15cf513c3f62d7c60fcaa044c37e6121c75e1742d53425af165c04320808bbaf",
+          "status": "ok"
+        },
+        "add_rmsnorm2d_bf16/gfx950/streaming_n8192": {
+          "arch": "gfx950",
+          "bytes": 40459,
+          "family": "add_rmsnorm2d_bf16",
+          "kernel_name": "rocke_add_rmsnorm2d_bf16_bf16_N8192_b256_v4_sr_nt",
+          "sha256": "f25604828e32b74725857540eadd0e13c39670b0b1d8d49572220b294d916c48",
+          "status": "ok"
+        },
+        "add_rmsnorm2d_bf16/gfx950/streaming_v8_n8192": {
+          "arch": "gfx950",
+          "bytes": 34191,
+          "family": "add_rmsnorm2d_bf16",
+          "kernel_name": "rocke_add_rmsnorm2d_bf16_bf16_N8192_b256_v8_sr_nt",
+          "sha256": "b7c3870c2246058fb5d38df4d25e7945c37259d9c1e66e93b98874a8f2f442cb",
+          "status": "ok"
+        },
         "attention/gfx942/2d_bf16_d128_b64": {
           "arch": "gfx942",
           "bytes": 393929,
@@ -1521,6 +1545,30 @@
           "kernel_name": "irhash_nontemporal_copy_gfx950",
           "sha256": "a5decd14eda561f53e16f1a59a6ded1af6c2c61296c79ddd307ef718d8d1131e",
           "status": "ok"
+        },
+        "rmsnorm2d/gfx950/default_n8192": {
+          "arch": "gfx950",
+          "bytes": 26998,
+          "family": "rmsnorm2d",
+          "kernel_name": "rocke_rmsnorm2d_fwd_bf16_N8192_b256_v4",
+          "sha256": "4558de2ba7bd10b1f381d890748a703d0a92eb647740cbe714f8fcaaa0e8cba9",
+          "status": "ok"
+        },
+        "rmsnorm2d/gfx950/streaming_n8192": {
+          "arch": "gfx950",
+          "bytes": 27306,
+          "family": "rmsnorm2d",
+          "kernel_name": "rocke_rmsnorm2d_fwd_bf16_N8192_b256_v4_nt",
+          "sha256": "141fad8f4a8c50545e537000183f246ba856af089a39e9c0146aa6d3a86ebd9f",
+          "status": "ok"
+        },
+        "rmsnorm2d/gfx950/streaming_v8_n8192": {
+          "arch": "gfx950",
+          "bytes": 23452,
+          "family": "rmsnorm2d",
+          "kernel_name": "rocke_rmsnorm2d_fwd_bf16_N8192_b256_v8_nt",
+          "sha256": "9a0393b3fe4ae9717be8ed49e7ebf684ca9635e6117e82fdd621c3905c28186e",
+          "status": "ok"
         }
       },
       "expected_failures": {
@@ -1549,10 +1597,11 @@
           "gfx1250": 4,
           "gfx90a": 5,
           "gfx942": 40,
-          "gfx950": 123
+          "gfx950": 129
         },
         "expected_failures": 4,
         "families": {
+          "add_rmsnorm2d_bf16": 3,
           "attention": 16,
           "attention_d128_swa": 1,
           "attention_d256": 2,
@@ -1571,13 +1620,38 @@
           "grouped_gemm": 1,
           "kda_chunkwise": 13,
           "moe": 9,
-          "nontemporal": 2
+          "nontemporal": 2,
+          "rmsnorm2d": 3
         },
-        "ok_cases": 190
+        "ok_cases": 196
       }
     },
     "llvm22": {
       "cases": {
+        "add_rmsnorm2d_bf16/gfx950/default_n8192": {
+          "arch": "gfx950",
+          "bytes": 39886,
+          "family": "add_rmsnorm2d_bf16",
+          "kernel_name": "rocke_add_rmsnorm2d_bf16_bf16_N8192_b256_v4_sr",
+          "sha256": "29a5fcc6ec9e0d9f2d5f6f7f325adffb5ebe15d0d4246b01cfabdcd93f7a782b",
+          "status": "ok"
+        },
+        "add_rmsnorm2d_bf16/gfx950/streaming_n8192": {
+          "arch": "gfx950",
+          "bytes": 40466,
+          "family": "add_rmsnorm2d_bf16",
+          "kernel_name": "rocke_add_rmsnorm2d_bf16_bf16_N8192_b256_v4_sr_nt",
+          "sha256": "0eb96c7613690048d145fe85668454665dda35ab790f7ac5e241e07ec2c4c39d",
+          "status": "ok"
+        },
+        "add_rmsnorm2d_bf16/gfx950/streaming_v8_n8192": {
+          "arch": "gfx950",
+          "bytes": 34198,
+          "family": "add_rmsnorm2d_bf16",
+          "kernel_name": "rocke_add_rmsnorm2d_bf16_bf16_N8192_b256_v8_sr_nt",
+          "sha256": "1ccd6df38761913a2ca94099be142cad9b7ccc2f0a4400178b86e5c7f7274a3d",
+          "status": "ok"
+        },
         "attention/gfx942/2d_bf16_d128_b64": {
           "arch": "gfx942",
           "bytes": 394025,
@@ -3097,6 +3171,30 @@
           "kernel_name": "irhash_nontemporal_copy_gfx950",
           "sha256": "6f72ea631a752d64195a2e64a3dbc39b1c6764ad3fa190b8ea49e2346379dca2",
           "status": "ok"
+        },
+        "rmsnorm2d/gfx950/default_n8192": {
+          "arch": "gfx950",
+          "bytes": 27005,
+          "family": "rmsnorm2d",
+          "kernel_name": "rocke_rmsnorm2d_fwd_bf16_N8192_b256_v4",
+          "sha256": "c019dc38571a2348ff37d82496080c1fa50e3a698f204e3edcab27c8a49332ee",
+          "status": "ok"
+        },
+        "rmsnorm2d/gfx950/streaming_n8192": {
+          "arch": "gfx950",
+          "bytes": 27313,
+          "family": "rmsnorm2d",
+          "kernel_name": "rocke_rmsnorm2d_fwd_bf16_N8192_b256_v4_nt",
+          "sha256": "d157fcd480f41920a7852d4c50bbf7a53f6f77031f401989b9ad7b2e79d3f720",
+          "status": "ok"
+        },
+        "rmsnorm2d/gfx950/streaming_v8_n8192": {
+          "arch": "gfx950",
+          "bytes": 23459,
+          "family": "rmsnorm2d",
+          "kernel_name": "rocke_rmsnorm2d_fwd_bf16_N8192_b256_v8_nt",
+          "sha256": "adc0aeedf41bb599b0641cef656a635406fb8c9b944e69943284603330d18f03",
+          "status": "ok"
         }
       },
       "expected_failures": {
@@ -3125,10 +3223,11 @@
           "gfx1250": 4,
           "gfx90a": 5,
           "gfx942": 40,
-          "gfx950": 123
+          "gfx950": 129
         },
         "expected_failures": 4,
         "families": {
+          "add_rmsnorm2d_bf16": 3,
           "attention": 16,
           "attention_d128_swa": 1,
           "attention_d256": 2,
@@ -3147,13 +3246,38 @@
           "grouped_gemm": 1,
           "kda_chunkwise": 13,
           "moe": 9,
-          "nontemporal": 2
+          "nontemporal": 2,
+          "rmsnorm2d": 3
         },
-        "ok_cases": 190
+        "ok_cases": 196
       }
     },
     "llvm23": {
       "cases": {
+        "add_rmsnorm2d_bf16/gfx950/default_n8192": {
+          "arch": "gfx950",
+          "bytes": 39950,
+          "family": "add_rmsnorm2d_bf16",
+          "kernel_name": "rocke_add_rmsnorm2d_bf16_bf16_N8192_b256_v4_sr",
+          "sha256": "27382fc18eaa4b61d0e2f63922e85b82354da5a8cf5c8b53d50e6fdc2816ba23",
+          "status": "ok"
+        },
+        "add_rmsnorm2d_bf16/gfx950/streaming_n8192": {
+          "arch": "gfx950",
+          "bytes": 40530,
+          "family": "add_rmsnorm2d_bf16",
+          "kernel_name": "rocke_add_rmsnorm2d_bf16_bf16_N8192_b256_v4_sr_nt",
+          "sha256": "4a5c14decc064351effefa6aad19826c3ae1b0a5de81b64277e20343597170ca",
+          "status": "ok"
+        },
+        "add_rmsnorm2d_bf16/gfx950/streaming_v8_n8192": {
+          "arch": "gfx950",
+          "bytes": 34262,
+          "family": "add_rmsnorm2d_bf16",
+          "kernel_name": "rocke_add_rmsnorm2d_bf16_bf16_N8192_b256_v8_sr_nt",
+          "sha256": "c6c65a43190ad91fc0363e092bed5ed7a1ef695de62a670cbba126d2c2cc708d",
+          "status": "ok"
+        },
         "attention/gfx942/2d_bf16_d128_b64": {
           "arch": "gfx942",
           "bytes": 394089,
@@ -4705,6 +4829,30 @@
           "kernel_name": "irhash_nontemporal_copy_gfx950",
           "sha256": "84b0fb5a8a92a0abec1e550febe86cbefe306b413ecdef02f3f04a6883d5a4fb",
           "status": "ok"
+        },
+        "rmsnorm2d/gfx950/default_n8192": {
+          "arch": "gfx950",
+          "bytes": 27069,
+          "family": "rmsnorm2d",
+          "kernel_name": "rocke_rmsnorm2d_fwd_bf16_N8192_b256_v4",
+          "sha256": "249d3cae54ab999ed9ddcbc5415f9e8debf28e30550d87b02cb40cc89ed1ab42",
+          "status": "ok"
+        },
+        "rmsnorm2d/gfx950/streaming_n8192": {
+          "arch": "gfx950",
+          "bytes": 27377,
+          "family": "rmsnorm2d",
+          "kernel_name": "rocke_rmsnorm2d_fwd_bf16_N8192_b256_v4_nt",
+          "sha256": "f28dd92de718b2a57b6f17f979ee4ec57e3e0e1a6044358d99bb052e05e0f8f9",
+          "status": "ok"
+        },
+        "rmsnorm2d/gfx950/streaming_v8_n8192": {
+          "arch": "gfx950",
+          "bytes": 23523,
+          "family": "rmsnorm2d",
+          "kernel_name": "rocke_rmsnorm2d_fwd_bf16_N8192_b256_v8_nt",
+          "sha256": "8709c5f2d55dc98e36c19db71b563e63ffd535b0dad1d48095e3c1fa6c13ae6c",
+          "status": "ok"
         }
       },
       "expected_failures": {},
@@ -4716,10 +4864,11 @@
           "gfx1250": 8,
           "gfx90a": 5,
           "gfx942": 40,
-          "gfx950": 123
+          "gfx950": 129
         },
         "expected_failures": 0,
         "families": {
+          "add_rmsnorm2d_bf16": 3,
           "attention": 16,
           "attention_d128_swa": 1,
           "attention_d256": 2,
@@ -4738,9 +4887,10 @@
           "grouped_gemm": 1,
           "kda_chunkwise": 13,
           "moe": 9,
-          "nontemporal": 2
+          "nontemporal": 2,
+          "rmsnorm2d": 3
         },
-        "ok_cases": 194
+        "ok_cases": 200
       }
     }
   },

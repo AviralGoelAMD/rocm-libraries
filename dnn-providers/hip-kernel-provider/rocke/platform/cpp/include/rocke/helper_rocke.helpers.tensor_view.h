@@ -165,20 +165,45 @@ void rocke_tensor_view_store_scalar(rocke_ir_builder_t* b,
                                     rocke_value_t* value,
                                     int align);
 
-/* TensorView.load_vec(b, indices, n). */
+/* TensorView.load_vec(b, indices, n). Forwards to rocke_tensor_view_load_vec_ex
+ * with opts == NULL (all defaults). */
 rocke_value_t* rocke_tensor_view_load_vec(rocke_ir_builder_t* b,
                                           const rocke_tensor_view_t* v,
                                           rocke_value_t* const* indices,
                                           int num_indices,
                                           int n);
 
-/* TensorView.store_vec(b, indices, value, n). */
+/* TensorView.load_vec(b, indices, n, temporal_hint=...). `opts` follows the
+ * rocke_mem_opts_t rules in ir.h (NULL = all defaults); its temporal_hint is
+ * forwarded to rocke_b_global_load_vN_ex on the global f16/bf16/f64 path. Any
+ * other path with a non-default hint records ROCKE_ERR_NOTIMPL (Python
+ * NotImplementedError) and returns NULL before emitting IR. */
+rocke_value_t* rocke_tensor_view_load_vec_ex(rocke_ir_builder_t* b,
+                                             const rocke_tensor_view_t* v,
+                                             rocke_value_t* const* indices,
+                                             int num_indices,
+                                             int n,
+                                             const rocke_mem_opts_t* opts);
+
+/* TensorView.store_vec(b, indices, value, n). Forwards to
+ * rocke_tensor_view_store_vec_ex with opts == NULL. */
 void rocke_tensor_view_store_vec(rocke_ir_builder_t* b,
                                  const rocke_tensor_view_t* v,
                                  rocke_value_t* const* indices,
                                  int num_indices,
                                  rocke_value_t* value,
                                  int n);
+
+/* TensorView.store_vec(b, indices, value, n, temporal_hint=...). The hint is
+ * forwarded to rocke_b_global_store_vN_ex on the global path; an LDS / buffer
+ * view with a non-default hint records ROCKE_ERR_NOTIMPL and emits nothing. */
+void rocke_tensor_view_store_vec_ex(rocke_ir_builder_t* b,
+                                    const rocke_tensor_view_t* v,
+                                    rocke_value_t* const* indices,
+                                    int num_indices,
+                                    rocke_value_t* value,
+                                    int n,
+                                    const rocke_mem_opts_t* opts);
 
 /* TensorView.load_vec_at(b, elem_off, n). (No buffer mask in this phase.) */
 rocke_value_t* rocke_tensor_view_load_vec_at(rocke_ir_builder_t* b,
@@ -217,6 +242,15 @@ rocke_value_t* rocke_tile_window_load_vec(rocke_ir_builder_t* b,
                                           int num_indices,
                                           int n);
 
+/* TileWindow.load_vec(b, *local_indices, n, temporal_hint=...): `opts` as for
+ * rocke_tensor_view_load_vec_ex. */
+rocke_value_t* rocke_tile_window_load_vec_ex(rocke_ir_builder_t* b,
+                                             const rocke_tile_window_t* w,
+                                             rocke_value_t* const* local_indices,
+                                             int num_indices,
+                                             int n,
+                                             const rocke_mem_opts_t* opts);
+
 /* TileWindow.store_vec(b, *local_indices, value, n). */
 void rocke_tile_window_store_vec(rocke_ir_builder_t* b,
                                  const rocke_tile_window_t* w,
@@ -224,6 +258,41 @@ void rocke_tile_window_store_vec(rocke_ir_builder_t* b,
                                  int num_indices,
                                  rocke_value_t* value,
                                  int n);
+
+/* TileWindow.store_vec(b, *local_indices, value, n, temporal_hint=...): `opts`
+ * as for rocke_tensor_view_store_vec_ex. */
+void rocke_tile_window_store_vec_ex(rocke_ir_builder_t* b,
+                                    const rocke_tile_window_t* w,
+                                    rocke_value_t* const* local_indices,
+                                    int num_indices,
+                                    rocke_value_t* value,
+                                    int n,
+                                    const rocke_mem_opts_t* opts);
+
+/* TileWindow.load_vec_as_f32(b, *local_indices, n, temporal_hint=...): the
+ * hinted form of rocke_tile_window_load_vec_as_f32 (declared in
+ * helper_rocke.helpers.sweep.h), which forwards here with opts == NULL. A
+ * non-default hint with n == 1 records ROCKE_ERR_NOTIMPL ("temporal_hint
+ * needs a vector load") and emits nothing. */
+void rocke_tile_window_load_vec_as_f32_ex(rocke_ir_builder_t* b,
+                                          const rocke_tile_window_t* w,
+                                          rocke_value_t* const* local_indices,
+                                          int num_indices,
+                                          int n,
+                                          rocke_value_t** out,
+                                          const rocke_mem_opts_t* opts);
+
+/* TileWindow.store_vec_from_f32(b, *local_indices, values, temporal_hint=...):
+ * the hinted form of rocke_tile_window_store_vec_from_f32, which forwards here
+ * with opts == NULL. A non-default hint with num_values == 1 records
+ * ROCKE_ERR_NOTIMPL ("temporal_hint needs a vector store"). */
+void rocke_tile_window_store_vec_from_f32_ex(rocke_ir_builder_t* b,
+                                             const rocke_tile_window_t* w,
+                                             rocke_value_t* const* local_indices,
+                                             int num_indices,
+                                             rocke_value_t* const* values,
+                                             int num_values,
+                                             const rocke_mem_opts_t* opts);
 
 /* TileWindow.load_vec_scalars(b, *local_indices, n): vector load split into
  * ``n`` scalars in the window's own dtype (no f32 promotion). Writes them to

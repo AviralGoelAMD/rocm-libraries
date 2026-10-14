@@ -68,6 +68,30 @@ static int make_spec(int idx, rocke_rmsnorm2d_spec_t* s)
         s->dtype = "f16";
         s->save_inv_rms = false;
         break;
+    case 6: /* N8192 b256 v8 bf16 streaming */
+        s->n_per_block = 8192;
+        s->block_size = 256;
+        s->vec = 8;
+        s->dtype = "bf16";
+        s->save_inv_rms = false;
+        s->streaming = true;
+        break;
+    case 7: /* N131072 b256 v4 f16 streaming (two-pass: pass-1 loads stay default) */
+        s->n_per_block = 131072;
+        s->block_size = 256;
+        s->vec = 4;
+        s->dtype = "f16";
+        s->save_inv_rms = false;
+        s->streaming = true;
+        break;
+    case 8: /* N4096 b512 v8 f16 save_inv_rms streaming */
+        s->n_per_block = 4096;
+        s->block_size = 512;
+        s->vec = 8;
+        s->dtype = "f16";
+        s->save_inv_rms = true;
+        s->streaming = true;
+        break;
     default:
         return -1;
     }
@@ -78,7 +102,7 @@ int main(int argc, char** argv)
 {
     if(argc < 2)
     {
-        fprintf(stderr, "usage: %s <config_index 0..5> [mode]\n", argv[0]);
+        fprintf(stderr, "usage: %s <config_index 0..8> [mode]\n", argv[0]);
         return 2;
     }
     int idx = atoi(argv[1]);

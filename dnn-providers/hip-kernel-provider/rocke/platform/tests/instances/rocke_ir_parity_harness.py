@@ -1287,6 +1287,22 @@ def build_streaming_copy(arch):
     return _build
 
 
+def build_row_kernel(module, spec_cls, build_fn, arch=None, **spec_kw):
+    """One ``rocke.instances.common.<module>`` row kernel (norm / quant family)
+    from ``spec_cls(**spec_kw)``. ``arch`` is forwarded only to the builders
+    that take one (rmsnorm2d / layernorm2d build from the spec alone)."""
+
+    def _build():
+        import importlib
+
+        mod = importlib.import_module(f"rocke.instances.common.{module}")
+        spec = getattr(mod, spec_cls)(**spec_kw)
+        build = getattr(mod, build_fn)
+        return build(spec) if arch is None else build(spec, arch=arch)
+
+    return _build
+
+
 def cases():
     out = []
 
@@ -3900,6 +3916,40 @@ def cases():
             f"nontemporal/{_arch}/copy_bf16x8",
             _arch,
             build_streaming_copy(_arch),
+        )
+
+    # Memory-bound row kernels: the spec-default config plus each opt-in
+    # cache / reduction knob, so a knob or default change shows up per case.
+    for _case_id, _over in (
+        ("default_n8192", {}),
+        ("streaming_n8192", {"streaming": True}),
+        ("streaming_v8_n8192", {"vec": 8, "streaming": True}),
+    ):
+        add(
+            "rmsnorm2d",
+            f"rmsnorm2d/gfx950/{_case_id}",
+            "gfx950",
+            build_row_kernel(
+                "rmsnorm2d",
+                "RMSNorm2DSpec",
+                "build_rmsnorm2d",
+                n_per_block=8192,
+                dtype="bf16",
+                **_over,
+            ),
+        )
+        add(
+            "add_rmsnorm2d_bf16",
+            f"add_rmsnorm2d_bf16/gfx950/{_case_id}",
+            "gfx950",
+            build_row_kernel(
+                "add_rmsnorm2d_bf16",
+                "AddRMSNorm2DBF16Spec",
+                "build_add_rmsnorm2d_bf16",
+                arch="gfx950",
+                n_per_block=8192,
+                **_over,
+            ),
         )
 
     return out

@@ -38,6 +38,7 @@ rocke_add_rmsnorm2d_bf16_spec_t rocke_add_rmsnorm2d_bf16_spec_default(void)
     s.save_residual = true;
     s.wave_size = 64;
     s.name = "rocke_add_rmsnorm2d_bf16";
+    s.streaming = false;
     return s;
 }
 
@@ -55,13 +56,13 @@ rocke_status_t rocke_add_rmsnorm2d_bf16_kernel_name(const rocke_add_rmsnorm2d_bf
                                                     size_t out_cap)
 {
     /* kernel_name_join(name, dtype, f"N{n}", f"b{bs}", f"v{vec}",
-     *                  flags={"sr": save_residual}) */
+     *                  flags={"sr": save_residual, "nt": streaming}) */
     char part_n[32];
     char part_b[32];
     char part_v[32];
     const char* parts[4];
-    const char* flag_names[1];
-    int flag_on[1];
+    const char* flag_names[2];
+    int flag_on[2];
 
     if(spec == NULL)
     {
@@ -76,8 +77,10 @@ rocke_status_t rocke_add_rmsnorm2d_bf16_kernel_name(const rocke_add_rmsnorm2d_bf
     parts[3] = part_v;
     flag_names[0] = "sr";
     flag_on[0] = spec->save_residual ? 1 : 0;
+    flag_names[1] = "nt";
+    flag_on[1] = spec->streaming ? 1 : 0;
 
-    return rocke_kernel_name_join(spec->name, parts, 4, flag_names, flag_on, 1, out, out_cap, NULL);
+    return rocke_kernel_name_join(spec->name, parts, 4, flag_names, flag_on, 2, out, out_cap, NULL);
 }
 
 /* ===================================================================== *
@@ -185,15 +188,17 @@ bool rocke_is_valid_spec_add_rmsnorm2d_bf16(const rocke_add_rmsnorm2d_bf16_spec_
  *  tensor_view port does not expose the compute-promoting variants).
  * ===================================================================== */
 
-/* TileWindow.load_vec_as_f32(b, row, col, n=VEC) -> n f32 scalars into out.
- * Mirrors Python: load_vec then per-lane cast_to_f32(vec_extract). The
- * row/col local indices match the window rank (2). n is in {2,4,8} here. */
+/* TileWindow.load_vec_as_f32(b, row, col, n=VEC, temporal_hint=...) -> n f32
+ * scalars into out. Mirrors Python: load_vec then per-lane
+ * cast_to_f32(vec_extract). The row/col local indices match the window rank
+ * (2). n is in {2,4,8} here. `opts` carries the temporal hint (NULL = default). */
 static void rms_tile_load_vec_as_f32(rocke_ir_builder_t* b,
                                      const rocke_tile_window_t* w,
                                      rocke_value_t* row,
                                      rocke_value_t* col,
                                      int n,
-                                     rocke_value_t** out)
+                                     rocke_value_t** out,
+                                     const rocke_mem_opts_t* opts)
 {
     rocke_value_t* idx[2];
     rocke_value_t* v;
@@ -201,21 +206,22 @@ static void rms_tile_load_vec_as_f32(rocke_ir_builder_t* b,
 
     idx[0] = row;
     idx[1] = col;
-    v = rocke_tile_window_load_vec(b, w, idx, 2, n);
+    v = rocke_tile_window_load_vec_ex(b, w, idx, 2, n, opts);
     for(i = 0; i < n; ++i)
     {
         out[i] = rocke_b_cast_to_f32(b, rocke_b_vec_extract(b, v, i));
     }
 }
 
-/* TileWindow.store_vec_from_f32(b, row, col, values) -- f32 demote + pack +
- * vector store. Mirrors Python for len(values) in {2,4,8}. */
+/* TileWindow.store_vec_from_f32(b, row, col, values, temporal_hint=...) -- f32
+ * demote + pack + vector store. Mirrors Python for len(values) in {2,4,8}. */
 static void rms_tile_store_vec_from_f32(rocke_ir_builder_t* b,
                                         const rocke_tile_window_t* w,
                                         rocke_value_t* row,
                                         rocke_value_t* col,
                                         rocke_value_t* const* values,
-                                        int n)
+                                        int n,
+                                        const rocke_mem_opts_t* opts)
 {
     rocke_value_t* idx[2];
     rocke_value_t* casts[8];
@@ -230,7 +236,7 @@ static void rms_tile_store_vec_from_f32(rocke_ir_builder_t* b,
         casts[i] = rocke_b_cast_f32_to(b, values[i], dt);
     }
     packed = rocke_b_vec_pack(b, casts, n, dt);
-    rocke_tile_window_store_vec(b, w, idx, 2, packed, n);
+    rocke_tile_window_store_vec_ex(b, w, idx, 2, packed, n, opts);
 }
 
 /* TensorView.load_vec_as_f32(b, [n_off], n=VEC) -> n f32 scalars (Gamma view,
@@ -421,6 +427,9 @@ rocke_kernel_def_t* rocke_build_add_rmsnorm2d_bf16(rocke_ir_builder_t* b,
     }
 
     /* ---- Pass 1: stream A & B, x = a + b, per-thread sum-of-squares ---- */
+    /* stream = TemporalHint.STREAMING if spec.streaming else DEFAULT */
+    rocke_mem_opts_t stream = ROCKE_MEM_OPTS_INIT;
+    stream.temporal_hint = spec->streaming ? ROCKE_TEMPORAL_STREAMING : ROCKE_TEMPORAL_DEFAULT;
     s_sq = rocke_b_const_f32(b, 0.0);
     c_vec = rocke_b_const_i32(b, VEC);
     chunks_per_thread = rocke_add_rmsnorm2d_bf16_elems_per_thread(spec) / VEC;
@@ -448,8 +457,10 @@ rocke_kernel_def_t* rocke_build_add_rmsnorm2d_bf16(rocke_ir_builder_t* b,
         /* Python passes a FRESH b.const_i32(0) as the row local-index on each
          * load/store call; mirror that here so the constant-id sequence lines up
          * with the reference builder. */
-        rms_tile_load_vec_as_f32(b, &a_tile, rocke_b_const_i32(b, 0), n_off, VEC, a_scalars);
-        rms_tile_load_vec_as_f32(b, &bt_tile, rocke_b_const_i32(b, 0), n_off, VEC, b_scalars);
+        rms_tile_load_vec_as_f32(
+            b, &a_tile, rocke_b_const_i32(b, 0), n_off, VEC, a_scalars, &stream);
+        rms_tile_load_vec_as_f32(
+            b, &bt_tile, rocke_b_const_i32(b, 0), n_off, VEC, b_scalars, &stream);
 
         for(i = 0; i < VEC; ++i)
         {
@@ -472,7 +483,8 @@ rocke_kernel_def_t* rocke_build_add_rmsnorm2d_bf16(rocke_ir_builder_t* b,
 
         if(spec->save_residual)
         {
-            rms_tile_store_vec_from_f32(b, &x_tile, rocke_b_const_i32(b, 0), n_off, chunk_x, VEC);
+            rms_tile_store_vec_from_f32(
+                b, &x_tile, rocke_b_const_i32(b, 0), n_off, chunk_x, VEC, &stream);
         }
     }
 
@@ -513,7 +525,8 @@ rocke_kernel_def_t* rocke_build_add_rmsnorm2d_bf16(rocke_ir_builder_t* b,
         {
             y_vec[i] = rocke_b_fmul(b, cached_x[k * VEC + i], rocke_b_fmul(b, inv_rms, gv[i]));
         }
-        rms_tile_store_vec_from_f32(b, &y_tile, rocke_b_const_i32(b, 0), n_off, y_vec, VEC);
+        rms_tile_store_vec_from_f32(
+            b, &y_tile, rocke_b_const_i32(b, 0), n_off, y_vec, VEC, &stream);
     }
 
     return b->kernel;

@@ -39,7 +39,8 @@
  *       if tile.dtype.name == "f64":
  *           x_scalars = tile.load_vec_scalars(b, b.const_i32(0), n_off, n=vec)
  *       else:
- *           x_scalars = tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=vec)
+ *           x_scalars = tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=vec,
+ *                                            temporal_hint=temporal_hint)
  *       if cache: cached.extend(x_scalars)
  *       if body is not None: body(n_off, x_scalars)
  *   return RowChunkSweepResult(cached=cached, chunks_per_thread=...)
@@ -54,6 +55,22 @@ rocke_row_chunk_sweep_result_t rocke_sweep_row_chunks(rocke_ir_builder_t* b,
                                                       rocke_sweep_row_body_fn body,
                                                       void* user,
                                                       bool cache)
+{
+    return rocke_sweep_row_chunks_ex(
+        b, tile, tid, block_size, vec, elems_per_thread, row, body, user, cache, NULL);
+}
+
+rocke_row_chunk_sweep_result_t rocke_sweep_row_chunks_ex(rocke_ir_builder_t* b,
+                                                         const rocke_tile_window_t* tile,
+                                                         rocke_value_t* tid,
+                                                         int block_size,
+                                                         int vec,
+                                                         int elems_per_thread,
+                                                         rocke_value_t* row,
+                                                         rocke_sweep_row_body_fn body,
+                                                         void* user,
+                                                         bool cache,
+                                                         const rocke_mem_opts_t* opts)
 {
     rocke_row_chunk_sweep_result_t res;
     rocke_tile_window_t shifted;
@@ -129,7 +146,8 @@ rocke_row_chunk_sweep_result_t rocke_sweep_row_chunks(rocke_ir_builder_t* b,
         mul_tid = rocke_b_mul(b, tid, c_vec);
         n_off = rocke_b_add(b, mul_kbs, mul_tid);
 
-        /* tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=vec)
+        /* tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=vec,
+         *                      temporal_hint=temporal_hint)
          * The b.const_i32(0) is allocated at the call site each iteration
          * (NOT hoisted) so the SSA-id counter advances exactly as in Python,
          * which spells the literal-0 column index inline at the load. */
@@ -138,7 +156,7 @@ rocke_row_chunk_sweep_result_t rocke_sweep_row_chunks(rocke_ir_builder_t* b,
         if(strcmp(rocke_tile_window_dtype(t)->name, "f64") == 0)
             rocke_tile_window_load_vec_scalars(b, t, local_indices, 2, vec, scratch);
         else
-            rocke_tile_window_load_vec_as_f32(b, t, local_indices, 2, vec, scratch);
+            rocke_tile_window_load_vec_as_f32_ex(b, t, local_indices, 2, vec, scratch, opts);
 
         if(cache && res.cached != NULL)
         {
@@ -175,7 +193,8 @@ rocke_row_chunk_sweep_result_t rocke_sweep_row_chunks(rocke_ir_builder_t* b,
  *       else:          x_scalars = []
  *       out = body(n_off, k, x_scalars)
  *       if len(out) != vec: raise ValueError(...)
- *       tile.store_vec_from_f32(b, b.const_i32(0), n_off, values=out)
+ *       tile.store_vec_from_f32(b, b.const_i32(0), n_off, values=out,
+ *                               temporal_hint=temporal_hint)
  * ------------------------------------------------------------------------ */
 void rocke_pass2_row_chunks(rocke_ir_builder_t* b,
                             const rocke_tile_window_t* tile,
@@ -188,6 +207,33 @@ void rocke_pass2_row_chunks(rocke_ir_builder_t* b,
                             void* user,
                             rocke_value_t* const* cached_f32,
                             int num_cached_f32)
+{
+    rocke_pass2_row_chunks_ex(b,
+                              tile,
+                              tid,
+                              block_size,
+                              vec,
+                              elems_per_thread,
+                              row,
+                              body,
+                              user,
+                              cached_f32,
+                              num_cached_f32,
+                              NULL);
+}
+
+void rocke_pass2_row_chunks_ex(rocke_ir_builder_t* b,
+                               const rocke_tile_window_t* tile,
+                               rocke_value_t* tid,
+                               int block_size,
+                               int vec,
+                               int elems_per_thread,
+                               rocke_value_t* row,
+                               rocke_pass2_row_body_fn body,
+                               void* user,
+                               rocke_value_t* const* cached_f32,
+                               int num_cached_f32,
+                               const rocke_mem_opts_t* opts)
 {
     rocke_tile_window_t shifted;
     const rocke_tile_window_t* t;
@@ -268,11 +314,12 @@ void rocke_pass2_row_chunks(rocke_ir_builder_t* b,
         /* out = body(n_off, k, x_scalars); the callback fills out[0..vec). */
         body(b, n_off, k, x_scalars, num_x, out, vec, user);
 
-        /* tile.store_vec_from_f32(b, b.const_i32(0), n_off, values=out)
+        /* tile.store_vec_from_f32(b, b.const_i32(0), n_off, values=out,
+         *                         temporal_hint=temporal_hint)
          * b.const_i32(0) allocated at the call site (NOT hoisted) so the
          * SSA-id counter advances exactly as in Python. */
         local_indices[0] = rocke_b_const_i32(b, 0);
         local_indices[1] = n_off;
-        rocke_tile_window_store_vec_from_f32(b, t, local_indices, 2, out, vec);
+        rocke_tile_window_store_vec_from_f32_ex(b, t, local_indices, 2, out, vec, opts);
     }
 }

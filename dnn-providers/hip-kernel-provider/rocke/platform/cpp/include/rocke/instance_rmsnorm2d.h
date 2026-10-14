@@ -61,11 +61,15 @@ extern "C" {
  *       dtype: DType = "f16"          # "f16" | "bf16"
  *       save_inv_rms: bool = False
  *       wave_size: int = 64
+ *       streaming: bool = False
  *       name: str = "rocke_rmsnorm2d_fwd"
  *
  * `dtype` / `name` are const char* (string literals); compared by strcmp like
  * the Python. n_per_block has no default (it is the one required field), but
- * rocke_rmsnorm2d_spec_default() seeds it to 0 so an unset value is visible. */
+ * rocke_rmsnorm2d_spec_default() seeds it to 0 so an unset value is visible.
+ * `streaming` puts the TemporalHint.STREAMING (``nt``) hint on the read-once X
+ * row loads (single-pass path only) and the write-once Y stores; gamma keeps
+ * the default policy. It is appended last so existing field offsets hold. */
 typedef struct rocke_rmsnorm2d_spec
 {
     int n_per_block;
@@ -75,6 +79,7 @@ typedef struct rocke_rmsnorm2d_spec
     bool save_inv_rms; /* default false */
     int wave_size; /* default 64  */
     const char* name; /* default "rocke_rmsnorm2d_fwd" */
+    bool streaming; /* default false */
 } rocke_rmsnorm2d_spec_t;
 
 /* Default-constructed spec (every field == Python dataclass default;
@@ -87,7 +92,7 @@ int rocke_rmsnorm2d_elems_per_thread(const rocke_rmsnorm2d_spec_t* spec);
 /* RMSNorm2DSpec.kernel_name() -> NUL-terminated into out (capacity out_cap).
  *
  *   kernel_name_join(name, dtype, f"N{n_per_block}", f"b{block_size}",
- *                    f"v{vec}", flags={"sr": save_inv_rms})
+ *                    f"v{vec}", flags={"sr": save_inv_rms, "nt": streaming})
  *
  * Returns ROCKE_OK, or ROCKE_ERR_VALUE (buffer too small / format error). */
 rocke_status_t

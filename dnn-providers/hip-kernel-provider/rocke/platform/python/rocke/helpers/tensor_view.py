@@ -62,7 +62,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional, Sequence, Tuple, Union
 
-from ..core.ir import IRBuilder, Type, Value
+from ..core.ir import IRBuilder, TemporalHint, Type, Value
 
 
 StrideElem = Union[int, Value]
@@ -418,11 +418,28 @@ class TensorView:
 
     # ---- vector ops ----
 
-    def load_vec(self, b: IRBuilder, indices: Sequence[Value], n: int) -> Value:
+    def load_vec(
+        self,
+        b: IRBuilder,
+        indices: Sequence[Value],
+        n: int,
+        temporal_hint: TemporalHint = TemporalHint.DEFAULT,
+    ) -> Value:
         """Vectorised load of ``n`` consecutive elements starting at
         ``indices``. Supports ``n in {2, 4, 8}`` for f16/bf16 (global &
         LDS) and ``n = 2`` for f64 (global); buffer ops use ``dwords =
-        n // 2`` for f16 and support ``n in {2, 4, 8}`` accordingly."""
+        n // 2`` for f16 and support ``n in {2, 4, 8}`` accordingly.
+
+        ``temporal_hint`` is forwarded to :meth:`IRBuilder.global_load_vN`
+        on the global f16/bf16/f64 path; any other path rejects a
+        non-default hint."""
+        if temporal_hint is not TemporalHint.DEFAULT and not (
+            self.addr_space == "global"
+            and self.dtype.name in ("f16", "bf16", "f64")
+        ):
+            raise NotImplementedError(
+                f"temporal_hint not wired for {self.addr_space}/{self.dtype.name}"
+            )
         if self.addr_space == "lds":
             if self.dtype.name in ("f16", "bf16"):
                 return b.smem_load_vN(self.base, *indices, dtype=self.dtype, n=n)
@@ -448,7 +465,9 @@ class TensorView:
             )
         off = self.desc.offset(b, indices)
         if self.dtype.name in ("f16", "bf16", "f64"):
-            return b.global_load_vN(self.base, off, self.dtype, n)
+            return b.global_load_vN(
+                self.base, off, self.dtype, n, temporal_hint=temporal_hint
+            )
         if self.dtype.name == "f32":
             # f32 global vec loads aren't wired through ``global_load_vN``
             # yet (the IR primitive only covers 16-bit elements). Fall
@@ -470,8 +489,15 @@ class TensorView:
         indices: Sequence[Value],
         value: Value,
         n: int,
+        temporal_hint: TemporalHint = TemporalHint.DEFAULT,
     ) -> None:
-        """Vectorised store. ``value`` must be a ``<n x dtype>`` vector."""
+        """Vectorised store. ``value`` must be a ``<n x dtype>`` vector.
+        ``temporal_hint`` is forwarded to :meth:`IRBuilder.global_store_vN`
+        on the global path; LDS / buffer views reject a non-default hint."""
+        if temporal_hint is not TemporalHint.DEFAULT and self.addr_space != "global":
+            raise NotImplementedError(
+                f"temporal_hint not wired for {self.addr_space} stores"
+            )
         if self.addr_space == "lds":
             b.smem_store_vN(self.base, list(indices), value, n)
             return
@@ -492,7 +518,7 @@ class TensorView:
                 f"buffer vec store not yet wired for dtype {self.dtype.name}"
             )
         off = self.desc.offset(b, indices)
-        b.global_store_vN(self.base, off, value, n)
+        b.global_store_vN(self.base, off, value, n, temporal_hint=temporal_hint)
 
     # ---- flat-offset variants (skip the descriptor) ----
     #
@@ -872,13 +898,32 @@ class TileWindow:
 
     # ---- vector ops ----
 
-    def load_vec(self, b: IRBuilder, *local_indices: Value, n: int) -> Value:
-        return self.view.load_vec(b, self._global_indices(b, local_indices), n=n)
+    def load_vec(
+        self,
+        b: IRBuilder,
+        *local_indices: Value,
+        n: int,
+        temporal_hint: TemporalHint = TemporalHint.DEFAULT,
+    ) -> Value:
+        return self.view.load_vec(
+            b, self._global_indices(b, local_indices), n=n, temporal_hint=temporal_hint
+        )
 
     def store_vec(
-        self, b: IRBuilder, *local_indices: Value, value: Value, n: int
+        self,
+        b: IRBuilder,
+        *local_indices: Value,
+        value: Value,
+        n: int,
+        temporal_hint: TemporalHint = TemporalHint.DEFAULT,
     ) -> None:
-        self.view.store_vec(b, self._global_indices(b, local_indices), value=value, n=n)
+        self.view.store_vec(
+            b,
+            self._global_indices(b, local_indices),
+            value=value,
+            n=n,
+            temporal_hint=temporal_hint,
+        )
 
     def load_vec_scalars(
         self, b: IRBuilder, *local_indices: Value, n: int
@@ -897,7 +942,11 @@ class TileWindow:
     # ---- compute-promoting vector ops ----
 
     def load_vec_as_f32(
-        self, b: IRBuilder, *local_indices: Value, n: int
+        self,
+        b: IRBuilder,
+        *local_indices: Value,
+        n: int,
+        temporal_hint: TemporalHint = TemporalHint.DEFAULT,
     ) -> list[Value]:
         """Vector load + per-lane promotion to f32.
 
@@ -910,15 +959,22 @@ class TileWindow:
         ``n == 1`` routes through :meth:`load_scalar` (one scalar load
         + f32 promote) so the vector and scalar
         :class:`rocke.helpers.LoadStoreTraits` paths stay uniform.
+        ``temporal_hint`` is forwarded to the vector load.
         """
         if n == 1:
+            if temporal_hint is not TemporalHint.DEFAULT:
+                raise NotImplementedError("temporal_hint needs a vector load")
             scalar = self.load_scalar(b, *local_indices)
             return [b.cast_to_f32(scalar)]
-        v = self.load_vec(b, *local_indices, n=n)
+        v = self.load_vec(b, *local_indices, n=n, temporal_hint=temporal_hint)
         return [b.cast_to_f32(b.vec_extract(v, i)) for i in range(n)]
 
     def store_vec_from_f32(
-        self, b: IRBuilder, *local_indices: Value, values: list[Value]
+        self,
+        b: IRBuilder,
+        *local_indices: Value,
+        values: list[Value],
+        temporal_hint: TemporalHint = TemporalHint.DEFAULT,
     ) -> None:
         """f32 demote + pack + vector store. ``len(values) == 1``
         routes through :meth:`store_scalar` (one scalar store).
@@ -934,12 +990,16 @@ class TileWindow:
                 "cast manually and use store_vec"
             )
         if len(values) == 1:
+            if temporal_hint is not TemporalHint.DEFAULT:
+                raise NotImplementedError("temporal_hint needs a vector store")
             scalar = b.cast_f32_to(values[0], self.dtype)
             self.store_scalar(b, *local_indices, value=scalar)
             return
         casts = [b.cast_f32_to(v, self.dtype) for v in values]
         packed = b.vec_pack(casts, self.dtype)
-        self.store_vec(b, *local_indices, value=packed, n=len(values))
+        self.store_vec(
+            b, *local_indices, value=packed, n=len(values), temporal_hint=temporal_hint
+        )
 
     # ---- distribution-driven load / store (CK Tile parity) ----
 

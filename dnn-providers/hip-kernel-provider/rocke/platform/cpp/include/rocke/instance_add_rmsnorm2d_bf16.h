@@ -49,7 +49,10 @@ extern "C" {
 /* ----------------------------------------------------- AddRMSNorm2DBF16Spec *
  *
  * Mirror of the Python @dataclass(frozen=True). `dtype` is the Python Literal
- * "f16" | "bf16" string (compared by strcmp like Python). */
+ * "f16" | "bf16" string (compared by strcmp like Python). `streaming` puts the
+ * TemporalHint.STREAMING (``nt``) hint on the read-once A/B loads and the
+ * write-once X/Y stores (gamma keeps the default policy); it is appended last
+ * so existing field offsets hold. */
 typedef struct rocke_add_rmsnorm2d_bf16_spec
 {
     int n_per_block; /* mandatory; no default                       */
@@ -59,6 +62,7 @@ typedef struct rocke_add_rmsnorm2d_bf16_spec
     bool save_residual; /* default true (write x = a + b to X)         */
     int wave_size; /* default 64                                  */
     const char* name; /* default "rocke_add_rmsnorm2d_bf16"         */
+    bool streaming; /* default false                               */
 } rocke_add_rmsnorm2d_bf16_spec_t;
 
 /* Default-constructed spec (every field == Python dataclass default). The

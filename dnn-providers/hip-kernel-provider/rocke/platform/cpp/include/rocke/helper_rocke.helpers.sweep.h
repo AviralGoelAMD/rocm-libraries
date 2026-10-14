@@ -162,6 +162,22 @@ rocke_row_chunk_sweep_result_t rocke_sweep_row_chunks(rocke_ir_builder_t* b,
                                                       void* user,
                                                       bool cache);
 
+/* sweep_row_chunks(..., temporal_hint=...): `opts` (rocke_mem_opts_t, NULL =
+ * all defaults) carries the temporal_hint forwarded to every per-chunk vector
+ * load (rocke_tile_window_load_vec_as_f32_ex); the f64 scalar path ignores it,
+ * as in Python. rocke_sweep_row_chunks forwards here with opts == NULL. */
+rocke_row_chunk_sweep_result_t rocke_sweep_row_chunks_ex(rocke_ir_builder_t* b,
+                                                         const rocke_tile_window_t* tile,
+                                                         rocke_value_t* tid,
+                                                         int block_size,
+                                                         int vec,
+                                                         int elems_per_thread,
+                                                         rocke_value_t* row,
+                                                         rocke_sweep_row_body_fn body,
+                                                         void* user,
+                                                         bool cache,
+                                                         const rocke_mem_opts_t* opts);
+
 /* ---------------------------------------------------------- pass2_row_chunks */
 
 /* pass2_row_chunks(b, tile, *, tid, block_size, vec, elems_per_thread,
@@ -194,6 +210,23 @@ void rocke_pass2_row_chunks(rocke_ir_builder_t* b,
                             void* user,
                             rocke_value_t* const* cached_f32,
                             int num_cached_f32);
+
+/* pass2_row_chunks(..., temporal_hint=...): `opts` carries the temporal_hint
+ * forwarded to every per-chunk vector store
+ * (rocke_tile_window_store_vec_from_f32_ex). rocke_pass2_row_chunks forwards
+ * here with opts == NULL. */
+void rocke_pass2_row_chunks_ex(rocke_ir_builder_t* b,
+                               const rocke_tile_window_t* tile,
+                               rocke_value_t* tid,
+                               int block_size,
+                               int vec,
+                               int elems_per_thread,
+                               rocke_value_t* row,
+                               rocke_pass2_row_body_fn body,
+                               void* user,
+                               rocke_value_t* const* cached_f32,
+                               int num_cached_f32,
+                               const rocke_mem_opts_t* opts);
 
 #ifdef __cplusplus
 } /* extern "C" */

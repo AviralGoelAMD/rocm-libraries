@@ -15,6 +15,7 @@
 #include "rocke/arena.h"
 #include "rocke/ir_internal.h" /* rocke_i_set_err for Python-NotImplementedError parity */
 
+#include <stddef.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------ helpers */
@@ -279,11 +280,34 @@ void rocke_tensor_view_store_scalar(rocke_ir_builder_t* b,
         rocke_b_global_store(b, v->base, off, value, align);
 }
 
+/* True when `opts` carries a non-default temporal_hint inside the caller's
+ * struct_size (Python ``temporal_hint is not TemporalHint.DEFAULT``). The
+ * struct_size validity check itself belongs to rocke_b_global_*_vN_ex. */
+static bool rocke_tv_hint_non_default(const rocke_mem_opts_t* opts)
+{
+    if(opts == NULL)
+        return false;
+    if(opts->struct_size
+       < offsetof(rocke_mem_opts_t, temporal_hint) + sizeof(opts->temporal_hint))
+        return false;
+    return opts->temporal_hint != ROCKE_TEMPORAL_DEFAULT;
+}
+
 rocke_value_t* rocke_tensor_view_load_vec(rocke_ir_builder_t* b,
                                           const rocke_tensor_view_t* v,
                                           rocke_value_t* const* indices,
                                           int num_indices,
                                           int n)
+{
+    return rocke_tensor_view_load_vec_ex(b, v, indices, num_indices, n, NULL);
+}
+
+rocke_value_t* rocke_tensor_view_load_vec_ex(rocke_ir_builder_t* b,
+                                             const rocke_tensor_view_t* v,
+                                             rocke_value_t* const* indices,
+                                             int num_indices,
+                                             int n,
+                                             const rocke_mem_opts_t* opts)
 {
     /* Python TensorView.load_vec. */
     const rocke_type_t* dt;
@@ -291,6 +315,23 @@ rocke_value_t* rocke_tensor_view_load_vec(rocke_ir_builder_t* b,
     if(b == NULL || v == NULL)
         return NULL;
     dt = v->desc.dtype;
+
+    /* if temporal_hint is not DEFAULT and not (global and dtype in
+     * (f16, bf16, f64)): raise NotImplementedError */
+    if(rocke_tv_hint_non_default(opts)
+       && !(v->addr_space == ROCKE_ADDR_GLOBAL
+            && (rocke_tv_name_is(dt, "f16") || rocke_tv_name_is(dt, "bf16")
+                || rocke_tv_name_is(dt, "f64"))))
+    {
+        rocke_i_set_err(b,
+                        ROCKE_ERR_NOTIMPL,
+                        "temporal_hint not wired for %s/%s",
+                        v->addr_space == ROCKE_ADDR_LDS
+                            ? "lds"
+                            : (v->addr_space == ROCKE_ADDR_BUFFER ? "buffer" : "global"),
+                        dt && dt->name ? dt->name : "<null>");
+        return NULL;
+    }
 
     if(v->addr_space == ROCKE_ADDR_LDS)
     {
@@ -312,7 +353,7 @@ rocke_value_t* rocke_tensor_view_load_vec(rocke_ir_builder_t* b,
     }
     off = rocke_tensor_descriptor_offset(b, &v->desc, indices, num_indices);
     if(rocke_tv_name_is(dt, "f16") || rocke_tv_name_is(dt, "bf16") || rocke_tv_name_is(dt, "f64"))
-        return rocke_b_global_load_vN(b, v->base, off, dt, n, 0);
+        return rocke_b_global_load_vN_ex(b, v->base, off, dt, n, 0, opts);
     if(rocke_tv_name_is(dt, "f32"))
     {
         /* Python TensorView.load_vec f32 branch: f32 global vec loads aren't
@@ -343,10 +384,32 @@ void rocke_tensor_view_store_vec(rocke_ir_builder_t* b,
                                  rocke_value_t* value,
                                  int n)
 {
+    rocke_tensor_view_store_vec_ex(b, v, indices, num_indices, value, n, NULL);
+}
+
+void rocke_tensor_view_store_vec_ex(rocke_ir_builder_t* b,
+                                    const rocke_tensor_view_t* v,
+                                    rocke_value_t* const* indices,
+                                    int num_indices,
+                                    rocke_value_t* value,
+                                    int n,
+                                    const rocke_mem_opts_t* opts)
+{
     /* Python TensorView.store_vec. */
     rocke_value_t* off;
     if(b == NULL || v == NULL)
         return;
+
+    /* if temporal_hint is not DEFAULT and addr_space != "global":
+     *     raise NotImplementedError */
+    if(rocke_tv_hint_non_default(opts) && v->addr_space != ROCKE_ADDR_GLOBAL)
+    {
+        rocke_i_set_err(b,
+                        ROCKE_ERR_NOTIMPL,
+                        "temporal_hint not wired for %s stores",
+                        v->addr_space == ROCKE_ADDR_LDS ? "lds" : "buffer");
+        return;
+    }
 
     if(v->addr_space == ROCKE_ADDR_LDS)
     {
@@ -363,7 +426,7 @@ void rocke_tensor_view_store_vec(rocke_ir_builder_t* b,
         return;
     }
     off = rocke_tensor_descriptor_offset(b, &v->desc, indices, num_indices);
-    rocke_b_global_store_vN(b, v->base, off, value, n, 0);
+    rocke_b_global_store_vN_ex(b, v->base, off, value, n, 0, opts);
 }
 
 rocke_value_t* rocke_tensor_view_load_vec_at(rocke_ir_builder_t* b,
@@ -488,12 +551,22 @@ rocke_value_t* rocke_tile_window_load_vec(rocke_ir_builder_t* b,
                                           int num_indices,
                                           int n)
 {
+    return rocke_tile_window_load_vec_ex(b, w, local_indices, num_indices, n, NULL);
+}
+
+rocke_value_t* rocke_tile_window_load_vec_ex(rocke_ir_builder_t* b,
+                                             const rocke_tile_window_t* w,
+                                             rocke_value_t* const* local_indices,
+                                             int num_indices,
+                                             int n,
+                                             const rocke_mem_opts_t* opts)
+{
     rocke_value_t* gidx[ROCKE_TV_MAX_RANK];
     if(b == NULL || w == NULL || w->view == NULL)
         return NULL;
     if(!rocke_tile_window_global_indices(b, w, local_indices, num_indices, gidx))
         return NULL;
-    return rocke_tensor_view_load_vec(b, w->view, gidx, w->rank, n);
+    return rocke_tensor_view_load_vec_ex(b, w->view, gidx, w->rank, n, opts);
 }
 
 void rocke_tile_window_store_vec(rocke_ir_builder_t* b,
@@ -503,12 +576,23 @@ void rocke_tile_window_store_vec(rocke_ir_builder_t* b,
                                  rocke_value_t* value,
                                  int n)
 {
+    rocke_tile_window_store_vec_ex(b, w, local_indices, num_indices, value, n, NULL);
+}
+
+void rocke_tile_window_store_vec_ex(rocke_ir_builder_t* b,
+                                    const rocke_tile_window_t* w,
+                                    rocke_value_t* const* local_indices,
+                                    int num_indices,
+                                    rocke_value_t* value,
+                                    int n,
+                                    const rocke_mem_opts_t* opts)
+{
     rocke_value_t* gidx[ROCKE_TV_MAX_RANK];
     if(b == NULL || w == NULL || w->view == NULL)
         return;
     if(!rocke_tile_window_global_indices(b, w, local_indices, num_indices, gidx))
         return;
-    rocke_tensor_view_store_vec(b, w->view, gidx, w->rank, value, n);
+    rocke_tensor_view_store_vec_ex(b, w->view, gidx, w->rank, value, n, opts);
 }
 
 void rocke_tile_window_load_vec_scalars(rocke_ir_builder_t* b,
@@ -605,11 +689,23 @@ void rocke_tile_window_load_vec_as_f32(rocke_ir_builder_t* b,
                                        int n,
                                        rocke_value_t** out)
 {
+    rocke_tile_window_load_vec_as_f32_ex(b, w, local_indices, num_indices, n, out, NULL);
+}
+
+void rocke_tile_window_load_vec_as_f32_ex(rocke_ir_builder_t* b,
+                                          const rocke_tile_window_t* w,
+                                          rocke_value_t* const* local_indices,
+                                          int num_indices,
+                                          int n,
+                                          rocke_value_t** out,
+                                          const rocke_mem_opts_t* opts)
+{
     /* Python TileWindow.load_vec_as_f32:
      *   if n == 1:
+     *       if temporal_hint is not DEFAULT: raise NotImplementedError
      *       scalar = self.load_scalar(b, *local_indices)
      *       return [b.cast_to_f32(scalar)]
-     *   v = self.load_vec(b, *local_indices, n=n)
+     *   v = self.load_vec(b, *local_indices, n=n, temporal_hint=temporal_hint)
      *   return [b.cast_to_f32(b.vec_extract(v, i)) for i in range(n)]
      */
     int i;
@@ -617,12 +713,19 @@ void rocke_tile_window_load_vec_as_f32(rocke_ir_builder_t* b,
         return;
     if(n == 1)
     {
-        rocke_value_t* scalar = rocke_tile_window_load_scalar(b, w, local_indices, num_indices);
+        rocke_value_t* scalar;
+        if(rocke_tv_hint_non_default(opts))
+        {
+            rocke_i_set_err(b, ROCKE_ERR_NOTIMPL, "temporal_hint needs a vector load");
+            return;
+        }
+        scalar = rocke_tile_window_load_scalar(b, w, local_indices, num_indices);
         out[0] = rocke_b_cast_to_f32(b, scalar);
         return;
     }
     {
-        rocke_value_t* v = rocke_tile_window_load_vec(b, w, local_indices, num_indices, n);
+        rocke_value_t* v
+            = rocke_tile_window_load_vec_ex(b, w, local_indices, num_indices, n, opts);
         for(i = 0; i < n; ++i)
             out[i] = rocke_b_cast_to_f32(b, rocke_b_vec_extract(b, v, i));
     }
@@ -635,16 +738,30 @@ void rocke_tile_window_store_vec_from_f32(rocke_ir_builder_t* b,
                                           rocke_value_t* const* values,
                                           int num_values)
 {
+    rocke_tile_window_store_vec_from_f32_ex(
+        b, w, local_indices, num_indices, values, num_values, NULL);
+}
+
+void rocke_tile_window_store_vec_from_f32_ex(rocke_ir_builder_t* b,
+                                             const rocke_tile_window_t* w,
+                                             rocke_value_t* const* local_indices,
+                                             int num_indices,
+                                             rocke_value_t* const* values,
+                                             int num_values,
+                                             const rocke_mem_opts_t* opts)
+{
     /* Python TileWindow.store_vec_from_f32:
      *   if self.dtype.name not in ("f16", "bf16"):
      *       raise NotImplementedError(...)
      *   if len(values) == 1:
+     *       if temporal_hint is not DEFAULT: raise NotImplementedError
      *       scalar = b.cast_f32_to(values[0], self.dtype)
      *       self.store_scalar(b, *local_indices, value=scalar)
      *       return
      *   casts = [b.cast_f32_to(v, self.dtype) for v in values]
      *   packed = b.vec_pack(casts, self.dtype)
-     *   self.store_vec(b, *local_indices, value=packed, n=len(values))
+     *   self.store_vec(b, *local_indices, value=packed, n=len(values),
+     *                  temporal_hint=temporal_hint)
      */
     const rocke_type_t* dt;
     rocke_value_t** casts;
@@ -665,7 +782,13 @@ void rocke_tile_window_store_vec_from_f32(rocke_ir_builder_t* b,
     }
     if(num_values == 1)
     {
-        rocke_value_t* scalar = rocke_b_cast_f32_to(b, values[0], dt);
+        rocke_value_t* scalar;
+        if(rocke_tv_hint_non_default(opts))
+        {
+            rocke_i_set_err(b, ROCKE_ERR_NOTIMPL, "temporal_hint needs a vector store");
+            return;
+        }
+        scalar = rocke_b_cast_f32_to(b, values[0], dt);
         rocke_tile_window_store_scalar(b, w, local_indices, num_indices, scalar, 0);
         return;
     }
@@ -678,7 +801,7 @@ void rocke_tile_window_store_vec_from_f32(rocke_ir_builder_t* b,
     for(i = 0; i < num_values; ++i)
         casts[i] = rocke_b_cast_f32_to(b, values[i], dt);
     packed = rocke_b_vec_pack(b, casts, num_values, dt);
-    rocke_tile_window_store_vec(b, w, local_indices, num_indices, packed, num_values);
+    rocke_tile_window_store_vec_ex(b, w, local_indices, num_indices, packed, num_values, opts);
 }
 
 void rocke_tensor_view_load_vec_as_f32(rocke_ir_builder_t* b,

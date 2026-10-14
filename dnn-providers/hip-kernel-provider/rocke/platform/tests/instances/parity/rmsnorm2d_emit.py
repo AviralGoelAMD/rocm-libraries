@@ -39,6 +39,34 @@ def _spec(idx: int) -> RMSNorm2DSpec:
         return RMSNorm2DSpec(
             n_per_block=131072, block_size=256, vec=4, dtype="f16", save_inv_rms=False
         )
+    if idx == 6:
+        return RMSNorm2DSpec(
+            n_per_block=8192,
+            block_size=256,
+            vec=8,
+            dtype="bf16",
+            save_inv_rms=False,
+            streaming=True,
+        )
+    if idx == 7:
+        # Two-pass row: pass-1 loads keep the default policy.
+        return RMSNorm2DSpec(
+            n_per_block=131072,
+            block_size=256,
+            vec=4,
+            dtype="f16",
+            save_inv_rms=False,
+            streaming=True,
+        )
+    if idx == 8:
+        return RMSNorm2DSpec(
+            n_per_block=4096,
+            block_size=512,
+            vec=8,
+            dtype="f16",
+            save_inv_rms=True,
+            streaming=True,
+        )
     raise SystemExit(f"unknown config index {idx}")
 
 
@@ -50,7 +78,7 @@ def main() -> int:
     return run_emit(
         _spec,
         _build,
-        usage="usage: rmsnorm2d_emit.py <config_index 0..5> [mode]\n",
+        usage="usage: rmsnorm2d_emit.py <config_index 0..8> [mode]\n",
     )
 
 

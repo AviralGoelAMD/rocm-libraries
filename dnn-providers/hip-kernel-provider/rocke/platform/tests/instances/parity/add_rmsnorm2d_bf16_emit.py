@@ -70,6 +70,26 @@ def _spec(idx: int) -> AddRMSNorm2DBF16Spec:
             save_residual=True,
             wave_size=64,
         )
+    if idx == 6:
+        return AddRMSNorm2DBF16Spec(
+            n_per_block=8192,
+            block_size=256,
+            vec=8,
+            dtype="bf16",
+            save_residual=True,
+            wave_size=64,
+            streaming=True,
+        )
+    if idx == 7:
+        return AddRMSNorm2DBF16Spec(
+            n_per_block=4096,
+            block_size=512,
+            vec=8,
+            dtype="f16",
+            save_residual=False,
+            wave_size=64,
+            streaming=True,
+        )
     raise SystemExit(f"unknown config index {idx}")
 
 
