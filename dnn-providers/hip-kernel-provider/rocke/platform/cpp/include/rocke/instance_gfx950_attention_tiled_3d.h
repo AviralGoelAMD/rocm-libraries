@@ -213,8 +213,6 @@ typedef struct rocke_unified_attention_3d_tiled_spec
     int kv_load_aux; /* 0 */
     /* kv_prefetch block-table reads as invariant (scalar) loads. */
     bool scalar_block_ids; /* False */
-    /* Segment-fastest CTA order (re-split of the linear launch id). */
-    bool seg_major_order; /* False */
 } rocke_unified_attention_3d_tiled_spec_t;
 
 rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_default(void);

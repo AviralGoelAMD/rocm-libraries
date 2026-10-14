@@ -173,7 +173,6 @@ typedef struct rocke_gfx950_attn_tiled_3d_config
 
     /* ---- decode-path knobs (spec fields of the same lower-case name) ---- */
     bool DECODE_FAST_PATH; /* spec.decode_fast_path                 */
-    bool SEG_MAJOR_ORDER; /* spec.seg_major_order                  */
     int TILE_MULT; /* kv_tile_mult if paged else 1 (build entry) */
     int PAGE_HALVES; /* BS * HD                               */
     bool PREFETCH; /* spec.kv_prefetch                      */
