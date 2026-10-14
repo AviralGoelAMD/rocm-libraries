@@ -789,25 +789,50 @@ def _d256_gfx950_spec_overrides() -> dict:
     )
 
 
-def _gfx950_prefill_pipeline(problem: "UnifiedAttentionProblem") -> bool:
-    """gfx950 single-seq causal prefill on the pipelined transposed-32x32 stack.
+def _gfx950_prefill_pipeline_cohort(problem: "UnifiedAttentionProblem") -> bool:
+    """Shape cohort of the gfx950 pipelined prefill stack (backend-agnostic).
 
-    The cohort of ``_enable_single_batch_combo`` without sliding window or
-    ALiBi / QQ-bias, paged ``block_size == 16``, LLVM-direct backend (the
-    scoped-noalias LDS metadata the stack relies on is LLVM-IR only, and the
-    heaviest-first block order measured slower under hipcc). Head sizes are
-    the measured ones. The knob constellation is
-    ``_gfx950_prefill_pipeline_overrides``; the tile is 64 tokens
-    (``_select_2d_tile_size``).
+    Single-seq: the ``_enable_single_batch_combo`` cohort. Multi-seq (ragged
+    or not): the transposed-32x32 half-local-PV body with the no-SW softmax
+    sub-flags (``_enable_transposed_subflags``), i.e. the same body the
+    single-seq combo builds. Both without sliding window / ALiBi / QQ-bias /
+    sinks / softcap / FP8, paged ``block_size == 16``, head_size 128.
+    ``_select_2d_compile_backend`` pins this cohort to LLVM-direct.
     """
+    if problem.num_seqs == 1:
+        body = _enable_single_batch_combo(problem)
+    else:
+        body = (
+            _enable_transposed_half_local_pv(problem)
+            and _enable_transposed_subflags(problem)
+            and not _enable_combo_2d(problem)
+        )
     return (
-        _enable_single_batch_combo(problem)
+        body
         and problem.sliding_window == 0
         and not problem.use_alibi
         and not problem.use_qq_bias
+        and not problem.use_sinks
+        and problem.softcap == 0
+        and not problem.use_fp8
         and problem.block_size == 16
         and problem.head_size == 128
-        and _select_2d_compile_backend(problem) == "llvm"
+    )
+
+
+def _gfx950_prefill_pipeline(problem: "UnifiedAttentionProblem") -> bool:
+    """gfx950 causal prefill on the pipelined transposed-32x32 stack.
+
+    ``_gfx950_prefill_pipeline_cohort`` on the LLVM-direct backend (the
+    scoped-noalias LDS metadata the stack relies on is LLVM-IR only, and the
+    heaviest-first block order measured slower under hipcc); an explicit
+    ``compile_backend="hipcc"`` keeps the plain body. The knob constellation
+    is ``_gfx950_prefill_pipeline_overrides``; the tile is 64 tokens
+    (``_select_2d_tile_size``). Heaviest-first order is a pure permutation of
+    the grid's Q-block axis, so it holds across sequences of a ragged batch.
+    """
+    return _gfx950_prefill_pipeline_cohort(problem) and (
+        _select_2d_compile_backend(problem) == "llvm"
     )
 
 
@@ -1333,6 +1358,12 @@ def _select_2d_num_warps(problem: UnifiedAttentionProblem) -> int:
                 continue
             break
         return max(1, target)
+    if problem.num_seqs >= 2 and _gfx950_prefill_pipeline_cohort(problem):
+        # Multi-seq pipelined prefill: the measured geometry is nw=4 at T=64.
+        # The generic LDS step-down below budgets P/Acc tiles this
+        # register-resident transposed body never allocates, and would
+        # halve it to nw=2.
+        return 4
     if _enable_single_batch_combo(problem):
         # Single-batch (num_seqs == 1) d128/d64 prefill full-combo cohort
         # (re-tuned by the joint num_warps x schedule sweep). Per shape
@@ -4637,6 +4668,11 @@ def _select_2d_compile_backend(problem: UnifiedAttentionProblem) -> str:
     # 143us). The total_work rule below would otherwise pick hipcc for these
     # long single-seq shapes, so gate them to LLVM explicitly.
     if _enable_single_batch_combo(problem):
+        return "llvm"
+    # Pipelined prefill cohort (incl. multi-seq): the stack's alias-scoped LDS
+    # DMA overlap is LLVM-IR only; measured faster than the hipcc build of the
+    # same spec on 4x2048 / ragged batches.
+    if _gfx950_prefill_pipeline_cohort(problem):
         return "llvm"
     # P_LDS transposed-read PV path correctness pin. When the 2D
     # kernel lands on the legacy 16x16x32 path with neither the register-P
