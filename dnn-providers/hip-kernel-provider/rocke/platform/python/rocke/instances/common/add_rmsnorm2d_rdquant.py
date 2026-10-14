@@ -44,7 +44,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Literal, Tuple
 
-from ...core.ir import F32, I32, IRBuilder, KernelDef, PtrType, Value
+from ...core.ir import F32, I32, IRBuilder, KernelDef, PtrType, TemporalHint, Value
 from ...helpers.io import io_ir_type, store_scalar_from_f32
 from ...helpers.quant import (
     QDType,
@@ -93,6 +93,9 @@ class AddRmsnorm2DRdquantSpec:
     # Fold the sum-of-squares / amax pair with the wave XOR butterfly plus
     # one cross-warp LDS round instead of the full block-wide LDS tree.
     wave_reduce: bool = False
+    # Streaming (``nt``) cache hint on the read-once A/B loads and the
+    # write-once residual X stores; gamma and QY keep the default policy.
+    streaming: bool = False
     name: str = "rocke_add_rmsnorm2d_rdquant"
 
     @property
@@ -107,7 +110,12 @@ class AddRmsnorm2DRdquantSpec:
             f"N{self.n_per_block}",
             f"b{self.block_size}",
             f"v{self.vec}",
-            flags={"sr": self.save_residual, "ys": self.save_yscale, "wr": self.wave_reduce},
+            flags={
+                "sr": self.save_residual,
+                "ys": self.save_yscale,
+                "wr": self.wave_reduce,
+                "nt": self.streaming,
+            },
         )
 
 
@@ -285,10 +293,13 @@ def build_add_rmsnorm2d_rdquant(
     s_sq = b.const_f32(0.0)
     s_amax_g = b.const_f32(0.0)
     cached_xg: List[Value] = []
+    stream = TemporalHint.STREAMING if spec.streaming else TemporalHint.DEFAULT
 
     def pass1_body(n_off, a_scalars):
         nonlocal s_sq, s_amax_g
-        b_scalars = bt_tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=VEC)
+        b_scalars = bt_tile.load_vec_as_f32(
+            b, b.const_i32(0), n_off, n=VEC, temporal_hint=stream
+        )
         g_scalars = g_view.load_vec_as_f32(b, [n_off], n=VEC)
         chunk_x: List[Value] = []
         chunk_xg: List[Value] = []
@@ -314,7 +325,9 @@ def build_add_rmsnorm2d_rdquant(
             # the next layer's residual stream can pick it up. The
             # pass-2 quantise path doesn't need ``x``; it reads
             # ``xg`` straight out of the cache.
-            x_tile.store_vec_from_f32(b, b.const_i32(0), n_off, values=chunk_x)
+            x_tile.store_vec_from_f32(
+                b, b.const_i32(0), n_off, values=chunk_x, temporal_hint=stream
+            )
 
     sweep_row_chunks(
         b,
@@ -325,6 +338,7 @@ def build_add_rmsnorm2d_rdquant(
         elems_per_thread=spec.elems_per_thread,
         body=pass1_body,
         cache=False,  # we manage the cache ourselves (``xg``, not raw ``a``).
+        temporal_hint=stream,
     )
 
     # Twin-channel cross-thread reduction: ``sum`` for the sum-of-squares
