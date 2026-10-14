@@ -4561,7 +4561,14 @@ def _select_2d_compile_backend(problem: UnifiedAttentionProblem) -> str:
     # backend until the system hipcc is upgraded / the path is moved onto
     # register-P for hd256. The perf delta is the ~5% hipcc-scheduler edge,
     # which correctness strictly outranks.
-    if not _enable_register_pv(problem) and not _enable_mfma_32x32(problem):
+    # The D256 fast path is the transposed 32x32 body (P^T stays in registers),
+    # not the P_LDS transposed-read path the pin guards, so it keeps hipcc
+    # eligibility for fp16 as well as bf16.
+    if (
+        not _d256_gfx950_fast(problem)
+        and not _enable_register_pv(problem)
+        and not _enable_mfma_32x32(problem)
+    ):
         return "llvm"
     total_work = problem.num_seqs * max(problem.max_seqlen_q, 1)
     if problem.max_seqlen_q > 512 and total_work > 1024:
