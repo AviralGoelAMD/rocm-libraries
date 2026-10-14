@@ -34,6 +34,7 @@ from kernels.common._attention_strided_kv import (
     strided_kv_resource,
 )
 
+from rocke.core.codegen_policy import F32_DENORMAL_MODE_ATTR, F32DenormalMode
 from rocke.core.ir import (
     BF16,
     F16,
@@ -334,6 +335,8 @@ def build_unified_attention_3d_tiled(
     b.kernel.attrs["max_workgroup_size"] = THREADS
     if spec.waves_per_eu is not None:
         b.kernel.attrs["waves_per_eu"] = spec.waves_per_eu
+    # Flush f32 denormals so the softmax exp2 drops its denormal fix-up.
+    b.kernel.attrs[F32_DENORMAL_MODE_ATTR] = F32DenormalMode.PRESERVE_SIGN.value
 
     # ---------------- parameter declarations ----------------
     # NOTE: the AITER 3D signature distinguishes between segm_* workspace
@@ -1122,6 +1125,8 @@ def build_unified_attention_reduce_tiled(
     b.kernel.attrs["max_workgroup_size"] = THREADS
     if spec.waves_per_eu is not None:
         b.kernel.attrs["waves_per_eu"] = spec.waves_per_eu
+    # Same f32 denormal policy as the segment kernel (exp2 rescale factors).
+    b.kernel.attrs[F32_DENORMAL_MODE_ATTR] = F32DenormalMode.PRESERVE_SIGN.value
 
     out = b.param(
         "output_ptr", PtrType(dtype, "global"), noalias=True, writeonly=True, align=16

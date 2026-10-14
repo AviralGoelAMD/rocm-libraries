@@ -930,6 +930,8 @@ static rocke_kernel_def_t* build_segment_gfx950(rocke_ir_builder_t* b,
             {
                 rocke_attr_set_int(b, &b->kernel->attrs, "waves_per_eu", spec->waves_per_eu);
             }
+            /* Python: attrs[F32_DENORMAL_MODE_ATTR] = "preserve-sign". */
+            rocke_attr_set_str(b, &b->kernel->attrs, "f32_denormal_mode", "preserve-sign");
         }
 
         /* ---- phase functions in Python execution order ----
@@ -1024,6 +1026,8 @@ rocke_kernel_def_t* rocke_build_unified_attention_reduce_tiled_gfx950(
             {
                 rocke_attr_set_int(b, &b->kernel->attrs, "waves_per_eu", spec->waves_per_eu);
             }
+            /* Python: attrs[F32_DENORMAL_MODE_ATTR] = "preserve-sign". */
+            rocke_attr_set_str(b, &b->kernel->attrs, "f32_denormal_mode", "preserve-sign");
         }
 
         /* ---- reduce phase functions in Python execution order ----

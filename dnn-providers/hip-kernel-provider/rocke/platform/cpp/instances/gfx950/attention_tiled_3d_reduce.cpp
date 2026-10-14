@@ -149,6 +149,8 @@ void rocke_gfx950_attention_tiled_3d_reduce_declare_and_prologue(
         {
             rocke_attr_set_int(b, &b->kernel->attrs, "waves_per_eu", spec->waves_per_eu);
         }
+        /* Python: attrs[F32_DENORMAL_MODE_ATTR] = "preserve-sign". */
+        rocke_attr_set_str(b, &b->kernel->attrs, "f32_denormal_mode", "preserve-sign");
     }
 
     /* ---- params (lines 1019-1027, load-bearing ABI order) ---- */
