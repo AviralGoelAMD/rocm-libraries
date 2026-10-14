@@ -350,6 +350,20 @@ _CONFIGS = {
         kv_prefetch=True,
         kv_split_wait=True,
     ),
+    23: dict(
+        # fp8 K/V + fold_kv_scale
+        head_size=128,
+        block_size=16,
+        num_query_heads=32,
+        num_kv_heads=8,
+        dtype="bf16",
+        num_segments=16,
+        use_sinks=False,
+        sliding_window=0,
+        has_softcap=False,
+        kv_storage_dtype="fp8e4m3",
+        fold_kv_scale=True,
+    ),
 }
 
 

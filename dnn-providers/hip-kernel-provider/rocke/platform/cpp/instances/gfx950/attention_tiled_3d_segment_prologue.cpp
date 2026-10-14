@@ -463,6 +463,11 @@ void rocke_gfx950_attention_tiled_3d_emit_prologue(rocke_gfx950_attention_tiled_
     ctx->one_f = rocke_b_const_f32(B, 1.0);
     ctx->rcp_ln2 = rocke_b_const_f32(B, 1.4426950408889634);
     ctx->qk_scale = rocke_b_fmul(B, ctx->scale_p, ctx->rcp_ln2);
+    if(CFG.FOLD_SCALE)
+    {
+        /* K is dequantized without its scale; apply it to the logits instead. */
+        ctx->qk_scale = rocke_b_fmul(B, ctx->qk_scale, ctx->k_scale_p);
+    }
     ctx->sw_const = rocke_b_const_i32(B, CFG.SLIDING_WINDOW);
     ctx->z8 = rocke_b_zero_vec(B, dtype, 8);
 
@@ -1010,7 +1015,8 @@ static rocke_value_t* rocke__fp8_chunk_load(rocke_gfx950_attention_tiled_3d_buil
 
 /* _fp8_chunk_store(fp8_vec, buf_idx, row, col, lds_token): dequantize one
  * <8 x fp8> chunk (UNFUSED cvt_pk_f32_fp8x4 + fmul scale; the fused E8M0 cvt
- * would truncate non-power-of-two per-tensor scales) and store it to LDS. */
+ * would truncate non-power-of-two per-tensor scales) and store it to LDS. With
+ * FOLD_SCALE the scale is applied to the logits / segment output instead. */
 static void rocke__fp8_chunk_store(rocke_gfx950_attention_tiled_3d_build_ctx_t* ctx,
                                    rocke_value_t* fp8_vec,
                                    rocke_value_t* buf_idx,
@@ -1023,7 +1029,37 @@ static void rocke__fp8_chunk_store(rocke_gfx950_attention_tiled_3d_build_ctx_t* 
     const rocke_type_t* dtype = CFG.dtype;
     rocke_value_t* packed;
     rocke_value_t* idxs[3];
-    packed = rocke_dequant_fp8x8_to_dtype(B, fp8_vec, scale, dtype);
+    if(CFG.FOLD_SCALE)
+    {
+        rocke_value_t* q4[4];
+        rocke_value_t* comps[8];
+        rocke_value_t* lo_f32;
+        rocke_value_t* hi_f32;
+        int i;
+        for(i = 0; i < 4; ++i)
+        {
+            q4[i] = rocke_b_vec_extract(B, fp8_vec, i);
+        }
+        lo_f32 = rocke_b_cvt_pk_f32_fp8x4(B, rocke_b_vec_pack(B, q4, 4, rocke_fp8e4m3()));
+        for(i = 0; i < 4; ++i)
+        {
+            q4[i] = rocke_b_vec_extract(B, fp8_vec, 4 + i);
+        }
+        hi_f32 = rocke_b_cvt_pk_f32_fp8x4(B, rocke_b_vec_pack(B, q4, 4, rocke_fp8e4m3()));
+        for(i = 0; i < 4; ++i)
+        {
+            comps[i] = rocke_b_cast_f32_to(B, rocke_b_vec_extract(B, lo_f32, i), dtype);
+        }
+        for(i = 0; i < 4; ++i)
+        {
+            comps[4 + i] = rocke_b_cast_f32_to(B, rocke_b_vec_extract(B, hi_f32, i), dtype);
+        }
+        packed = rocke_b_vec_pack(B, comps, 8, dtype);
+    }
+    else
+    {
+        packed = rocke_dequant_fp8x8_to_dtype(B, fp8_vec, scale, dtype);
+    }
     idxs[0] = buf_idx;
     idxs[1] = row;
     idxs[2] = col;

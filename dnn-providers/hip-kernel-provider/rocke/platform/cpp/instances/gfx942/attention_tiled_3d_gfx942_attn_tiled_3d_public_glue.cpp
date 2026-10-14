@@ -142,6 +142,7 @@ rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_de
     s.kv_prefetch = false;
     s.transposed_softmax = false;
     s.kv_split_wait = false;
+    s.fold_kv_scale = false;
     return s;
 }
 

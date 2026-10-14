@@ -1124,6 +1124,20 @@ void rocke_gfx950_attention_tiled_3d_emit_epilogue(rocke_gfx950_attention_tiled_
     int n, reg;
     rocke_value_t* lane_writes_ml;
 
+    if(cfg->FOLD_SCALE)
+    {
+        /* fp8 K/V dequantized without v_scale: apply it to the segment output. */
+        for(n = 0; n < cfg->PV_N_TILES; n++)
+        {
+            rocke_value_t* comps[4];
+            for(reg = 0; reg < 4; reg++)
+            {
+                rocke_value_t* e = rocke_b_vec_extract(b, ctx->acc_final[n], reg);
+                comps[reg] = rocke_b_fmul(b, e, ctx->v_scale_p);
+            }
+            ctx->acc_final[n] = rocke_b_vec_pack(b, comps, 4, rocke_f32());
+        }
+    }
     if(cfg->TRANS)
     {
         rocke__emit_epilogue_trans(ctx);

@@ -132,7 +132,7 @@ _KNOBS = [
     ({**_FAST, "transposed_softmax": True, "kv_split_wait": True}, False),
     ({**_FAST, "transposed_softmax": True}, False),
     (_FAST, True),
-    ({**_FAST, "transposed_softmax": True}, True),
+    ({**_FAST, "transposed_softmax": True, "fold_kv_scale": True}, True),
 ]
 
 
