@@ -204,7 +204,6 @@ rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_de
     s.use_f32_denormal_flush = false;
     s.decode_fast_path = false;
     s.kv_tile_mult = 1;
-    s.kv_prefetch = false;
     return s;
 }
 
@@ -340,7 +339,7 @@ static int rocke_attn3d950_kernel_name(const rocke_unified_attention_3d_tiled_sp
     /* kernel_name_join("rocke_uattn3d_tiled", d.., b.., h..kv.., seg.., dtype,
      *   kv<...> if kv_storage_dtype else "", "i64kv", "sinks", "sw<sw>",
      *   "softcap", "alibi", "qqb", "ftz", "stridedkv", "dec", "t<T>" (kv_tile_mult
-     *   > 1), "pf") -- each only when its knob is set.
+     *   > 1)) -- each only when its knob is set.
      *
      * Positional parts list (NOT flags=...): empty parts are skipped by
      * kernel_name_join. We materialise each part and feed the non-empty ones in
@@ -420,10 +419,6 @@ static int rocke_attn3d950_kernel_name(const rocke_unified_attention_3d_tiled_sp
     {
         snprintf(t_part, sizeof(t_part), "t%d", s->block_size * s->kv_tile_mult);
         parts[np++] = t_part;
-    }
-    if(s->kv_prefetch)
-    {
-        parts[np++] = "pf";
     }
 
     st = rocke_kernel_name_join("", parts, np, NULL, NULL, 0, buf, cap, &out_len);
@@ -751,14 +746,11 @@ bool rocke_gfx950_attn_tiled_3d_config_from_spec(
     out->Q_VECS_PER_THREAD = (out->BLOCK_M * out->Q_VECS_PER_ROW) / out->THREADS;
     out->bm1_div_nqk = nqk > 0 ? (out->BLOCK_M - 1) / nqk : -1;
 
-    /* decode-path knobs. TILE_MULT / PREFETCH_IDS default to the paged layout;
-     * the strided build entry overrides them after ctx_init. */
+    /* decode-path knobs. TILE_MULT defaults to the paged layout; the strided
+     * build entry overrides it after ctx_init. */
     out->DECODE_FAST_PATH = spec->decode_fast_path;
     out->TILE_MULT = spec->kv_tile_mult;
     out->PAGE_HALVES = out->BS * out->HD;
-    out->PREFETCH = spec->kv_prefetch;
-    out->PREFETCH_IDS = spec->kv_prefetch;
-    out->FP8_REG_PREFETCH = spec->kv_prefetch && out->KV_FP8;
 
     /* reduce-kernel-only fields stay 0 for the segment kind. */
     out->HALFS_PER_THREAD = 0;
@@ -977,9 +969,8 @@ static rocke_kernel_def_t* build_segment_gfx950(rocke_ir_builder_t* b,
 
         ctx.strided_kv = strided_kv;
         /* Layout-dependent knobs: strided KV addresses one contiguous tile, so a
-         * tile is never split into pages and no block ids are prefetched. */
+         * tile is never split into pages. */
         ctx.cfg.TILE_MULT = strided_kv ? 1 : spec->kv_tile_mult;
-        ctx.cfg.PREFETCH_IDS = spec->kv_prefetch && !strided_kv;
 
         /* b.kernel.attrs["max_workgroup_size"] = THREADS (line 303). */
         if(b->kernel != NULL)
