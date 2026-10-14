@@ -199,6 +199,13 @@ class TraitSpec:
     # overlaps the MFMAs as intended. Requires ``direct_to_lds`` and
     # ``dtl_prefetch``; default off (byte-identical).
     dtl_lds_alias: bool = False
+    # DTL prefetch distance in K-tiles. 1 = the ping-pong (2 LDS slots, loads
+    # one tile ahead). 2 = a 3-slot LDS-DMA alias ring that keeps two tiles of
+    # loads in flight: each K-tile's barrier keeps the newest tile's DMA in
+    # flight (``sync(keep_lds_dma=loads_per_tile)``), so only the oldest tile
+    # must land before its MFMAs. Depth 2 requires ``dtl_lds_alias`` (without
+    # the slot tags the backend drains every in-flight DMA before each read).
+    dtl_prefetch_depth: int = 1
     # MoE active-tile early-exit. When True (only honored in
     # ``batched=True`` mode), the kernel takes two extra args
     # (``SortedTokenIds: ptr<i32>``, ``slot_size: i32``) and at CTA
@@ -333,6 +340,7 @@ class UniversalGemmSpec(WarpTileBlockSizeMixin):
                 "dtl": tr.direct_to_lds,
                 "pref": tr.dtl_prefetch,
                 "lalias": tr.dtl_lds_alias,
+                f"pd{tr.dtl_prefetch_depth}": tr.dtl_prefetch_depth > 1,
                 "actt": tr.active_tile_skip,
                 f"spk{tr.split_k}": tr.split_k > 1,
                 "noalc": tr.cshuffle_no_alias,
@@ -597,7 +605,12 @@ def is_valid_spec(spec: UniversalGemmSpec, arch: str = "gfx950") -> Tuple[bool, 
     # for a single-buffered compv4+cshuffle) and under-reserving. Both
     # sites share :func:`_ab_lds_plan` to stay in lock-step.
     ab_single, _, _ab_dbl = _ab_lds_plan(spec, arch)
-    ab_bytes = ab_single * (2 if _ab_dbl else 1)
+    _nbuf_ab = (
+        spec.trait.dtl_prefetch_depth + 1
+        if spec.trait.dtl_prefetch_depth > 1
+        else (2 if _ab_dbl else 1)
+    )
+    ab_bytes = ab_single * _nbuf_ab
     c_bytes = t.tile_m * t.tile_n * 2 if spec.trait.epilogue == "cshuffle" else 0
     bytes_lds = ab_bytes + c_bytes
     if not target.fits_lds(bytes_lds):
@@ -650,6 +663,10 @@ def is_valid_spec(spec: UniversalGemmSpec, arch: str = "gfx950") -> Tuple[bool, 
                     f"dtl_lds_alias requires {_nm}*tile_k/{_alias_halves} to be a "
                     f"multiple of block_size {spec.block_size}"
                 )
+    if spec.trait.dtl_prefetch_depth not in (1, 2):
+        return False, f"dtl_prefetch_depth must be 1 or 2 (got {spec.trait.dtl_prefetch_depth})"
+    if spec.trait.dtl_prefetch_depth > 1 and not spec.trait.dtl_lds_alias:
+        return False, "dtl_prefetch_depth > 1 requires dtl_lds_alias"
 
     return True, "ok"
 
@@ -1200,7 +1217,11 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
     if _pf_depth > 1 and _unroll_k > 0:
         _nbuf = _pf_depth + 1
     else:
-        _nbuf = 2 if _two_buf else 1
+        _nbuf = (
+            spec.trait.dtl_prefetch_depth + 1
+            if spec.trait.dtl_prefetch_depth > 1
+            else (2 if _two_buf else 1)
+        )
     _A_LDS_M = _nbuf * block_m
     _B_LDS_N = _nbuf * block_n
     # LDS K-padding (non-DTL only): widen each row's stride to break the
@@ -2170,54 +2191,95 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
     def _emit_kloop_prefetch_ring(K_minus_one_tile: Value) -> None:
         """``_emit_kloop_prefetch`` steady state + tail for ``dtl_lds_alias``.
 
-        The A/B ring slot tags must be compile-time facts, so the ping-pong
-        loop is unrolled 2x with static parity: each pair iteration runs tile
-        ``2j`` from slot 0 (while DMA fills slot 1) and tile ``2j+1`` from
-        slot 1 (while DMA fills slot 0). A 0/1-trip remainder loop runs an odd
-        last steady-state tile from slot 0; it carries the slot of the final
-        tile, which the tail then reads through ``any_slot`` after its full
-        drain. Same per-tile barrier discipline as the parity loop: the one
-        barrier publishes the current slot (RAW) and releases the other slot
-        for the next DMA (WAR), and the next DMA is issued after it. That DMA
-        is therefore never in flight at a barrier, so each barrier keeps no
-        LDS-DMA op in flight (``keep_lds_dma=0``); the tags remove the
-        backend's drain of the in-flight DMA before the current slot's reads.
+        A/B are rings of ``n = dtl_prefetch_depth + 1`` slots; tile ``i``
+        lives in slot ``i % n``. The slot tags must be compile-time facts, so
+        the steady-state loop is unrolled ``n``x: copy ``s`` reads tile slot
+        ``s`` while DMA fills slot ``(s + n - 1) % n`` with the tile
+        ``n - 1`` ahead. Up to ``n - 1`` leftover steady-state tiles run in
+        0/1-trip remainder loops (slots ``0 .. n - 2``); each carries the slot
+        of the final tile, which the tail reads through ``any_slot`` after a
+        full drain. One barrier per tile: it publishes the current slot (RAW)
+        and releases the slot read one tile ago for the next DMA (WAR); the
+        next DMA is issued after it. At each barrier the ``n - 2`` newer
+        tiles' DMA may stay in flight (``keep_lds_dma``), as those writes
+        target other slots; LDS-DMA ops retire in issue order, so the current
+        tile has landed. Depth > 1 clamps load offsets past the slice to its
+        last tile: the duplicate lands in a slot nothing reads again and the
+        per-tile DMA count (hence ``keep_lds_dma``) stays static.
         """
         nonlocal _for_results
-        c_pair = b.const_i32(2 * block_k)
+        nslots = _nbuf
+        keep = (nslots - 2) * (_dtl_a_passes + _dtl_b_passes)
+
+        def _ahead(k: Value) -> Value:
+            return k if nslots == 2 else b.smin(k, K_minus_one_tile)
+
+        # Prologue: tile 0 (slot 0) was issued by the caller; tiles 1..n-2.
+        for j in range(1, nslots - 1):
+            emit_load_phase(
+                A_smem,
+                B_smem,
+                _ahead(b.add(k_lo, b.const_i32(j * block_k))),
+                lds_parity=j,
+            )
+        c_cyc = b.const_i32(nslots * block_k)
+
+        def _c_tiles(n: int) -> Value:
+            if n == 1:
+                return c_block_k
+            return c_cyc if n == nslots else b.const_i32(n * block_k)
+
         # Steady-state tiles: ceil((K_minus_one_tile - k_lo) / block_k), as
-        # the parity loop iterates; the pair loop covers the even part.
+        # the parity loop iterates; the cycle loop covers whole cycles.
         trips = b.div(
             b.add(b.sub(K_minus_one_tile, k_lo), b.const_i32(block_k - 1)), c_block_k
         )
-        pair_end = b.add(k_lo, b.mul(b.div(trips, b.const_i32(2)), c_pair))
-        pair_op = b.scf_for_iter(k_lo, pair_end, c_pair, accs, iv_name="k0")
-        with pair_op as (k0, iter_vars):
+        cyc_end = b.add(k_lo, b.mul(b.div(trips, b.const_i32(nslots)), c_cyc))
+        cyc_op = b.scf_for_iter(k_lo, cyc_end, c_cyc, accs, iv_name="k0")
+        with cyc_op as (k0, iter_vars):
             acc = list(iter_vars)
-            for s in (0, 1):
-                b.sync(keep_lds_dma=0)
-                k_next = b.add(k0, c_block_k if s == 0 else c_pair)
-                emit_load_phase(A_smem, B_smem, k_next, lds_parity=1 - s)
+            for s in range(nslots):
+                b.sync(keep_lds_dma=keep)
+                k_next = _ahead(b.add(k0, _c_tiles(s + nslots - 1)))
+                emit_load_phase(
+                    A_smem, B_smem, k_next, lds_parity=(s + nslots - 1) % nslots
+                )
                 acc = emit_mfma_phase(A_smem, B_smem, acc, lds_parity=s)
             b.scf_yield(*acc)
 
-        rem_args = [("rpar", c0)] + [
-            (f"r_{nm}", v) for (nm, _init), v in zip(accs, pair_op.results)
-        ]
-        rem_op = b.scf_for_iter(
-            pair_end, K_minus_one_tile, c_block_k, rem_args, iv_name="k0r"
-        )
-        with rem_op as (k0, iter_vars):
-            b.sync(keep_lds_dma=0)
-            emit_load_phase(A_smem, B_smem, b.add(k0, c_block_k), lds_parity=1)
-            acc = emit_mfma_phase(A_smem, B_smem, iter_vars[1:], lds_parity=0)
-            b.scf_yield(b.const_i32(1), *acc)
+        # Remainder: loop r runs leftover tile r (slot r) when it exists.
+        rem_lo = cyc_end
+        rem_par: Value = c0
+        rem_accs: Sequence[Value] = cyc_op.results
+        for r in range(nslots - 1):
+            last = r == nslots - 2
+            rem_hi = (
+                K_minus_one_tile
+                if last
+                else b.smin(b.add(rem_lo, c_block_k), K_minus_one_tile)
+            )
+            sfx = "" if r == 0 else str(r)
+            rem_args = [(f"rpar{sfx}", rem_par)] + [
+                (f"r{sfx}_{nm}", v) for (nm, _init), v in zip(accs, rem_accs)
+            ]
+            rem_op = b.scf_for_iter(
+                rem_lo, rem_hi, c_block_k, rem_args, iv_name=f"k0r{sfx}"
+            )
+            with rem_op as (k0, iter_vars):
+                b.sync(keep_lds_dma=keep)
+                k_next = _ahead(b.add(k0, _c_tiles(r + nslots - 1)))
+                emit_load_phase(
+                    A_smem, B_smem, k_next, lds_parity=(r + nslots - 1) % nslots
+                )
+                acc = emit_mfma_phase(A_smem, B_smem, iter_vars[1:], lds_parity=r)
+                b.scf_yield(b.const_i32(r + 1), *acc)
+            rem_lo = rem_hi
+            rem_par = rem_op.results[0]
+            rem_accs = rem_op.results[1:]
 
-        # Tail: the last tile sits in slot rem_op.results[0] (run-time).
+        # Tail: the last tile sits in slot rem_par (run-time).
         b.sync(keep_lds_dma=0)
-        _for_results = emit_mfma_phase(
-            A_smem, B_smem, rem_op.results[1:], lds_parity=rem_op.results[0]
-        )
+        _for_results = emit_mfma_phase(A_smem, B_smem, rem_accs, lds_parity=rem_par)
 
     _for_results: Sequence[Value] = ()
 
