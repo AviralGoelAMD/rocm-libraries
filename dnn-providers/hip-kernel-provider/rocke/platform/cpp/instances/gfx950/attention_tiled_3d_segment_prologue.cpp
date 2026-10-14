@@ -887,7 +887,7 @@ static void rocke__issue_kv_async(rocke_gfx950_attention_tiled_3d_build_ctx_t* c
         dst = rocke_b_smem_ptr_add(
             B, buf_base, rocke_b_const_i64(B, (int64_t)call * CFG.bytes_per_call));
         rocke_b_async_buffer_load_lds_addr(
-            B, call_rsrc, dst, voff, ctx->zero_soff, CFG.ASYNC_LDS_DWORDS, ROCKE_CACHE_ALL);
+            B, call_rsrc, dst, voff, ctx->zero_soff, CFG.ASYNC_LDS_DWORDS, CFG.KV_LOAD_AUX);
     }
 }
 

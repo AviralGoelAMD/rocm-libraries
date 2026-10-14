@@ -201,6 +201,9 @@ class UnifiedAttention3DTiledSpec:
     # FP8 K/V: fold k_scale into the QK scale and v_scale into the segment
     # output, so the dequant is a bare fp8 -> f32 -> bf16/fp16 convert.
     fold_kv_scale: bool = False
+    # Buffer-load AUX cache-policy bits of the K/V DMAs (0 default, 1 GLC,
+    # 2 SLC, 3 GLC|SLC).
+    kv_load_aux: int = 0
 
     def __post_init__(self):
         if type(self.use_f32_denormal_flush) is not bool:
@@ -237,6 +240,8 @@ class UnifiedAttention3DTiledSpec:
             raise ValueError("kv_split_wait needs kv_prefetch with a bf16/fp16 KV cache")
         if self.fold_kv_scale and self.kv_storage_dtype is None:
             raise ValueError("fold_kv_scale needs an fp8 KV cache")
+        if self.kv_load_aux not in (0, 1, 2, 3):
+            raise ValueError(f"kv_load_aux must be 0..3 (got {self.kv_load_aux})")
 
     @property
     def num_queries_per_kv(self) -> int:
@@ -296,6 +301,7 @@ class UnifiedAttention3DTiledSpec:
             "tsm" if self.transposed_softmax else "",
             "kvsw" if self.kv_split_wait else "",
             "fks" if self.fold_kv_scale else "",
+            f"aux{self.kv_load_aux}" if self.kv_load_aux else "",
         )
 
 
@@ -868,7 +874,9 @@ def build_unified_attention_3d_tiled(
                 if own_rsrc is not None:
                     call_rsrc = own_rsrc
             dst = b.smem_ptr_add(buf_base, b.const_i64(call * bytes_per_call))
-            b.async_buffer_load_lds_addr(call_rsrc, dst, voff, zero_soff, 4)
+            b.async_buffer_load_lds_addr(
+                call_rsrc, dst, voff, zero_soff, 4, coherency=spec.kv_load_aux
+            )
 
     def _issue_k_load(kv_tile_idx: Value, buf_idx: Value, block_ids=None) -> None:
         _issue_kv_async(kv_tile_idx, buf_idx, "K", block_ids)
