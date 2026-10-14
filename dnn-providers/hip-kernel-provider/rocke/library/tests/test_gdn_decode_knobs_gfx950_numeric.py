@@ -14,7 +14,7 @@ pins byte for byte. Every knob in ``KNOBS`` also runs at DK = DV = 64 and 256,
 and ``out_lds`` at DV = 256 and 512 and with two store rounds. ``row_loads``,
 which only applies to single-wave ``fuse_conv`` tiles, has its own tests: each
 forced order on every such BPV=1 tile at DK = DV = 128, and on a set of them at
-DK = DV = 64 and 256 and with an f16 state. All eleven knobs also run at once.
+DK = DV = 64 and 256 and with an f16 state. All twelve knobs also run at once.
 
 ``check`` scores the output, the written recurrent state, the written conv
 state, and every untouched pool page against the fp32 reference, so a knob
@@ -68,6 +68,7 @@ KNOBS = {
     "norm_gate_once": dict(conv_once=True, norm_gate_once=True),
     "out_lds": dict(out_lds=True),
     "waves_per_eu": dict(waves_per_eu=4),
+    "kernarg_preload": dict(kernarg_preload=True),
 }
 _FUSED_HEADS = dict(num_k_heads=16, num_v_heads=16)
 
@@ -187,7 +188,7 @@ def test_xcd_remap_on_a_grid_that_is_not_a_multiple_of_8(fused, batch):
 @pytest.mark.parametrize("gate", ["gdn", "kda"])
 @pytest.mark.parametrize("state_dtype", ["bf16", "f32"])
 def test_every_knob_together(gate, state_dtype):
-    """All eleven knobs on at once, at the fused (4,16,1) and (1,16,1) tiles
+    """All twelve knobs on at once, at the fused (4,16,1) and (1,16,1) tiles
     (``row_loads`` forces ``"first"``, the order auto does not choose there;
     it changes code only on the one-wave tile)."""
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
@@ -225,6 +226,7 @@ _BITWISE_KNOBS = [
     "conv_once",
     "out_lds",
     "waves_per_eu",
+    "kernarg_preload",
 ]
 
 

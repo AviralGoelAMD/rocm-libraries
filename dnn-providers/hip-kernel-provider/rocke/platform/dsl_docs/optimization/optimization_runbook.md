@@ -2099,6 +2099,7 @@ moved measured throughput by under 1 % on direct-conv kernels.
 | `pack_args` vs `pack_args_kernelparams` | `runtime/packing.py` | AMDGPU kernarg buffer vs the safer `kernelParams` path |
 | HIP graph capture | torch | Amortizes launch overhead — pair with `no_fence` and many iters |
 | `rocm-smi --setperflevel high && --setsclk 7` | shell | Lock clocks to avoid thermal / DVFS noise during measurement |
+| Kernarg preload (`param.attrs["inreg"]`) | `core/lower_llvm.py` `_param_attrs` + C++ `rocke_ll_param_attrs`; used by `GdnDecodeSpec.kernarg_preload` | A kernel parameter carrying `inreg` is preloaded into user SGPRs at wave launch (gfx950: up to 14 dwords after the kernarg segment pointer), so the first scalar loads of the kernarg segment drop off the critical path. Put the latency-critical parameters first; it changes the ABI order. Pays off for launch-bound kernels |
 
 #### 12.1.O Dispatcher / selector policy (per-shape branching)
 

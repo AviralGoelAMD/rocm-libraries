@@ -474,6 +474,12 @@ class GdnDecodeSpec:
     # force one order. A forced order equal to auto's is auto's kernel, and
     # elsewhere the field changes no code.
     row_loads: RowLoads = "auto"
+    # Preload the leading kernel arguments into SGPRs (LLVM ``inreg``): the
+    # parameters are reordered so the pool indices, the state and the next
+    # most latency-critical pointers come first, and the hardware hands
+    # them to the wave at launch instead of the kernel loading them from the
+    # kernarg segment. Changes the kernel ABI (parameter order).
+    kernarg_preload: bool = False
     name: str = "rocke_gdn_decode"
 
     @property
@@ -569,6 +575,7 @@ class GdnDecodeSpec:
                     token: self.row_loads == order and row_loads_overrides(self)
                     for order, token in _ROW_LOADS_TOKEN.items()
                 },
+                "kp": self.kernarg_preload and not self.simple,
             },
         )
 
@@ -598,6 +605,7 @@ def is_valid_spec(spec: GdnDecodeSpec, arch: str = "gfx950") -> Tuple[bool, str]
         "conv_once",
         "norm_gate_once",
         "out_lds",
+        "kernarg_preload",
     ):
         _value = getattr(spec, _field)
         if type(_value) is not bool:
@@ -1914,7 +1922,41 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
                             b, cst_w, b.add(base, b.const_i32(t)), val, dtype=spec.dtype
                         )
 
+    if spec.kernarg_preload:
+        params = b.kernel.params
+        by_name = {p.name: p for p in params}
+        params[:] = [by_name[n] for n in _preload_order(list(by_name))]
+        dwords = 0
+        for p in params:
+            size = 2 if isinstance(p.type, PtrType) else 1
+            if dwords + size > _PRELOAD_DWORDS:
+                break
+            p.attrs["inreg"] = True
+            dwords += size
     return b.kernel
+
+
+# kernarg_preload: the parameters the kernel waits on first, in that order
+# (the pool indices gate everything, the state is the long load), then the
+# per-token inputs and the output. The rest keep their order.
+_PRELOAD_FIRST = (
+    "read_indices",
+    "write_indices",
+    "state",
+    "mixed_qkv",
+    "query",
+    "key",
+    "value",
+    "out",
+)
+# User SGPRs the gfx950 kernel descriptor can preload kernel arguments into
+# (16, less the two of the kernarg segment pointer).
+_PRELOAD_DWORDS = 14
+
+
+def _preload_order(names):
+    first = [n for n in _PRELOAD_FIRST if n in names]
+    return first + [n for n in names if n not in first]
 
 
 def gdn_decode_pointer_alignment(spec: GdnDecodeSpec) -> Dict[str, int]:
@@ -1978,4 +2020,8 @@ def gdn_decode_signature(spec: GdnDecodeSpec):
         sig = sig.scalar("qkv_stride", "i32")
     if spec.fuse_out_norm:
         sig = sig.scalar("og_stride", "i32").scalar("norm_eps", "f32")
-    return sig.build()
+    built = sig.build()
+    if spec.kernarg_preload and not spec.simple:
+        by_name = {p["name"]: p for p in built}
+        built = [by_name[n] for n in _preload_order(list(by_name))]
+    return built

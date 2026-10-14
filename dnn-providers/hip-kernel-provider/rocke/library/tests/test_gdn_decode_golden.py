@@ -235,6 +235,18 @@ def _cases():
                         spec, arch=_ARCH
                     )
                 )
+                if fused and state_dtype != "f16":
+                    # kernarg_preload (inreg parameters, reordered ABI) on the
+                    # auto fused stack: both engines must emit the inreg
+                    # attribute.
+                    for tag, knobs in (
+                        ("kp", dict(kernarg_preload=True)),
+                    ):
+                        cases[f"knob_{tag}_auto_{gate_kind}_{mode}_st{state_dtype}"] = (
+                            lambda spec=dc.replace(result.spec.kernel_spec, **knobs): (
+                                build_gdn_decode(spec, arch=_ARCH)
+                            )
+                        )
     return cases
 
 
@@ -250,6 +262,7 @@ _KNOB_ON = {
     "norm_gate_once": dict(conv_once=True, norm_gate_once=True),
     "out_lds": dict(out_lds=True),
     "waves_per_eu": dict(waves_per_eu=4),
+    "kernarg_preload": dict(kernarg_preload=True),
 }
 _CV_RN = dict(fuse_conv=True, fuse_out_norm=True)
 # The fused paths each knob runs on: every fusion mode a fused-only knob
