@@ -242,6 +242,11 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # qk_lookahead only: KV tiles per loop trip (1 or 2). Two alternates the
     # carried score registers instead of copying them at every back edge.
     qk_lookahead_unroll: int = field(default=1, kw_only=True)
+    # qk_lookahead only: bit 1 reads every K operand of a tile from LDS before
+    # its first QK MFMA, bit 2 every V operand before the first PV MFMA, each
+    # behind a scheduling fence, so the MFMA run carries no LDS waits. Costs
+    # the operand registers of a whole tile.
+    bulk_operand_reads: int = field(default=0, kw_only=True)
 
     def resolved_exp_per_pv_step(self) -> int:
         if self.exp_per_pv_step is not None:
@@ -453,6 +458,17 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
             raise ValueError(
                 f"qk_lookahead_unroll must be 1 or 2, got {self.qk_lookahead_unroll}"
             )
+        if self.bulk_operand_reads not in (0, 1, 2, 3):
+            raise ValueError(
+                f"bulk_operand_reads must be 0..3, got {self.bulk_operand_reads}"
+            )
+        if self.bulk_operand_reads and (
+            not self.qk_lookahead
+            or (self.head_size != 128 and not self.wide_lds_dma)
+        ):
+            raise ValueError(
+                "bulk_operand_reads requires qk_lookahead (D128 or wide_lds_dma)"
+            )
 
     @property
     def resolved_persist_decode(self) -> str:
@@ -597,6 +613,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "lds_dma_manual_wait",
             "wave_group_pingpong",
             "qk_lookahead_unroll",
+            "bulk_operand_reads",
         )
     }
 )
@@ -729,6 +746,8 @@ def build_attention_dense(
     PV_PRIORITY = int(spec.pv_priority)
     PINGPONG = spec.wave_group_pingpong
     UNROLL = int(spec.qk_lookahead_unroll)
+    BULK_K = bool(spec.bulk_operand_reads & 1)
+    BULK_V = bool(spec.bulk_operand_reads & 2)
     IGLP = spec.resolved_iglp_mode()
     gqa = Hq // Hkv
     stride_q_tok = Hq * D
@@ -1168,6 +1187,8 @@ def build_attention_dense(
         ``after_mfma`` (optional) is called after every MFMA so a caller can place
         independent softmax work in program order between them; ``accs`` (optional
         list) receives each nsub's raw accumulator vector."""
+        if BULK_K:
+            return _do_qk_bulk(kbuf, after_mfma, accs)
         s_reg = []
         for nsub in range(N_SUB):
             acc = b.zero_vec_f32(16)
@@ -1206,6 +1227,51 @@ def build_attention_dense(
             # so the scale adds no per-score instruction. Needs qk_scale > 0
             # (max commutes with the scale); the runner enforces the
             # [_MIN_SCALE, _MAX_SCALE] range.
+            if accs is not None:
+                accs.append(acc)
+            s_reg.append([b.vec_extract(acc, i) for i in range(16)])
+        return s_reg
+
+    def _do_qk_bulk(kbuf, after_mfma, accs):
+        """``bulk_operand_reads``: issue every K operand read of the tile before
+        the first QK MFMA (one LDS wait), so the MFMA run has no LDS waits."""
+        packs = []
+        for nsub in range(N_SUB):
+            if WIDE_DMA:
+                kline = b.mod(lane_m, b.const_i32(8))
+                kelem_base = b.add(
+                    b.add(
+                        b.mul(b.div(lane_m, b.const_i32(8)), b.const_i32(64)),
+                        b.mul(lane_h, b.const_i32(8)),
+                    ),
+                    b.const_i32(nsub * 256),
+                )
+            else:
+                krow = b.add(b.const_i32(nsub * 32), lane_m)
+            for ks in range(K_STEPS):
+                if WIDE_DMA:
+                    kelem = b.add(kelem_base, b.const_i32((ks % 4) * 16))
+                    packs.append(
+                        b.smem_load_vN(
+                            K_lds, kbuf, b.const_i32(ks // 4), kline, kelem,
+                            dtype=dtype, n=8,
+                        )
+                    )
+                else:
+                    col = b.add(b.const_i32(ks * 16), d_base)
+                    packs.append(
+                        b.smem_load_vN(K_lds, kbuf, krow, col, dtype=dtype, n=8)
+                    )
+        b.sched_barrier(0)
+        s_reg = []
+        for nsub in range(N_SUB):
+            acc = b.zero_vec_f32(16)
+            for ks in range(K_STEPS):
+                acc = mfma_32x32x16_for_dtype(
+                    b, dtype, packs[nsub * K_STEPS + ks], q_packs[ks], acc
+                )
+                if after_mfma is not None:
+                    after_mfma()
             if accs is not None:
                 accs.append(acc)
             s_reg.append([b.vec_extract(acc, i) for i in range(16)])
@@ -1346,11 +1412,16 @@ def build_attention_dense(
             dtype=dtype,
         )
 
-    def do_pv(o_acc_in, p_packs, vbuf, after_mfma=None):
+    def do_pv(o_acc_in, p_packs, vbuf, after_mfma=None, bulk=False):
         out = list(o_acc_in)
-        for dt, kk_step in PV_STEPS:
+        if bulk:
+            # bulk_operand_reads: all V operand reads ahead of the PV MFMA run.
+            vops = [read_v(dt, kk_step, vbuf) for dt, kk_step in PV_STEPS]
+            b.sched_barrier(0)
+        for idx, (dt, kk_step) in enumerate(PV_STEPS):
+            vop = vops[idx] if bulk else read_v(dt, kk_step, vbuf)
             out[dt] = mfma_32x32x16_for_dtype(
-                b, dtype, read_v(dt, kk_step, vbuf), p_packs[kk_step], out[dt]
+                b, dtype, vop, p_packs[kk_step], out[dt]
             )
             if after_mfma is not None:
                 after_mfma()
@@ -1631,7 +1702,7 @@ def build_attention_dense(
 
             if PV_PRIORITY and not PINGPONG:
                 b.s_setprio(PV_PRIORITY)
-            o_acc = do_pv(o_acc, p_packs, buf_j, after_mfma=max_hook)
+            o_acc = do_pv(o_acc, p_packs, buf_j, after_mfma=max_hook, bulk=BULK_V)
             if PV_PRIORITY and not PINGPONG:
                 b.s_setprio(0)
             for n, i in mslots:
