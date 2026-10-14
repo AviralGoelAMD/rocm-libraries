@@ -975,6 +975,113 @@ class TestWideDmaFeatures:
         ), f"{spec_id} {dtype} {_name}: max_abs={max_abs:.3e}"
 
 
+# qk_lookahead loop knob sets on the wide-DMA grid body (block_m, knobs).
+_LOOKAHEAD_BASE = dict(
+    wide_lds_dma=True,
+    lds_dma_manual_wait=True,
+    qk_lookahead=True,
+    qk_lookahead_unroll=2,
+    permlane32_reduce=True,
+    pv_priority=0,
+)
+_LOOKAHEAD_ARMS = {
+    "lookahead": (128, dict(_LOOKAHEAD_BASE, o_store_width=8)),
+    "unroll1": (256, dict(_LOOKAHEAD_BASE, qk_lookahead_unroll=1)),
+    "read_base": (256, dict(_LOOKAHEAD_BASE, lds_read_base=True, scalar_uniforms=True)),
+    "read_ahead": (
+        256,
+        dict(_LOOKAHEAD_BASE, lds_read_base=True, operand_read_ahead=4),
+    ),
+    "bulk": (256, dict(_LOOKAHEAD_BASE, lds_read_base=True, bulk_operand_reads=3)),
+    "pingpong": (256, dict(_LOOKAHEAD_BASE, wave_group_pingpong=True)),
+    "windows4": (
+        256,
+        dict(
+            _LOOKAHEAD_BASE,
+            lds_read_base=True,
+            scalar_uniforms=True,
+            wave_group_pingpong=True,
+            mfma_windows=4,
+            o_store_width=8,
+        ),
+    ),
+    "windows4_prio1": (
+        256,
+        dict(
+            _LOOKAHEAD_BASE,
+            lds_read_base=True,
+            wave_group_pingpong=True,
+            mfma_windows=4,
+            window_priority=1,
+        ),
+    ),
+    "windows3": (
+        256,
+        dict(
+            _LOOKAHEAD_BASE,
+            lds_read_base=True,
+            wave_group_pingpong=True,
+            mfma_windows=3,
+            qk_lookahead_unroll=1,
+        ),
+    ),
+}
+
+
+@requires_gfx950_gpu
+@pytest.mark.gpu
+class TestLookaheadKnobsNumeric:
+    """Every qk_lookahead knob set: O and LSE against an FP32 reference, with
+    NaN-prefilled outputs so an unwritten tile cannot pass."""
+
+    @pytest.mark.parametrize("arm", sorted(_LOOKAHEAD_ARMS))
+    @pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
+    @pytest.mark.parametrize("dtype", ["bf16", "fp16"])
+    @pytest.mark.parametrize("use_sinks", [False, True], ids=["plain", "sinks"])
+    def test_lookahead_knobs(self, arm, causal, dtype, use_sinks):
+        from dispatch.attention import AttentionRequest, attention_tuning_spec
+
+        block_m, knobs = _LOOKAHEAD_ARMS[arm]
+        if dtype == "fp16" and knobs.get("o_store_width", 4) != 4:
+            knobs = dict(knobs, o_store_width=4)
+        B, S, Hq, Hkv, D = 2, 1280, 16, 4, 128
+        base = attention_tuning_spec(
+            AttentionRequest(
+                batch=B,
+                nhead_q=Hq,
+                nhead_k=Hkv,
+                seqlen_q=S,
+                seqlen_k=S,
+                hdim_q=D,
+                hdim_v=D,
+                arch="gfx950",
+                mask_type=1 if causal else 0,
+                dtype=dtype,
+                use_sinks=use_sinks,
+            ),
+            "gfx950_dense_grid",
+        ).kernel_spec
+        spec = replace(base, block_m=block_m, emit_lse=True, **knobs)
+        tdt = getattr(torch, _TORCH_DT[dtype])
+        torch.manual_seed(5)
+        q = torch.randn(B, S, Hq, D, device="cuda", dtype=tdt)
+        k = torch.randn(B, S, Hkv, D, device="cuda", dtype=tdt)
+        v = torch.randn(B, S, Hkv, D, device="cuda", dtype=tdt)
+        sinks = torch.randn(Hq, device="cuda", dtype=tdt) if use_sinks else None
+        out = torch.full_like(q, float("nan"))
+        lse = torch.full((B, Hq, S, 1), float("nan"), device="cuda", dtype=torch.float32)
+        scale = 1.0 / math.sqrt(D)
+        run_attention_dense_torch(
+            spec=spec, q=q, k=k, v=v, out=out, lse=lse, scale=scale, sinks=sinks
+        )
+        torch.cuda.synchronize()
+        ref, lse_ref = _lse_reference(q, k, v, scale, causal=causal, sinks=sinks)
+        assert torch.isfinite(out).all(), f"{arm}: unwritten or non-finite O"
+        max_abs = (out.float() - ref).abs().max().item()
+        assert max_abs < _tolerance(dtype), f"{arm}: max_abs={max_abs:.3e}"
+        assert (lse - lse_ref).abs().max().item() < _tolerance(dtype)
+
+
 def _lse_reference(q, k, v, scale, *, causal, diagonal=0, window=0, sinks=None):
     """Independent FP32 O and natural-log LSE, including truly empty rows.
 
