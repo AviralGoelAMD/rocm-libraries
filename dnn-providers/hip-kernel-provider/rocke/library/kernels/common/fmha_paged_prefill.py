@@ -48,8 +48,9 @@ class FmhaFwdPagedPrefillSpec:
     # P67: when ``use_mfma_body=True``, the kernel swaps the
     # warp-distributed ``fmha_warp_fwd_inner_body`` for
     # :func:`rocke.helpers.mfma_attention.mfma_attention_fwd_inner_body`.
-    # Requires ``total_q % MFMA_ATTN_BLOCK_M == 0`` and
-    # ``head_size % MFMA_ATTN_BLOCK_K == 0``; the helper accepts the
+    # Requires ``head_size % MFMA_ATTN_BLOCK_K == 0``; per-sequence q / k
+    # lengths are arbitrary (partial tiles are row / K-tail masked). The
+    # launch grid is ``fmha_fwd_paged_prefill_grid``. The helper accepts the
     # paged-row callback so the page-table indirection plumbs in
     # without a body change. ~10-30× speedup on production paged-
     # prefill workloads (long-context, batched).
@@ -149,14 +150,11 @@ def build_fmha_fwd_paged_prefill(
     cu_seqlens_q = kb.ptr("cu_seqlens_q")
     seqlens_k_ptr = kb.ptr("seqlens_k")
     scale_log2 = kb.scalar("scale_log2")
-    if spec.use_mfma_body:
-        # MFMA mode: block_id_x is a BLOCK_M=16 query *tile*; the sequence
-        # search, local query position and Q/O addressing all need the
-        # tile's first *token* (each sequence's query span must be a
-        # multiple of 16 so a tile never straddles two sequences).
-        q_token = b.mul(kb.q_token, b.const_i32(16))
-    else:
-        q_token = kb.q_token
+    # MFMA mode: block_id_x is a BLOCK_M=16 query *tile* index. Tiles are
+    # numbered per sequence: sequence ``s`` owns tiles starting at
+    # ``cu_q[s] // 16 + s`` (AITER ``find_seq_idx`` q-block mode), so a tile
+    # never straddles two sequences and every q length is covered.
+    q_token = kb.q_token
     head_idx = kb.head_idx
     kv_head_idx = kb.kv_head_idx
     block_table_stride = kb.scalar("block_table_stride")
@@ -166,11 +164,8 @@ def build_fmha_fwd_paged_prefill(
     # mirrors AITER's ``find_seq_idx(use_q_block_mode=False)`` in
     # ``aiter.ops.triton.attention.unified_attention``: we look for
     # the unique ``s`` such that ``cu_q[s] <= q_token < cu_q[s+1]``.
-    # The shared ``binary_search_seq_idx`` helper bakes in a
-    # ``cu_q[mid]/BLOCK_Q + mid`` invariant for the q-block-mode
-    # paths (varlen MFMA, tiled 2D / 3D), which is different from the
-    # per-token mode the paged-prefill kernel needs -- so we keep the
-    # inline form here instead of routing through the helper.
+    # MFMA mode uses the q-block invariant instead:
+    # ``cu_q[s] // 16 + s <= tile < cu_q[s+1] // 16 + s + 1``.
     bs_iters = max(1, int(math.ceil(math.log2(spec.batch + 1))))
     bs_loop = b.scf_for_iter(
         b.const_i32(0),
@@ -186,14 +181,39 @@ def build_fmha_fwd_paged_prefill(
         done = b.cmp_ge(left, right)
         mid = b.div(b.add(left, right), b.const_i32(2))
         cuq_next_mid = b.global_load_i32(cu_seqlens_q, b.add(mid, b.const_i32(1)))
-        go_right = b.cmp_le(cuq_next_mid, q_token)
+        if spec.use_mfma_body:
+            tile_next_mid = b.add(
+                b.lshr(cuq_next_mid, b.const_i32(4)), b.add(mid, b.const_i32(1))
+            )
+            go_right = b.cmp_le(tile_next_mid, q_token)
+        else:
+            go_right = b.cmp_le(cuq_next_mid, q_token)
         nl = b.select(go_right, b.add(mid, b.const_i32(1)), left)
         nr = b.select(go_right, right, mid)
         b.scf_yield(b.select(done, left, nl), b.select(done, right, nr))
     seq_idx = bs_loop.results[0]
     cuq_base = b.global_load_i32(cu_seqlens_q, seq_idx)
-    local_q = b.sub(q_token, cuq_base)
-    seqlen_k = b.global_load_i32(seqlens_k_ptr, seq_idx)
+    if spec.use_mfma_body:
+        q_len = b.sub(
+            b.global_load_i32(cu_seqlens_q, b.add(seq_idx, b.const_i32(1))), cuq_base
+        )
+        seqlen_k = b.global_load_i32(seqlens_k_ptr, seq_idx)
+        tile_first = b.add(b.lshr(cuq_base, b.const_i32(4)), seq_idx)
+        local_q = b.mul(b.sub(q_token, tile_first), b.const_i32(16))
+        # Rows of this tile inside the sequence; <= 0 for the spare tile a
+        # sequence may own past its end (it runs no K-tiles, stores nothing,
+        # and reads Q row 0 so its address stays in bounds).
+        q_rows_valid = b.sub(q_len, local_q)
+        tile_live = b.cmp_gt(q_rows_valid, b.const_i32(0))
+        q_tile_base = b.select(tile_live, b.add(cuq_base, local_q), b.const_i32(0))
+        k_tiles = b.select(
+            tile_live,
+            b.div(b.add(seqlen_k, b.const_i32(15)), b.const_i32(16)),
+            b.const_i32(0),
+        )
+    else:
+        local_q = b.sub(q_token, cuq_base)
+        seqlen_k = b.global_load_i32(seqlens_k_ptr, seq_idx)
 
     # Per-k_idx paged-KV indirection (full block_table walk). Because
     # ``page_block_size`` is validated as a positive power of two,
@@ -245,18 +265,12 @@ def build_fmha_fwd_paged_prefill(
 
     causal_ctx = local_q if s.mask_mode in ("causal", "sliding_window") else None
     if spec.use_mfma_body:
-        # P67: MFMA-tiled body. The host launcher must use the
-        # corresponding MFMA grid (``ceil_div(total_q,
-        # MFMA_ATTN_BLOCK_M)`` instead of the per-token grid). The
-        # paged-row callbacks plumb in via the helper's
-        # ``k_row_base_fn`` / ``v_row_base_fn`` signature; everything
-        # else is the same as the warp-distributed path.
-        from rocke.helpers.mfma_attention import (
-            MFMA_ATTN_BLOCK_M,
-            mfma_attention_fwd_inner_body,
-        )
+        # P67: MFMA-tiled body; launch with ``fmha_fwd_paged_prefill_grid``
+        # (per-sequence 16-row tiles). The paged-row callbacks plumb in via
+        # the helper's ``k_row_base_fn`` / ``v_row_base_fn`` signature.
+        # Partial Q tiles and a partial last K-tile are masked in the body.
+        from rocke.helpers.mfma_attention import mfma_attention_fwd_inner_body
 
-        q_tile_base = q_token  # already the tile's first token (see above)
         mfma_attention_fwd_inner_body(
             b,
             Q=Q,
@@ -286,6 +300,9 @@ def build_fmha_fwd_paged_prefill(
             causal_ctx_offset=b.const_i32(0) if causal_ctx is not None else None,
             k_row_base_fn=_paged_row(stride_block, stride_page, stride_kv_head),
             v_row_base_fn=_paged_row(stride_v_block, stride_v_page, stride_v_kv_head),
+            k_tile_stop=k_tiles,
+            q_rows_valid=q_rows_valid,
+            k_tail_mask=True,
             arch=arch,
         )
     else:
@@ -326,7 +343,9 @@ def fmha_fwd_paged_prefill_grid(
     spec: FmhaFwdPagedPrefillSpec, *, total_q: int
 ) -> Tuple[int, int, int]:
     if spec.use_mfma_body:
-        return ((total_q + 15) // 16, spec.common.shape.num_query_heads, 1)
+        # One 16-row tile index per ``cu_q[s] // 16 + s`` slot: at most
+        # ``total_q // 16 + batch`` tiles; spare tiles exit without work.
+        return (total_q // 16 + spec.batch, spec.common.shape.num_query_heads, 1)
     return (total_q, spec.common.shape.num_query_heads, 1)
 
 

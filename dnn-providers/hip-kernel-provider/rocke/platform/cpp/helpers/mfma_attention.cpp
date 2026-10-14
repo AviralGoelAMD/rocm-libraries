@@ -220,6 +220,36 @@ static rocke_value_t* rocke_attn_opt(rocke_ir_builder_t* b, rocke_value_t* v)
     return v != NULL ? v : rocke_b_const_i32(b, 0);
 }
 
+/* Python _store_cell(n_blk_atom, r, o_row): one epilogue O element. */
+static void rocke_mfma_attn_store_cell(rocke_ir_builder_t* b,
+                                       const rocke_mfma_attn_params_t* p,
+                                       const rocke_mfma_atom_t* atom,
+                                       const rocke_type_t* dtype_ir,
+                                       rocke_value_t* m_in_atom,
+                                       rocke_value_t* const* ls_final,
+                                       rocke_value_t* const* accs_final,
+                                       int nba,
+                                       int r,
+                                       rocke_value_t* o_row)
+{
+    rocke_value_t* o_nba = rocke_b_const_i32(b, nba);
+    rocke_value_t* o_atn = rocke_b_const_i32(b, atom->n);
+    rocke_value_t* o_col_t0 = rocke_b_mul(b, o_nba, o_atn);
+    rocke_value_t* o_col = rocke_b_add(b, o_col_t0, m_in_atom);
+    rocke_value_t* inv_l = rocke_safe_inv_l(b, ls_final[r]);
+    rocke_value_t* v_f32 = rocke_b_fmul(b, rocke_b_vec_extract(b, accs_final[nba], r), inv_l);
+    if(p->v_scale != NULL)
+    {
+        v_f32 = rocke_b_fmul(b, v_f32, p->v_scale);
+    }
+    rocke_value_t* v_out = rocke_b_cast_f32_to(b, v_f32, dtype_ir);
+    rocke_value_t* addr_t0 = rocke_b_mul(b, o_row, p->stride_o_token);
+    rocke_value_t* addr_t1 = rocke_b_mul(b, p->head_idx, p->stride_o_head);
+    rocke_value_t* addr_t2 = rocke_b_add(b, addr_t0, addr_t1);
+    rocke_value_t* addr = rocke_b_add(b, addr_t2, o_col);
+    rocke_b_global_store(b, p->O, addr, v_out, 2);
+}
+
 rocke_status_t rocke_mfma_attention_fwd_inner_body(rocke_ir_builder_t* b,
                                                    const rocke_mfma_attn_params_t* p)
 {
@@ -347,6 +377,13 @@ rocke_status_t rocke_mfma_attention_fwd_inner_body(rocke_ir_builder_t* b,
                             "fp8 / wider-atom / native-fp8 paths are CDNA-only");
             return ROCKE_ERR_VALUE;
         }
+        if(p->q_rows_valid != NULL || p->k_tail_mask)
+        {
+            rocke_i_set_err(b,
+                            ROCKE_ERR_VALUE,
+                            "wave32 (WMMA) attention does not support partial Q / K tiles");
+            return ROCKE_ERR_VALUE;
+        }
         return rocke_wmma_attention_fwd_inner_body(b, p, p->wmma_v_lds_stage, target);
     }
 
@@ -373,7 +410,19 @@ rocke_status_t rocke_mfma_attention_fwd_inner_body(rocke_ir_builder_t* b,
     rocke_value_t* v_off = rocke_attn_opt(b, p->v_token_offset_elems);
 
     /* ---- Pre-load Q ---- */
-    rocke_value_t* q_row = rocke_b_add(b, p->q_tile_base, m_in_atom);
+    rocke_value_t* q_row;
+    if(p->q_rows_valid != NULL)
+    {
+        /* add(q_tile_base, select(cmp_lt(m_in_atom, q_rows_valid), m_in_atom, 0)) */
+        rocke_value_t* q_row_ok = rocke_b_cmp_lt(b, m_in_atom, p->q_rows_valid);
+        rocke_value_t* q_row_sel
+            = rocke_b_select(b, q_row_ok, m_in_atom, rocke_b_const_i32(b, 0));
+        q_row = rocke_b_add(b, p->q_tile_base, q_row_sel);
+    }
+    else
+    {
+        q_row = rocke_b_add(b, p->q_tile_base, m_in_atom);
+    }
     /* Hoist inner ops into temporaries so emission order is Python's
      * left-to-right (C function-argument evaluation order is unspecified). */
     rocke_value_t* q_arb_t0 = rocke_b_mul(b, q_row, p->stride_q_token);
@@ -424,8 +473,23 @@ rocke_status_t rocke_mfma_attention_fwd_inner_body(rocke_ir_builder_t* b,
     rocke_value_t* c_block_k = rocke_b_const_i32(b, ROCKE_MFMA_ATTN_BLOCK_K);
     rocke_value_t* loop_start
         = (p->k_tile_start != NULL) ? p->k_tile_start : rocke_b_const_i32(b, 0);
-    rocke_value_t* loop_stop
-        = (p->k_tile_stop != NULL) ? p->k_tile_stop : rocke_b_div(b, p->seqlen_k, c_block_k);
+    rocke_value_t* loop_stop;
+    if(p->k_tile_stop != NULL)
+    {
+        loop_stop = p->k_tile_stop;
+    }
+    else if(p->k_tail_mask)
+    {
+        rocke_value_t* ls_t0
+            = rocke_b_add(b, p->seqlen_k, rocke_b_const_i32(b, ROCKE_MFMA_ATTN_BLOCK_K - 1));
+        loop_stop = rocke_b_div(b, ls_t0, c_block_k);
+    }
+    else
+    {
+        loop_stop = rocke_b_div(b, p->seqlen_k, c_block_k);
+    }
+    rocke_value_t* k_last
+        = p->k_tail_mask ? rocke_b_sub(b, p->seqlen_k, rocke_b_const_i32(b, 1)) : NULL;
 
     rocke_for_t kloop = rocke_b_scf_for_iter(
         b, loop_start, loop_stop, rocke_b_const_i32(b, 1), iter_args, n_ia, "kt", false, true);
@@ -450,6 +514,10 @@ rocke_status_t rocke_mfma_attention_fwd_inner_body(rocke_ir_builder_t* b,
 
         rocke_value_t* k_tile_base = rocke_b_mul(b, effective_kt, c_block_k);
         rocke_value_t* k_row_for_lane = rocke_b_add(b, k_tile_base, m_in_atom);
+        if(k_last != NULL)
+        {
+            k_row_for_lane = rocke_b_smin(b, k_row_for_lane, k_last);
+        }
 
         rocke_value_t* keep_tile
             = (p->extra_mask_predicate != NULL)
@@ -528,6 +596,11 @@ rocke_status_t rocke_mfma_attention_fwd_inner_body(rocke_ir_builder_t* b,
                                                     p->sliding_window,
                                                     p->causal_ctx_offset,
                                                     NULL);
+            if(k_last != NULL)
+            {
+                rocke_value_t* k_in = rocke_b_cmp_lt(b, k_col_pos, p->seqlen_k);
+                s_r_scaled = rocke_b_select(b, k_in, s_r_scaled, neg_inf);
+            }
             if(keep_tile != NULL)
             {
                 s_r_scaled = rocke_b_select(b, keep_tile, s_r_scaled, neg_inf);
@@ -582,6 +655,10 @@ rocke_status_t rocke_mfma_attention_fwd_inner_body(rocke_ir_builder_t* b,
             {
                 rocke_value_t* v_row_k = rocke_b_add(
                     b, k_tile_base, rocke_b_add(b, k_lane_start, rocke_b_const_i32(b, j)));
+                if(k_last != NULL)
+                {
+                    v_row_k = rocke_b_smin(b, v_row_k, k_last);
+                }
                 rocke_value_t* v_addr_row_base;
                 if(p->v_row_base_fn != NULL)
                 {
@@ -643,30 +720,36 @@ rocke_status_t rocke_mfma_attention_fwd_inner_body(rocke_ir_builder_t* b,
 
     /* ---- Epilogue ---- */
     rocke_value_t* m_blk = rocke_b_div(b, lane, c16);
-    for(int nba = 0; nba < n_pv_atoms; ++nba)
+    if(p->q_rows_valid == NULL)
     {
+        for(int nba = 0; nba < n_pv_atoms; ++nba)
+        {
+            for(int r = 0; r < atom->c_per_lane; ++r)
+            {
+                rocke_value_t* o_row_t0 = rocke_b_mul(b, m_blk, rocke_b_const_i32(b, 4));
+                rocke_value_t* o_row_t1 = rocke_b_add(b, p->q_tile_base, o_row_t0);
+                rocke_value_t* o_row = rocke_b_add(b, o_row_t1, rocke_b_const_i32(b, r));
+                rocke_mfma_attn_store_cell(
+                    b, p, atom, dtype_ir, m_in_atom, ls_final, accs_final, nba, r, o_row);
+            }
+        }
+    }
+    else
+    {
+        /* Partial tile: rows at or past q_rows_valid skip their store. */
         for(int r = 0; r < atom->c_per_lane; ++r)
         {
-            rocke_value_t* o_row_t0 = rocke_b_mul(b, m_blk, rocke_b_const_i32(b, 4));
-            rocke_value_t* o_row_t1 = rocke_b_add(b, p->q_tile_base, o_row_t0);
-            rocke_value_t* o_row = rocke_b_add(b, o_row_t1, rocke_b_const_i32(b, r));
-            rocke_value_t* o_nba = rocke_b_const_i32(b, nba);
-            rocke_value_t* o_atn = rocke_b_const_i32(b, atom->n);
-            rocke_value_t* o_col_t0 = rocke_b_mul(b, o_nba, o_atn);
-            rocke_value_t* o_col = rocke_b_add(b, o_col_t0, m_in_atom);
-            rocke_value_t* inv_l = rocke_safe_inv_l(b, ls_final[r]);
-            rocke_value_t* v_f32
-                = rocke_b_fmul(b, rocke_b_vec_extract(b, accs_final[nba], r), inv_l);
-            if(p->v_scale != NULL)
+            rocke_value_t* rit_t0 = rocke_b_mul(b, m_blk, rocke_b_const_i32(b, 4));
+            rocke_value_t* row_in_tile = rocke_b_add(b, rit_t0, rocke_b_const_i32(b, r));
+            rocke_if_t row_if = rocke_b_scf_if(b, rocke_b_cmp_lt(b, row_in_tile, p->q_rows_valid));
+            rocke_b_region_enter(b, row_if.then_region);
+            rocke_value_t* o_row = rocke_b_add(b, p->q_tile_base, row_in_tile);
+            for(int nba = 0; nba < n_pv_atoms; ++nba)
             {
-                v_f32 = rocke_b_fmul(b, v_f32, p->v_scale);
+                rocke_mfma_attn_store_cell(
+                    b, p, atom, dtype_ir, m_in_atom, ls_final, accs_final, nba, r, o_row);
             }
-            rocke_value_t* v_out = rocke_b_cast_f32_to(b, v_f32, dtype_ir);
-            rocke_value_t* addr_t0 = rocke_b_mul(b, o_row, p->stride_o_token);
-            rocke_value_t* addr_t1 = rocke_b_mul(b, p->head_idx, p->stride_o_head);
-            rocke_value_t* addr_t2 = rocke_b_add(b, addr_t0, addr_t1);
-            rocke_value_t* addr = rocke_b_add(b, addr_t2, o_col);
-            rocke_b_global_store(b, p->O, addr, v_out, 2);
+            rocke_b_region_leave(b);
         }
     }
 

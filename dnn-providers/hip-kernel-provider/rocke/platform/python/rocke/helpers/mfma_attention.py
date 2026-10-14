@@ -285,6 +285,8 @@ def mfma_attention_fwd_inner_body(
     use_async_kv: bool = False,
     codebook_ptr: Optional[Value] = None,
     wmma_v_lds_stage: bool = False,
+    q_rows_valid: Optional[Value] = None,
+    k_tail_mask: bool = False,
     arch: str = "gfx950",
 ) -> None:
     """One MFMA-tiled QK→softmax→PV pass for a ``BLOCK_M``-row Q tile.
@@ -339,6 +341,17 @@ def mfma_attention_fwd_inner_body(
     just pre-multiply ``scale_log2`` by ``k_scale`` before invoking
     the helper -- the QK MFMA result lands in the log2-space score,
     and a constant K-scale is absorbed cleanly into ``scale_log2``.
+
+    ``q_rows_valid`` (optional i32): number of valid Q rows in this tile
+    (``<= 0`` for an empty tile, may exceed ``BLOCK_M``). Rows at or past
+    it read Q row 0 of the tile and skip their O store, so a tile may
+    end mid-tile at a sequence boundary. ``q_tile_base`` must still
+    address a readable Q row.
+
+    ``k_tail_mask``: the last K-tile may be partial. Scores at
+    ``k >= seqlen_k`` are masked off and the K / V row index is clamped
+    to ``seqlen_k - 1`` so no address goes past the sequence. The
+    default K-loop bound becomes ``ceil(seqlen_k / BLOCK_K)``.
     """
     if head_size % MFMA_ATTN_BLOCK_M != 0:
         raise ValueError(
@@ -453,6 +466,10 @@ def mfma_attention_fwd_inner_body(
                 "wave32 (WMMA) attention supports f16/bf16 KV only; "
                 "fp8 / wider-atom / native-fp8 paths are CDNA-only"
             )
+        if q_rows_valid is not None or k_tail_mask:
+            raise ValueError(
+                "wave32 (WMMA) attention does not support partial Q / K tiles"
+            )
         _wmma_attention_fwd_inner_body(
             b,
             Q=Q,
@@ -527,7 +544,13 @@ def mfma_attention_fwd_inner_body(
     # ---- Pre-load Q ----
     # For each QK atom along head_dim, lane t holds Q[q_tile_base +
     # m_in_atom, k_blk_atom*atom.k + k_blk*a_per_lane + 0..a_per_lane).
-    q_row = b.add(q_tile_base, m_in_atom)
+    if q_rows_valid is not None:
+        q_row = b.add(
+            q_tile_base,
+            b.select(b.cmp_lt(m_in_atom, q_rows_valid), m_in_atom, b.const_i32(0)),
+        )
+    else:
+        q_row = b.add(q_tile_base, m_in_atom)
     q_addr_row_base = b.add(
         b.mul(q_row, stride_q_token),
         b.mul(head_idx, stride_q_head),
@@ -578,7 +601,15 @@ def mfma_attention_fwd_inner_body(
 
     c_block_k = b.const_i32(MFMA_ATTN_BLOCK_K)
     loop_start = k_tile_start if k_tile_start is not None else b.const_i32(0)
-    loop_stop = k_tile_stop if k_tile_stop is not None else b.div(seqlen_k, c_block_k)
+    if k_tile_stop is not None:
+        loop_stop = k_tile_stop
+    elif k_tail_mask:
+        loop_stop = b.div(
+            b.add(seqlen_k, b.const_i32(MFMA_ATTN_BLOCK_K - 1)), c_block_k
+        )
+    else:
+        loop_stop = b.div(seqlen_k, c_block_k)
+    k_last = b.sub(seqlen_k, b.const_i32(1)) if k_tail_mask else None
 
     kloop = b.scf_for_iter(
         loop_start,
@@ -609,6 +640,8 @@ def mfma_attention_fwd_inner_body(
         # and B operands in the QK MFMA).
         k_tile_base = b.mul(effective_kt, c_block_k)
         k_row_for_lane = b.add(k_tile_base, m_in_atom)  # k position for THIS lane
+        if k_last is not None:
+            k_row_for_lane = b.smin(k_row_for_lane, k_last)
 
         # Per-K-tile mask predicate (block-sparse / VSA): when false, the
         # whole tile is skipped -- no K/V loads, no MFMA, no PV. The
@@ -719,6 +752,10 @@ def mfma_attention_fwd_inner_body(
                 sliding_window=sliding_window,
                 context_len=causal_ctx_offset,
             )
+            if k_last is not None:
+                s_r_scaled = b.select(
+                    b.cmp_lt(k_col_pos, seqlen_k), s_r_scaled, neg_inf
+                )
             # If the whole K-tile is masked off (sparse-skip), force the
             # score to -inf so the softmax exponential collapses to 0.
             if keep_tile is not None:
@@ -786,6 +823,8 @@ def mfma_attention_fwd_inner_body(
                     k_tile_base,
                     b.add(k_lane_start, b.const_i32(j)),
                 )
+                if k_last is not None:
+                    v_row_k = b.smin(v_row_k, k_last)
                 if v_row_base_fn is not None:
                     v_addr_row_base = v_row_base_fn(b, v_row_k)
                 else:
@@ -842,35 +881,48 @@ def mfma_attention_fwd_inner_body(
     # Lane t writes to O[q_tile_base + m_blk*4 + r, head, n_blk*16 +
     # n_in_atom] for r in 0..3, n_blk in 0..n_pv_atoms.
     m_blk = b.div(lane, c16)
-    for n_blk_atom in range(n_pv_atoms):
+
+    def _store_cell(n_blk_atom: int, r: int, o_row: Value) -> None:
+        o_col = b.add(
+            b.mul(b.const_i32(n_blk_atom), b.const_i32(atom.n)),
+            m_in_atom,
+        )
+        # B08: guard ``l_final == 0`` -- when an entire Q tile is
+        # masked off (sparse jenga / VSA all-masked rows), the
+        # softmax denominator is zero. ``rcp(0) = +inf -> NaN``
+        # would poison the output; force ``inv_l = 0`` for the
+        # zero case so the contribution evaluates to ``acc * 0
+        # == 0`` (the intended "no attention" output).
+        inv_l = safe_inv_l(b, ls_final[r])
+        v_f32 = b.fmul(b.vec_extract(accs_final[n_blk_atom], r), inv_l)
+        if v_scale is not None:
+            v_f32 = b.fmul(v_f32, v_scale)
+        v_out = b.cast_f32_to(v_f32, dtype_ir)
+        addr = b.add(
+            b.add(
+                b.mul(o_row, stride_o_token),
+                b.mul(head_idx, stride_o_head),
+            ),
+            o_col,
+        )
+        b.global_store(O, addr, v_out, align=2)
+
+    if q_rows_valid is None:
+        for n_blk_atom in range(n_pv_atoms):
+            for r in range(atom.c_per_lane):
+                o_row = b.add(
+                    b.add(q_tile_base, b.mul(m_blk, b.const_i32(4))),
+                    b.const_i32(r),
+                )
+                _store_cell(n_blk_atom, r, o_row)
+    else:
+        # Partial tile: rows at or past ``q_rows_valid`` skip their store.
         for r in range(atom.c_per_lane):
-            o_row = b.add(
-                b.add(q_tile_base, b.mul(m_blk, b.const_i32(4))),
-                b.const_i32(r),
-            )
-            o_col = b.add(
-                b.mul(b.const_i32(n_blk_atom), b.const_i32(atom.n)),
-                m_in_atom,
-            )
-            # B08: guard ``l_final == 0`` -- when an entire Q tile is
-            # masked off (sparse jenga / VSA all-masked rows), the
-            # softmax denominator is zero. ``rcp(0) = +inf -> NaN``
-            # would poison the output; force ``inv_l = 0`` for the
-            # zero case so the contribution evaluates to ``acc * 0
-            # == 0`` (the intended "no attention" output).
-            inv_l = safe_inv_l(b, ls_final[r])
-            v_f32 = b.fmul(b.vec_extract(accs_final[n_blk_atom], r), inv_l)
-            if v_scale is not None:
-                v_f32 = b.fmul(v_f32, v_scale)
-            v_out = b.cast_f32_to(v_f32, dtype_ir)
-            addr = b.add(
-                b.add(
-                    b.mul(o_row, stride_o_token),
-                    b.mul(head_idx, stride_o_head),
-                ),
-                o_col,
-            )
-            b.global_store(O, addr, v_out, align=2)
+            row_in_tile = b.add(b.mul(m_blk, b.const_i32(4)), b.const_i32(r))
+            with b.scf_if(b.cmp_lt(row_in_tile, q_rows_valid)):
+                o_row = b.add(q_tile_base, row_in_tile)
+                for n_blk_atom in range(n_pv_atoms):
+                    _store_cell(n_blk_atom, r, o_row)
 
 
 # ---------------------------------------------------------------------------

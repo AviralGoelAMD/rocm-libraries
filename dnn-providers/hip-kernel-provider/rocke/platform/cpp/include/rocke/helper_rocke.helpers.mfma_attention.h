@@ -241,6 +241,8 @@ typedef struct rocke_mfma_attn_params
     bool use_async_kv;
     rocke_value_t* codebook_ptr;
     bool wmma_v_lds_stage;
+    rocke_value_t* q_rows_valid; /* NULL => every BLOCK_M row valid           */
+    bool k_tail_mask; /* mask k >= seqlen_k, clamp K/V rows        */
     const char* arch; /* NULL => "gfx950"                                  */
 } rocke_mfma_attn_params_t;
 

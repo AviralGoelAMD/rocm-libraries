@@ -381,6 +381,10 @@ rocke_kernel_def_t*
         rocke_value_t *seq_idx, *cuq_base, *local_q, *seqlen_k;
         rocke_value_t *block_table_row_base, *c_pg_log2, *c_pg_mask;
         rocke_value_t* causal_ctx;
+        /* MFMA mode only: per-sequence 16-row tile geometry. */
+        rocke_value_t* mfma_q_rows_valid = NULL;
+        rocke_value_t* mfma_q_tile_base = NULL;
+        rocke_value_t* mfma_k_tiles = NULL;
 
         rocke_fpp_paged_env_t env;
 
@@ -495,7 +499,20 @@ rocke_kernel_def_t*
         }
         cuq_next_mid = rocke_b_global_load_i32(
             b, cu_seqlens_q, rocke_b_add(b, mid, rocke_b_const_i32(b, 1)), 4);
-        go_right = rocke_b_cmp_le(b, cuq_next_mid, q_token);
+        if(spec->use_mfma_body)
+        {
+            /* MFMA mode (q-block invariant):
+             * tile_next_mid = b.add(b.lshr(cuq_next_mid, 4), b.add(mid, 1))
+             * go_right = b.cmp_le(tile_next_mid, q_token) */
+            rocke_value_t* tn_t0 = rocke_b_lshr(b, cuq_next_mid, rocke_b_const_i32(b, 4));
+            rocke_value_t* tn_t1 = rocke_b_add(b, mid, rocke_b_const_i32(b, 1));
+            rocke_value_t* tile_next_mid = rocke_b_add(b, tn_t0, tn_t1);
+            go_right = rocke_b_cmp_le(b, tile_next_mid, q_token);
+        }
+        else
+        {
+            go_right = rocke_b_cmp_le(b, cuq_next_mid, q_token);
+        }
         nl = rocke_b_select(b, go_right, rocke_b_add(b, mid, rocke_b_const_i32(b, 1)), left);
         nr = rocke_b_select(b, go_right, right, mid);
         bs_yields[0] = rocke_b_select(b, done, left, nl);
@@ -504,13 +521,42 @@ rocke_kernel_def_t*
         rocke_b_region_leave(b);
 
         /* seq_idx = bs_loop.results[0]
-         * cuq_base = b.global_load_i32(cu_seqlens_q, seq_idx)
-         * local_q  = b.sub(q_token, cuq_base)
-         * seqlen_k = b.global_load_i32(seqlens_k_ptr, seq_idx) */
+         * cuq_base = b.global_load_i32(cu_seqlens_q, seq_idx) */
         seq_idx = (bs_loop.op != NULL) ? bs_loop.op->results[0] : NULL;
         cuq_base = rocke_b_global_load_i32(b, cu_seqlens_q, seq_idx, 4);
-        local_q = rocke_b_sub(b, q_token, cuq_base);
-        seqlen_k = rocke_b_global_load_i32(b, seqlens_k_ptr, seq_idx, 4);
+        if(spec->use_mfma_body)
+        {
+            /* q_len = sub(load(cu_q, seq_idx + 1), cuq_base)
+             * seqlen_k = load(seqlens_k, seq_idx)
+             * tile_first = add(lshr(cuq_base, 4), seq_idx)
+             * local_q = mul(sub(q_token, tile_first), 16)
+             * q_rows_valid = sub(q_len, local_q); tile_live = q_rows_valid > 0
+             * q_tile_base = select(tile_live, add(cuq_base, local_q), 0)
+             * k_tiles = select(tile_live, div(add(seqlen_k, 15), 16), 0) */
+            rocke_value_t* ql_t0 = rocke_b_add(b, seq_idx, rocke_b_const_i32(b, 1));
+            rocke_value_t* ql_t1 = rocke_b_global_load_i32(b, cu_seqlens_q, ql_t0, 4);
+            rocke_value_t* q_len = rocke_b_sub(b, ql_t1, cuq_base);
+            seqlen_k = rocke_b_global_load_i32(b, seqlens_k_ptr, seq_idx, 4);
+            rocke_value_t* tf_t0 = rocke_b_lshr(b, cuq_base, rocke_b_const_i32(b, 4));
+            rocke_value_t* tile_first = rocke_b_add(b, tf_t0, seq_idx);
+            rocke_value_t* lq_t0 = rocke_b_sub(b, q_token, tile_first);
+            local_q = rocke_b_mul(b, lq_t0, rocke_b_const_i32(b, 16));
+            mfma_q_rows_valid = rocke_b_sub(b, q_len, local_q);
+            rocke_value_t* tile_live
+                = rocke_b_cmp_gt(b, mfma_q_rows_valid, rocke_b_const_i32(b, 0));
+            rocke_value_t* qtb_t0 = rocke_b_add(b, cuq_base, local_q);
+            mfma_q_tile_base = rocke_b_select(b, tile_live, qtb_t0, rocke_b_const_i32(b, 0));
+            rocke_value_t* kt_t0 = rocke_b_add(b, seqlen_k, rocke_b_const_i32(b, 15));
+            rocke_value_t* kt_t1 = rocke_b_div(b, kt_t0, rocke_b_const_i32(b, 16));
+            mfma_k_tiles = rocke_b_select(b, tile_live, kt_t1, rocke_b_const_i32(b, 0));
+        }
+        else
+        {
+            /* local_q = b.sub(q_token, cuq_base)
+             * seqlen_k = b.global_load_i32(seqlens_k_ptr, seq_idx) */
+            local_q = rocke_b_sub(b, q_token, cuq_base);
+            seqlen_k = rocke_b_global_load_i32(b, seqlens_k_ptr, seq_idx, 4);
+        }
 
         /* ---- per-k_idx paged-KV indirection setup ----
          *
@@ -560,28 +606,28 @@ rocke_kernel_def_t*
         env.v.stride_blk = stride_v_block;
         env.v.stride_pg = stride_v_page;
         /* The K / V closure head_off muls are emitted at the body call site (when the
-         * _paged_row(...) kwargs are evaluated). In the MFMA path q_tile_base is
-         * computed first, so the head_off muls are emitted inside each branch in the
-         * Python evaluation order (q_tile_base, then K head_off, then V head_off). */
+         * _paged_row(...) kwargs are evaluated), so they are emitted inside each
+         * branch in the Python evaluation order. */
 
         if(spec->use_mfma_body)
         {
-            /* P67: MFMA-tiled body.
+            /* P67: MFMA-tiled body (q_tile_base / q_rows_valid / k_tiles from the
+             * prologue above).
              *
-             * q_tile_base = b.mul(q_token, MFMA_ATTN_BLOCK_M)
              * mfma_attention_fwd_inner_body(b, Q=..., K=K_cache, V=V_cache, O=O, ...,
              *     stride_k_token=stride_page, stride_k_head=stride_kv_head,
              *     stride_v_token=stride_v_page, stride_v_head=stride_v_kv_head, ...,
-             *     causal_ctx_offset=causal_ctx,
+             *     causal_ctx_offset=b.const_i32(0) if causal_ctx is not None else None,
              *     k_row_base_fn=_paged_row(stride_block, stride_page, stride_kv_head),
              *     v_row_base_fn=_paged_row(stride_v_block, stride_v_page,
-             *                              stride_v_kv_head), arch=arch) */
+             *                              stride_v_kv_head),
+             *     k_tile_stop=k_tiles, q_rows_valid=q_rows_valid, k_tail_mask=True,
+             *     arch=arch) */
             rocke_mfma_attn_params_t p;
-            rocke_value_t* q_tile_base
-                = rocke_b_mul(b, q_token, rocke_b_const_i32(b, ROCKE_MFMA_ATTN_BLOCK_M));
-
-            /* kwargs left-to-right: k_row_base_fn=_paged_row(stride_block,...) then
+            /* kwargs left-to-right: causal_ctx_offset const, then
+             * k_row_base_fn=_paged_row(stride_block,...) then
              * v_row_base_fn=_paged_row(stride_v_block,...) */
+            rocke_value_t* causal_off = (causal_ctx != NULL) ? rocke_b_const_i32(b, 0) : NULL;
             env.k.head_off = rocke_b_mul(b, kv_head_idx, stride_kv_head);
             env.v.head_off = rocke_b_mul(b, kv_head_idx, stride_v_kv_head);
 
@@ -592,7 +638,7 @@ rocke_kernel_def_t*
             p.O = O;
             p.head_size = head_size;
             p.seqlen_k = seqlen_k;
-            p.q_tile_base = q_tile_base;
+            p.q_tile_base = mfma_q_tile_base;
             p.head_idx = head_idx;
             p.kv_head_idx = kv_head_idx;
             p.q_pos_base = local_q;
@@ -608,11 +654,14 @@ rocke_kernel_def_t*
             p.dtype = s->dtype;
             p.mask_mode = rocke_fpp_attn_mask(s->mask_mode);
             p.sliding_window = s->sliding_window;
-            p.causal_ctx_offset = causal_ctx;
+            p.causal_ctx_offset = causal_off;
             p.k_row_base_fn = rocke_fpp_paged_row_k;
             p.k_row_base_user = &env;
             p.v_row_base_fn = rocke_fpp_paged_row_v;
             p.v_row_base_user = &env;
+            p.k_tile_stop = mfma_k_tiles;
+            p.q_rows_valid = mfma_q_rows_valid;
+            p.k_tail_mask = true;
             p.arch = arch;
 
             rocke_mfma_attention_fwd_inner_body(b, &p);
@@ -686,6 +735,8 @@ rocke_kernel_def_t*
  * ===================================================================== */
 
 /* def fmha_fwd_paged_prefill_grid(spec, *, total_q):
+ *     if spec.use_mfma_body:
+ *         return (total_q // 16 + spec.batch, num_query_heads, 1)
  *     return (total_q, spec.common.shape.num_query_heads, 1) */
 rocke_status_t rocke_fmha_fwd_paged_prefill_grid(const rocke_fmha_fwd_paged_prefill_spec_t* spec,
                                                  int total_q,
@@ -695,7 +746,7 @@ rocke_status_t rocke_fmha_fwd_paged_prefill_grid(const rocke_fmha_fwd_paged_pref
     {
         return ROCKE_ERR_VALUE;
     }
-    out[0] = total_q;
+    out[0] = spec->use_mfma_body ? total_q / 16 + spec->batch : total_q;
     out[1] = spec->common.shape.num_query_heads;
     out[2] = 1;
     return ROCKE_OK;
