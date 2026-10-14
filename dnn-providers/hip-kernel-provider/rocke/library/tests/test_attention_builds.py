@@ -2929,7 +2929,48 @@ class TestAttentionDenseGfx950CodegenKnobs(unittest.TestCase):
         from kernels.common.attention_dense_spec import attention_dense_cache_key
 
         no_manual = dict(pv_sched_fence=False, pv_sched_group_template=False)
+        la = dict(
+            self._GRID,
+            wide_lds_dma=True,
+            lds_dma_manual_wait=True,
+            qk_lookahead=True,
+            block_m=256,
+        )
+        win = dict(lds_read_base=True, wave_group_pingpong=True)
         cases = (
+            (
+                "wide_grid",
+                dict(self._GRID, wide_lds_dma=True),
+                dict(lds_dma_manual_wait=True),
+                ("!alias.scope", True),
+            ),
+            ("wide_grid", dict(self._GRID, wide_lds_dma=True), dict(lds_read_base=True), None),
+            ("wide_grid", dict(self._GRID, wide_lds_dma=True), dict(scalar_uniforms=True), None),
+            (
+                "lookahead",
+                la,
+                dict(permlane32_reduce=True),
+                ("@llvm.amdgcn.permlane32.swap", True),
+            ),
+            ("lookahead", la, dict(qk_lookahead_unroll=2), None),
+            ("lookahead", la, dict(wave_group_pingpong=True), None),
+            ("lookahead", la, dict(bulk_operand_reads=3), None),
+            ("lookahead", la, dict(lds_read_base=True), None),
+            (
+                "lookahead",
+                la,
+                dict(lds_read_base=True, operand_read_ahead=4),
+                ("call void @llvm.amdgcn.sched.barrier(i32 1030)", True),
+            ),
+            ("lookahead", la, dict(win, mfma_windows=4), None),
+            ("lookahead", la, dict(win, mfma_windows=3), None),
+            (
+                "lookahead",
+                la,
+                dict(win, mfma_windows=4, window_priority=1),
+                ("call void @llvm.amdgcn.s.setprio(i16 1)", True),
+            ),
+            ("grid", self._GRID, dict(qk_lookahead=True, **no_manual), None),
             ("grid", self._GRID, dict(lazy_rescale_threshold=4.0), None),
             ("grid", self._GRID, dict(use_exp2_fast=False), None),
             ("grid", self._GRID, dict(exp_per_pv_step=1), None),
