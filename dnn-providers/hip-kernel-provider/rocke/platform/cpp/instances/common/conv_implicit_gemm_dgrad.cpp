@@ -2662,6 +2662,7 @@ static rocke_kernel_def_t*
     a_sync_loader.vector_axis_row = false;
     a_sync_loader.has_inner_dim = false;
     a_sync_loader.inner_dim = 0;
+    a_sync_loader.elem_dtype = NULL; /* F16 default */
 
     rocke_coalesced_tile_loader_t b_sync_loader;
     b_sync_loader.tile_rows = spec->lds_k_outer ? block_k : block_n;
@@ -2673,6 +2674,7 @@ static rocke_kernel_def_t*
     b_sync_loader.vector_axis_row = axis_b_row;
     b_sync_loader.has_inner_dim = false;
     b_sync_loader.inner_dim = 0;
+    b_sync_loader.elem_dtype = NULL; /* F16 default */
 
     // ---- wavelet loaders (pipeline="wavelet" only) ----
     rocke_coalesced_tile_loader_t a_wavelet_loader;

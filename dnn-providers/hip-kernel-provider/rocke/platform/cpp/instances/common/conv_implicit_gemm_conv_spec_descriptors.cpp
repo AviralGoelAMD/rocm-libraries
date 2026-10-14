@@ -1881,9 +1881,29 @@ struct rocke_dynamic_tensor_descriptor*
             trips_k[nt].shift = opts->channel_x.shift;
             trips_k[nt].dim = ctx->p_X;
             nt++;
-            trips_k[nt].mult = opts->channel_c.mult;
-            trips_k[nt].shift = opts->channel_c.shift;
-            trips_k[nt].dim = ctx->p_cpg;
+            if(opts->channel_c_const > 0)
+            {
+                /* Build-time channel run: Python passes ints for (mult, shift,
+                 * dim), which UnmergeMagicDynamic materialises at apply time. */
+                uint64_t c_mult = 0;
+                int c_shift = 0;
+                if(!rocke_calculate_magic_numbers(b, opts->channel_c_const, &c_mult, &c_shift))
+                {
+                    return NULL;
+                }
+                trips_k[nt].mult = NULL;
+                trips_k[nt].shift = NULL;
+                trips_k[nt].dim = NULL;
+                trips_k[nt].mult_c = (int)c_mult;
+                trips_k[nt].shift_c = c_shift;
+                trips_k[nt].dim_c = opts->channel_c_const;
+            }
+            else
+            {
+                trips_k[nt].mult = opts->channel_c.mult;
+                trips_k[nt].shift = opts->channel_c.shift;
+                trips_k[nt].dim = ctx->p_cpg;
+            }
             nt++;
             xforms[n_x] = rocke_unmerge_magic_dynamic(
                 b,
@@ -1905,8 +1925,8 @@ struct rocke_dynamic_tensor_descriptor*
              * stay ints so the multiply is skipped and the constants are
              * emitted where Python emits them. */
             const char* up_grp[2] = {"group", "c_in_group"};
-            rocke_value_t* strides_grp[2] = {ctx->p_cpg, NULL};
-            const int strides_grp_c[2] = {0, 1};
+            rocke_value_t* strides_grp[2] = {opts->channel_c_const > 0 ? NULL : ctx->p_cpg, NULL};
+            const int strides_grp_c[2] = {opts->channel_c_const, 1};
             xforms[n_x] = rocke_embed_dynamic_mixed(
                 b, up_grp, 2, "c", strides_grp, strides_grp_c, NULL, 0, 0, ctx->p_C);
             if(!xforms[n_x])

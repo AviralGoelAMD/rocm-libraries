@@ -372,11 +372,11 @@ rocke_status_t rocke_wgrad_conv_spec_kernel_name(const rocke_implicit_gemm_conv_
     /* acc_epilogue.tag() is always "" in this port (field omitted from struct). */
     const char* parts[5] = {short_buf, t_buf, w_buf, a_buf, pe_buf};
 
-    /* flags: async, kouter, pad{N}, spk/spkauto, twostage, wsr{N}, unroll, pfa,
-     * sk, skpers, skr{reduction} */
+    /* flags: async, kouter, pad{N}, spk/spkauto, gm{N}, twostage, wsr{N}, unroll,
+     * pfa, sk, skpers, skr{reduction} */
     char pad_flag[32] = {0};
-    const char* flag_names[11];
-    int flag_on[11];
+    const char* flag_names[12];
+    int flag_on[12];
     int n_flags = 0;
 
     flag_names[n_flags] = "async";
@@ -410,6 +410,19 @@ rocke_status_t rocke_wgrad_conv_spec_kernel_name(const rocke_implicit_gemm_conv_
     else if(s->split_k == -1)
     {
         flag_names[n_flags] = "spkauto";
+        flag_on[n_flags] = 1;
+        n_flags++;
+    }
+
+    /* gm<N>: the merge degree changes the emitted code but nothing else in the
+     * name reflects it (the problem tag carries the true group count either
+     * way), so a degree sweep would otherwise collide on one symbol. Only
+     * tagged when > 1, so the default keeps its name. Mirrors Python. */
+    char gm_buf[32];
+    if(s->group_merge > 1)
+    {
+        snprintf(gm_buf, sizeof(gm_buf), "gm%d", s->group_merge);
+        flag_names[n_flags] = gm_buf;
         flag_on[n_flags] = 1;
         n_flags++;
     }
@@ -600,6 +613,18 @@ static bool wgrad_group_merge_available(const rocke_implicit_gemm_conv_wgrad_spe
 #undef GM_REJECT
 }
 
+/* Python WgradConvSpec.merged_problem: the problem with Gm groups folded into
+ * one. cpg/kpg derive from groups, so this one substitution widens every
+ * channel run the loaders see. dW and the two-stage workspace do not merge and
+ * keep reading spec->problem. A plain copy at group_merge 1. */
+static rocke_conv_problem_t wgrad_merged_problem(const rocke_implicit_gemm_conv_wgrad_spec_t* s)
+{
+    rocke_conv_problem_t p = s->problem;
+    if(s->group_merge > 1)
+        p.groups = s->problem.groups / s->group_merge;
+    return p;
+}
+
 bool rocke_implicit_gemm_conv_wgrad_is_valid_spec(const rocke_implicit_gemm_conv_wgrad_spec_t* s,
                                                   const char* arch,
                                                   char* reason,
@@ -702,28 +727,21 @@ bool rocke_implicit_gemm_conv_wgrad_is_valid_spec(const rocke_implicit_gemm_conv
     if(!wgrad_streamk_gates(s, arch, reason, reason_cap))
         return false;
 
-    /* C-port-only gates, after every gate Python shares: grouped wgrad
-     * (groups > 1) and group merging are only ported on the stream-K path,
-     * which folds the group into its linear tile index; the grid-per-group
-     * path stays Python-only. This is an intentional divergence -- Python
-     * accepts these specs, the C port rejects them. */
+    /* C-port-only gate, after every gate Python shares: unmerged grouped
+     * wgrad (groups > 1, group_merge == 1) is only ported on the stream-K
+     * path, which folds the group into its linear tile index. The merged
+     * grid-per-group path (group_merge > 1, which wgrad_group_merge_available
+     * confines to depthwise and stream-K rejects) is ported; the unmerged
+     * grid-per-group path stays Python-only. This is an intentional
+     * divergence -- Python accepts those specs, the C port rejects them. */
     const bool sk_on = wgrad_streamk_on(s);
-    if(s->problem.groups != 1 && !sk_on)
+    if(s->problem.groups != 1 && !sk_on && s->group_merge == 1)
     {
         if(reason && reason_cap)
             snprintf(reason,
                      reason_cap,
                      "grouped convolution (groups=%d > 1) is not supported for wgrad",
                      s->problem.groups);
-        return false;
-    }
-    if(s->group_merge != 1 && !sk_on)
-    {
-        if(reason && reason_cap)
-            snprintf(reason,
-                     reason_cap,
-                     "group_merge=%d is not supported for wgrad in the C port",
-                     s->group_merge);
         return false;
     }
     /* Explicit vector widths fit one 16-byte per-lane access (Python:
@@ -1628,6 +1646,156 @@ static void wgrad_a_load_override(rocke_ir_builder_t* b,
 #include "rocke/helper_rocke.helpers.schedule.h"
 
 // ---------------------------------------------------------------------------
+// Group-merge epilogue helpers (Python _gm_coord_splitter, _gm_dw_addr_fn,
+// _grid_mn_runtime)
+// ---------------------------------------------------------------------------
+
+/* Under group merging a tile covers Gm conv groups on each side, so an
+ * accumulator element (m, n) carries an M-side group m / kpg and an N-side
+ * group (n / cpg) % Gm. Only the diagonal -- where the two agree -- is real
+ * work; the rest is the off-diagonal filler the epilogues drop.
+ *
+ * kpg / cpg are compile-time here: wgrad_group_merge_available admits
+ * group_merge > 1 only for depthwise (cpg == kpg == 1), so they are a property
+ * of the compiled kernel. The kpg / cpg > 1 guards are load-bearing: the
+ * builder does no constant folding, so a div or mod by 1 would emit real
+ * instructions. */
+typedef struct WgradGmSplitter
+{
+    int gm;
+    int kpg;
+    int cpg;
+    rocke_value_t* c_gm;
+    rocke_value_t* c_kpg;
+    rocke_value_t* c_cpg;
+    rocke_value_t* c_gm_cpg;
+    rocke_value_t* c_zero;
+} WgradGmSplitter;
+
+/* Python _gm_coord_splitter: the five constants, in Python's order. */
+static WgradGmSplitter
+    wgrad_gm_splitter(rocke_ir_builder_t* b, const rocke_conv_problem_t* p, int gm)
+{
+    WgradGmSplitter s;
+    s.gm = gm;
+    s.kpg = rocke_conv_problem_kpg(p);
+    s.cpg = rocke_conv_problem_cpg(p);
+    s.c_gm = rocke_b_const_i32(b, gm);
+    s.c_kpg = rocke_b_const_i32(b, s.kpg);
+    s.c_cpg = rocke_b_const_i32(b, s.cpg);
+    s.c_gm_cpg = rocke_b_const_i32(b, gm * s.cpg);
+    s.c_zero = rocke_b_const_i32(b, 0);
+    return s;
+}
+
+/* Python split(b_, c_m, c_n) -> (gm_m, km, gm_n, yx, cc): the two group
+ * indices, the row within the group's dW slab, the filter-spatial index and
+ * the channel within the group. */
+static void wgrad_gm_split(rocke_ir_builder_t* b,
+                           const WgradGmSplitter* s,
+                           rocke_value_t* c_m,
+                           rocke_value_t* c_n,
+                           rocke_value_t** gm_m,
+                           rocke_value_t** km,
+                           rocke_value_t** gm_n,
+                           rocke_value_t** yx,
+                           rocke_value_t** cc)
+{
+    *gm_m = s->kpg > 1 ? rocke_b_div(b, c_m, s->c_kpg) : c_m;
+    *km = s->kpg > 1 ? rocke_b_mod(b, c_m, s->c_kpg) : s->c_zero;
+    rocke_value_t* n_grp = s->cpg > 1 ? rocke_b_div(b, c_n, s->c_cpg) : c_n;
+    *gm_n = rocke_b_mod(b, n_grp, s->c_gm);
+    *yx = rocke_b_div(b, c_n, s->c_gm_cpg);
+    *cc = s->cpg > 1 ? rocke_b_mod(b, c_n, s->c_cpg) : s->c_zero;
+}
+
+/* Python _gm_dw_addr_fn closure state. */
+typedef struct WgradGmAddrCtx
+{
+    WgradGmSplitter split;
+    rocke_tensor_descriptor_t* dW_desc;
+    rocke_value_t* gm_group; /* merged group index (block_id_z / ks_count) */
+    rocke_value_t* c_gm;
+    rocke_value_t* c_kpg;
+    rocke_value_t* c_cpg;
+} WgradGmAddrCtx;
+
+/* Python _gm_dw_addr_fn(b, spec, dW_desc, gm_group): the splitter constants,
+ * then its own c_gm / c_kpg / c_cpg. */
+static void wgrad_gm_addr_init(rocke_ir_builder_t* b,
+                               WgradGmAddrCtx* g,
+                               const rocke_implicit_gemm_conv_wgrad_spec_t* spec,
+                               rocke_tensor_descriptor_t* dW_desc,
+                               rocke_value_t* gm_group)
+{
+    const rocke_conv_problem_t* p = &spec->problem;
+    g->split = wgrad_gm_splitter(b, p, spec->group_merge);
+    g->dW_desc = dW_desc;
+    g->gm_group = gm_group;
+    g->c_gm = rocke_b_const_i32(b, spec->group_merge);
+    g->c_kpg = rocke_b_const_i32(b, rocke_conv_problem_kpg(p));
+    g->c_cpg = rocke_b_const_i32(b, rocke_conv_problem_cpg(p));
+}
+
+/* Python dw_addr(b_, m_val, n_val) inside _gm_dw_addr_fn: the accumulator is
+ * indexed by merged coords, dW is not merged, so the address is rebuilt from
+ * true coords while the diagonal test rides in the valid predicate the
+ * epilogue already ANDs into its store guard. */
+static rocke_value_t* wgrad_gm_dw_addr(rocke_ir_builder_t* b,
+                                       rocke_value_t* m_val,
+                                       rocke_value_t* n_val,
+                                       rocke_value_t** out_valid,
+                                       void* user)
+{
+    const WgradGmAddrCtx* g = static_cast<const WgradGmAddrCtx*>(user);
+    const WgradGmSplitter* s = &g->split;
+    rocke_value_t *gm_m, *km, *gm_n, *yx, *cc;
+    wgrad_gm_split(b, s, m_val, n_val, &gm_m, &km, &gm_n, &yx, &cc);
+    /* True conv group, then its row in the global [K, ...] dW slab. */
+    rocke_value_t* g_base = rocke_b_mul(b, g->gm_group, g->c_gm);
+    rocke_value_t* group_true = rocke_b_add(b, g_base, gm_m);
+    rocke_value_t* k_out = group_true;
+    if(s->kpg > 1)
+    {
+        rocke_value_t* k_base = rocke_b_mul(b, group_true, g->c_kpg);
+        k_out = rocke_b_add(b, k_base, km);
+    }
+    rocke_value_t* n_wg = s->cpg > 1 ? rocke_b_mul(b, yx, g->c_cpg) : yx;
+    if(s->cpg > 1)
+        n_wg = rocke_b_add(b, n_wg, cc);
+    const char* names[2] = {"k_out", "n_wg"};
+    rocke_value_t* vals[2] = {k_out, n_wg};
+    rocke_value_t* off = NULL;
+    rocke_value_t* valid = NULL;
+    rocke_transforms_descriptor_offset(b, g->dW_desc, names, vals, 2, &off, &valid);
+    rocke_value_t* x = rocke_b_xor(b, gm_m, gm_n);
+    rocke_value_t* diag = rocke_b_cmp_eq(b, x, s->c_zero);
+    if(out_valid)
+        *out_valid = valid != NULL ? rocke_b_land(b, valid, diag) : diag;
+    return off;
+}
+
+/* Python _grid_mn_runtime: the GEMM extent one tile is bounded by. A merged
+ * tile covers Gm groups per side, so the per-group kernarg extents scale by
+ * the build-time degree; at Gm == 1 the kernargs pass through, no multiply. */
+static void wgrad_grid_mn_runtime(rocke_ir_builder_t* b,
+                                  const rocke_conv_build_ctx_t* ctx,
+                                  const rocke_implicit_gemm_conv_wgrad_spec_t* spec,
+                                  rocke_value_t** out_m,
+                                  rocke_value_t** out_n)
+{
+    if(spec->group_merge <= 1)
+    {
+        *out_m = ctx->p_wg_M;
+        *out_n = ctx->p_wg_N;
+        return;
+    }
+    rocke_value_t* c_gm = rocke_b_const_i32(b, spec->group_merge);
+    *out_m = rocke_b_mul(b, ctx->p_wg_M, c_gm);
+    *out_n = rocke_b_mul(b, ctx->p_wg_N, c_gm);
+}
+
+// ---------------------------------------------------------------------------
 // Two-stage deterministic workspace store epilogue
 // ---------------------------------------------------------------------------
 
@@ -1706,6 +1874,35 @@ static void wgrad_emit_workspace_store_epilogue(rocke_ir_builder_t* b,
     if(slab_idx != NULL)
         slab_off = rocke_b_mul(b, slab_idx, slab_v);
 
+    /* 2b. Merged-path setup (Python: only materialised when Gm > 1, for the
+     *     same SSA-renumbering reason). The scratch does NOT merge -- it keeps
+     *     its true [groups * R, wg_M, wg_N] shape -- so the address is rebuilt
+     *     from true coordinates while the accumulator bounds come from the
+     *     merged dims. */
+    const int gm = spec->group_merge;
+    WgradGmSplitter gm_split;
+    memset(&gm_split, 0, sizeof(gm_split));
+    rocke_value_t* c_gm_v = NULL;
+    rocke_value_t* c_reps_v = NULL;
+    rocke_value_t* bound_m_v = wg_M_v;
+    rocke_value_t* bound_n_v = wg_N_v;
+    if(gm > 1)
+    {
+        if(group_v == NULL)
+        {
+            rocke_i_set_err(b,
+                            ROCKE_ERR_VALUE,
+                            "group_merge > 1 needs the merged group index; "
+                            "the caller must pass gm_group");
+            return;
+        }
+        gm_split = wgrad_gm_splitter(b, &spec->problem, gm);
+        c_gm_v = rocke_b_const_i32(b, gm);
+        if(reps > 1)
+            c_reps_v = rocke_b_const_i32(b, reps);
+        wgrad_grid_mn_runtime(b, ctx, spec, &bound_m_v, &bound_n_v);
+    }
+
     /* 3. Per-warp M/N offsets -- Python: warp_m_off = b.mul(warp_m_idx, ...) */
     rocke_value_t* warp_m_off
         = rocke_b_mul(b, ctx->warp_m_idx, rocke_b_const_i32(b, mfmas_m * spec->warp_tile_m));
@@ -1770,16 +1967,57 @@ static void wgrad_emit_workspace_store_epilogue(rocke_ir_builder_t* b,
 
                 /* OOB guard: scf_if instead of sentinel -- an atomic to a
                  * sentinel offset would compute a real address and fault. */
-                rocke_value_t* m_ok = rocke_b_cmp_lt(b, c_m, wg_M_v);
-                rocke_value_t* n_ok = rocke_b_cmp_lt(b, c_n, wg_N_v);
-                rocke_value_t* in_bounds = rocke_b_land(b, m_ok, n_ok);
+                if(gm == 1)
+                {
+                    rocke_value_t* m_ok = rocke_b_cmp_lt(b, c_m, wg_M_v);
+                    rocke_value_t* n_ok = rocke_b_cmp_lt(b, c_n, wg_N_v);
+                    rocke_value_t* in_bounds = rocke_b_land(b, m_ok, n_ok);
+
+                    rocke_if_t if_op = rocke_b_scf_if(b, in_bounds);
+                    rocke_b_region_enter(b, if_op.then_region);
+                    {
+                        rocke_value_t* ws_off = rocke_b_add(b, rocke_b_mul(b, c_m, wg_N_v), c_n);
+                        if(slab_off != NULL)
+                            ws_off = rocke_b_add(b, slab_off, ws_off);
+                        rocke_b_global_atomic_add(b, ws_ptr, ws_off, val_f32, NULL);
+                    }
+                    rocke_b_region_leave(b);
+                    continue;
+                }
+
+                /* Merged: the tile covers a Gm x Gm block of group pairs and
+                 * only the diagonal is real work. */
+                rocke_value_t *gm_m, *km, *gm_n, *yx, *cc;
+                wgrad_gm_split(b, &gm_split, c_m, c_n, &gm_m, &km, &gm_n, &yx, &cc);
+                rocke_value_t* m_ok = rocke_b_cmp_lt(b, c_m, bound_m_v);
+                rocke_value_t* n_ok = rocke_b_cmp_lt(b, c_n, bound_n_v);
+                rocke_value_t* mn_ok = rocke_b_land(b, m_ok, n_ok);
+                rocke_value_t* x = rocke_b_xor(b, gm_m, gm_n);
+                rocke_value_t* diag = rocke_b_cmp_eq(b, x, gm_split.c_zero);
+                rocke_value_t* in_bounds = rocke_b_land(b, mn_ok, diag);
 
                 rocke_if_t if_op = rocke_b_scf_if(b, in_bounds);
                 rocke_b_region_enter(b, if_op.then_region);
                 {
-                    rocke_value_t* ws_off = rocke_b_add(b, rocke_b_mul(b, c_m, wg_N_v), c_n);
-                    if(slab_off != NULL)
-                        ws_off = rocke_b_add(b, slab_off, ws_off);
+                    /* True conv group, then its (kpg, Z*Y*X*cpg) slab. */
+                    rocke_value_t* g_base = rocke_b_mul(b, group_v, c_gm_v);
+                    rocke_value_t* group_true = rocke_b_add(b, g_base, gm_m);
+                    if(reps > 1)
+                    {
+                        rocke_value_t* g_rep = rocke_b_mul(b, group_true, c_reps_v);
+                        rocke_value_t* z = ctx->wgrad_replica_sel ? ctx->wgrad_replica_sel
+                                                                  : rocke_b_block_id_z(b);
+                        rocke_value_t* rep = rocke_b_mod(b, z, c_reps_v);
+                        group_true = rocke_b_add(b, g_rep, rep);
+                    }
+                    rocke_value_t* n_true
+                        = gm_split.cpg > 1 ? rocke_b_mul(b, yx, ctx->p_cpg) : yx;
+                    if(gm_split.cpg > 1)
+                        n_true = rocke_b_add(b, n_true, cc);
+                    rocke_value_t* slab_base = rocke_b_mul(b, group_true, slab_v);
+                    rocke_value_t* row_off = rocke_b_mul(b, km, wg_N_v);
+                    rocke_value_t* in_slab = rocke_b_add(b, row_off, n_true);
+                    rocke_value_t* ws_off = rocke_b_add(b, slab_base, in_slab);
                     rocke_b_global_atomic_add(b, ws_ptr, ws_off, val_f32, NULL);
                 }
                 rocke_b_region_leave(b);
@@ -1976,7 +2214,8 @@ static void wgrad_emit_split_k_epilogue_f32(rocke_ir_builder_t* b,
 //       .atomic_store(b, accs, dw_ptr=dW, wg_N=wg_N_v, bounds=(wg_M_v, wg_N_v))
 // vec_c uses split_k=1 semantics (same as the non-atomic cshuffle path) because
 // the cshuffle atomic path is not contraindicated by wide store_vec.
-// groups > 1 is not supported for C++ wgrad (rejected by the validator).
+// Grouped specs never reach it: unmerged grid-per-group grouped wgrad is
+// rejected by the validator, and group_merge > 1 requires two-stage split-K.
 // ---------------------------------------------------------------------------
 static void wgrad_emit_split_k_cshuffle_epilogue(rocke_ir_builder_t* b,
                                                  const rocke_conv_build_ctx_t* ctx,
@@ -2145,6 +2384,28 @@ static void wgrad_emit_direct_epilogue(rocke_ir_builder_t* b,
                                         ctx->num_final_accs,
                                         wgrad_dw_addr_pointwise,
                                         (void*)c_N,
+                                        dw_rsrc,
+                                        bound_m,
+                                        bound_n,
+                                        false);
+        }
+        else if(ctx->group_idx != NULL && spec->group_merge > 1)
+        {
+            /* Group-merged: the tile covers Gm groups per side. Rebuild the
+             * true dW address from the merged coords and drop off-diagonal
+             * group pairs; the bounds are what the TILE covers. */
+            WgradGmAddrCtx gm_ctx;
+            rocke_tensor_descriptor_t* dW_desc = wgrad_build_dw_descriptor(b, ctx);
+            wgrad_gm_addr_init(b, &gm_ctx, spec, dW_desc, ctx->group_idx);
+            rocke_value_t* bound_m = NULL;
+            rocke_value_t* bound_n = NULL;
+            wgrad_grid_mn_runtime(b, ctx, spec, &bound_m, &bound_n);
+            rocke_direct_epilogue_store(b,
+                                        &epi,
+                                        ctx->final_accs,
+                                        ctx->num_final_accs,
+                                        wgrad_gm_dw_addr,
+                                        &gm_ctx,
                                         dw_rsrc,
                                         bound_m,
                                         bound_n,
@@ -2496,11 +2757,25 @@ static bool wgrad_build_ctx_init(rocke_conv_build_ctx_t* ctx,
     ctx->c_block_k = rocke_b_const_i32(b, ctx->block_k);
     /* AOT: the reduction extent is the p_wg_K kernarg, not a folded constant. */
     rocke_value_t* c_wg_K = ctx->p_wg_K;
-    /* Grouped (stream-K only in this port): Python
+    /* Grouped: Python
      *   if grouped: c_kpg = p_kpg
-     * The group index itself comes from the stream-K tile decode. */
-    if(spec->problem.groups > 1)
+     *               if group_merge > 1: c_kpg = b.mul(p_kpg, b.const_i32(Gm))
+     * Under merging the load side reads the merged problem, whose dY channel
+     * slab is kpg*Gm wide; the kernargs describe the true problem, so the
+     * build-time Gm scales it in-kernel. The epilogue keeps the true kpg.
+     * Grouped here is groups > 1: Python's `merged.groups > 1 or Gm > 1`
+     * reduces to it because Gm divides groups. Stream-K (group_merge 1 only)
+     * binds the group from its tile decode; grid-per-group binds it below. */
+    const bool grouped = spec->problem.groups > 1;
+    if(grouped)
+    {
         ctx->wgrad_c_kpg = ctx->p_kpg;
+        if(spec->group_merge > 1)
+        {
+            rocke_value_t* c_gm = rocke_b_const_i32(b, spec->group_merge);
+            ctx->wgrad_c_kpg = rocke_b_mul(b, ctx->p_kpg, c_gm);
+        }
+    }
 
     /* Split-K K-slice bounds. The degree is a launch parameter (ks_count),
      * never a compile-time constant, so there is exactly one shape of decode:
@@ -2513,8 +2788,9 @@ static bool wgrad_build_ctx_init(rocke_conv_build_ctx_t* ctx,
      * wg_K. The tail past wg_K reads zero through the descriptor bounds, so
      * the padding contributes nothing -- which is what lets the split and
      * unsplit cases share one computation instead of two branches that have to
-     * be kept in step. Grouped wgrad is rejected by the validator here, so the
-     * group half of the decode is not emitted.
+     * be kept in step. Grouped (grid-per-group, which this port reaches only
+     * under group_merge > 1) shares the z axis with the K-slice:
+     *     group = z / ks_count ;  slice = z % ks_count
      *
      * C leaves argument evaluation order unspecified, so each subexpression is
      * bound to a temp in Python's left-to-right order. */
@@ -2526,6 +2802,11 @@ static bool wgrad_build_ctx_init(rocke_conv_build_ctx_t* ctx,
     if(!wgrad_streamk_on(spec))
     {
         rocke_value_t* z_id = rocke_b_block_id_z(b);
+        if(grouped)
+        {
+            rocke_value_t* g_div = rocke_b_div(b, z_id, ks_count_param);
+            ctx->group_idx = rocke_b_to_sgpr_u32(b, g_div);
+        }
         rocke_value_t* slice_id = rocke_b_mod(b, z_id, ks_count_param);
         rocke_value_t* mul_lo = rocke_b_mul(b, slice_id, ks_param);
         k_lo = rocke_b_to_sgpr_u32(b, mul_lo);
@@ -2694,8 +2975,9 @@ static bool wgrad_build_ctx_init(rocke_conv_build_ctx_t* ctx,
         const int a_cols = ctx->lds_k_outer ? ctx->block_m : ctx->block_k;
         const int b_rows = ctx->lds_k_outer ? ctx->block_k : ctx->block_n;
         const int b_cols = ctx->lds_k_outer ? ctx->block_n : ctx->block_k;
-        const int a_contig = ctx->lds_k_outer ? rocke_conv_problem_kpg(&spec->problem) : 0;
-        const int b_contig = ctx->lds_k_outer ? rocke_conv_problem_cpg(&spec->problem) : 0;
+        const rocke_conv_problem_t p_load = wgrad_merged_problem(spec);
+        const int a_contig = ctx->lds_k_outer ? rocke_conv_problem_kpg(&p_load) : 0;
+        const int b_contig = ctx->lds_k_outer ? rocke_conv_problem_cpg(&p_load) : 0;
         const int max_dwords
             = rocke_archtarget_async_lds_max_dwords(rocke_archtarget_from_gfx(ctx->arch));
         rocke_status_t sa = rocke_async_tile_loader_from_tile(
@@ -2719,9 +3001,11 @@ static bool wgrad_build_ctx_init(rocke_conv_build_ctx_t* ctx,
         /* Every sync path (MFMA and WMMA); the async branch is handled above. */
         {
             /* free-axis width: widest of {8,4,2,1} ({4,2,1} for fp32) dividing
-             * the channel count -- Python _free_axis_vec(kpg/cpg, dtype). */
-            int kpg = rocke_conv_problem_kpg(&spec->problem);
-            int cpg = rocke_conv_problem_cpg(&spec->problem);
+             * the channel run the loader sees -- Python _free_axis_vec(
+             * p_load.kpg/cpg, dtype), the merged problem under group_merge. */
+            const rocke_conv_problem_t p_load = wgrad_merged_problem(spec);
+            int kpg = rocke_conv_problem_kpg(&p_load);
+            int cpg = rocke_conv_problem_cpg(&p_load);
             bool a_fp32 = (spec->dtype_a != NULL && strcmp(spec->dtype_a, "fp32") == 0);
             bool b_fp32 = (spec->dtype_b != NULL && strcmp(spec->dtype_b, "fp32") == 0);
             int cap_a = 1;
@@ -2794,6 +3078,8 @@ static bool wgrad_build_ctx_init(rocke_conv_build_ctx_t* ctx,
         ctx->a_sync_loader.vector_axis_row = axis_a;
         ctx->a_sync_loader.has_inner_dim = false;
         ctx->a_sync_loader.inner_dim = 0;
+        /* Python elem_dtype=ir_dtype_a: a bf16 operand loads and stages bf16. */
+        ctx->a_sync_loader.elem_dtype = rocke_conv_tr_elem_dtype(spec->dtype_a);
 
         ctx->b_sync_loader.tile_rows = spec->lds_k_outer ? ctx->block_k : ctx->block_n;
         ctx->b_sync_loader.tile_cols = spec->lds_k_outer ? ctx->block_n : ctx->block_k;
@@ -2804,6 +3090,7 @@ static bool wgrad_build_ctx_init(rocke_conv_build_ctx_t* ctx,
         ctx->b_sync_loader.vector_axis_row = axis_b;
         ctx->b_sync_loader.has_inner_dim = false;
         ctx->b_sync_loader.inner_dim = 0;
+        ctx->b_sync_loader.elem_dtype = rocke_conv_tr_elem_dtype(spec->dtype_b);
 
         ctx->have_sync_loaders = true;
         ctx->have_async_loaders = false;
@@ -3700,6 +3987,16 @@ rocke_kernel_def_t* rocke_build_implicit_gemm_conv_wgrad(
         x_opts.channel_x.shift = ctx.p_magic_n_X_shift;
         x_opts.channel_c.mult = ctx.p_magic_n_cpg_mult;
         x_opts.channel_c.shift = ctx.p_magic_n_cpg_shift;
+        /* Group-merged: X's channel decode runs over the merged per-group
+         * channel run (cpg*Gm) and the merged group's slab, not the true cpg
+         * the host packed. Merging is depthwise-only, so that run is the
+         * build-time Gm and its magic pair folds in as constants (Python's
+         * x_params override of p_cpg). The epilogue keeps the true cpg. */
+        if(spec->group_merge > 1)
+        {
+            const rocke_conv_problem_t p_load = wgrad_merged_problem(spec);
+            x_opts.channel_c_const = rocke_conv_problem_cpg(&p_load);
+        }
         X_desc = (rocke_tensor_descriptor_t*)rocke_conv_make_a_descriptor_dynamic_opts(
             b, &ctx, /*decompose_m=*/true, &x_opts);
 
@@ -3850,7 +4147,48 @@ rocke_kernel_def_t* rocke_build_implicit_gemm_conv_wgrad(
         dw_addr_ctx.group = NULL;
         dw_addr_ctx.c_kpg = NULL;
 
-        if(spec->epilogue && strcmp(spec->epilogue, "cshuffle") == 0)
+        if(spec->epilogue && strcmp(spec->epilogue, "cshuffle") == 0 && ctx.group_idx != NULL
+           && spec->group_merge > 1)
+        {
+            /* Group-merged (Python _emit_wgrad_cshuffle_epilogue, merged
+             * branch): rebuild the true dW address from merged coords and mask
+             * the off-diagonal group pairs. Safe per element because the store
+             * stays scalar -- cpg == 1 under the group-merge gate, so the
+             * vector width derived below is 1. */
+            WgradGmAddrCtx gm_ctx;
+            rocke_tensor_descriptor_t* dW_desc = wgrad_build_dw_descriptor(b, &ctx);
+            wgrad_gm_addr_init(b, &gm_ctx, spec, dW_desc, ctx.group_idx);
+            /* Grouped: the packed dW inner (store) dim is cpg, so the default
+             * width is default_vector_sizes(cpg, kpg, dtype_d, split_k)[2]. */
+            const char* dtype_d = spec->dtype_d ? spec->dtype_d : "fp16";
+            int vec_c = 1;
+            if(spec->has_vector_size_c)
+                vec_c = spec->vector_size_c;
+            else if(spec->split_k == 1)
+            {
+                const int cpg = rocke_conv_problem_cpg(p);
+                for(vec_c = strcmp(dtype_d, "fp32") == 0 ? 4 : 8; vec_c > 1; vec_c /= 2)
+                    if(cpg % vec_c == 0)
+                        break;
+            }
+            rocke_cshuffle_epilogue_t cepi
+                = rocke_cshuffle_epilogue_from_grid(ctx.atom, &ctx.grid, vec_c);
+            cepi.out_dtype = dtype_d;
+            /* Merged tiles are bounded by what the TILE covers. */
+            rocke_value_t* bound_m = NULL;
+            rocke_value_t* bound_n = NULL;
+            wgrad_grid_mn_runtime(b, &ctx, spec, &bound_m, &bound_n);
+            rocke_cshuffle_epilogue_store(b,
+                                          &cepi,
+                                          post_accs,
+                                          ctx.num_final_accs,
+                                          wgrad_gm_dw_addr,
+                                          &gm_ctx,
+                                          ctx.d_rsrc,
+                                          bound_m,
+                                          bound_n);
+        }
+        else if(spec->epilogue && strcmp(spec->epilogue, "cshuffle") == 0)
         {
             dw_addr_ctx.dW_desc = ctx.is_pointwise ? NULL : wgrad_build_dw_descriptor(b, &ctx);
             /* _emit_wgrad_cshuffle_epilogue: CShuffleEpilogue.from_grid(...).store(...)

@@ -700,8 +700,11 @@ void rocke_cshuffle_epilogue_store(rocke_ir_builder_t* b,
             if(sv == 1)
             {
                 rocke_value_t* vf32 = rocke_b_smem_load_vN_f32(b, c_smem, idx, 2, 1);
-                rocke_b_buffer_store_f32(
-                    b, d_rsrc, safe, rocke_b_const_i32(b, 0), rocke_b_vec_extract(b, vf32, 0));
+                /* Python evaluates const_i32(0) before vec_extract; C leaves
+                 * call-argument order unspecified, so sequence them. */
+                rocke_value_t* c0 = rocke_b_const_i32(b, 0);
+                rocke_value_t* e0 = rocke_b_vec_extract(b, vf32, 0);
+                rocke_b_buffer_store_f32(b, d_rsrc, safe, c0, e0);
             }
             else
             {
@@ -716,8 +719,10 @@ void rocke_cshuffle_epilogue_store(rocke_ir_builder_t* b,
                 /* One element, as Python: a 2-wide load at the last column
                  * reads past the end of the C tile row. */
                 rocke_value_t* vbf = rocke_b_smem_load_vN(b, c_smem, idx, 2, rocke_bf16(), 1);
-                rocke_b_buffer_store_bf16(
-                    b, d_rsrc, safe, rocke_b_const_i32(b, 0), rocke_b_vec_extract(b, vbf, 0));
+                /* Python evaluates const_i32(0) before vec_extract; sequence them. */
+                rocke_value_t* c0 = rocke_b_const_i32(b, 0);
+                rocke_value_t* e0 = rocke_b_vec_extract(b, vbf, 0);
+                rocke_b_buffer_store_bf16(b, d_rsrc, safe, c0, e0);
             }
             else
             {
