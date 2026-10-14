@@ -217,6 +217,9 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # and combine the two halves once before the epilogue, instead of a
     # cross-half exchange per KV tile.
     defer_row_sum: bool = field(default=True, kw_only=True)
+    # Combine the two 32-lane halves of the row max (and, under qk_lookahead,
+    # the row sum) with v_permlane32_swap_b32 instead of a ds_bpermute shuffle.
+    permlane32_reduce: bool = field(default=False, kw_only=True)
     # Grid body only: tag LDS-DMA writes and LDS reads with disjoint alias
     # scopes so the backend's waitcnt pass no longer drains every in-flight
     # K/V DMA (vmcnt(0)) before the first LDS read after it. The body's own
@@ -549,6 +552,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "o_store_width",
             "grid_order",
             "defer_row_sum",
+            "permlane32_reduce",
             "lds_dma_manual_wait",
         )
     }
@@ -1198,12 +1202,22 @@ def build_attention_dense(
                     b.cmp_lt(ktok, b.const_i32(Skv)), s_reg[nsub][i], neg_inf
                 )
 
+    def half_combine(x, op):
+        """op(x, x from lane ^ 32). ``permlane32_reduce``: one VALU
+        v_permlane32_swap_b32 (both halves of the result carry the other half's
+        value) instead of a ds_bpermute round trip through LDS."""
+        if not spec.permlane32_reduce:
+            return op(x, b.warp_shuffle_xor(x, 32))
+        xi = b.bitcast(x, I32)
+        lo, hi = b.permlane32_swap(xi, xi)
+        return op(b.bitcast(lo, F32), b.bitcast(hi, F32))
+
     def softmax_max(s_reg, m_i):
         local_max = neg_inf
         for nsub in range(N_SUB):
             for i in range(16):
                 local_max = b.fmax(local_max, s_reg[nsub][i])
-        tile_max_raw = b.fmax(local_max, b.warp_shuffle_xor(local_max, 32))
+        tile_max_raw = half_combine(local_max, b.fmax)
         # Into the log2 domain the running max, threshold, and sinks use.
         tile_max = b.fmul(tile_max_raw, qk_scale)
         if LAZY_RESCALE:
@@ -1336,7 +1350,7 @@ def build_attention_dense(
         if spec.defer_row_sum:
             l_tile = l_local
         else:
-            l_tile = b.fadd(l_local, b.warp_shuffle_xor(l_local, 32))
+            l_tile = half_combine(l_local, b.fadd)
         return out, p_vals, l_tile
 
     if varlen:
@@ -1411,7 +1425,7 @@ def build_attention_dense(
     if spec.defer_row_sum:
         l0 = l0_local
     else:
-        l0 = b.fadd(l0_local, b.warp_shuffle_xor(l0_local, 32))
+        l0 = half_combine(l0_local, b.fadd)
     if use_sinks:
         # Rescale l_init by alpha0: when m0 > m_init (sink), multiply by alpha0 to change
         # the sink's contribution from exp(sink - m_init) = 1.0 to exp(sink - m0).
@@ -1547,7 +1561,7 @@ def build_attention_dense(
     res = loop.results
     l_i = res[1]
     if spec.defer_row_sum:
-        l_i = b.fadd(l_i, b.warp_shuffle_xor(l_i, 32))
+        l_i = half_combine(l_i, b.fadd)
     o_acc = list(res[2 : 2 + D_TILES])
     p_prev = list(res[2 + D_TILES : 2 + D_TILES + KK_STEPS])
 
