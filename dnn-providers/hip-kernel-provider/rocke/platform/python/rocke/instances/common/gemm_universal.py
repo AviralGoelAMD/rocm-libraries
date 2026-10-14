@@ -196,6 +196,11 @@ class TraitSpec:
     # ordering stays with the explicit ``s_waitcnt`` + barrier at the top of
     # each K-tile. Requires ``dtl_prefetch``; default off (byte-identical).
     dtl_lds_alias: bool = False
+    # DTL prefetch distance in K-tiles. 1 = the ping-pong (2 LDS buffers,
+    # loads one tile ahead). 2 = a 3-buffer LDS ring that keeps two tiles of
+    # async loads in flight and waits with ``vmcnt(loads_per_tile)`` so only
+    # the oldest tile must land before its MFMAs. Requires ``dtl_prefetch``.
+    dtl_prefetch_depth: int = 1
     # compv4 double-buffer (non-DTL) register prefetch: issue the next
     # K-tile's global loads, run the current tile's MFMAs, and only then
     # write the staged registers to the other LDS half. The default emits
@@ -336,6 +341,7 @@ class UniversalGemmSpec(WarpTileBlockSizeMixin):
                 "dtl": tr.direct_to_lds,
                 "pref": tr.dtl_prefetch,
                 "lalias": tr.dtl_lds_alias,
+                f"pd{tr.dtl_prefetch_depth}": tr.dtl_prefetch_depth > 1,
                 "dfst": tr.db_defer_lds_store,
                 "actt": tr.active_tile_skip,
                 f"spk{tr.split_k}": tr.split_k > 1,
@@ -601,7 +607,10 @@ def is_valid_spec(spec: UniversalGemmSpec, arch: str = "gfx950") -> Tuple[bool, 
     # for a single-buffered compv4+cshuffle) and under-reserving. Both
     # sites share :func:`_ab_lds_plan` to stay in lock-step.
     ab_single, _, _ab_dbl = _ab_lds_plan(spec, arch)
-    ab_bytes = ab_single * (2 if _ab_dbl else 1)
+    _nbuf_ab = (spec.trait.dtl_prefetch_depth + 1) if spec.trait.dtl_prefetch else (
+        2 if _ab_dbl else 1
+    )
+    ab_bytes = ab_single * _nbuf_ab
     c_bytes = t.tile_m * t.tile_n * 2 if spec.trait.epilogue == "cshuffle" else 0
     bytes_lds = ab_bytes + c_bytes
     if not target.fits_lds(bytes_lds):
@@ -641,6 +650,10 @@ def is_valid_spec(spec: UniversalGemmSpec, arch: str = "gfx950") -> Tuple[bool, 
         return False, f"split_k > 1 is CDNA-only (got family {family!r} on {arch})"
     if spec.trait.dtl_lds_alias and not spec.trait.dtl_prefetch:
         return False, "dtl_lds_alias requires dtl_prefetch"
+    if spec.trait.dtl_prefetch_depth not in (1, 2):
+        return False, f"dtl_prefetch_depth must be 1 or 2 (got {spec.trait.dtl_prefetch_depth})"
+    if spec.trait.dtl_prefetch_depth > 1 and not spec.trait.dtl_prefetch:
+        return False, "dtl_prefetch_depth > 1 requires dtl_prefetch"
 
     return True, "ok"
 
@@ -1181,7 +1194,7 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
     if _pf_depth > 1 and _unroll_k > 0:
         _nbuf = _pf_depth + 1
     else:
-        _nbuf = 2 if _two_buf else 1
+        _nbuf = (spec.trait.dtl_prefetch_depth + 1) if _prefetch else (2 if _two_buf else 1)
     _A_LDS_M = _nbuf * block_m
     _B_LDS_N = _nbuf * block_n
     # LDS K-padding (non-DTL only): widen each row's stride to break the
@@ -1958,7 +1971,9 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
         do_work_cond = b.cmp_ge(first_token, c0)
 
     def emit_compute_and_epilogue() -> None:
-        if _prefetch:
+        if _prefetch and spec.trait.dtl_prefetch_depth == 2:
+            _emit_kloop_prefetch2()
+        elif _prefetch:
             _emit_kloop_prefetch()
         elif _db:
             _emit_kloop_db()
@@ -2168,6 +2183,63 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
             A_smem, B_smem, for_op.results[1:], lds_parity=final_parity
         )
         _for_results = epi_accs
+
+    def _emit_kloop_prefetch2() -> None:
+        """Depth-2 DTL prefetch: a 3-buffer LDS ring with two tiles in flight.
+
+        Structure (``cur`` = K-tile index mod 3, carried as an iter-arg):
+          prologue: DTL load tile 0 -> buf 0, tile 1 -> buf 1
+          for k in [k_lo, k_hi - block_k) step block_k:
+              s_waitcnt vmcnt(loads_per_tile) lgkmcnt(0) ; barrier
+              DTL load tile k + 2*block_k -> buf (cur + 2) % 3
+              MFMA from buf cur
+          epilogue: s_waitcnt vmcnt(0) ; barrier ; MFMA last tile
+
+        The partial ``vmcnt`` keeps the newest tile's loads in flight (VMEM
+        loads retire in issue order), so each tile's HBM latency overlaps two
+        tiles of MFMAs instead of one. The single barrier covers both hazards:
+        tile k has landed (RAW), and buf (cur + 2) % 3 -- read one iteration
+        ago -- is drained by every wave's ``lgkmcnt(0)`` (WAR). Load offsets
+        past the slice are clamped to its last tile: the duplicate lands in a
+        buffer nothing reads again, and the per-iteration load count (hence
+        the ``vmcnt`` immediate) stays static.
+        """
+        nonlocal _for_results
+        loads_per_tile = _dtl_a_passes + _dtl_b_passes
+        if 2 * loads_per_tile > 63:  # vmcnt is 6 bits on gfx9
+            _emit_kloop_prefetch()
+            return
+        c1_i32 = b.const_i32(1)
+        c2_i32 = b.const_i32(2)
+        c3_i32 = b.const_i32(3)
+        last_k = b.sub(_k_upper, c_block_k)
+
+        def _clamp(k: Value) -> Value:
+            return b.smin(k, last_k)
+
+        emit_load_phase(A_smem, B_smem, k_lo, lds_parity=0)
+        emit_load_phase(A_smem, B_smem, _clamp(b.add(k_lo, c_block_k)), lds_parity=1)
+        loop_args = [("cur", c0)] + list(accs)
+        for_op = b.scf_for_iter(k_lo, last_k, c_block_k, loop_args, iv_name="k0")
+        with for_op as (k0, iter_vars):
+            cur = iter_vars[0]
+            acc_iter = iter_vars[1:]
+            nxt = b.add(cur, c1_i32)
+            nxt = b.select(b.cmp_ge(nxt, c3_i32), c0, nxt)
+            ld = b.add(cur, c2_i32)
+            ld = b.select(b.cmp_ge(ld, c3_i32), b.sub(ld, c3_i32), ld)
+            b.s_waitcnt(vmcnt=loads_per_tile, lgkmcnt=0)
+            b.s_barrier_bare()
+            k_ld = _clamp(b.add(k0, b.mul(c2_i32, c_block_k)))
+            emit_load_phase(A_smem, B_smem, k_ld, lds_parity=ld)
+            new_accs = emit_mfma_phase(A_smem, B_smem, acc_iter, lds_parity=cur)
+            b.scf_yield(nxt, *new_accs)
+        final_cur = for_op.results[0]
+        b.s_waitcnt(vmcnt=0, lgkmcnt=0)
+        b.s_barrier_bare()
+        _for_results = emit_mfma_phase(
+            A_smem, B_smem, for_op.results[1:], lds_parity=final_cur
+        )
 
     _for_results: Sequence[Value] = ()
 
