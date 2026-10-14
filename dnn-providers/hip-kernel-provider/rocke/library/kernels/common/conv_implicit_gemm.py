@@ -246,6 +246,11 @@ class ImplicitGemmConvSpec:
     epilogue: str = "default"
     async_dma: bool = False
     unroll_k: bool = False  # NEW: Clean Python-level K-loop unrolling
+    # Register-staged prefetch on the sync (single LDS buffer) K loop: the
+    # global reads of tile k+1 are issued into VGPRs before the MFMA phase of
+    # tile k and written to LDS after it, so their latency hides behind the
+    # MFMAs instead of stalling every iteration. Sync path only.
+    reg_prefetch: bool = False
     lds_k_pad: Optional[int] = None
     # Per-operand vector widths (elements). ``None`` means auto-select via the
     # shared ``choose_load_vec`` / ``CShuffleEpilogue.from_grid`` heuristics.
@@ -420,6 +425,7 @@ class ImplicitGemmConvSpec:
                 # that would otherwise share the plain kernel's name. Only
                 # tagged when set, so every other kernel keeps its name.
                 "unroll": self.unroll_k,
+                "rpf": self.reg_prefetch,
                 # Gm changes the emitted body, so it must reach the symbol:
                 # without it two degrees collide on one name and the compile
                 # cache hands the second the first's binary.
@@ -461,6 +467,13 @@ class ImplicitGemmConvSpec:
             raise ValueError(
                 "async_dma requires lds_k_pad to be 0/None because "
                 "raw_ptr_buffer_load_lds writes a packed lane-contiguous tile"
+            )
+        if self.reg_prefetch and (
+            self.async_dma or self.unroll_k or self.pipeline == "wavelet"
+        ):
+            raise ValueError(
+                "reg_prefetch is a sync single-buffer K loop; it excludes "
+                "async_dma, unroll_k and the wavelet pipeline"
             )
         if (
             self.acc_epilogue.clamp_min is not None
@@ -2207,6 +2220,41 @@ def _build_implicit_gemm_conv_impl(
 
             b.scf_yield(*accs_b)
 
+        final_accs = for_op.results
+    elif spec.reg_prefetch:
+        # Register-staged prefetch, single LDS buffer. Tile k+1's global reads
+        # are issued before tile k's MFMA phase and land in LDS after it, so
+        # the read latency overlaps the MFMAs. The tile fetched past K_gemm on
+        # the last iteration is bounds-clamped by the buffer resource and is
+        # never consumed.
+        if a_load_override is not None:
+            raise ValueError("reg_prefetch does not support an A load override")
+
+        def fetch_phase(k_off: Value):
+            k_off_capture[0] = k_off
+            fa = a_sync_loader.load_global(
+                b, tid=tid, descriptor=a_descriptor, rsrc=a_rsrc
+            )
+            fb = b_sync_loader.load_global(
+                b, tid=tid, descriptor=b_descriptor, rsrc=b_rsrc
+            )
+            return fa, fb
+
+        def store_phase(fetched) -> None:
+            a_sync_loader.store_lds(b, smem_dst=A_smem, staged=fetched[0])
+            b_sync_loader.store_lds(b, smem_dst=B_smem, staged=fetched[1])
+
+        store_phase(fetch_phase(c0))
+        b.sync()
+        for_op = b.scf_for_iter(c0, c_K_gemm, c_block_k, accs, iv_name="k0")
+        with for_op as (k0, iter_vars):
+            nxt = fetch_phase(b.add(k0, c_block_k))
+            k_off_capture[0] = k0
+            new_accs = emit_mfma_phase(A_smem, B_smem, iter_vars)
+            b.sync()
+            store_phase(nxt)
+            b.sync()
+            b.scf_yield(*new_accs)
         final_accs = for_op.results
     elif not spec.async_dma:
         # mem / compv3 / compv4 / basic: all use scf_for_iter — only bound changes to runtime.

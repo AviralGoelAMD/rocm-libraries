@@ -675,6 +675,12 @@ class DgradConvSpec:
     # byte-identical IR and keeps its kernel name. See
     # ``default_uniform_k_decode`` for the selection policy.
     uniform_k_decode: bool = False
+    # Register-staged prefetch on the plain sync K loop: tile k+1's global
+    # reads are issued into VGPRs before tile k's MFMA phase and written to
+    # the single LDS buffer after it, hiding their latency behind the MFMAs.
+    # Applies to the plain loop and to both loops of ``uniform_k_decode``.
+    # Not with the wavelet pipeline, which has its own K loop.
+    reg_prefetch: bool = False
 
     @property
     def block_size(self) -> int:
@@ -853,6 +859,7 @@ class DgradConvSpec:
                 "spkauto": self.split_k == -1,
                 # A different K-loop body; only tagged when set.
                 "ukd": self.uniform_k_decode,
+                "rpf": self.reg_prefetch,
             },
         )
 
@@ -1028,6 +1035,11 @@ def _uniform_k_decode_conflict(spec: "DgradConvSpec") -> str:
     if spec.uniform_k_decode and spec.pipeline == "wavelet":
         return (
             "uniform_k_decode is not supported with pipeline='wavelet': the "
+            "wavelet load/math split has its own K loop"
+        )
+    if spec.reg_prefetch and spec.pipeline == "wavelet":
+        return (
+            "reg_prefetch is not supported with pipeline='wavelet': the "
             "wavelet load/math split has its own K loop"
         )
     return ""
@@ -2355,9 +2367,19 @@ def _build_tilde_dgrad(
 
         n_acc = len(accs)
         uk_iter = list(accs) + [("uk_k", uk_k0), ("uk_x", uk_x0), ("uk_y", uk_y0)]
-        for_uk = b.scf_for_iter(k_lo, uk_hi, c_block_k, uk_iter, iv_name="k0")
-        with for_uk as (_k0, iter_vars):
-            ko, xd, yd = iter_vars[n_acc:]
+
+        def uk_next(ko: Value, xd: Value, yd: Value) -> Tuple[Value, Value, Value]:
+            # Next tile: k_out wraps into the next filter tap.
+            nk = b.add(ko, c_block_k)
+            wrap_k = b.cmp_ge(nk, c_kd)
+            nk = b.select(wrap_k, c0, nk)
+            nx = b.add(xd, b.select(wrap_k, c1, c0))
+            wrap_x = b.cmp_ge(nx, c_xs)
+            nx = b.select(wrap_x, c0, nx)
+            ny = b.add(yd, b.select(wrap_x, c1, c0))
+            return nk, nx, ny
+
+        def uk_fetch(ko: Value, xd: Value, yd: Value):
             uk_cap[0] = tile_uniforms(ko, xd, yd)
             # Every global read of the tile before the first LDS write. With
             # the address math this short there is nothing left to interleave
@@ -2370,32 +2392,77 @@ def _build_tilde_dgrad(
             b_staged = b_sync_loader.load_global(
                 b, tid=tid, descriptor=w_uk_fn, rsrc=w_rsrc
             )
-            a_sync_loader.store_lds(b, smem_dst=A_smem, staged=a_staged)
-            b_sync_loader.store_lds(b, smem_dst=B_smem, staged=b_staged)
+            return a_staged, b_staged
+
+        if spec.reg_prefetch:
+            # Prologue stages the first tile; each iteration fetches the next
+            # tile into VGPRs ahead of the MFMA phase (see reg_prefetch).
+            emit_store_staged(uk_fetch(uk_k0, uk_x0, uk_y0))
             b.sync()
-            new_accs = emit_mfma_phase(A_smem, B_smem, list(iter_vars[:n_acc]))
-            b.sync()
-            # Next tile: k_out wraps into the next filter tap.
-            nk = b.add(ko, c_block_k)
-            wrap_k = b.cmp_ge(nk, c_kd)
-            nk = b.select(wrap_k, c0, nk)
-            nx = b.add(xd, b.select(wrap_k, c1, c0))
-            wrap_x = b.cmp_ge(nx, c_xs)
-            nx = b.select(wrap_x, c0, nx)
-            ny = b.add(yd, b.select(wrap_x, c1, c0))
+        for_uk = b.scf_for_iter(k_lo, uk_hi, c_block_k, uk_iter, iv_name="k0")
+        with for_uk as (_k0, iter_vars):
+            ko, xd, yd = iter_vars[n_acc:]
+            if spec.reg_prefetch:
+                nk, nx, ny = uk_next(ko, xd, yd)
+                staged = uk_fetch(nk, nx, ny)
+                new_accs = emit_mfma_phase(A_smem, B_smem, list(iter_vars[:n_acc]))
+                b.sync()
+                emit_store_staged(staged)
+                b.sync()
+            else:
+                emit_store_staged(uk_fetch(ko, xd, yd))
+                b.sync()
+                new_accs = emit_mfma_phase(A_smem, B_smem, list(iter_vars[:n_acc]))
+                b.sync()
+                nk, nx, ny = uk_next(ko, xd, yd)
             b.scf_yield(*new_accs, nk, nx, ny)
         uk_accs = list(for_uk.results)[:n_acc]
 
         fb_lo = b.select(uk_ok, k_hi, k_lo)
         fb_iter = [(f"fb_{name}", v) for (name, _), v in zip(accs, uk_accs)]
-        for_fb = b.scf_for_iter(fb_lo, k_hi, c_block_k, fb_iter, iv_name="k1")
-        with for_fb as (k1, iter_vars):
-            emit_load_phase(k1, A_smem, B_smem)
+        return emit_plain_kloop(fb_lo, k_hi, fb_iter, "k1")
+
+    def emit_fetch(k_off: Value):
+        """Global reads of one K tile into VGPRs (the reg_prefetch half of
+        emit_load_phase); emit_store_staged writes them to LDS."""
+        k_off_capture[0] = k_off
+        a_staged = a_sync_loader.load_global(
+            b, tid=tid, descriptor=dy_descriptor, rsrc=dy_rsrc
+        )
+        b_staged = b_sync_loader.load_global(
+            b, tid=tid, descriptor=_b_desc_fn, rsrc=w_rsrc
+        )
+        return a_staged, b_staged
+
+    def emit_store_staged(staged) -> None:
+        a_sync_loader.store_lds(b, smem_dst=A_smem, staged=staged[0])
+        b_sync_loader.store_lds(b, smem_dst=B_smem, staged=staged[1])
+
+    def emit_plain_kloop(lo: Value, hi: Value, iter_accs, iv_name: str) -> List[Value]:
+        if spec.reg_prefetch:
+            # Tile k+1 is read into VGPRs before tile k's MFMA phase and lands
+            # in the single LDS buffer after it. The tile fetched at hi on the
+            # last iteration is bounds-clamped and never consumed.
+            emit_store_staged(emit_fetch(lo))
+            b.sync()
+            for_op = b.scf_for_iter(lo, hi, c_block_k, iter_accs, iv_name=iv_name)
+            with for_op as (kv, iter_vars):
+                staged = emit_fetch(b.add(kv, c_block_k))
+                k_off_capture[0] = kv
+                new_accs = emit_mfma_phase(A_smem, B_smem, iter_vars)
+                b.sync()
+                emit_store_staged(staged)
+                b.sync()
+                b.scf_yield(*new_accs)
+            return list(for_op.results)
+        for_op = b.scf_for_iter(lo, hi, c_block_k, iter_accs, iv_name=iv_name)
+        with for_op as (kv, iter_vars):
+            emit_load_phase(kv, A_smem, B_smem)
             b.sync()
             new_accs = emit_mfma_phase(A_smem, B_smem, iter_vars)
             b.sync()
             b.scf_yield(*new_accs)
-        return list(for_fb.results)
+        return list(for_op.results)
 
     # ---- K loop ----
     if spec.pipeline == "wavelet":
@@ -2440,14 +2507,7 @@ def _build_tilde_dgrad(
     if spec.uniform_k_decode:
         final_accs = _emit_uniform_k_decode_loops()
     else:
-        for_op = b.scf_for_iter(k_lo, k_hi, c_block_k, accs, iv_name="k0")
-        with for_op as (k0, iter_vars):
-            emit_load_phase(k0, A_smem, B_smem)
-            b.sync()
-            new_accs = emit_mfma_phase(A_smem, B_smem, iter_vars)
-            b.sync()
-            b.scf_yield(*new_accs)
-        final_accs = for_op.results
+        final_accs = emit_plain_kloop(k_lo, k_hi, accs, "k0")
 
     # ---- epilogue ----
     # Epilogue dispatch.  Two independent axes:
