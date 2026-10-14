@@ -141,7 +141,7 @@ hard-coded defaults if the model is absent or predicts an invalid config.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Optional, Sequence, Tuple
 
 from rocke.core.arch import ArchTarget
@@ -498,7 +498,7 @@ class ConvGroupedSpec:
     arch: str
     split_k: int = 1  # wgrad only
     lds_k_outer: bool = False  # wgrad only
-    group_merge: int = 1  # wgrad only, depthwise only
+    group_merge: int = 1  # fwd and wgrad, depthwise only
     name: str = "rocke_conv_grouped"
 
     def kernel_name(self) -> str:
@@ -524,7 +524,7 @@ class ConvGroupedSpec:
         #     tile, with a diagonal mask in the epilogue.
         if self.direction in ("wgrad", "dgrad") and self.lds_k_outer:
             parts.append("kouter")
-        if self.direction == "wgrad" and self.group_merge > 1:
+        if self.direction in ("fwd", "wgrad") and self.group_merge > 1:
             parts.append(f"gm{self.group_merge}")
         return kernel_name_join(self.name, *parts)
 
@@ -552,6 +552,7 @@ class ConvGroupedSpec:
             pipeline=self.pipeline,
             epilogue=self.epilogue,
             groups=problem.groups,
+            group_merge=self.group_merge,
         )
 
     def to_wgrad_spec(self, problem: "ConvProblem") -> "WgradConvSpec":
@@ -638,10 +639,14 @@ class ConvGroupedSpec:
 def _fwd_grid(spec: ConvGroupedSpec, req: OperatorRequest) -> Tuple[int, int, int]:
     assert isinstance(req, ConvGroupedRequest)
     p = _problem(req)
+    # Launched over the MERGED dims: under group_merge the tile covers
+    # N_gemm * Gm columns and groups / Gm groups exist (the same computation as
+    # ImplicitGemmConvSpec.grid_N_gemm / grid_groups). Identical at Gm == 1.
+    merge = max(1, int(spec.group_merge))
     gm = (p.M + spec.tile_m - 1) // spec.tile_m
-    gn = (p.N_gemm + spec.tile_n - 1) // spec.tile_n
+    gn = (p.N_gemm * merge + spec.tile_n - 1) // spec.tile_n
     # grid_order "NM": x=n-tiles, y=m-tiles — mirrors the fwd conv manifest
-    return (gn, gm, p.groups)
+    return (gn, gm, p.groups // merge)
 
 
 # ws_bytes is i32 in the kernel ABI, so a two-stage workspace above this would
@@ -817,6 +822,37 @@ def _block(spec: ConvGroupedSpec) -> Tuple[int, int, int]:
 
 
 # ---------------------------------------------------------------------------
+# Forward depthwise group merging: the largest admissible degree up to this
+# cap. Unmerged, a depthwise implicit GEMM has N_gemm = kpg = 1, so a 64-wide
+# tile is 1/64 dense and gridDim.z is one CTA column per group. Merging Gm
+# groups fills Gm tile columns and divides the group axis of the grid by Gm.
+# Past 16 the merged reduction (Y*X*Gm, with a 1/Gm-dense diagonal B tile)
+# grows faster than the density gains, and 32/64 measured no better than 16
+# on any depthwise shape and clearly worse on the 7x7 ones.
+_GFX950_FWD_MAX_GROUP_MERGE = 16
+
+
+def _fwd_merge_degree(req: "ConvGroupedRequest", spec: ImplicitGemmConvSpec) -> int:
+    """``group_merge`` for a gfx950 forward request: the largest degree up to
+    :data:`_GFX950_FWD_MAX_GROUP_MERGE` that the kernel's own gate admits.
+
+    Probes :func:`fwd_group_merge_available` (through the instance validator)
+    rather than re-deriving it, so the choice cannot drift from the gate: it
+    rejects non-depthwise, pointwise, 3-D and non-dividing degrees itself.
+    """
+    p = _problem(req)
+    if p.cpg != 1 or p.kpg != 1 or p.groups <= 1:
+        return 1
+    for gm in sorted(_GROUP_MERGE_DEGREES, reverse=True):
+        if gm > _GFX950_FWD_MAX_GROUP_MERGE:
+            continue
+        ok, _why = _fwd_is_valid_spec(replace(spec, group_merge=gm), arch=req.arch)
+        if ok:
+            return gm
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # gfx950 forward candidate (wave64, MFMA 32×32×16)
 # ---------------------------------------------------------------------------
 
@@ -838,7 +874,7 @@ def _make_gfx950_fwd_candidate() -> KernelCandidate:
             _GFX950_WARP_TILE_K,
         )
 
-    def _build_instance_spec(req: ConvGroupedRequest) -> ImplicitGemmConvSpec:
+    def _build_unmerged_spec(req: ConvGroupedRequest) -> ImplicitGemmConvSpec:
         tm, tn, tk, wm, wn, wtmn, wtk = _tile(req)
         return ImplicitGemmConvSpec(
             problem=_problem(req),
@@ -857,6 +893,14 @@ def _make_gfx950_fwd_candidate() -> KernelCandidate:
             epilogue=_epilogue_for(req),
             groups=int(req.G),
         )
+
+    def _group_merge(req: ConvGroupedRequest) -> int:
+        return _fwd_merge_degree(req, _build_unmerged_spec(req))
+
+    def _build_instance_spec(req: ConvGroupedRequest) -> ImplicitGemmConvSpec:
+        spec = _build_unmerged_spec(req)
+        gm = _fwd_merge_degree(req, spec)
+        return spec if gm == 1 else replace(spec, group_merge=gm)
 
     def support(req: OperatorRequest) -> Tuple[bool, str]:
         errors = _request_errors(req)
@@ -894,6 +938,7 @@ def _make_gfx950_fwd_candidate() -> KernelCandidate:
             epilogue=_epilogue_for(req),
             dtype=req.dtype.lower(),
             arch=req.arch,
+            group_merge=_group_merge(req),
             name=name,
         )
 
