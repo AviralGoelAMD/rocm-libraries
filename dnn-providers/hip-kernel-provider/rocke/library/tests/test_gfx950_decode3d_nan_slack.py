@@ -131,11 +131,12 @@ _KNOBS = [
     ({"seg_major_order": True}, False),
     (_FAST, False),
     ({**_FAST, "seg_major_order": True}, False),
-    ({**_FAST, "transposed_softmax": True, "lds_dma_scopes": True,
-      "scalar_block_ids": True, "kv_split_wait": True}, False),
-    ({**_FAST, "transposed_softmax": True, "decode_lean_mask": True}, False),
+    ({**_FAST, "seg_major_order": True, "transposed_softmax": True,
+      "scalar_block_ids": True, "kv_split_wait": True, "kv_load_aux": 3}, False),
+    ({**_FAST, "transposed_softmax": True, "scalar_block_ids": True}, False),
     (_FAST, True),
-    ({**_FAST, "transposed_softmax": True, "fold_kv_scale": True}, True),
+    ({**_FAST, "seg_major_order": True, "transposed_softmax": True,
+      "scalar_block_ids": True, "fold_kv_scale": True}, True),
 ]
 
 

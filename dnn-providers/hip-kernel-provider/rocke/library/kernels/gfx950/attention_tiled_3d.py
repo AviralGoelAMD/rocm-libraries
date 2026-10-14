@@ -204,12 +204,6 @@ class UnifiedAttention3DTiledSpec:
     # Buffer-load AUX cache-policy bits of the K/V DMAs (0 default, 1 GLC,
     # 2 SLC, 3 GLC|SLC).
     kv_load_aux: int = 0
-    # Tag the K/V LDS DMAs and the kernel's LDS accesses with disjoint alias
-    # scopes. Untagged, the backend must assume every LDS access may alias
-    # every in-flight LDS DMA and drains vmcnt to 0 before the first K read,
-    # so the prefetched tile never overlaps compute. The kernel's explicit
-    # s_waitcnt calls order every DMA-written read.
-    lds_dma_scopes: bool = False
     # kv_prefetch block-table reads as invariant loads, so the uniform address
     # selects a scalar s_load: the ids then never sit in the vmcnt queue ahead
     # of (or behind) the K/V DMAs.
@@ -318,7 +312,6 @@ class UnifiedAttention3DTiledSpec:
             "kvsw" if self.kv_split_wait else "",
             "fks" if self.fold_kv_scale else "",
             f"aux{self.kv_load_aux}" if self.kv_load_aux else "",
-            "lsc" if self.lds_dma_scopes else "",
             "sbt" if self.scalar_block_ids else "",
             "smo" if self.seg_major_order else "",
         )
@@ -450,8 +443,6 @@ def build_unified_attention_3d_tiled(
     if spec.waves_per_eu is not None:
         b.kernel.attrs["waves_per_eu"] = spec.waves_per_eu
     apply_codegen_policy(b.kernel, spec.codegen_policy)
-    if spec.lds_dma_scopes:
-        b.kernel.attrs["lds_dma_alias_scopes"] = True
 
     # ---------------- parameter declarations ----------------
     # NOTE: the AITER 3D signature distinguishes between segm_* workspace
