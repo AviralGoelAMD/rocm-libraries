@@ -974,6 +974,20 @@ def build_unified_attention_3d_tiled(
             b.s_waitcnt(vmcnt=kv_calls_per_tile, lgkmcnt=kv_calls_per_tile)
             b.sync()
 
+        # Keys >= seq_len in the sequence's last tile hold whatever the cache
+        # has in the page slack. Their P is 0, but
+        # 0 * NaN = NaN inside the PV MFMA, so zero those V rows in LDS before
+        # PV. Uniform branch, taken only on the tile that crosses seq_len.
+        with b.scf_if(b.cmp_gt(b.add(tile_off, b.const_i32(T)), seq_len)):
+            v_vecs_per_row = HD // 8
+            for li in range((T * HD // 8) // THREADS):
+                v_vid = b.add(b.const_i32(li * THREADS), tid)
+                v_row = b.div(v_vid, b.const_i32(v_vecs_per_row))
+                v_col = b.mul(b.mod(v_vid, b.const_i32(v_vecs_per_row)), b.const_i32(8))
+                with b.scf_if(b.cmp_ge(b.add(tile_off, v_row), seq_len)):
+                    b.smem_store_vN(V_lds, [cur_buf, v_row, v_col], z8, 8)
+            b.sync_lds_only()
+
         new_acc = []
         for n in range(PV_N_TILES):
             scaled_comps = []
