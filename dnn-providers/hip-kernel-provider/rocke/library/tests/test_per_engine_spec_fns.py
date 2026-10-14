@@ -286,6 +286,8 @@ def _reference_gfx950_generic(problem):
     sched = {
         "use_v_double_buffer": _enable_v_double_buffer(problem),
         "use_sched_barrier": _enable_sched_barrier(problem),
+        "use_f32_denormal_flush": au._enable_f32_denormal_flush(problem),
+        "use_fp_contract": au._enable_fp_contract(problem),
     }
     if _enable_softmax_mfma_interleave(problem):
         sched["use_softmax_mfma_interleave"] = True
@@ -547,6 +549,11 @@ def _reference_generic_3d(problem):
         use_invariant_hoist=_enable_gfx942_3d_invariant_hoist(problem),
         use_wide_kv_load=_enable_gfx942_3d_wide_kv_load(problem),
         use_i64_kv_addr=_enable_i64_kv_addr(problem),
+        **(
+            {"use_f32_denormal_flush": True}
+            if au._enable_f32_denormal_flush(problem)
+            else {}
+        ),
     )
 
 

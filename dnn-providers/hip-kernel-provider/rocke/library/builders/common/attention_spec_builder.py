@@ -297,10 +297,13 @@ def _spec_gfx950_generic(problem: UnifiedAttentionProblem):
     # gfx950 spec class always declares them). v_double_buffer / sched_barrier
     # take the helper's value unconditionally; interleave + k_single_buffer stay
     # value-conditional (only set when their helper fires), matching the guarded
-    # fallthrough byte-for-byte.
+    # fallthrough byte-for-byte. The floating-point policy flags go through the
+    # ``_kau.`` handle so tests can steer them like ``_d256_gfx950_fast``.
     _schedule_fields = {
         "use_v_double_buffer": _enable_v_double_buffer(problem),
         "use_sched_barrier": _enable_sched_barrier(problem),
+        "use_f32_denormal_flush": _kau._enable_f32_denormal_flush(problem),
+        "use_fp_contract": _kau._enable_fp_contract(problem),
     }
     if _enable_softmax_mfma_interleave(problem):
         _schedule_fields["use_softmax_mfma_interleave"] = True
@@ -378,6 +381,13 @@ def _spec_generic_3d(problem: UnifiedAttentionProblem):
     arch = _kau._resolve_attention_arch()
     UnifiedAttention3DTiledSpec, *_ = _tiled_3d_impl(arch)
     tile_size_override = _gfx942_3d_tile_size_override(problem)
+    # The f32 denormal flag is gfx950-only (its predicate hard-gates to gfx950,
+    # and only the gfx950 spec class declares it), so set it value-conditionally.
+    policy_fields = (
+        {"use_f32_denormal_flush": True}
+        if _kau._enable_f32_denormal_flush(problem)
+        else {}
+    )
     return UnifiedAttention3DTiledSpec(
         head_size=problem.head_size,
         block_size=problem.block_size,
@@ -397,6 +407,7 @@ def _spec_generic_3d(problem: UnifiedAttentionProblem):
         use_invariant_hoist=_enable_gfx942_3d_invariant_hoist(problem),
         use_wide_kv_load=_enable_gfx942_3d_wide_kv_load(problem),
         use_i64_kv_addr=_enable_i64_kv_addr(problem),
+        **policy_fields,
     )
 
 

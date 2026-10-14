@@ -43,6 +43,11 @@ from dataclasses import dataclass
 import math
 from typing import Optional, Tuple
 
+from rocke.core.codegen_policy import (
+    CodegenPolicy,
+    F32DenormalMode,
+    apply_codegen_policy,
+)
 from rocke.core.ir import (
     BF16,
     CACHE_STREAM,
@@ -473,8 +478,26 @@ class UnifiedAttention2DTiledSpec:
     # no-SW transposed-32x32 combo (TRANSPOSED_MASK_LIMIT). Default OFF
     # (golden-safe; the single-loop body is byte-identical).
     use_mask_phase_split: bool = False
+    # Backend floating-point policy (rocke.core.codegen_policy). Flushing f32
+    # denormals ("denormal-fp-math-f32"="preserve-sign") lets the AMDGPU backend
+    # lower the precise softmax exp2 to a bare v_exp_f32 without the IEEE
+    # denormal range fix-up; every exp2 argument is x - m <= 0, so the only
+    # values flushed are softmax weights below 2^-126, which are invisible next
+    # to the row's unit maximum term and in the bf16/fp16 P operand.
+    # ``use_fp_contract`` marks fadd/fsub/fmul ``contract`` so the backend may
+    # fuse the softmax scale and rescale chains into FMA (rounding may differ
+    # by one ulp from the unfused form). Both default OFF (golden-safe); the
+    # gfx950 selector turns them on (_enable_f32_denormal_flush /
+    # _enable_fp_contract).
+    use_f32_denormal_flush: bool = False
+    use_fp_contract: bool = False
 
     def __post_init__(self):
+        for knob in ("use_f32_denormal_flush", "use_fp_contract"):
+            if type(getattr(self, knob)) is not bool:
+                raise ValueError(
+                    f"{knob} must be a bool (got {getattr(self, knob)!r})"
+                )
         if self.num_warps not in (1, 2, 4, 8):
             raise ValueError(
                 f"num_warps must be 1, 2, 4, or 8 (got {self.num_warps}). "
@@ -834,6 +857,16 @@ class UnifiedAttention2DTiledSpec:
             return 32
         return max(1, int(math.ceil(math.log2(self.num_seqs + 1))))
 
+    @property
+    def codegen_policy(self) -> CodegenPolicy:
+        """Backend codegen policy selected by the floating-point knobs."""
+        return CodegenPolicy(
+            f32_denormal_mode=(
+                F32DenormalMode.PRESERVE_SIGN if self.use_f32_denormal_flush else None
+            ),
+            fp_contract=self.use_fp_contract,
+        )
+
     def kernel_name(self) -> str:
         from rocke.helpers.spec import kernel_name_join
 
@@ -889,6 +922,8 @@ class UnifiedAttention2DTiledSpec:
             "fp8mfma" if self.use_fp8_mfma_qk else "",
             "fp8pv" if self.use_fp8_mfma_pv else "",
             "regpv" if self.use_register_pv else "",
+            "ftz" if self.use_f32_denormal_flush else "",
+            "fpc" if self.use_fp_contract else "",
         )
 
 
@@ -1186,6 +1221,7 @@ def build_unified_attention_2d_tiled(
         b.kernel.attrs["waves_per_eu"] = spec.waves_per_eu
     if spec.use_agpr_alloc_zero:
         b.kernel.attrs["agpr_alloc"] = (0, 0)
+    apply_codegen_policy(b.kernel, spec.codegen_policy)
 
     # ---------------- parameter declarations ----------------
     output = b.param(

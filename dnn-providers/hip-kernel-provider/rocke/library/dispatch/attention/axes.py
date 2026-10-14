@@ -122,6 +122,14 @@ _3D_AXES: Tuple[KnobAxis, ...] = (
     _flag("use_wide_kv_load"),
 )
 
+# Backend floating-point policy flags (rocke.core.codegen_policy). gfx950 only:
+# the gfx942 spec classes do not declare them. The dispatcher turns them on.
+_GFX950_FP_POLICY_AXES: Tuple[KnobAxis, ...] = (
+    _flag("use_f32_denormal_flush"),
+    _flag("use_fp_contract"),
+)
+_GFX950_3D_AXES: Tuple[KnobAxis, ...] = _3D_AXES + (_flag("use_f32_denormal_flush"),)
+
 # Dense-kernel spec fields the tuning space never varies. Problem fields come
 # from the request; variant fields are fixed by the registered dense candidate
 # (gfx950: the grid or persistent body, and wide DMA under persistent; gfx942
@@ -267,9 +275,9 @@ _GFX942_DENSE_AXES: Tuple[KnobAxis, ...] = (
 
 # Axes cover every tuning field; ones an arch rejects are pruned at once.
 _AXES: Mapping[Tuple[str, str], Tuple[KnobAxis, ...]] = {
-    ("gfx950", "2d"): _GFX950_2D_AXES,
+    ("gfx950", "2d"): _GFX950_2D_AXES + _GFX950_FP_POLICY_AXES,
     ("gfx942", "2d"): _GFX942_2D_AXES,
-    ("gfx950", "3d"): _3D_AXES,
+    ("gfx950", "3d"): _GFX950_3D_AXES,
     ("gfx942", "3d"): _3D_AXES,
     ("gfx950", "dense"): _GFX950_DENSE_AXES,
     ("gfx942", "dense"): _GFX942_DENSE_AXES,

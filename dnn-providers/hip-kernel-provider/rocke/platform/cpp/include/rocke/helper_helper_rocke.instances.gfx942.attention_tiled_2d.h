@@ -178,6 +178,10 @@ typedef struct rocke_attention_tiled_2d_spec
     const char* kv_cache_policy; /* "stream" */
     bool use_global_load_lds_k; /* False */
     bool use_q_major_grid; /* False */
+    /* gfx950 backend floating-point policy (CodegenPolicy f32_denormal_mode /
+     * fp_contract). Rejected on gfx942. */
+    bool use_f32_denormal_flush; /* False */
+    bool use_fp_contract; /* False */
 } rocke_attention_tiled_2d_spec_t;
 
 /* Materialise every defaulted field (the dataclass defaults). The required

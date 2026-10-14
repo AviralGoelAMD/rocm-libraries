@@ -2043,6 +2043,8 @@ read the validator before combining flags. Cohort impact is from §17.4.
 | `use_k_single_buffer` | One `K_lds` slot instead of two, keeping `T=2*block_size` | In the tree but **not the production lever** — it addressed an llvm20 occupancy wall that does not exist on llvm22 (the d128 body is already 213 VGPR / 2 WG/CU) |
 | `use_sched_barrier` | Compile-time `llvm.amdgcn.sched.barrier` fence between the QK MFMA cluster and the post-QK prefetch issue (keeps QK MFMAs packed) | An early llvm20 measurement gave +35–36 % at `num_warps==1` only; **backend-specific and superseded** by `use_softmax_mfma_interleave` on llvm22 — off on every live cohort, kept for the mechanism |
 | `use_agpr_alloc_zero` | Force VGPR-form MFMA | Bit-accurate but **not** the d128 lever on llvm22 (leaves the inter-MFMA gap unchanged); redundant on R4 (already 0 AGPR moves) |
+| `use_f32_denormal_flush` | `CodegenPolicy.f32_denormal_mode=preserve-sign` (§12.1.M): the softmax `exp2` lowers to a bare `v_exp_f32`. Also on the 3D segment + reduce specs | **Selector-driven on gfx950** (`_enable_f32_denormal_flush`) for paged 2D and 3D; off elsewhere |
+| `use_fp_contract` | `CodegenPolicy.fp_contract` (§12.1.M): FMA contraction of the softmax scale / rescale chains | **Selector-driven on gfx950 2D** (`_enable_fp_contract`); not used by 3D decode (memory-bound) |
 
 **Selector-driven (auto-on) attention routing levers.** The single-batch d128
 levers above are *selected automatically* by
@@ -2083,6 +2085,9 @@ selection is a typed per-kernel policy; see
 |---|---|---|
 | `-O3` | ✅ default | LLVM optimization level |
 | `CodegenPolicy(scheduler_strategy=...)` | validate per candidate | Bounded AMDGPU machine-scheduler strategy; sweep the default plus the five supported values |
+| `CodegenPolicy(f32_denormal_mode="preserve-sign")` | ✅ for max-subtracted softmax / exp-heavy kernels | Emits `"denormal-fp-math-f32"="preserve-sign,preserve-sign"`; precise `exp2`/`log2`/`sqrt`/`fdiv` drop their IEEE denormal range fix-up. Prefer it over `exp2_fast`, which is scalar-only and blocks SLP packing of the `s - m` subtract. hipcc path: `-fgpu-flush-denormals-to-zero` |
+| `CodegenPolicy(fp_contract=True)` | ✅ when one-ulp FMA rounding is acceptable | Marks IR `fadd`/`fsub`/`fmul` `contract` so the backend may fuse into `v_fma`/`v_pk_fma` |
+| `-ffp-contract=fast` (COMGR option) | ⚠️ no-op | Ignored for LLVM-IR input; use `CodegenPolicy(fp_contract=True)` |
 | `-DNDEBUG` | ✅ | Disable C++ assertions on device |
 | `-fno-offload-uniform-block` | ✅ | Required for some launch / perf assumptions |
 | `-mllvm -amdgpu-function-calls=false` | ✅ | Force inline |

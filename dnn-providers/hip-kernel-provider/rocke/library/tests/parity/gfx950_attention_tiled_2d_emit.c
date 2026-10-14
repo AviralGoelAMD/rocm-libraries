@@ -914,6 +914,41 @@ static int make_spec(int idx, rocke_attention_tiled_2d_spec_t* s)
         s->tile_size = 64;
         break;
 
+    /* Backend floating-point policy (use_f32_denormal_flush / use_fp_contract)
+     * on the dispatcher's gfx950 D128 GQA-4 paged prefill geometry. 56: both
+     * flags (the shipping spec); 57: fp16 + flush only; 58: contract only.
+     * Kept in lockstep with the Python _CONFIGS. */
+    case 56:
+    case 57:
+    case 58:
+        s->head_size = 128;
+        s->block_size = 16;
+        s->num_query_heads = 32;
+        s->num_kv_heads = 8;
+        s->dtype = (idx == 57) ? "fp16" : "bf16";
+        s->use_sinks = false;
+        s->sliding_window = 0;
+        s->has_softcap = false;
+        s->num_seqs = 1;
+        s->num_warps = 4;
+        s->has_waves_per_eu = true;
+        s->waves_per_eu = 2;
+        s->has_tile_size = true;
+        s->tile_size = 32;
+        s->block_m_per_warp = 32;
+        s->use_mfma_32x32 = true;
+        s->use_transposed_qk_32x32 = true;
+        s->use_transposed_scalar_state = true;
+        s->use_transposed_mask_once = true;
+        s->use_transposed_half_local_pv = true;
+        s->use_mfma32_skip_legacy_qreg = true;
+        s->use_transposed_mask_limit = true;
+        s->use_softmax_mfma_interleave = true;
+        s->softmax_interleave_mode = 1;
+        s->use_f32_denormal_flush = (idx != 58);
+        s->use_fp_contract = (idx != 57);
+        break;
+
     default:
         return -1;
     }
