@@ -1998,6 +1998,13 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
         # numerically identical to the flat-hint emission.
         if _sched_hints and spec.trait.pipeline in ("compv3", "compv4"):
             _emit_hotloop_schedule(b, spec, load_vec)
+        # dtl_lds_alias: ask the scheduler to issue every operand read of
+        # this K-tile before its MFMAs. Without the hint the scheduler splits
+        # the reads of the ring's unrolled loop around the MFMAs, so the
+        # second half's LDS latency is exposed. Pure scheduling hint.
+        if _a_ring is not None:
+            b.sched_group_barrier(0x100, k_atoms * (mfmas_m + mfmas_n), 0)
+            b.sched_group_barrier(0x008, k_atoms * mfmas_m * mfmas_n, 0)
 
         return new_accs
 

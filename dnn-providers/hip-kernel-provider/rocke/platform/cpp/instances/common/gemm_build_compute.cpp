@@ -205,6 +205,13 @@ void rocke_gemm_emit_mfma_phase(rocke_gemm_build_ctx_t* ctx,
     {
         rocke_gemm_emit_hotloop_schedule(b, ctx->spec, ctx->load_vec);
     }
+    /* dtl_lds_alias: issue every operand read of this K-tile before its
+     * MFMAs (DS-read group, then MFMA group). Pure scheduling hint. */
+    if(ctx->lds_alias)
+    {
+        rocke_b_sched_group_barrier(b, 0x100, k_atoms * (mfmas_m + mfmas_n), 0);
+        rocke_b_sched_group_barrier(b, 0x008, k_atoms * mfmas_m * mfmas_n, 0);
+    }
 }
 
 /* ===================================================================== *
