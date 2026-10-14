@@ -215,9 +215,13 @@ def _spec_cdna_decode(req: GemmRequest, name: str) -> UniversalGemmSpec:
 # grids take the 128x128 tile.
 _DTL256_MIN_TILES = 128
 _DTL_CHIPLET_MIN_TILES = 2048
+# At <= one 128x128 tile per CU the kernel is latency-bound; the 3-buffer
+# depth-2 ring keeps two K-tiles of loads in flight. Larger grids keep the
+# 2-buffer ping-pong (the third buffer would cost a resident CTA per CU).
+_DTL128_DEPTH2_MAX_TILES = 256
 
 
-def _dtl_trait(tiles: int) -> TraitSpec:
+def _dtl_trait(tiles: int, depth: int = 1) -> TraitSpec:
     return TraitSpec(
         pipeline="compv4",
         scheduler="intrawave",
@@ -225,6 +229,7 @@ def _dtl_trait(tiles: int) -> TraitSpec:
         direct_to_lds=True,
         dtl_prefetch=True,
         dtl_lds_alias=True,
+        dtl_prefetch_depth=depth,
         lds_swizzle=True,
         chiplet_swizzle=tiles >= _DTL_CHIPLET_MIN_TILES,
     )
@@ -242,11 +247,12 @@ def _spec_cdna4_dtl256(req: GemmRequest, name: str) -> UniversalGemmSpec:
 
 def _spec_cdna4_dtl128(req: GemmRequest, name: str) -> UniversalGemmSpec:
     tiles = (req.M // 128) * (req.N // 128)
+    depth = 2 if tiles <= _DTL128_DEPTH2_MAX_TILES else 1
     return _make_spec(
         name=name,
         arch=req.arch,
         tile=TileSpec(128, 128, 64, 2, 2, 1, 16, 16, 32),
-        trait=_dtl_trait(tiles),
+        trait=_dtl_trait(tiles, depth),
     )
 
 
