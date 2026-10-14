@@ -239,6 +239,105 @@ static int make_spec(int idx, rocke_unified_attention_3d_tiled_spec_t* s)
         s->kv_prefetch = true;
         s->kv_tile_mult = 2;
         break;
+    case 15:
+        /* transposed_softmax only (PV K-step 16) */
+        s->head_size = 128;
+        s->block_size = 16;
+        s->num_query_heads = 32;
+        s->num_kv_heads = 8;
+        s->dtype = "bf16";
+        s->num_segments = 16;
+        s->use_sinks = false;
+        s->sliding_window = 0;
+        s->has_softcap = false;
+        s->transposed_softmax = true;
+        break;
+    case 16:
+        /* transposed_softmax + kv_tile_mult=2 (PV K-step 32) */
+        s->head_size = 128;
+        s->block_size = 16;
+        s->num_query_heads = 32;
+        s->num_kv_heads = 8;
+        s->dtype = "bf16";
+        s->num_segments = 16;
+        s->use_sinks = false;
+        s->sliding_window = 0;
+        s->has_softcap = false;
+        s->transposed_softmax = true;
+        s->kv_tile_mult = 2;
+        break;
+    case 17:
+        /* transposed_softmax + kv_prefetch (no split wait) */
+        s->head_size = 128;
+        s->block_size = 16;
+        s->num_query_heads = 32;
+        s->num_kv_heads = 8;
+        s->dtype = "bf16";
+        s->num_segments = 16;
+        s->use_sinks = false;
+        s->sliding_window = 0;
+        s->has_softcap = false;
+        s->transposed_softmax = true;
+        s->kv_prefetch = true;
+        break;
+    case 18:
+        /* fp16 transposed_softmax, HD128 PV K-step 16 */
+        s->head_size = 128;
+        s->block_size = 16;
+        s->num_query_heads = 32;
+        s->num_kv_heads = 8;
+        s->dtype = "fp16";
+        s->num_segments = 16;
+        s->use_sinks = false;
+        s->sliding_window = 0;
+        s->has_softcap = false;
+        s->transposed_softmax = true;
+        s->kv_prefetch = true;
+        break;
+    case 19:
+        /* sliding window + softcap + sinks + transposed_softmax */
+        s->head_size = 128;
+        s->block_size = 32;
+        s->num_query_heads = 32;
+        s->num_kv_heads = 8;
+        s->dtype = "fp16";
+        s->num_segments = 16;
+        s->use_sinks = true;
+        s->sliding_window = 1024;
+        s->has_softcap = true;
+        s->transposed_softmax = true;
+        s->kv_prefetch = true;
+        break;
+    case 20:
+        /* HD256 BS64 transposed_softmax + kv_prefetch */
+        s->head_size = 256;
+        s->block_size = 64;
+        s->num_query_heads = 32;
+        s->num_kv_heads = 8;
+        s->dtype = "bf16";
+        s->num_segments = 8;
+        s->use_sinks = false;
+        s->sliding_window = 0;
+        s->has_softcap = false;
+        s->transposed_softmax = true;
+        s->kv_prefetch = true;
+        s->decode_fast_path = true;
+        break;
+    case 21:
+        /* kv_tile_mult=4 BS32 HD64 + transposed_softmax */
+        s->head_size = 64;
+        s->block_size = 32;
+        s->num_query_heads = 16;
+        s->num_kv_heads = 4;
+        s->dtype = "bf16";
+        s->num_segments = 16;
+        s->use_sinks = false;
+        s->sliding_window = 0;
+        s->has_softcap = false;
+        s->kv_tile_mult = 4;
+        s->transposed_softmax = true;
+        s->kv_prefetch = true;
+        break;
     default:
         return -1;
     }

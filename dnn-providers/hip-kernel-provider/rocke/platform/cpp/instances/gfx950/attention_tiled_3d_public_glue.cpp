@@ -205,6 +205,7 @@ rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_de
     s.decode_fast_path = false;
     s.kv_tile_mult = 1;
     s.kv_prefetch = false;
+    s.transposed_softmax = false;
     return s;
 }
 
@@ -254,6 +255,11 @@ bool rocke_gfx950_unified_attention_3d_tiled_spec_validate(
         rocke_i_set_err(b,
                         ROCKE_ERR_VALUE,
                         "kv_tile_mult needs block_size*head_size %% 512 == 0 and a tile <= 128");
+        return false;
+    }
+    if(s->transposed_softmax && (s->use_alibi || s->use_qq_bias))
+    {
+        rocke_i_set_err(b, ROCKE_ERR_VALUE, "transposed_softmax does not support ALiBi or QQ bias");
         return false;
     }
     return true;
@@ -340,7 +346,7 @@ static int rocke_attn3d950_kernel_name(const rocke_unified_attention_3d_tiled_sp
     /* kernel_name_join("rocke_uattn3d_tiled", d.., b.., h..kv.., seg.., dtype,
      *   kv<...> if kv_storage_dtype else "", "i64kv", "sinks", "sw<sw>",
      *   "softcap", "alibi", "qqb", "ftz", "stridedkv", "dec", "t<T>" (kv_tile_mult
-     *   > 1), "pf") -- each only when its knob is set.
+     *   > 1), "pf", "tsm") -- each only when its knob is set.
      *
      * Positional parts list (NOT flags=...): empty parts are skipped by
      * kernel_name_join. We materialise each part and feed the non-empty ones in
@@ -424,6 +430,10 @@ static int rocke_attn3d950_kernel_name(const rocke_unified_attention_3d_tiled_sp
     if(s->kv_prefetch)
     {
         parts[np++] = "pf";
+    }
+    if(s->transposed_softmax)
+    {
+        parts[np++] = "tsm";
     }
 
     st = rocke_kernel_name_join("", parts, np, NULL, NULL, 0, buf, cap, &out_len);
@@ -759,6 +769,14 @@ bool rocke_gfx950_attn_tiled_3d_config_from_spec(
     out->PREFETCH = spec->kv_prefetch;
     out->PREFETCH_IDS = spec->kv_prefetch;
     out->FP8_REG_PREFETCH = spec->kv_prefetch && out->KV_FP8;
+    out->TRANS = spec->transposed_softmax;
+    out->NR = out->TRANS ? 1 : 4;
+    if(out->QK_K_ITERS > 8)
+    {
+        rocke_i_set_err(
+            b, ROCKE_ERR_VALUE, "attn_tiled_3d: QK_K_ITERS=%d outside [0,8]", out->QK_K_ITERS);
+        return false;
+    }
 
     /* reduce-kernel-only fields stay 0 for the segment kind. */
     out->HALFS_PER_THREAD = 0;
