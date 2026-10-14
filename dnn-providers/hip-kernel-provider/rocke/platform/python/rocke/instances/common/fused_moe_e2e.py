@@ -110,7 +110,11 @@ from .grouped_gemm import (
     GroupedGemmSpec,
     build_grouped_gemm,
 )
-from .moe_sorting import MoeSortingLauncher, MoeSortingSpec
+from .moe_sorting import (
+    MoeSortingLauncher,
+    MoeSortingSpec,
+    moe_sort_padded_bound_blocks,
+)
 from .moe_gemm_fused import (
     FusedDownReduceGemmSpec,
     FusedGateUpSiluGemmSpec,
@@ -1514,125 +1518,142 @@ class FusedMoeForward:
     # Grouped sorted-token GEMM dispatch (de-padded dynamic path)
     # ------------------------------------------------------------------
 
-    def _dispatch_grouped_gemm(
+    def _forward_dynamic_grouped(
         self,
         *,
-        counts_cpu: Any,
-        offsets_cpu: Any,
-        grouped_input: Any,
-        sorted_token_ids: Any,
-        sorted_weights: Any,
-        y_f32: Any,
+        routing_logits: Any,
+        X: Any,
         W_gate: Any,
         W_up: Any,
         W_down: Any,
         Y: Any,
-        device: Any,
         stream: int,
-    ) -> bool:
-        """De-padded grouped GEMM for the dynamic path.
+    ) -> None:
+        """De-padded grouped GEMM forward, entirely on device.
 
-        Packs the routed tokens into a dense, ``tile_m``-aligned per-expert
-        layout (each expert's ``count[e]`` rows rounded up to ``tile_m``,
-        concatenated) and dispatches the ``grouped=True`` interleaved
-        gate+up+silu and down-reduce kernels over a flat M-block grid. Each
-        M-block looks up its expert from a host-built ``BlockExpertIds``
-        array; total GEMM rows = ``num_m_blocks * tile_m`` (~total routed
-        tokens rounded to ``tile_m``) instead of ``E * MAX_PADDED_M``.
+        The sort lands the routed tokens directly in a dense,
+        ``tile_m``-aligned per-expert layout (each expert's ``count[e]``
+        rows rounded up to ``tile_m``, concatenated): the padded scan
+        (:func:`~.moe_sorting.build_moe_sort_scan_padded`) turns the
+        histogram into tile-aligned offsets plus ``BlockExpertIds`` and
+        marks every unused row with token id ``-1``; the scatter then
+        writes each pair into its packed row. The gather and the
+        ``grouped=True`` gate+up+silu and down-reduce GEMMs run over the
+        routing-independent bound :func:`~.moe_sorting.moe_sort_padded_bound_blocks`
+        of M-blocks; blocks past the used ones carry expert ``-1`` and
+        exit at once. No ``Counts`` / ``Offsets`` host round trip, no
+        stream synchronization and no per-expert host copies.
 
-        Returns True when it handled the forward (the caller returns),
-        False to fall back to the batched padded path (e.g. degenerate
-        empty routing).
+        Rows of a partial block that hold no token keep whatever the
+        gather left there: every GEMM row is independent, and the
+        down-reduce skips rows whose token id is ``-1``.
         """
         import torch
 
-        from ...runtime.launcher import WorkspaceSpec as _WS
-
         s = self.spec
         tile_m = s.gemm_tile.tile_m
-        # Only the M (token) axis is packed here; the N axis (hidden /
-        # intermediate columns) is tiled inside the GEMM kernel's grid, so
-        # tile_n is not needed in this host-side de-padding packer.
-
-        # Per-expert block counts + dense packed block layout.
-        blocks_per_expert = [
-            (int(counts_cpu[e]) + tile_m - 1) // tile_m for e in range(s.experts)
-        ]
-        num_m_blocks = sum(blocks_per_expert)
-        if num_m_blocks == 0:
-            # No tokens routed anywhere; output stays zero.
-            Y.copy_(y_f32.to(Y.dtype))
-            return True
+        device = X.device
+        i32 = torch.int32
+        f32 = torch.float32
+        act = _torch_dtype_for(s.dtype)
+        num_m_blocks = moe_sort_padded_bound_blocks(self._sort_launcher.spec, tile_m)
         total_packed = num_m_blocks * tile_m
-
-        act_dtype = grouped_input.dtype
-        grouped_input_packed = self._pool.get_spec(
-            _WS("GroupedInputPacked", (total_packed, s.hidden), act_dtype, device)
-        )
-        hidden_packed = self._pool.get_spec(
-            _WS("HiddenPacked", (total_packed, s.intermediate), act_dtype, device)
-        )
-        sorted_token_ids_packed = self._pool.get_spec(
-            _WS("SortedTokenIdsPacked", (total_packed,), torch.int32, device)
-        )
-        sorted_weights_packed = self._pool.get_spec(
-            _WS("SortedWeightsPacked", (total_packed,), torch.float32, device)
-        )
-        block_expert_ids = self._pool.get_spec(
-            _WS("BlockExpertIds", (num_m_blocks,), torch.int32, device)
-        )
-
-        # Padded tail rows of partial tiles must read zero A (so their
-        # gate/up GEMM contributes nothing) and carry token id -1 (so the
-        # down-reduce skips their atomic write). ``hidden_packed`` is fully
-        # overwritten by the gate-up kernel, so it needs no pre-zero.
-        grouped_input_packed.zero_()
-        sorted_token_ids_packed.fill_(-1)
-        sorted_weights_packed.zero_()
-
-        # Host-build BlockExpertIds and the dense per-expert copies. The
-        # copies reuse the existing per-expert host loop pattern (one
-        # contiguous slice copy per non-empty expert).
-        block_expert_cpu = torch.empty(num_m_blocks, dtype=torch.int32)
-        blk = 0
-        for e in range(s.experts):
-            be = blocks_per_expert[e]
-            if be == 0:
-                continue
-            block_expert_cpu[blk : blk + be] = e
-            ce = int(counts_cpu[e])
-            uoff = int(offsets_cpu[e])
-            poff = blk * tile_m
-            grouped_input_packed[poff : poff + ce].copy_(
-                grouped_input[uoff : uoff + ce]
+        ws = self._pool.prepare(
+            (
+                WorkspaceSpec("TopkIds", (s.tokens, s.topk), i32, device),
+                WorkspaceSpec("TopkWeights", (s.tokens, s.topk), f32, device),
+                WorkspaceSpec("Hist", (s.experts,), i32, device),
+                WorkspaceSpec("Counter", (s.experts,), i32, device),
+                WorkspaceSpec("Offsets", (s.experts,), i32, device),
+                WorkspaceSpec("Counts", (s.experts,), i32, device),
+                WorkspaceSpec("BlockExpertIds", (num_m_blocks,), i32, device),
+                WorkspaceSpec("SortedTokenIdsPacked", (total_packed,), i32, device),
+                WorkspaceSpec("SortedTopkIdsPacked", (total_packed,), i32, device),
+                WorkspaceSpec("SortedWeightsPacked", (total_packed,), f32, device),
+                WorkspaceSpec(
+                    "GroupedInputPacked", (total_packed, s.hidden), act, device
+                ),
+                WorkspaceSpec("HiddenPacked", (total_packed, s.intermediate), act, device),
+                WorkspaceSpec("Y_f32", (s.tokens, s.hidden), f32, device),
             )
-            sorted_token_ids_packed[poff : poff + ce].copy_(
-                sorted_token_ids[uoff : uoff + ce]
-            )
-            sorted_weights_packed[poff : poff + ce].copy_(
-                sorted_weights[uoff : uoff + ce]
-            )
-            blk += be
-        block_expert_ids.copy_(block_expert_cpu)
-
-        gate_up_launcher = self._grouped_gate_up_silu_launcher()
-        down_launcher = self._grouped_down_reduce_launcher()
-
-        gate_up_grid = moe_gate_up_silu_gemm_grouped_grid(
-            num_m_blocks, s.intermediate, self._grouped_gate_up_spec()
         )
-        down_grid = moe_down_reduce_gemm_grouped_grid(
-            num_m_blocks, s.hidden, self._grouped_down_spec()
-        )
-        gemm_block = (self.spec.to_batched_gemm_spec().block_size, 1, 1)
+        topk_ids = ws["TopkIds"]
+        topk_weights = ws["TopkWeights"]
+        sorted_token_ids = ws["SortedTokenIdsPacked"]
+        sorted_weights = ws["SortedWeightsPacked"]
+        block_expert_ids = ws["BlockExpertIds"]
+        grouped_input = ws["GroupedInputPacked"]
+        hidden = ws["HiddenPacked"]
+        y_f32 = ws["Y_f32"]
 
-        gate_up_callable = make_kernel(
-            gate_up_launcher,
+        # Atomic-add targets: histogram, scatter counter, f32 output.
+        ws["Hist"].zero_()
+        ws["Counter"].zero_()
+        y_f32.zero_()
+
+        router_callable = make_kernel(
+            self._ensure_topk_launcher(),
             {
-                "A": grouped_input_packed,
+                "X": routing_logits,
+                "Y": topk_weights,
+                "Idx": topk_ids,
+                "M": s.tokens,
+                "N": s.experts,
+            },
+            topk_softmax_grid(s.tokens, s.to_topk_softmax_spec()),
+            (s.router_block_size, 1, 1),
+        )
+        sort_callables = self._sort_launcher.make_padded_callables(
+            {
+                "histogram": {
+                    "TopkIds": topk_ids,
+                    "Hist": ws["Hist"],
+                    "num_pairs": s.total_pairs,
+                    "num_experts": s.experts,
+                },
+                "scan": {
+                    "Hist": ws["Hist"],
+                    "Offsets": ws["Offsets"],
+                    "Counts": ws["Counts"],
+                    "BlockExpertIds": block_expert_ids,
+                    "SortedTokenIds": sorted_token_ids,
+                    "num_experts": s.experts,
+                },
+                "scatter": {
+                    "TopkIds": topk_ids,
+                    "TopkWeights": topk_weights,
+                    "Offsets": ws["Offsets"],
+                    "Counter": ws["Counter"],
+                    "SortedTokenIds": sorted_token_ids,
+                    "SortedTopkIds": ws["SortedTopkIdsPacked"],
+                    "SortedWeights": sorted_weights,
+                    "tokens": s.tokens,
+                    "topk": s.topk,
+                    "num_experts": s.experts,
+                },
+            },
+            tile_m,
+        )
+        gather_callable = make_kernel(
+            self._fused_moe_launcher._ensure_launchers()["gather"],
+            {
+                "X": X,
+                "SortedTokenIds": sorted_token_ids,
+                "GroupedInput": grouped_input,
+                "tokens": s.tokens,
+                "hidden": s.hidden,
+            },
+            (total_packed, 1, 1),
+            (s.streaming_block_size, 1, 1),
+        )
+        gemm_block = (s.to_batched_gemm_spec().block_size, 1, 1)
+        gate_up_callable = make_kernel(
+            self._grouped_gate_up_silu_launcher(),
+            {
+                "A": grouped_input,
                 "WGate": W_gate,
                 "WUp": W_up,
-                "Hidden": hidden_packed,
+                "Hidden": hidden,
                 "M": total_packed,
                 "N": s.intermediate,
                 "K": s.hidden,
@@ -1641,16 +1662,18 @@ class FusedMoeForward:
                 "stride_c": 0,  # dense packed Hidden
                 "BlockExpertIds": block_expert_ids,
             },
-            gate_up_grid,
+            moe_gate_up_silu_gemm_grouped_grid(
+                num_m_blocks, s.intermediate, self._grouped_gate_up_spec()
+            ),
             gemm_block,
         )
         down_callable = make_kernel(
-            down_launcher,
+            self._grouped_down_reduce_launcher(),
             {
-                "A": hidden_packed,
+                "A": hidden,
                 "WDown": W_down,
-                "SortedTokenIds": sorted_token_ids_packed,
-                "SortedWeights": sorted_weights_packed,
+                "SortedTokenIds": sorted_token_ids,
+                "SortedWeights": sorted_weights,
                 "Y": y_f32,
                 "M": total_packed,
                 "N": s.hidden,
@@ -1661,16 +1684,20 @@ class FusedMoeForward:
                 "tokens": s.tokens,
                 "BlockExpertIds": block_expert_ids,
             },
-            down_grid,
+            moe_down_reduce_gemm_grouped_grid(
+                num_m_blocks, s.hidden, self._grouped_down_spec()
+            ),
             gemm_block,
         )
         launch_kernel(
             StreamConfig(stream_id=int(stream)),
+            router_callable,
+            *sort_callables,
+            gather_callable,
             gate_up_callable,
             down_callable,
         )
         Y.copy_(y_f32.to(Y.dtype))
-        return True
 
     def _grouped_down_spec(self) -> FusedDownReduceGemmSpec:
         return FusedDownReduceGemmSpec(
@@ -1730,13 +1757,14 @@ class FusedMoeForward:
     ) -> None:
         """Run one fused-MoE forward, in-place into ``Y``.
 
-        Issues 5 streaming-kernel launches plus 3*E grouped-GEMM
-        launches on ``stream``. Includes a small device-to-host copy
-        of ``(experts,)`` i32 ``Counts`` and ``Offsets`` arrays after
-        the sort completes (needed to construct the per-expert GEMM
-        argument lists). Returns after the final cast ``Y_f32 -> Y``;
-        the caller is responsible for any further sync via
-        ``torch.cuda.synchronize()`` if reading ``Y`` on the host.
+        With ``use_grouped_gemm`` (the default) this is
+        :meth:`_forward_dynamic_grouped`, which never leaves the device.
+        Otherwise it runs the uniform per-expert padded path below, which
+        copies the ``(experts,)`` i32 ``Counts`` and ``Offsets`` arrays to
+        the host after the sort to size the batched GEMMs. Returns after
+        the final cast ``Y_f32 -> Y``; the caller is responsible for any
+        further sync via ``torch.cuda.synchronize()`` if reading ``Y`` on
+        the host.
 
         Per-expert offset alignment
         ---------------------------
@@ -1760,6 +1788,17 @@ class FusedMoeForward:
         import torch
 
         self._ensure_compiled()
+        if self.spec.use_grouped_gemm:
+            self._forward_dynamic_grouped(
+                routing_logits=routing_logits,
+                X=X,
+                W_gate=W_gate,
+                W_up=W_up,
+                W_down=W_down,
+                Y=Y,
+                stream=stream,
+            )
+            return
         s = self.spec
         tile_m = self.spec.gemm_tile.tile_m
 
@@ -1782,23 +1821,13 @@ class FusedMoeForward:
         # reduce output). The unpadded GroupedInput is fully overwritten
         # by the gather (every one of the tokens*topk pairs is routed),
         # and GateOut / UpOut / Hidden / DownOut are not read or written
-        # by either dynamic dispatch (the grouped path uses its packed
-        # buffers, the uniform path its padded buffers, both zeroed where
-        # they are allocated), so none of them needs a memset.
+        # by this path (it uses its padded buffers, zeroed where they are
+        # allocated), so none of them needs a memset.
         hist.zero_()
         counter.zero_()
         y_f32.zero_()
 
         topk_launcher = self._ensure_topk_launcher()
-        # The grouped (single-launch-per-expert) GEMM launcher is
-        # warmed up here so the first real forward call doesn't pay
-        # the compile cost. It's referenced only via
-        # ``self._gemm_launcher`` further down (the dynamic path
-        # currently uses the batched single-launch dispatch instead,
-        # but we keep the warm-up so a future toggle back to the
-        # grouped launcher pays no compile penalty mid-loop).
-        if self.spec.use_grouped_gemm:
-            self._ensure_gemm_launcher()
 
         # ---------------- Stage 1 + 2: router + sort ----------------
         # 1 launch (topk-softmax) + 3 launches (sort) chained on ``stream``
@@ -1879,24 +1908,6 @@ class FusedMoeForward:
         counts_cpu = counts.cpu()
         offsets_cpu = offsets.cpu()
         torch.cuda.synchronize()
-
-        if self.spec.use_grouped_gemm:
-            done = self._dispatch_grouped_gemm(
-                counts_cpu=counts_cpu,
-                offsets_cpu=offsets_cpu,
-                grouped_input=grouped_input,
-                sorted_token_ids=sorted_token_ids,
-                sorted_weights=sorted_weights,
-                y_f32=y_f32,
-                W_gate=W_gate,
-                W_up=W_up,
-                W_down=W_down,
-                Y=Y,
-                device=device,
-                stream=stream,
-            )
-            if done:
-                return
 
         # ---------------- Uniform per-expert padded layout ----------------
         # Each expert's GEMM slot has a uniform ``MAX_PADDED_M`` rows

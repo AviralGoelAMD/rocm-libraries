@@ -94,32 +94,32 @@ and `use_experimental_fused_down_reduce` flags, both default `True`).
 **Dynamic path** (`use_grouped_gemm=True`, the default):
 
 ```
-router (topk_softmax)            1 kernel    logits -> topk_ids, topk_weights
-  -> sort (hist + scan + scatter)  3 kernels   bucket tokens by expert
+router (topk_softmax)              1 kernel    logits -> topk_ids, topk_weights
+  -> sort (hist + padded scan + scatter)
+                                   3 kernels   bucket tokens by expert, tile_m-aligned
   -> gather                        1 kernel    pull X rows into bucket order
-                                                — 5 above chained in one launch_kernel —
   -> gate/up+SiLU GEMM (grouped)   1 kernel    silu(gate)⊙up, SiLU in epilogue
   -> down+reduce GEMM (grouped)    1 kernel    Hidden·Wd^T then w-scaled atomic-add into Y
-                                                — 2 above chained in one launch_kernel —
+                                                — all 7 chained in one launch_kernel —
 ```
 
 The two grouped GEMMs are **single-launch** kernels over a flat M-block grid: the
-routed tokens are packed into a dense `tile_m`-aligned per-expert layout
-(`_dispatch_grouped_gemm`) and each M-block looks up its expert from a host-built
-`BlockExpertIds` array. So the total launch count is a constant **7 launches**,
-independent of `E` — not `5 + 3·E`. (A legacy per-expert dispatch through
-`GroupedGemmLauncher` — one HIP launch per expert in a Python loop — still exists
-and is warmed up, but is not on the default path; the dynamic path returns from
-`_dispatch_grouped_gemm` before it is ever invoked.)
+routed tokens land in a dense `tile_m`-aligned per-expert layout and each M-block
+looks up its expert from `BlockExpertIds`. So the total launch count is a constant
+**7 launches**, independent of `E` — not `5 + 3·E`.
 
-**Per-expert dispatch detail.** The de-padding packer needs `(count[e], offsets[e])`,
-which come from the sort scan as device i32 buffers. To pack on the host, the chain
-copies those two `(E,)` arrays back to CPU once after the sort. This small D→H copy
-is the dynamic path's irreducible host stall — and the reason static-offset /
-HIP-graph mode exists (§7). The **static path** eliminates it entirely: it drops
-the histogram + scan kernels and the host roundtrip, running router → scatter →
-gather → gate/up+SiLU → down+reduce as **5 launches** in a single `launch_kernel`
-chain.
+**Per-expert dispatch detail.** The padded scan
+(`build_moe_sort_scan_padded`) rounds each expert's count up to `tile_m`, scans
+those block counts, and writes the tile-aligned `Offsets`, `BlockExpertIds` and a
+`-1` token id for every packed row the scatter will not fill. The scatter then
+writes each pair straight into its packed row. The gather and both GEMMs are
+launched over a routing-independent bound of `T·K/tile_m + min(E, T·K)` M-blocks;
+blocks past the used ones carry expert `-1` and exit at once. Nothing is copied
+back to the host, so the dynamic path has no stream synchronization. (With
+`use_grouped_gemm=False` the uniform padded path still copies `Counts`/`Offsets`
+to the host to size its batched GEMMs.) The **static path** drops the histogram
+and scan kernels as well, running router → scatter → gather → gate/up+SiLU →
+down+reduce as **5 launches** in a single `launch_kernel` chain.
 
 **Activation barrier.** The gate and up GEMMs and the SiLU activation can be
 combined three ways; `tune_gate_up_silu.py` is the harness that compares them:

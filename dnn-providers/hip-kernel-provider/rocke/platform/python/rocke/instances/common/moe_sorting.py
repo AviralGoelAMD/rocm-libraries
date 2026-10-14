@@ -438,6 +438,108 @@ def build_moe_sort_scan(spec: MoeSortingSpec, arch: str = "gfx950") -> KernelDef
 
     return b.kernel
 
+def moe_sort_padded_bound_blocks(spec: MoeSortingSpec, tile_m: int) -> int:
+    """Upper bound on ``sum_e ceil(count[e] / tile_m)`` for any routing.
+
+    Each non-empty expert adds at most one partial block on top of the
+    ``total_pairs / tile_m`` full blocks, and at most
+    ``min(experts, total_pairs)`` experts are non-empty.
+    """
+    return spec.total_pairs // tile_m + min(spec.experts, spec.total_pairs)
+
+
+def build_moe_sort_scan_padded(
+    spec: MoeSortingSpec, tile_m: int, arch: str = "gfx950"
+) -> KernelDef:
+    """Exclusive scan over per-expert counts rounded up to ``tile_m``.
+
+    Builds the tile-aligned packed layout the grouped MoE GEMMs consume
+    entirely on device, so the forward needs no host round trip:
+
+    * ``Counts[e]``  = ``Hist[e]``.
+    * ``Offsets[e]`` = ``tile_m * sum_{j<e} ceil(Hist[j] / tile_m)`` -- the
+      first row of expert ``e``'s run in the packed layout. Feeding these
+      offsets to :func:`build_moe_sort_scatter` writes every pair straight
+      into its packed row.
+    * ``BlockExpertIds[b] = e`` for each of expert ``e``'s
+      ``ceil(Hist[e] / tile_m)`` M-blocks and ``-1`` for every block up to
+      :func:`moe_sort_padded_bound_blocks` past the last used one, so the
+      grouped GEMMs launched over the bound skip the tail.
+    * ``SortedTokenIds[r] = -1`` for every packed row that the scatter
+      does not fill (the partial-block pad of each expert and all tail
+      rows), so the gather and the down-reduce skip them.
+
+    Grid ``(1, 1, 1)``, one lane per expert (``experts <= block_size``).
+    """
+    ok, why = is_valid_spec(spec, arch)
+    if not ok:
+        raise ValueError(f"invalid moe_sorting spec: {why}")
+    if tile_m <= 0:
+        raise ValueError(f"tile_m must be > 0 (got {tile_m})")
+
+    BS = spec.block_size
+    E = spec.experts
+    NB = moe_sort_padded_bound_blocks(spec, tile_m)
+
+    b = IRBuilder(spec.kernel_name(f"scan_pad{tile_m}"))
+    b.kernel.attrs["max_workgroup_size"] = BS
+
+    Hist = b.param("Hist", PtrType(I32, "global"), noalias=True, readonly=True, align=4)
+    Offsets = b.param("Offsets", PtrType(I32, "global"), writeonly=True, align=4)
+    Counts = b.param("Counts", PtrType(I32, "global"), writeonly=True, align=4)
+    BlockExpertIds = b.param(
+        "BlockExpertIds", PtrType(I32, "global"), writeonly=True, align=4
+    )
+    SortedTokenIds = b.param(
+        "SortedTokenIds", PtrType(I32, "global"), writeonly=True, align=4
+    )
+    _ = b.param("num_experts", I32)  # noqa: F841 - ABI symmetry with scan
+
+    tid = b.thread_id_x()
+    c0 = b.const_i32(0)
+    c1 = b.const_i32(1)
+    c_neg1 = b.const_i32(-1)
+    c_tm = b.const_i32(tile_m)
+    c_bs = b.const_i32(BS)
+    in_bounds = b.cmp_lt(tid, b.const_i32(E))
+    safe_e = b.select(in_bounds, tid, c0)
+
+    # Slot E holds the total number of used blocks after the scan.
+    lds = b.smem_alloc(I32, [E + 1], name_hint="lds_scan_pad")
+    v = b.select(in_bounds, b.global_load_i32(Hist, safe_e), c0)
+    nblk = b.div(b.add(v, b.const_i32(tile_m - 1)), c_tm)
+    with b.scf_if(in_bounds):
+        b.global_store(Counts, tid, v, align=4)
+        b.smem_store_vN(lds, [tid], nblk, 1)
+    b.sync()
+
+    block_exclusive_scan_i32(b, lds, tid=tid, block_size=BS, length=E)
+
+    boff = b.vec_extract(b.smem_load_vN(lds, safe_e, dtype=I32, n=1), 0)
+    with b.scf_if(b.cmp_eq(tid, b.const_i32(E - 1))):
+        b.smem_store_vN(lds, [b.const_i32(E)], b.add(boff, nblk), 1)
+    b.sync()
+    used = b.vec_extract(b.smem_load_vN(lds, b.const_i32(E), dtype=I32, n=1), 0)
+
+    with b.scf_if(in_bounds):
+        row0 = b.mul(boff, c_tm)
+        b.global_store(Offsets, tid, row0, align=4)
+        with b.scf_for(c0, nblk, c1, iv_name="blk") as j:
+            b.global_store(BlockExpertIds, b.add(boff, j), tid, align=4)
+        pad_end = b.add(row0, b.mul(nblk, c_tm))
+        with b.scf_for(b.add(row0, v), pad_end, c1, iv_name="prow") as r:
+            b.global_store(SortedTokenIds, r, c_neg1, align=4)
+
+    # Tail past the last used block, up to the launch bound.
+    with b.scf_for(b.add(used, tid), b.const_i32(NB), c_bs, iv_name="tblk") as i:
+        b.global_store(BlockExpertIds, i, c_neg1, align=4)
+    tail_row0 = b.add(b.mul(used, c_tm), tid)
+    with b.scf_for(tail_row0, b.const_i32(NB * tile_m), c_bs, iv_name="trow") as r:
+        b.global_store(SortedTokenIds, r, c_neg1, align=4)
+
+    return b.kernel
+
+
 
 # ---------------------------------------------------------------------
 # Kernel 3: scatter
@@ -577,6 +679,19 @@ def moe_sort_scan_signature(spec: MoeSortingSpec):
         .ptr("Hist", "i32")
         .ptr("Offsets", "i32")
         .ptr("Counts", "i32")
+        .scalar("num_experts", "i32")
+        .build()
+    )
+
+
+def moe_sort_scan_padded_signature(spec: MoeSortingSpec):
+    return (
+        SignatureBuilder()
+        .ptr("Hist", "i32")
+        .ptr("Offsets", "i32")
+        .ptr("Counts", "i32")
+        .ptr("BlockExpertIds", "i32")
+        .ptr("SortedTokenIds", "i32")
         .scalar("num_experts", "i32")
         .build()
     )
@@ -838,6 +953,7 @@ class MoeSortingLauncher:
     def __post_init__(self) -> None:
         object.__setattr__(self, "_launchers", None)
         object.__setattr__(self, "_persistent", None)
+        object.__setattr__(self, "_scan_padded", {})
 
     def _stages(
         self,
@@ -922,6 +1038,68 @@ class MoeSortingLauncher:
             ),
             make_kernel(
                 launchers["scan"],
+                values["scan"],
+                moe_sort_scan_grid(s),
+                block,
+            ),
+            make_kernel(
+                launchers["scatter"],
+                values["scatter"],
+                moe_sort_scatter_grid(s),
+                block,
+            ),
+        ]
+
+    def _ensure_scan_padded(self, tile_m: int) -> Any:
+        cached = self._scan_padded.get(tile_m)  # type: ignore[attr-defined]
+        if cached is not None:
+            return cached
+        from ...helpers.compile import compile_kernel
+        from ...runtime.launcher import KernelLauncher
+
+        arch = _resolve_launch_arch(self.arch)
+        s = self.spec
+        phase = f"scan_pad{tile_m}"
+        artifact = compile_kernel(
+            build_moe_sort_scan_padded(s, tile_m, arch), arch=arch, capture_ir_text=False
+        )
+        launcher = KernelLauncher(
+            hsaco=artifact.hsaco,
+            kernel_name=artifact.kernel_name,
+            signature=moe_sort_scan_padded_signature(s),
+            cache_key=("moe_sorting", phase, s.kernel_name(phase)),
+        )
+        self._scan_padded[tile_m] = launcher  # type: ignore[attr-defined]
+        return launcher
+
+    def make_padded_callables(
+        self,
+        values: Mapping[str, Mapping[str, Any]],
+        tile_m: int,
+    ) -> List[Callable[[Any], None]]:
+        """Histogram -> padded scan -> scatter closures.
+
+        Same chain as :meth:`make_callables`, but the scan is
+        :func:`build_moe_sort_scan_padded`: the scatter lands every pair in
+        the ``tile_m``-aligned packed layout and ``values["scan"]`` must
+        also carry ``BlockExpertIds`` (bound
+        :func:`moe_sort_padded_bound_blocks`) and the packed
+        ``SortedTokenIds`` (bound ``* tile_m`` rows).
+        """
+        from ...runtime.launcher import make_kernel
+
+        s = self.spec
+        block = (s.block_size, 1, 1)
+        launchers = self._ensure_launchers()
+        return [
+            make_kernel(
+                launchers["histogram"],
+                values["histogram"],
+                moe_sort_histogram_grid(s),
+                block,
+            ),
+            make_kernel(
+                self._ensure_scan_padded(tile_m),
                 values["scan"],
                 moe_sort_scan_grid(s),
                 block,
@@ -1029,13 +1207,16 @@ __all__ = [
     "build_moe_sort_histogram",
     "build_moe_sort_persistent",
     "build_moe_sort_scan",
+    "build_moe_sort_scan_padded",
     "build_moe_sort_scatter",
     "is_valid_spec",
     "lds_zero_i32",
     "moe_sort_histogram_grid",
+    "moe_sort_padded_bound_blocks",
     "moe_sort_histogram_signature",
     "moe_sort_scan_grid",
     "moe_sort_scan_signature",
+    "moe_sort_scan_padded_signature",
     "moe_sort_scatter_grid",
     "moe_sort_scatter_signature",
     "moe_sort_persistent_grid",
