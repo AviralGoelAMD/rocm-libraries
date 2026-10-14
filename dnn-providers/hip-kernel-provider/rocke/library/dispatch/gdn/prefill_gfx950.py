@@ -116,6 +116,14 @@ def _scan_tile(req: GdnPrefillRequest, value_splits: int) -> KdaTileSpec:
 def _scan_spec(req: OperatorRequest) -> KdaChunkScanSpec:
     assert isinstance(req, GdnPrefillRequest)
     value_splits = value_splits_for(req.batch_heads)
+    # Double-buffered per-chunk tile staging. Prefetch doubles the staged tiles,
+    # halving resident workgroups per CU, so it only pays where the scan cannot
+    # already hide its HBM latency behind a second resident workgroup. That is
+    # the ``value_splits=8`` band: ``BH <= 64`` caps demand at
+    # ``BH * 8 / num_CUs <= 2`` workgroups per CU, which the prefetch footprint
+    # still supplies. Outside the band the flag is illegal, not merely slower: at
+    # vs=2/vs=1 the wider state slice pushes prefetch LDS over the
+    # min_occupancy=2 budget and ``is_valid_scan_spec`` rejects it.
     return KdaChunkScanSpec(
         head_k=int(req.head_k_dim),
         head_v=int(req.head_v_dim),
@@ -125,6 +133,7 @@ def _scan_spec(req: OperatorRequest) -> KdaChunkScanSpec:
         token_major_io=True,
         has_initial_state=bool(req.has_initial_state),
         store_final_state=bool(req.store_final_state),
+        prefetch_tiles=value_splits == 8,
     )
 
 

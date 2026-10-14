@@ -138,6 +138,56 @@ def test_value_splits_bands():
     assert value_splits_for(4096) == 1
 
 
+@pytest.mark.parametrize(
+    "num_v_heads,batch_heads,value_splits,prefetch",
+    [
+        (1, 8, 8, True),  # TP=4 production shard: BH=8, 0.25 waves/CU
+        (2, 16, 8, True),
+        (4, 32, 8, True),
+        (8, 64, 8, True),  # band edge: BH*8/256 == 2 WGs/CU exactly
+        (16, 128, 2, False),
+        (32, 256, 1, False),
+    ],
+)
+def test_scan_prefetch_follows_the_vs8_band(
+    num_v_heads, batch_heads, value_splits, prefetch
+):
+    """Tile prefetch is selected exactly where it is both legal and a win.
+
+    It doubles the staged tiles, so it only pays where the scan cannot already
+    hide HBM latency behind a second resident workgroup -- the ``vs=8`` band,
+    where ``BH <= 64`` caps demand at 2 WGs/CU. Outside it the doubled footprint
+    is rejected outright by the LDS budget, so this is a legality gate as much
+    as a tuning one.
+    """
+    spec = dispatch_gdn_prefill(
+        _req(num_k_heads=1, num_v_heads=num_v_heads, algorithm="chunk_scan")
+    ).spec
+    assert spec.value_splits == value_splits
+    assert spec.prefetch_tiles is prefetch
+    # The flag must reach the cache key, or a prefetch build could be served
+    # from a non-prefetch entry (and the reverse).
+    assert spec.kernel_name().endswith("_pf") is prefetch
+
+
+def test_dispatched_scan_is_always_lds_legal():
+    """The prefetch gate must never hand the builder a spec it will reject."""
+    from kernels.gfx950.kda_chunkwise import is_valid_scan_spec
+
+    for num_v_heads in (1, 2, 4, 8, 16, 32, 128):
+        for has_initial_state in (False, True):
+            spec = dispatch_gdn_prefill(
+                _req(
+                    num_k_heads=1,
+                    num_v_heads=num_v_heads,
+                    algorithm="chunk_scan",
+                    has_initial_state=has_initial_state,
+                )
+            ).spec
+            ok, why = is_valid_scan_spec(spec, arch=ARCH)
+            assert ok, f"BH={8 * num_v_heads} vs={spec.value_splits}: {why}"
+
+
 def test_auto_has_no_fused_default():
     with pytest.raises(ValueError, match="no fused default"):
         dispatch_gdn_prefill(_req())  # algorithm/spec_id both "auto"
