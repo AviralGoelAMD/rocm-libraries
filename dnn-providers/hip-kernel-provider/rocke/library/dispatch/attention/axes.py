@@ -349,6 +349,16 @@ _R4_HLPV = {
 _VDBUF = {"use_v_double_buffer": True}
 _VDBUF_STGW = {**_VDBUF, "use_staggered_iter_wait": True}
 _PROD_SCHED_BARRIER_MASKS = (0x0, 0x008, 0x108)
+# The gfx950 paged decode config (kernels.common.attention_unified.
+# _gfx950_decode_3d_knobs) with the f32 flush the dispatcher also sets.
+_GFX950_DECODE_3D = {
+    "decode_fast_path": True,
+    "seg_major_order": True,
+    "kv_prefetch": True,
+    "scalar_block_ids": True,
+    "transposed_softmax": True,
+    "use_f32_denormal_flush": True,
+}
 
 _PRODUCTION_STACKS: Mapping[Tuple[str, str], Tuple[Tuple[str, Mapping], ...]] = {
     ("gfx950", "narrow"): (
@@ -453,7 +463,13 @@ _PRODUCTION_STACKS: Mapping[Tuple[str, str], Tuple[Tuple[str, Mapping], ...]] = 
         ("widekv", {"use_wide_kv_load": True}),
         ("hoist_widekv", {"use_invariant_hoist": True, "use_wide_kv_load": True}),
     ),
-    ("gfx950", "splitkv"): (("baseline", {}),),
+    ("gfx950", "splitkv"): (
+        ("baseline", {}),
+        # The paged decode config the dispatcher selects (_gfx950_decode_3d_knobs).
+        ("decode", _GFX950_DECODE_3D),
+        ("decode_bf16kv", {**_GFX950_DECODE_3D, "kv_split_wait": True, "kv_load_aux": 3}),
+        ("decode_fp8kv", {**_GFX950_DECODE_3D, "fold_kv_scale": True}),
+    ),
 }
 # Production micro-axes layered on some stacks: padded K for the single-K
 # unaliased-Q stack, the sched_group_barrier interleave on three transposed

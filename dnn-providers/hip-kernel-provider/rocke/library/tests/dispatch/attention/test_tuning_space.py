@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import unittest
+from unittest import mock
 from dataclasses import replace
 from itertools import islice
 
@@ -162,6 +163,33 @@ class TestTuningSpace(unittest.TestCase):
         self.assertLess(len(full), 256)
         self.assertEqual(len(specs), len(full))
         self.assertEqual({s.tuning_id for s in specs}, {s.tuning_id for s in full})
+
+    def test_gfx950_decode_stacks_reach_the_dispatcher_config(self):
+        """The splitkv production stacks contain the paged decode config the
+        dispatcher selects, and the explicit spec builder maps the 2x tile to
+        the two-page KV tile."""
+        from kernels.common import attention_unified as au
+
+        candidate, req, specs = _specs_for(
+            "attention_gfx950_u3d_splitkv_seg32_t2xb",
+            10_000,
+            batch=4,
+            seqlen_q=1,
+            seqlen_k=32768,
+        )
+        problem = _problem_of(req)
+        with mock.patch.object(au, "_resolve_attention_arch", return_value="gfx950"):
+            want = au._gfx950_decode_3d_knobs(problem)
+        self.assertTrue(want)
+        hits = [
+            s.kernel_spec
+            for s in specs
+            if all(getattr(s.kernel_spec, k) == v for k, v in want.items())
+            and s.kernel_spec.use_f32_denormal_flush
+        ]
+        self.assertTrue(hits)
+        self.assertTrue(all(k.kv_tile_mult == 2 for k in hits))
+        self.assertTrue(all(k.num_segments == 32 for k in hits))
 
     def test_decode_fast_path_rejects_prefill(self):
         from dispatch.attention.tuning_specs import (

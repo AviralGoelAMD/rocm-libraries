@@ -77,7 +77,12 @@ def test_gfx950_3d_spec_turns_flush_on_only(arch):
     with arch("gfx950"):
         spec = sb._tiled_3d_spec_from_problem(_decode_problem())
     assert spec.use_f32_denormal_flush
-    assert spec.kernel_name().endswith("_ftz")
+    assert "_ftz" in spec.kernel_name()
+    # Outside the paged decode cohort the flush tag ends the name.
+    with arch("gfx950"):
+        prefill = sb._tiled_3d_spec_from_problem(_problem())
+    assert prefill.use_f32_denormal_flush
+    assert prefill.kernel_name().endswith("_ftz")
 
 
 @pytest.mark.parametrize("name", ["gfx942", "gfx1201"])

@@ -1059,6 +1059,95 @@ rocke_attention_tiled_2d_spec_t
     return s;
 }
 
+/* ----------------------------------------- gfx950 paged decode 3D config */
+
+/* Python: _next_power_of_2(x) = 1 if x <= 1 else 1 << (x - 1).bit_length(). */
+static int attn_next_pow2(int x)
+{
+    int p = 1;
+    while(p < x)
+        p <<= 1;
+    return p;
+}
+
+/* Python: _gfx950_decode_3d_cohort(problem); ``arch`` is the running box. */
+static bool gfx950_decode_3d_cohort(const rocke_unified_attn_problem_t* p, const char* arch)
+{
+    if(p->clamp_arch != NULL && strcmp(p->clamp_arch, "gfx950") != 0)
+        return false;
+    if(p->max_seqlen_q != 1 || p->dtype == NULL || strcmp(p->dtype, "bf16") != 0)
+        return false;
+    if(p->q_dtype != NULL && strcmp(p->q_dtype, "bf16") != 0)
+        return false;
+    if(p->fp8_fnuz || p->head_size != 128 || p->block_size != 16 || p->num_kv_heads <= 0)
+        return false;
+    if(p->num_query_heads % p->num_kv_heads != 0)
+        return false;
+    {
+        int nq = p->num_query_heads / p->num_kv_heads;
+        if(nq != 4 && nq != 8)
+            return false;
+    }
+    if(p->sliding_window != 0 || p->use_sinks || p->softcap != 0 || p->use_alibi
+       || p->use_qq_bias)
+        return false;
+    return arch != NULL && strcmp(arch, "gfx950") == 0;
+}
+
+/* Python: _gfx950_decode_3d_segments(problem). */
+static int gfx950_decode_3d_segments(const rocke_unified_attn_problem_t* p)
+{
+    int target = (p->target_ctas > 0) ? p->target_ctas : p->num_cus * 4;
+    int pairs = p->num_seqs * p->num_kv_heads;
+    int fill;
+    int span;
+    int span_pow2 = 1;
+    int seg;
+    if(pairs < 1)
+        pairs = 1;
+    fill = attn_next_pow2((target + pairs - 1) / pairs);
+    span = p->max_seqlen_k / 128;
+    if(span < 1)
+        span = 1;
+    while(span_pow2 * 2 <= span)
+        span_pow2 <<= 1;
+    seg = 128;
+    if(span_pow2 < seg)
+        seg = span_pow2;
+    if(fill < seg)
+        seg = fill;
+    return seg < 1 ? 1 : seg;
+}
+
+rocke_unified_attn_decode_3d_config_t
+    rocke_unified_attn_gfx950_decode_3d_config(const rocke_unified_attn_problem_t* p,
+                                               const char* arch)
+{
+    rocke_unified_attn_decode_3d_config_t c;
+    memset(&c, 0, sizeof(c));
+    c.kv_tile_mult = 1;
+    if(p == NULL || !gfx950_decode_3d_cohort(p, arch))
+        return c;
+    c.cohort = true;
+    c.num_segments = gfx950_decode_3d_segments(p);
+    c.decode_fast_path = true;
+    c.seg_major_order = true;
+    c.kv_tile_mult = 2;
+    c.kv_prefetch = true;
+    c.scalar_block_ids = true;
+    c.transposed_softmax = true;
+    if(p->use_fp8)
+    {
+        c.fold_kv_scale = true;
+    }
+    else
+    {
+        c.kv_split_wait = true;
+        c.kv_load_aux = 3;
+    }
+    return c;
+}
+
 /* --------------------------------------------------- LDS-budget resolver */
 /* Python: _out_stripe_cols / _tiled_2d_lds_bytes / _kv_lds_elem_bytes /
  * _lds_bytes_regpv / _ldsfix_single_k / _ldsfix_tile64 / _resolve_lds_budget

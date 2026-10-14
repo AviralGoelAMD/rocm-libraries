@@ -72,9 +72,10 @@ def _variants():
                         compile_backend=backend,
                     )
     # gfx950 3D has fixed BLOCK_M=16; the segment count is the load-balancing
-    # geometry and the KV tile is one or two pages.
+    # geometry and the KV tile is one or two pages (two is the decode config's
+    # tile). The decode segment rule reaches down to one segment per sequence.
     for tile in ("1x", "2x"):
-        for segments in (8, 16, 32, 64, 128):
+        for segments in (1, 2, 4, 8, 16, 32, 64, 128):
             yield AttentionGeometryVariant(
                 arch="gfx950",
                 path="3d",

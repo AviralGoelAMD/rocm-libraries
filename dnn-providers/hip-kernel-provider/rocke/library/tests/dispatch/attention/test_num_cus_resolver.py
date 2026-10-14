@@ -9,7 +9,8 @@ defaulted to a stale 120, under-subscribing the device (e.g. 304-CU gfx942,
 count behind an explicit-caller override seam. Auto-resolution covers the arches
 in ``_AUTO_RESOLVE_ARCHS`` (gfx942 and gfx950); every other arch keeps the legacy
 120. gfx950's segment clamp is conservative -- the num_cus bump never raises an
-already-3D split. ``target_ctas`` is the direct device-subscription target
+already-3D split -- except for the paged gfx950 decode cohort, whose segment rule
+fills the device by design. ``target_ctas`` is the direct device-subscription target
 override: when > 0 it replaces ``num_cus * 4`` for routing/segmentation without a
 device CU count. These tests mock the device query/arch (no GPU) and assert the
 resolution order plus the downstream routing/segment effects.
@@ -18,6 +19,7 @@ resolution order plus the downstream routing/segment effects.
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 import dispatch.attention as A
 import dispatch.attention.common as AC
@@ -43,7 +45,18 @@ def _req(**kw):
     return AttentionRequest(**d)
 
 
-def _prob(num_cus, *, nq=64, nk=8, D=64, kv=8192, batch=64, tctas=0, clamp_arch=None):
+def _prob(
+    num_cus,
+    *,
+    nq=64,
+    nk=8,
+    D=64,
+    kv=8192,
+    batch=64,
+    tctas=0,
+    clamp_arch=None,
+    dtype="bf16",
+):
     return UnifiedAttentionProblem(
         total_q=batch,
         num_seqs=batch,
@@ -53,7 +66,7 @@ def _prob(num_cus, *, nq=64, nk=8, D=64, kv=8192, batch=64, tctas=0, clamp_arch=
         block_size=16,
         max_seqlen_q=1,
         max_seqlen_k=kv,
-        dtype="bf16",
+        dtype=dtype,
         sliding_window=0,
         use_sinks=False,
         num_cus=num_cus,
@@ -285,17 +298,18 @@ class TestNumCusResolver(unittest.TestCase):
 
     def test_gfx950_segments_conservatively_clamped(self):
         """Conservative gfx950 clamp: the num_cus bump never raises the 3D split for
-        ANY already-3D shape (including D64 / long-kv that gfx942 leaves uncapped)."""
+        an already-3D shape outside the paged decode cohort (including D64 /
+        long-kv that gfx942 leaves uncapped). fp16 keeps D128 out of the cohort."""
         p = _Patch()
         try:
             au._RESOLVED_ATTENTION_ARCH = None
             p.attr(au, "_resolve_attention_arch", lambda: "gfx950")
             # Live gfx950 count ~256; every case must equal its num_cus=120 split.
             cases = [
-                dict(nq=32, nk=8, D=128, kv=2048, batch=1),
-                dict(nq=32, nk=8, D=128, kv=8192, batch=1),
+                dict(nq=32, nk=8, D=128, kv=2048, batch=1, dtype="fp16"),
+                dict(nq=32, nk=8, D=128, kv=8192, batch=1, dtype="fp16"),
                 dict(
-                    nq=32, nk=8, D=128, kv=32768, batch=1
+                    nq=32, nk=8, D=128, kv=32768, batch=1, dtype="fp16"
                 ),  # gfx942 uncaps this; gfx950 clamps it
                 dict(
                     nq=32, nk=4, D=64, kv=8192, batch=1
@@ -303,9 +317,57 @@ class TestNumCusResolver(unittest.TestCase):
                 dict(nq=32, nk=4, D=64, kv=32768, batch=1),
             ]
             for c in cases:
+                assert not au._gfx950_decode_3d_cohort(_prob(256, **c)), c
                 s120 = au._num_segments(_prob(120, **c))
                 s256 = au._num_segments(_prob(256, **c))
                 assert s120 == s256, f"gfx950 over-split {c}: {s120} -> {s256}"
+        finally:
+            au._RESOLVED_ATTENTION_ARCH = None
+            p.restore()
+
+    def test_gfx950_decode_cohort_fills_the_device(self):
+        """Paged gfx950 decode (bf16, D128, 16-token pages, GQA 4/8) uses the
+        decode segment rule: 4 CTAs per CU over the (sequence, KV head) pairs,
+        rounded up to a power of two, at least 4 x 32-key tiles per segment,
+        at most 128. The strided kernel keeps the generic split."""
+        p = _Patch()
+        try:
+            au._RESOLVED_ATTENTION_ARCH = None
+            p.attr(au, "_resolve_attention_arch", lambda: "gfx950")
+            # (batch, nq, nk, kv) -> segments at num_cus=256 (target 1024 CTAs).
+            expect = {
+                (1, 32, 8, 8192): 64,  # kv clamp 8192/128 = 64
+                (1, 32, 8, 32768): 128,  # fill 128
+                (4, 32, 8, 32768): 32,
+                (16, 32, 8, 8192): 8,
+                (64, 32, 8, 8192): 2,
+                (64, 8, 1, 32768): 16,
+                (1, 8, 1, 8192): 64,
+                (256, 32, 8, 8192): 1,
+                (1, 32, 8, 200): 1,  # one segment below 256 keys
+            }
+            for (batch, nq, nk, kv), segs in expect.items():
+                prob = _prob(256, nq=nq, nk=nk, D=128, kv=kv, batch=batch)
+                assert au._gfx950_decode_3d_cohort(prob)
+                assert au._num_segments(prob) == segs, (batch, nq, nk, kv)
+                assert au._num_segments(prob, paged_kv=False) <= 128
+            # The rule scales with the device: num_cus=120 -> 480 CTAs.
+            assert au._num_segments(_prob(120, nq=32, nk=8, D=128, batch=4, kv=32768)) == 16
+            # An explicit target replaces num_cus * 4.
+            assert (
+                au._num_segments(
+                    _prob(256, nq=32, nk=8, D=128, batch=4, kv=32768, tctas=256)
+                )
+                == 8
+            )
+            # Out of cohort: gfx942 clamp_arch, MHA, prefill.
+            assert not au._gfx950_decode_3d_cohort(
+                _prob(256, nq=32, nk=8, D=128, clamp_arch="gfx942")
+            )
+            assert not au._gfx950_decode_3d_cohort(_prob(256, nq=8, nk=8, D=128))
+            assert not au._gfx950_decode_3d_cohort(
+                replace(_prob(256, nq=32, nk=8, D=128), max_seqlen_q=4, total_q=256)
+            )
         finally:
             au._RESOLVED_ATTENTION_ARCH = None
             p.restore()

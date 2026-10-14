@@ -408,6 +408,8 @@ def _spec_generic_3d(problem: UnifiedAttentionProblem):
         use_wide_kv_load=_enable_gfx942_3d_wide_kv_load(problem),
         use_i64_kv_addr=_enable_i64_kv_addr(problem),
         **policy_fields,
+        # gfx950 paged decode config (empty off-cohort; gfx950-only fields).
+        **_kau._gfx950_decode_3d_knobs(problem),
     )
 
 

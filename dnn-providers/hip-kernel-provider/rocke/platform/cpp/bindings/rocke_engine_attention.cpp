@@ -1325,6 +1325,8 @@ static rocke_unified_attn_problem_t problem_dict_to_c(const py::dict& d, Store& 
     p.use_fp8 = a_bool(d, "use_fp8", false);
     p.num_cus = a_int(d, "num_cus", 120);
     p.num_kv_blocks = a_int(d, "num_kv_blocks", 0);
+    p.target_ctas = a_int(d, "target_ctas", 0);
+    p.fp8_fnuz = a_bool(d, "fp8_fnuz", false);
     std::string v;
     if(a_str(d, "dtype", v))
         p.dtype = st.keep(v);
@@ -1332,6 +1334,8 @@ static rocke_unified_attn_problem_t problem_dict_to_c(const py::dict& d, Store& 
         p.dtype = "bf16";
     if(a_str(d, "q_dtype", v))
         p.q_dtype = st.keep(v);
+    if(a_str(d, "clamp_arch", v))
+        p.clamp_arch = st.keep(v);
     return p;
 }
 
@@ -1426,4 +1430,30 @@ void register_attention(py::module_& m)
         "Run the gfx950 tiled-2D selector on a UnifiedAttentionProblem dict "
         "and return the assembled spec as a dict (mirrors "
         "attention_spec_builder._tiled_spec_from_problem).");
+
+    m.def(
+        "gfx950_attn_decode_3d_config",
+        [](const py::dict& d, const std::string& arch) {
+            Store st;
+            rocke_unified_attn_problem_t p = problem_dict_to_c(d, st);
+            rocke_unified_attn_decode_3d_config_t c = rocke_unified_attn_gfx950_decode_3d_config(
+                &p, arch.empty() ? "gfx950" : arch.c_str());
+            py::dict out;
+            out["cohort"] = c.cohort;
+            out["num_segments"] = c.num_segments;
+            out["decode_fast_path"] = c.decode_fast_path;
+            out["seg_major_order"] = c.seg_major_order;
+            out["kv_tile_mult"] = c.kv_tile_mult;
+            out["kv_prefetch"] = c.kv_prefetch;
+            out["scalar_block_ids"] = c.scalar_block_ids;
+            out["transposed_softmax"] = c.transposed_softmax;
+            out["kv_split_wait"] = c.kv_split_wait;
+            out["kv_load_aux"] = c.kv_load_aux;
+            out["fold_kv_scale"] = c.fold_kv_scale;
+            return out;
+        },
+        py::arg("problem"),
+        py::arg("arch") = std::string("gfx950"),
+        "Run the gfx950 paged decode 3D selector on a UnifiedAttentionProblem dict "
+        "(mirrors attention_unified._gfx950_decode_3d_cohort / _segments / _knobs).");
 }
