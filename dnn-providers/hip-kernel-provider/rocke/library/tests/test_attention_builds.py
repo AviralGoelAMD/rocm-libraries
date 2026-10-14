@@ -2888,7 +2888,6 @@ class TestAttentionDenseGfx950CodegenKnobs(unittest.TestCase):
             ("iglp_mode", 2),
             ("pv_loop_order", "row_major"),
             ("o_store_width", 3),
-            ("o_store_width", 8),
         )
         for name, value in bad:
             with self.subTest(**{name: value}):
@@ -2897,12 +2896,21 @@ class TestAttentionDenseGfx950CodegenKnobs(unittest.TestCase):
 
     def test_narrow_output_stores_are_bf16_only(self):
         fp16 = dict(self._GRID, dtype="fp16")
-        for width in (1, 2):
+        for width in (1, 2, 8):
             with self.subTest(o_store_width=width):
                 with self.assertRaisesRegex(ValueError, "bf16-only"):
                     self._spec(fp16, o_store_width=width)
                 self._spec(self._GRID, o_store_width=width)
         self._spec(fp16, o_store_width=4)
+
+    def test_wide_output_store_builds_with_lse(self):
+        for persistent in (False, True):
+            extra = dict(persistent=True, num_persistent=16) if persistent else {}
+            with self.subTest(persistent=persistent):
+                spec = self._spec(self._GRID, o_store_width=8, emit_lse=True, **extra)
+                ir = self._lower(spec)
+                self.assertIn("store <8 x bfloat>", ir)
+                self.assertIn("@llvm.amdgcn.permlane32.swap", ir)
 
     def test_iglp_is_exclusive_with_manual_scheduling(self):
         with self.assertRaisesRegex(ValueError, "iglp_mode"):
@@ -2962,6 +2970,12 @@ class TestAttentionDenseGfx950CodegenKnobs(unittest.TestCase):
             ("grid", self._GRID, dict(causal_diag_split=False), None),
             ("grid", self._GRID, dict(o_store_width=2), None),
             ("grid", self._GRID, dict(o_store_width=1), None),
+            (
+                "grid",
+                self._GRID,
+                dict(o_store_width=8),
+                ("@llvm.amdgcn.permlane32.swap", True),
+            ),
             (
                 "persistent",
                 dict(self._GRID, persistent=True, num_persistent=16),
