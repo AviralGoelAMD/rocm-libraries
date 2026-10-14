@@ -150,10 +150,8 @@ def validate_tiled(cfg: TiledScaledGemmConfig) -> Tuple[bool, str]:
             return False, "lds_stages must be >= 2 (exactly 2 with per-K-group block scales)"
         if cfg.lds_stages * (cfg.tile_m + cfg.tile_n) * 128 > 160 * 1024:
             return False, f"lds_stages={cfg.lds_stages} panels exceed the 160 KiB LDS"
-        per_step = (cfg.tile_m + cfg.tile_n) * 8 // cfg.block_size
-        if cfg.scaled_mfma:
-            per_step += (128 // cfg.atom.k) * (cfg.mfma_m + cfg.mfma_n)
-        if (cfg.lds_stages - 2) * per_step > 63:
+        copies = (cfg.tile_m + cfg.tile_n) * 8 // cfg.block_size
+        if (cfg.lds_stages - 2) * copies > 63:
             return False, f"lds_stages={cfg.lds_stages} keeps more copies in flight than vmcnt can count"
     if cfg.lds_alias and not cfg.lds_dma:
         return False, "lds_alias needs lds_dma=True"
@@ -585,11 +583,11 @@ def _lds_dma_loop(
     b_dma = dma_slots(TN, n_cta)
     a_base = b.smem_addr_of(A_s)
     b_base = b.smem_addr_of(B_s)
-    # VMEM instructions one step issues per wave (copies + MX scale bytes);
-    # S - 2 younger steps may stay in flight when step t must have landed.
+    # LDS copies one step issues per wave. Step t has landed once at most the
+    # (S - 2) younger steps' copies are outstanding. The MX scale-byte loads
+    # are left out of the count: counting them lets the wait pass while a
+    # copy of step t is still in flight.
     per_step = len(a_dma) + len(b_dma)
-    if cfg.scaled_mfma:
-        per_step += (loop_k // cfg.atom.k) * (cfg.mfma_m + cfg.mfma_n)
 
     def issue(tr, buf):
         k0 = b.mul(tr, b.const_i32(loop_k))
