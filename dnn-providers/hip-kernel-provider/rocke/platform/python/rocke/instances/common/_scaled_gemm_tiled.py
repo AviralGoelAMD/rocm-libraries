@@ -187,6 +187,14 @@ def emit_tiled_scaled_gemm(
     decode_mx,
 ) -> None:
     """Emit the whole tiled kernel body into ``b`` (params already declared)."""
+    # gfx950 computes v_pk_{add,mul}_f32 wrongly when src0 selects its low
+    # half and src1 its high half (op_sel [0,1]); upstream LLVM commutes
+    # such instructions (GCNHazardRecognizer::fixPkF32InvalidOpSel) but the
+    # ROCm 7.13 compiler emits them. The scale folds here multiply by
+    # broadcast scales whose loads LLVM merges into register pairs, which is
+    # exactly how that form arises (e.g. k_unroll=2 B-scale pairs). Keep the
+    # kernel on scalar f32 VALU ops so the form cannot be selected.
+    b.kernel.attrs["target_features"] = "-packed-fp32-ops"
     atom = cfg.atom
     mx = cfg.scale_mode == "mx"
     M, N, K = cfg.M, cfg.N, cfg.K

@@ -6566,6 +6566,11 @@ class _Lowerer:
         agpr_alloc = self.kernel.attrs.get("agpr_alloc")
         if agpr_alloc is not None:
             attr_parts.append(f'"amdgpu-agpr-alloc"="{_format_agpr_alloc(agpr_alloc)}"')
+        # Optional per-kernel subtarget feature overrides, e.g.
+        # "-packed-fp32-ops" (see _scaled_gemm_tiled for why).
+        target_features = self.kernel.attrs.get("target_features")
+        if target_features:
+            attr_parts.append(f'"target-features"="{target_features}"')
         # gfx1250 workgroup-cluster shape. The backend copies it to the
         # code-object ``.cluster_dims`` metadata without range checks, so it
         # is validated here; the launch must pass the same shape.
