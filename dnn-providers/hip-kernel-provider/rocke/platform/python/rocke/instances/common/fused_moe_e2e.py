@@ -1729,7 +1729,7 @@ class FusedMoeForward:
             gate_up_callable,
             down_callable,
         )
-        Y.copy_(y_f32.to(Y.dtype))
+        Y.copy_(y_f32)
 
     def _grouped_down_spec(self) -> FusedDownReduceGemmSpec:
         return FusedDownReduceGemmSpec(
@@ -1956,7 +1956,7 @@ class FusedMoeForward:
         if max_padded_m == 0:
             # Degenerate case: every expert has count=0 (no tokens
             # routed). Output stays at zero, return early.
-            Y.copy_(y_f32.to(Y.dtype))
+            Y.copy_(y_f32)
             return
         if max_padded_m < tile_m:
             max_padded_m = tile_m
@@ -2181,7 +2181,7 @@ class FusedMoeForward:
         # The reduce kernel atomic-adds into f32; cast to the user's
         # output dtype. Inside the timed region so the benchmark
         # number reflects what an end-to-end caller observes.
-        Y.copy_(y_f32.to(Y.dtype))
+        Y.copy_(y_f32)
 
     # ------------------------------------------------------------------
     # HIP graph capture (opt-in, benchmark / fixed-input use)
@@ -2801,4 +2801,4 @@ class FusedMoeForward:
             *gate_stage_callables,
             *down_stage_callables,
         )
-        Y.copy_(y_f32.to(Y.dtype))
+        Y.copy_(y_f32)

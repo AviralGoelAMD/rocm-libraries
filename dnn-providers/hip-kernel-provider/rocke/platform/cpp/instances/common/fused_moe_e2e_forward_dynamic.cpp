@@ -84,7 +84,7 @@ rocke_status_t rocke_fmoe_dispatch_grouped_gemm(rocke_fmoe_build_ctx_t* ctx, boo
     if(num_m_blocks == 0)
     {
         /* No tokens routed anywhere; output stays zero (line 1473). */
-        /* TODO(port): Y.copy_(y_f32.to(Y.dtype)) */
+        /* TODO(port): Y.copy_(y_f32) (one casting copy) */
         ctx->total_packed = 0;
         *handled = true;
         return ROCKE_ERR_NOTIMPL;
@@ -185,7 +185,7 @@ rocke_status_t rocke_fmoe_dispatch_grouped_gemm(rocke_fmoe_build_ctx_t* ctx, boo
      *     stride_a=0, stride_b=s->hidden*s->intermediate, slot_size=0,
      *     tokens=s->tokens, BlockExpertIds=block_expert_ids
      *   launch_kernel(StreamConfig(stream), gate_up_callable, down_callable)
-     *   Y.copy_(y_f32.to(Y.dtype)) */
+     *   Y.copy_(y_f32) (one casting copy) */
 
     *handled = true; /* line 1582: return True */
     return ROCKE_ERR_NOTIMPL;
@@ -322,7 +322,7 @@ rocke_status_t rocke_fmoe_forward_dynamic(rocke_fmoe_build_ctx_t* ctx)
          * zero, return early (lines 1830-1834). */
         ctx->max_padded_m = 0;
         ctx->total_padded = 0;
-        /* TODO(port): Y.copy_(y_f32.to(Y.dtype)) */
+        /* TODO(port): Y.copy_(y_f32) (one casting copy) */
         return ROCKE_ERR_NOTIMPL;
     }
     if(max_padded_m < tile_m)
@@ -471,7 +471,7 @@ rocke_status_t rocke_fmoe_forward_dynamic(rocke_fmoe_build_ctx_t* ctx)
      *       silu_mul_callable, down_callable, reduce_callable) */
 
     /* ---- Stage 7: dtype cast (lines 2054-2058) ----
-     * TODO(port): Y.copy_(y_f32.to(Y.dtype)) */
+     * TODO(port): Y.copy_(y_f32) (one casting copy) */
 
     return ROCKE_ERR_NOTIMPL;
 }

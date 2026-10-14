@@ -420,7 +420,7 @@ rocke_status_t rocke_fmoe_forward_static(rocke_fmoe_build_ctx_t* ctx)
      * No host roundtrip. */
     /* TODO(port): launch the chain on StreamConfig(stream_id=ctx->stream). */
 
-    /* ---- stage 7 cast (line 2678): Y.copy_(y_f32.to(Y.dtype)). ---- */
+    /* ---- stage 7 cast (line 2678): Y.copy_(y_f32), one casting copy. ---- */
     /* TODO(port): cast Y_f32 -> Y (ctx->Y) in the activation dtype. */
 
     /* The faithful path-selection decisions above are complete; the HIP launch
