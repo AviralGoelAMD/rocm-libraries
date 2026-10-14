@@ -300,9 +300,13 @@ voffset once the cache exceeds **2 GiB** (~65 K bf16 / ~131 K fp8 blocks) — an
 production caches are far larger (captured traces ~350 K blocks ≈ 11 GiB).
 `_enable_i64_kv_addr` switches the load paths to fold `block · stride` into a
 **64-bit base** (only a small within-block offset stays in the 32-bit field)
-when `num_kv_blocks · block_stride > 2³¹`, so small caches keep the exact fast
-i32 path and only large caches pay the tiny per-block-base cost. Without it,
-large caches silently read garbage (verified `max_abs ≈ 1.4`).
+when `num_kv_blocks · block_stride > 0x7FFF0000`, so small caches keep the
+exact fast i32 path and only large caches pay the tiny per-block-base cost.
+The bound is the i32 path's buffer-resource `num_records`
+(`KV_BUFFER_NUM_RECORDS`, 2 GiB − 64 KiB), not 2³¹: a load at or past it reads
+zero, so the last 64 KiB of a cache of exactly 2 GiB would load as zeros.
+Without the i64 path, large caches silently read garbage (verified
+`max_abs ≈ 1.4`).
 
 ### 7.3 fp8 KV cache (bf16-Q + fp8-KV)
 

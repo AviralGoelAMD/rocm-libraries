@@ -39,6 +39,7 @@ import math
 import os
 from typing import Optional, Tuple
 
+from kernels.common.attention_kv_cache import KV_BUFFER_NUM_RECORDS
 from rocke.core.ir import (
     BF16,
     CACHE_ALL,
@@ -2413,7 +2414,7 @@ def build_unified_attention_2d_tiled(
     # ---- Pre-loop: build K/V buffer descriptors and pre-fetch tile 0.
     # The buffer rsrc bounds OOB voffsets to return zero. We size it large
     # so valid block offsets never trip the check.
-    big_bytes = b.const_i32(0x7FFF0000)
+    big_bytes = b.const_i32(KV_BUFFER_NUM_RECORDS)
     key_rsrc = b.buffer_rsrc(key, big_bytes)
     value_rsrc = b.buffer_rsrc(value, big_bytes)
 
