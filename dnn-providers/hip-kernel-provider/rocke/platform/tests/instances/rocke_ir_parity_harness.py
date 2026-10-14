@@ -3000,6 +3000,10 @@ def cases():
                 "pv_sched_group_template": True,
             },
         ),
+        # Grid body with wide (dwordx4 slab) LDS DMA.
+        ("grid_widedma_sq512", {"wide_lds_dma": True}),
+        ("grid_widedma_noncausal_sq512", {"wide_lds_dma": True, "causal": False}),
+        ("grid_widedma_bm128_sq512", {"wide_lds_dma": True, "block_m": 128}),
         # --- bottom-right diagonal. Four cases pin the aligned and arbitrary
         # shifted-diagonal routes, the sink composition, and the BM128 geometry.
         (
