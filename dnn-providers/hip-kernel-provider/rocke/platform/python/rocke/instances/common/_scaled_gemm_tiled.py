@@ -58,6 +58,9 @@ class TiledScaledGemmConfig:
     # 0: CTA (m, n) = (block_id_y, block_id_x). G > 0: XCD-aware remap, then
     # G-tile-row grouped order (see _cta_coords).
     tile_swizzle: int = 0
+    # LDS staging only: unpadded 128-byte rows with XOR-permuted 16-byte chunks
+    # instead of 144-byte padded rows (see _lds_mainloop.lds_col).
+    lds_swizzle: bool = False
 
     @property
     def tile_m(self) -> int:
@@ -128,6 +131,8 @@ def validate_tiled(cfg: TiledScaledGemmConfig) -> Tuple[bool, str]:
         return False, "split_k accumulates f32 atomically; out_dtype must be 'f32'"
     if cfg.tile_swizzle < 0 or (cfg.tile_swizzle and (cfg.M // cfg.tile_m) % cfg.tile_swizzle):
         return False, f"tile_swizzle ({cfg.tile_swizzle}) must divide the M tile count ({cfg.M // cfg.tile_m})"
+    if cfg.lds_swizzle and (not cfg.lds or _loop_k(cfg) % 128):
+        return False, "lds_swizzle needs lds=True and a K step that is a multiple of 128"
     return True, "ok"
 
 
@@ -371,10 +376,23 @@ def _lds_mainloop(
     atom = cfg.atom
     K = cfg.K
     TM, TN, BS = cfg.tile_m, cfg.tile_n, cfg.block_size
-    row_bytes = loop_k + _LDS_PAD
+    swz = cfg.lds_swizzle
+    row_bytes = loop_k if swz else loop_k + _LDS_PAD
     chunks = loop_k // 16
     A_s = b.smem_alloc(dtype, [TM, row_bytes], name_hint="A_s")
     B_s = b.smem_alloc(dtype, [TN, row_bytes], name_hint="B_s")
+
+    def lds_col(row, byte):
+        """LDS byte column of logical (row, byte). Swizzled layout: unpadded
+        128-byte rows whose 16-byte chunks are XOR-permuted by
+        f(row) = (row & 7) ^ ((row >> 3) & 1), so the 16 rows a ds_read_b128
+        wavefront slice touches land on 16 distinct (bank-half, chunk) slots
+        and 8 consecutive rows on 8 distinct chunks."""
+        if not swz:
+            return byte
+        f = b.xor(b.mod(row, b.const_i32(8)), b.mod(b.div(row, b.const_i32(8)), b.const_i32(2)))
+        chunk = b.xor(b.div(byte, b.const_i32(16)), f)
+        return b.add(b.mul(chunk, b.const_i32(16)), b.mod(byte, b.const_i32(16)))
 
     def copy_slots(rows, base_row):
         slots = []
@@ -383,7 +401,7 @@ def _lds_mainloop(
             r = b.div(c, b.const_i32(chunks))
             col = b.mul(b.mod(c, b.const_i32(chunks)), b.const_i32(16))
             g = b.add(b.mul(b.add(base_row, r), b.const_i32(K)), col)
-            slots.append((r, col, g))
+            slots.append((r, lds_col(r, col), g))
         return slots
 
     a_slots = copy_slots(TM, m_cta)
@@ -434,11 +452,11 @@ def _lds_mainloop(
     def read_frag(smem, row, t):
         if atom.k == 128:
             c0 = b.mul(k_blk, b.const_i32(16))
-            lo = b.smem_load_vN(smem, row, c0, dtype=dtype, n=16)
-            hi = b.smem_load_vN(smem, row, b.add(c0, b.const_i32(64)), dtype=dtype, n=16)
+            lo = b.smem_load_vN(smem, row, lds_col(row, c0), dtype=dtype, n=16)
+            hi = b.smem_load_vN(smem, row, lds_col(row, b.add(c0, b.const_i32(64))), dtype=dtype, n=16)
             return b.vec_concat(lo, hi)
         c0 = b.add(b.const_i32(t * atom.k), b.mul(k_blk, b.const_i32(atom.a_per_lane)))
-        return b.smem_load_vN(smem, row, c0, dtype=dtype, n=atom.a_per_lane)
+        return b.smem_load_vN(smem, row, lds_col(row, c0), dtype=dtype, n=atom.a_per_lane)
 
     def frags_from_lds(scales):
         flat = []
