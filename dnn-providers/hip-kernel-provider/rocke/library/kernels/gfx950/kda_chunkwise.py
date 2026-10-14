@@ -3540,14 +3540,7 @@ class KdaChunkPairSpec:
         return MfmaAtom.bf16_32x32x16()
 
     def lds_bytes(self) -> int:
-        C, PDK, PC = self.chunk, self.head_k + 8, self.chunk + 8
-        # GK1, GQ1, Kt0^T (C x DK) and A1, A0^T, M^T, A1 M (C x C), bf16.
-        n = 3 * 2 * C * PDK + 4 * 2 * C * PC
-        if self.uw:
-            P2 = 2 * C + 8
-            # A2 (2C x 2C), GK2^T (DK x 2C), V^T (EV x 2C), bf16.
-            n += 2 * (2 * C + self.head_k + self.head_v) * P2
-        return n
+        return _pair_lds_layout(self)["pool"]
 
     def kernel_name(self) -> str:
         parts = [self.name, f"dk{self.head_k}", self.dtype, f"c{self.chunk}x2"]
@@ -3593,19 +3586,43 @@ def is_valid_pair_spec(spec: KdaChunkPairSpec, arch: str = "gfx950") -> Tuple[bo
     return True, "ok"
 
 
+def _pair_lds_layout(spec: KdaChunkPairSpec) -> dict:
+    """Byte offsets inside the pair kernel's one LDS pool.
+
+    The pool is sized for occupancy, not capacity -- the kernel is a short,
+    latency-bound chain of small products, so what hides it is more resident
+    workgroups. Region ``A`` holds the cross-chunk operands (GK1, GQ1, Kt0^T)
+    until ``M`` / ``GQ1 Kt0^T`` have read them, then the ``uw`` B operands
+    (GK2^T, V^T); ``P = A1 M`` overwrites ``M^T`` in place (one wave reads it
+    and then writes it); ``A1`` is read straight out of ``A2``'s diagonal.
+    """
+    C, DK = spec.chunk, spec.head_k
+    PDK, PC, P2 = DK + 8, C + 8, 2 * C + 8
+    region_a = 3 * 2 * C * PDK  # GK1, GQ1, Kt0^T (C x DK)
+    if spec.uw:
+        region_a = max(region_a, 2 * (DK + spec.head_v) * P2)  # GK2^T, V^T (x 2C)
+    lay = {"a": 0, "a0t": region_a}
+    lay["mt"] = lay["a0t"] + 2 * C * PC
+    lay["a2"] = lay["mt"] + 2 * C * PC
+    lay["pool"] = lay["a2"] + 2 * (2 * C) * P2
+    return lay
+
+
 def build_kda_chunk_pair(spec: KdaChunkPairSpec, arch: str = "gfx950") -> KernelDef:
     """Combine chunks ``2p`` and ``2p+1`` of every head into one ``2C`` chunk.
 
     Kernel signature::
 
         (a, gk, gq, aqk, kt: ptr<bf16>, dec: ptr<f32>,          # C tiles
-         a2, gk2, gq2, aqk2, kt2: ptr<bf16>, dec2: ptr<f32>)    # 2C tiles
+         a2, gk2, gq2, aqk2, kt2: ptr<bf16>, dec2: ptr<f32>     # 2C tiles
+         [, v: ptr<bf16>, u2: ptr<bf16>, nc, heads, tseq: i32]) # uw only
 
     The diagonal blocks and the decay-scaled copies are elementwise. The three
     cross-chunk products are ``C x C`` atoms: ``M`` and ``GQ1 Kt0^T`` on waves 0
-    and 1 (both contract over ``DK``), then ``-(A1 M) A0`` on wave 0. Each
-    product's B operand is staged transposed so every MFMA operand read is one
-    ``ds_read_b128`` along its contraction.
+    and 1 (both contract over ``DK``), then ``-(A1 M) A0`` on wave 0, while the
+    other waves stage the ``uw`` operands. Each product's B operand is staged
+    transposed so every MFMA operand read is one ``ds_read_b128`` along its
+    contraction.
     """
     ok, why = is_valid_pair_spec(spec, arch=arch)
     if not ok:
@@ -3613,7 +3630,7 @@ def build_kda_chunk_pair(spec: KdaChunkPairSpec, arch: str = "gfx950") -> Kernel
 
     C, DK, BLOCK = spec.chunk, spec.head_k, spec.block_size
     C2 = 2 * C
-    PDK, PC = DK + 8, C + 8
+    PDK, PC, P2 = DK + 8, C + 8, C2 + 8
     ELEM = _DTYPE_IR[spec.dtype]
     atom = spec.atom
 
@@ -3640,18 +3657,18 @@ def build_kda_chunk_pair(spec: KdaChunkPairSpec, arch: str = "gfx950") -> Kernel
         tseq = b.param("tseq", I32)
         io = _RawTokenAddr(b, heads=heads, tseq=tseq, nc=nc2, chunk=C2, dk=DK)
 
-    gk1_s = b.smem_alloc(ELEM, [C, PDK], "gk1_s")
-    gq1_s = b.smem_alloc(ELEM, [C, PDK], "gq1_s")
-    kt0t_s = b.smem_alloc(ELEM, [C, PDK], "kt0t_s")
-    a1_s = b.smem_alloc(ELEM, [C, PC], "a1_s")
-    a0t_s = b.smem_alloc(ELEM, [C, PC], "a0t_s")
-    mt_s = b.smem_alloc(ELEM, [C, PC], "mt_s")
-    p_s = b.smem_alloc(ELEM, [C, PC], "p_s")
+    lay = _pair_lds_layout(spec)
+    pool = b.smem_alloc(I8, [lay["pool"]], "pair_pool")
+    gk1_s = _LdsTile(pool, lay["a"], ELEM, (C, PDK))
+    gq1_s = _LdsTile(pool, lay["a"] + 2 * C * PDK, ELEM, (C, PDK))
+    kt0t_s = _LdsTile(pool, lay["a"] + 4 * C * PDK, ELEM, (C, PDK))
+    a0t_s = _LdsTile(pool, lay["a0t"], ELEM, (C, PC))
+    mt_s = _LdsTile(pool, lay["mt"], ELEM, (C, PC))
+    p_s = mt_s  # P = A1 M overwrites M^T on the one wave that reads it
+    a2_s = _LdsTile(pool, lay["a2"], ELEM, (C2, P2))
     if spec.uw:
-        P2 = C2 + 8
-        a2_s = b.smem_alloc(ELEM, [C2, P2], "a2_s")
-        gkt_s = b.smem_alloc(ELEM, [DK, P2], "gkt_s")
-        vtt_s = b.smem_alloc(ELEM, [EV, P2], "vtt_s")
+        gkt_s = _LdsTile(pool, lay["a"], ELEM, (DK, P2))
+        vtt_s = _LdsTile(pool, lay["a"] + 2 * DK * P2, ELEM, (EV, P2))
 
     tid = b.thread_id_x()
     lane = b.mod(tid, b.const_i32(64))
@@ -3660,6 +3677,7 @@ def build_kda_chunk_pair(spec: KdaChunkPairSpec, arch: str = "gfx950") -> Kernel
     t0 = b.mul(pair, b.const_i32(2))
     t1 = b.add(t0, b.const_i32(1))
     zero8 = b.vec_pack([b.cast_f32_to(b.const_f32(0.0), ELEM)] * 8, ELEM)
+    c_C = b.const_i32(C)
 
     def scaled8(vec, scales):
         return b.vec_pack(
@@ -3679,6 +3697,21 @@ def build_kda_chunk_pair(spec: KdaChunkPairSpec, arch: str = "gfx950") -> Kernel
                 b.scf_if(b.cmp_gt(b.const_i32(n_slot), vidx)) if tail else nullcontext()
             )
 
+    def cd_slot(vidx):
+        """(off, row, col, dec0[col:col+8]) of one 8-wide slot of a C x DK tile."""
+        off = b.mul(vidx, b.const_i32(8))
+        row = b.div(off, b.const_i32(DK))
+        col = b.mod(off, b.const_i32(DK))
+        dbase = b.add(b.mul(t0, b.const_i32(DK)), col)
+        dec0 = []
+        for h in range(2):
+            dv = b.global_load_vN(dec_in, b.add(dbase, b.const_i32(4 * h)), F32, 4)
+            dec0 += [b.vec_extract(dv, j) for j in range(4)]
+        return off, row, col, dec0
+
+    def tile_load(src, t, elems, off):
+        return b.global_load_vN(src, b.add(b.mul(t, b.const_i32(elems)), off), ELEM, 8)
+
     # ---- dec2 = dec0 * dec1 ---------------------------------------------
     with b.scf_if(b.cmp_gt(b.const_i32(DK // 4), tid)):
         d4 = b.mul(tid, b.const_i32(4))
@@ -3695,77 +3728,117 @@ def build_kda_chunk_pair(spec: KdaChunkPairSpec, arch: str = "gfx950") -> Kernel
         )
 
     # ---- GK2 / GQ2: chunk 0 as is, chunk 1 times dec0 per channel --------
+    # GK1 / GQ1 are staged as the cross-chunk products' A operands. Under uw
+    # GK2 is not an output (W takes its slot below).
     out_cd = b.mul(pair, b.const_i32(C2 * DK))
     for vidx, guard in slots(C * DK // 8):
         with guard:
-            off = b.mul(vidx, b.const_i32(8))
-            row = b.div(off, b.const_i32(DK))
-            col = b.mod(off, b.const_i32(DK))
-            dbase = b.add(b.mul(t0, b.const_i32(DK)), col)
-            dec0 = []
-            for h in range(2):
-                dv = b.global_load_vN(dec_in, b.add(dbase, b.const_i32(4 * h)), F32, 4)
-                dec0 += [b.vec_extract(dv, j) for j in range(4)]
+            off, row, col, dec0 = cd_slot(vidx)
             for src, dst, stage in ((gk_in, gk_out, gk1_s), (gq_in, gq_out, gq1_s)):
-                v0 = b.global_load_vN(src, b.add(b.mul(t0, b.const_i32(C * DK)), off), ELEM, 8)
-                v1 = b.global_load_vN(src, b.add(b.mul(t1, b.const_i32(C * DK)), off), ELEM, 8)
-                b.smem_store_vN(stage, [row, col], v1, 8)
-                v1s = scaled8(v1, dec0)
+                v1 = tile_load(src, t1, C * DK, off)
+                _st(b, stage, row, col, value=v1, n=8)
                 if spec.uw and src is gk_in:
-                    # GK2 is consumed here (W = A2 GK2), transposed for the B side.
-                    for jj in range(8):
-                        dd = b.add(col, b.const_i32(jj))
-                        _st(b, gkt_s, dd, row, value=b.vec_extract(v0, jj), n=1)
-                        _st(b, gkt_s, dd, b.add(row, b.const_i32(C)), value=b.vec_extract(v1s, jj), n=1)
                     continue
-                b.global_store_vN(dst, b.add(out_cd, off), v0, 8)
-                b.global_store_vN(dst, b.add(out_cd, b.add(b.const_i32(C * DK), off)), v1s, 8)
+                b.global_store_vN(dst, b.add(out_cd, off), tile_load(src, t0, C * DK, off), 8)
+                b.global_store_vN(
+                    dst, b.add(out_cd, b.add(b.const_i32(C * DK), off)), scaled8(v1, dec0), 8
+                )
 
     # ---- Kt2 = [Kt0 * dec1 | Kt1]; Kt0 also staged transposed -----------
     out_kt = b.mul(pair, b.const_i32(DK * C2))
     for vidx, guard in slots(DK * C // 8):
         with guard:
             off = b.mul(vidx, b.const_i32(8))
-            d = b.div(off, b.const_i32(C))
-            j = b.mod(off, b.const_i32(C))
+            d = b.div(off, c_C)
+            j = b.mod(off, c_C)
             drow = b.add(out_kt, b.add(b.mul(d, b.const_i32(C2)), j))
             dec1 = b.global_load_f32(dec_in, b.add(b.mul(t1, b.const_i32(DK)), d))
-            k0 = b.global_load_vN(kt_in, b.add(b.mul(t0, b.const_i32(DK * C)), off), ELEM, 8)
+            k0 = tile_load(kt_in, t0, DK * C, off)
             b.global_store_vN(kt_out, drow, scaled8(k0, [dec1] * 8), 8)
-            k1 = b.global_load_vN(kt_in, b.add(b.mul(t1, b.const_i32(DK * C)), off), ELEM, 8)
-            b.global_store_vN(kt_out, b.add(drow, b.const_i32(C)), k1, 8)
+            b.global_store_vN(kt_out, b.add(drow, c_C), tile_load(kt_in, t1, DK * C, off), 8)
             for jj in range(8):
                 _st(b, kt0t_s, b.add(j, b.const_i32(jj)), d, value=b.vec_extract(k0, jj), n=1)
 
     # ---- diagonal blocks of A2 / Aqk2, zero upper-right ------------------
+    # A0 / A1 always land in A2's on-chip copy (A1 M reads A1 from there);
+    # without uw A2 also goes out, with uw W and U are its only consumers.
     out_cc = b.mul(pair, b.const_i32(C2 * C2))
     for vidx, guard in slots(C * C // 8):
         with guard:
             off = b.mul(vidx, b.const_i32(8))
-            i = b.div(off, b.const_i32(C))
-            j = b.mod(off, b.const_i32(C))
+            i = b.div(off, c_C)
+            j = b.mod(off, c_C)
             top = b.add(out_cc, b.add(b.mul(i, b.const_i32(C2)), j))
             bottom = b.add(top, b.const_i32(C * C2 + C))
             for src, dst in ((a_in, a_out), (aqk_in, aqk_out)):
-                v0 = b.global_load_vN(src, b.add(b.mul(t0, b.const_i32(C * C)), off), ELEM, 8)
-                v1 = b.global_load_vN(src, b.add(b.mul(t1, b.const_i32(C * C)), off), ELEM, 8)
+                v0 = tile_load(src, t0, C * C, off)
+                v1 = tile_load(src, t1, C * C, off)
                 if src is a_in:
-                    b.smem_store_vN(a1_s, [i, j], v1, 8)
+                    _st(b, a2_s, i, j, value=v0, n=8)
+                    _st(b, a2_s, i, b.add(j, c_C), value=zero8, n=8)
+                    _st(b, a2_s, b.add(i, c_C), b.add(j, c_C), value=v1, n=8)
                     for jj in range(8):
                         _st(b, a0t_s, b.add(j, b.const_i32(jj)), i, value=b.vec_extract(v0, jj), n=1)
                     if spec.uw:
-                        # A2 stays on chip: W and U are its only consumers.
-                        b.smem_store_vN(a2_s, [i, j], v0, 8)
-                        b.smem_store_vN(a2_s, [i, b.add(j, b.const_i32(C))], zero8, 8)
-                        b.smem_store_vN(
-                            a2_s, [b.add(i, b.const_i32(C)), b.add(j, b.const_i32(C))], v1, 8
-                        )
                         continue
                 b.global_store_vN(dst, top, v0, 8)
-                b.global_store_vN(dst, b.add(top, b.const_i32(C)), zero8, 8)
+                b.global_store_vN(dst, b.add(top, c_C), zero8, 8)
                 b.global_store_vN(dst, bottom, v1, 8)
+    b.sync_lds_only()
+
+    lane_m = b.mod(lane, b.const_i32(atom.m))
+    koff = b.mul(b.div(lane, b.const_i32(atom.m)), b.const_i32(atom.a_per_lane))
+
+    def mm(a_s, arow, b_s, brow, ksteps, acol0=0):
+        """``D[r][c] = sum_k a_s[arow+r][acol0+k] * b_s[brow+c][k]``, one atom tile."""
+        acc = atom.zero_acc(b)
+        ar = b.add(b.const_i32(arow), lane_m) if isinstance(arow, int) else b.add(arow, lane_m)
+        br = b.add(b.const_i32(brow), lane_m) if isinstance(brow, int) else b.add(brow, lane_m)
+        for ks in range(ksteps):
+            kb = b.add(b.const_i32(ks * atom.k), koff)
+            av = _ld(b, a_s, ar, b.add(kb, b.const_i32(acol0)) if acol0 else kb,
+                     dtype=ELEM, n=atom.a_per_lane)
+            bv = _ld(b, b_s, br, kb, dtype=ELEM, n=atom.b_per_lane)
+            acc = atom.emit(b, av, bv, acc)
+        return acc
+
+    def lower_left(r, c):
+        """Flat offset of (C + r, c) in a 2C x 2C tile."""
+        return b.add(out_cc, b.add(b.mul(b.add(r, c_C), b.const_i32(C2)), c))
+
+    # ---- M = GK1 Kt0^T (wave 0, kept as M^T) and GQ1 Kt0^T (wave 1) ------
+    with b.scf_if(b.cmp_eq(wave, b.const_i32(0))):
+        m = mm(gk1_s, 0, kt0t_s, 0, DK // atom.k)
+        for s in range(atom.c_per_lane):
+            r, c = atom.lane_to_output(b, lane, s)
+            _st(b, mt_s, c, r, value=b.cast_f32_to(b.vec_extract(m, s), ELEM), n=1)
+    with b.scf_if(b.cmp_eq(wave, b.const_i32(1))):
+        q = mm(gq1_s, 0, kt0t_s, 0, DK // atom.k)
+        for s in range(atom.c_per_lane):
+            r, c = atom.lane_to_output(b, lane, s)
+            b.global_store_vN(
+                aqk_out, lower_left(r, c), b.cast_f32_to(b.vec_extract(q, s), ELEM), 1
+            )
+    b.sync_lds_only()
+
+    # ---- P = A1 M (wave 0); the other waves stage the uw B operands -------
+    with b.scf_if(b.cmp_eq(wave, b.const_i32(0))):
+        p = mm(a2_s, C, mt_s, 0, C // atom.k, acol0=C)
+        for s in range(atom.c_per_lane):
+            r, c = atom.lane_to_output(b, lane, s)
+            _st(b, p_s, r, c, value=b.cast_f32_to(b.vec_extract(p, s), ELEM), n=1)
     if spec.uw:
-        # V^T of the pair's 2C tokens, the B operand of U = A2 V.
+        # Region A is free: M and GQ1 Kt0^T were its last readers. GK2^T and V^T
+        # are written transposed (row = contraction index of W = A2 GK2 / U = A2 V).
+        for vidx, guard in slots(C * DK // 8):
+            with guard:
+                off, row, col, dec0 = cd_slot(vidx)
+                g0 = tile_load(gk_in, t0, C * DK, off)
+                g1 = scaled8(tile_load(gk_in, t1, C * DK, off), dec0)
+                for jj in range(8):
+                    dd = b.add(col, b.const_i32(jj))
+                    _st(b, gkt_s, dd, row, value=b.vec_extract(g0, jj), n=1)
+                    _st(b, gkt_s, dd, b.add(row, c_C), value=b.vec_extract(g1, jj), n=1)
         for vidx, guard in slots(C2 * EV // 8):
             with guard:
                 off = b.mul(vidx, b.const_i32(8))
@@ -3776,54 +3849,14 @@ def build_kda_chunk_pair(spec: KdaChunkPairSpec, arch: str = "gfx950") -> Kernel
                     _st(b, vtt_s, b.add(e, b.const_i32(jj)), row, value=b.vec_extract(vv, jj), n=1)
     b.sync_lds_only()
 
-    lane_m = b.mod(lane, b.const_i32(atom.m))
-    koff = b.mul(b.div(lane, b.const_i32(atom.m)), b.const_i32(atom.a_per_lane))
-
-    def mm(a_s, b_s, ksteps):
-        """``D[r][c] = sum_k a_s[r][k] * b_s[c][k]`` over one atom tile."""
-        acc = atom.zero_acc(b)
-        for ks in range(ksteps):
-            kb = b.add(b.const_i32(ks * atom.k), koff)
-            av = _ld(b, a_s, lane_m, kb, dtype=ELEM, n=atom.a_per_lane)
-            bv = _ld(b, b_s, lane_m, kb, dtype=ELEM, n=atom.b_per_lane)
-            acc = atom.emit(b, av, bv, acc)
-        return acc
-
-    def lower_left(r, c):
-        """Flat offset of (C + r, c) in a 2C x 2C tile."""
-        return b.add(out_cc, b.add(b.mul(b.add(r, b.const_i32(C)), b.const_i32(C2)), c))
-
-    # ---- M = GK1 Kt0^T (wave 0, kept as M^T) and GQ1 Kt0^T (wave 1) ------
-    with b.scf_if(b.cmp_eq(wave, b.const_i32(0))):
-        m = mm(gk1_s, kt0t_s, DK // atom.k)
-        for s in range(atom.c_per_lane):
-            r, c = atom.lane_to_output(b, lane, s)
-            _st(b, mt_s, c, r, value=b.cast_f32_to(b.vec_extract(m, s), ELEM), n=1)
-    with b.scf_if(b.cmp_eq(wave, b.const_i32(1))):
-        q = mm(gq1_s, kt0t_s, DK // atom.k)
-        for s in range(atom.c_per_lane):
-            r, c = atom.lane_to_output(b, lane, s)
-            b.global_store_vN(
-                aqk_out, lower_left(r, c), b.cast_f32_to(b.vec_extract(q, s), ELEM), 1
-            )
-    b.sync_lds_only()
-
-    # ---- P = A1 M --------------------------------------------------------
-    with b.scf_if(b.cmp_eq(wave, b.const_i32(0))):
-        p = mm(a1_s, mt_s, C // atom.k)
-        for s in range(atom.c_per_lane):
-            r, c = atom.lane_to_output(b, lane, s)
-            _st(b, p_s, r, c, value=b.cast_f32_to(b.vec_extract(p, s), ELEM), n=1)
-    b.sync_lds_only()
-
     # ---- A2 lower-left = -P A0 -------------------------------------------
     with b.scf_if(b.cmp_eq(wave, b.const_i32(0))):
-        x = mm(p_s, a0t_s, C // atom.k)
+        x = mm(p_s, 0, a0t_s, 0, C // atom.k)
         for s in range(atom.c_per_lane):
             r, c = atom.lane_to_output(b, lane, s)
             val = b.cast_f32_to(b.fneg(b.vec_extract(x, s)), ELEM)
             if spec.uw:
-                _st(b, a2_s, b.add(r, b.const_i32(C)), c, value=val, n=1)
+                _st(b, a2_s, b.add(r, c_C), c, value=val, n=1)
             else:
                 b.global_store_vN(a_out, lower_left(r, c), val, 1)
 
@@ -3832,27 +3865,17 @@ def build_kda_chunk_pair(spec: KdaChunkPairSpec, arch: str = "gfx950") -> Kernel
         # ---- W = A2 GK2 (into GK2's slot) and U = A2 V ---------------------
         # Wave w owns output columns [32w, 32w + 32) of both; row tile 0 only
         # contracts over the first chunk (A2's upper-right block is zero).
-        ccol = b.add(b.mul(wave, b.const_i32(atom.n)), lane_m)
+        col0 = b.mul(wave, b.const_i32(atom.n))
         for b_s, dst, ncols in ((gkt_s, gk_out, DK), (vtt_s, u_out, EV)):
             base = b.mul(pair, b.const_i32(C2 * ncols))
             for rt in range(C2 // atom.m):
-                acc = atom.zero_acc(b)
-                arow = b.add(b.const_i32(rt * atom.m), lane_m)
-                for ks in range((rt + 1) * atom.m // atom.k):
-                    kb = b.add(b.const_i32(ks * atom.k), koff)
-                    acc = atom.emit(
-                        b,
-                        _ld(b, a2_s, arow, kb, dtype=ELEM, n=atom.a_per_lane),
-                        _ld(b, b_s, ccol, kb, dtype=ELEM, n=atom.b_per_lane),
-                        acc,
-                    )
+                acc = mm(a2_s, rt * atom.m, b_s, col0, (rt + 1) * atom.m // atom.k)
                 for s in range(atom.c_per_lane):
                     r, c = atom.lane_to_output(b, lane, s)
                     orow = b.add(b.const_i32(rt * atom.m), r)
-                    ocol = b.add(b.mul(wave, b.const_i32(atom.n)), c)
                     b.global_store_vN(
                         dst,
-                        b.add(base, b.add(b.mul(orow, b.const_i32(ncols)), ocol)),
+                        b.add(base, b.add(b.mul(orow, b.const_i32(ncols)), b.add(col0, c))),
                         b.cast_f32_to(b.vec_extract(acc, s), ELEM),
                         1,
                     )
