@@ -531,6 +531,16 @@ class UnifiedAttention2DTiledSpec:
     # own ``vmcnt(0)`` in front of the operand reads. Ordering between a tile's
     # DMA and its reads is carried entirely by the explicit waits + barriers.
     use_lds_dma_overlap: bool = False
+    # Load the paged-KV block ids one tile ahead and carry them through the
+    # loop. Without it every K/V DMA call first does its own block-table
+    # ``global_load``; because ``vmcnt`` retires in order, the wait for that
+    # id also drains the DMAs issued just before it, so the calls of a tile
+    # serialise into id-load -> DMA round trips. With it the ids for tile i+2
+    # are loaded after the iteration-start wait, the next tile's DMAs take
+    # their block base from those (already resident) ids as a scalar
+    # ``soffset``, and the per-call voffset is loop-invariant. K and V share
+    # the ids.
+    use_kv_block_id_prefetch: bool = False
 
     def __post_init__(self):
         for knob in ("use_f32_denormal_flush", "use_fp_contract"):
@@ -872,6 +882,19 @@ class UnifiedAttention2DTiledSpec:
                     "use_lds_dma_overlap does not support staggered_iter_wait "
                     "with early_v_schedule"
                 )
+        if self.use_kv_block_id_prefetch:
+            if self.kv_storage_dtype is not None:
+                raise ValueError("use_kv_block_id_prefetch does not support FP8 KV")
+            if self.use_fast_paged_kv_desc or self.use_i64_kv_addr:
+                raise ValueError(
+                    "use_kv_block_id_prefetch needs the i32 paged descriptor path"
+                )
+            if self.use_grouped_kv2_softmax:
+                raise ValueError("use_kv_block_id_prefetch does not support grouped_kv2")
+            if (512 // self.head_size) > self.block_size:
+                # One wave's DMA call (64 lanes x 8 halves) must stay inside
+                # one block for its block id to be wave-uniform.
+                raise ValueError("use_kv_block_id_prefetch needs 512/head_size <= block_size")
 
     @property
     def num_queries_per_kv(self) -> int:
@@ -999,6 +1022,7 @@ class UnifiedAttention2DTiledSpec:
             "kswz" if self.use_k_lds_xor_swizzle else "",
             "vswz" if self.use_v_lds_xor_swizzle else "",
             "dmaov" if self.use_lds_dma_overlap else "",
+            "bidpf" if self.use_kv_block_id_prefetch else "",
         )
 
 
@@ -2250,6 +2274,60 @@ def build_unified_attention_2d_tiled(
                 ),
             )
 
+    # ---- paged block-id prefetch (see ``use_kv_block_id_prefetch``) ----
+    # A DMA call covers 64 * 8 halves per wave, i.e. <= BS rows, so its block
+    # is wave-uniform. Per call we precompute (loop-invariant) the block index
+    # within the tile and the within-block byte offset of the lane's chunk;
+    # the per-tile block id becomes the scalar ``soffset``.
+    BLOCK_ID_PREFETCH = bool(spec.use_kv_block_id_prefetch)
+    _prefetched_ids: dict = {}
+    if BLOCK_ID_PREFETCH:
+
+        def _dma_call_coords(swz_halves):
+            bwt, within = [], []
+            for call in range(kv_calls_per_tile):
+                lh = b.add(b.const_i32(call * KV_HALVES_PER_CALL), lane_half_base)
+                row = b.div(lh, b.const_i32(HD))
+                bwt.append(b.div(row, b.const_i32(BS)))
+                if swz_halves is not None:
+                    lh = _swizzle_dma_linear_half(lh, swz_halves)
+                token = b.mod(b.div(lh, b.const_i32(HD)), b.const_i32(BS))
+                dim = b.mod(lh, b.const_i32(HD))
+                within.append(
+                    b.add(
+                        b.add(
+                            b.mul(token, b.const_i32(kv_stride_tok_b)),
+                            b.mul(kv_head_idx, b.const_i32(kv_stride_h_b)),
+                        ),
+                        b.mul(dim, b.const_i32(KV_BYTES)),
+                    )
+                )
+            return bwt, within
+
+        dma_bwt, k_dma_within = _dma_call_coords(_k_swz_halves if K_LDS_SWZ else None)
+        _, v_dma_within = _dma_call_coords(_v_swz_halves if V_LDS_SWZ else None)
+
+        def _load_block_ids(tile_idx: Value) -> list:
+            """Per-call physical block ids of ``tile_idx`` (VGPR, wave-uniform).
+
+            Out-of-table indices (over-fetch past the last tile) clamp to
+            entry 0 instead of selecting 0 after the load: the loaded value
+            then has no consumer in the issuing iteration, so no ``vmcnt``
+            wait lands mid-iteration. Those tokens are masked out as before.
+            """
+            tile_base = b.add(seq_base, b.mul(tile_idx, b.const_i32(N_BLOCKS_PER_TILE)))
+            ids = []
+            for call in range(kv_calls_per_tile):
+                idx = b.add(tile_base, dma_bwt[call])
+                idx = b.select(b.cmp_lt(idx, block_table_max_idx), idx, b.const_i32(0))
+                ids.append(b.global_load(block_tables, idx, I32, align=4))
+            return ids
+
+        def _block_soffs(ids: list) -> list:
+            return [
+                b.mul(b.to_sgpr_u32(i), b.const_i32(kv_stride_blk_b)) for i in ids
+            ]
+
     def _issue_k_load_runtime(kv_tile_idx: Value, buf_idx: Value) -> None:
         """Issue async K loads for one tile into K_lds[buf_idx].
 
@@ -2271,9 +2349,15 @@ def build_unified_attention_2d_tiled(
         K_wave_base = b.smem_ptr_add(K_buf_base, wave_lds_offset_K_i64)
         if FAST_PAGED_KV_DESC:
             fast_block0, fast_block1 = _fast_paged_kv_blocks(kv_tile_idx)
+        pf_ids = _prefetched_ids.get(id(kv_tile_idx))
+        pf_soffs = _block_soffs(pf_ids) if pf_ids is not None else None
         for call in range(kv_calls_per_tile):
             k_rsrc = key_rsrc
-            if FAST_PAGED_KV_DESC:
+            k_soff = zero_soff
+            if pf_soffs is not None:
+                voff = k_dma_within[call]
+                k_soff = pf_soffs[call]
+            elif FAST_PAGED_KV_DESC:
                 base_i64, voff = _fast_paged_kv_voff(call, fast_block0, fast_block1)
                 if base_i64 is not None:  # I64_KV_ADDR: per-block 64-bit base
                     k_rsrc = b.buffer_rsrc(
@@ -2309,7 +2393,7 @@ def build_unified_attention_2d_tiled(
             # ``dsl_docs/primitives/intrinsics_and_primitives.md`` as the
             # right hint for K-loop streaming tile loads.
             b.async_buffer_load_lds_addr(
-                k_rsrc, k_dst, voff, zero_soff, 4, coherency=CACHE_STREAM,
+                k_rsrc, k_dst, voff, k_soff, 4, coherency=CACHE_STREAM,
                 lds_dma_scope=LDS_DMA_TAG,
             )
 
@@ -2332,9 +2416,15 @@ def build_unified_attention_2d_tiled(
             V_wave_base = b.smem_ptr_add(V_lds_addr, wave_lds_offset_i64)
         if FAST_PAGED_KV_DESC:
             fast_block0, fast_block1 = _fast_paged_kv_blocks(kv_tile_idx)
+        pf_ids = _prefetched_ids.get(id(kv_tile_idx))
+        pf_soffs = _block_soffs(pf_ids) if pf_ids is not None else None
         for call in range(kv_calls_per_tile):
             v_rsrc = value_rsrc
-            if FAST_PAGED_KV_DESC:
+            v_soff = zero_soff
+            if pf_soffs is not None:
+                voff = v_dma_within[call]
+                v_soff = pf_soffs[call]
+            elif FAST_PAGED_KV_DESC:
                 base_i64, voff = _fast_paged_kv_voff(call, fast_block0, fast_block1)
                 if base_i64 is not None:
                     v_rsrc = b.buffer_rsrc(
@@ -2369,7 +2459,7 @@ def build_unified_attention_2d_tiled(
             # re-read within this kernel; see _issue_k_load_runtime for
             # the rationale.
             b.async_buffer_load_lds_addr(
-                v_rsrc, v_dst, voff, zero_soff, 4, coherency=CACHE_STREAM,
+                v_rsrc, v_dst, voff, v_soff, 4, coherency=CACHE_STREAM,
                 lds_dma_scope=LDS_DMA_TAG,
             )
 
@@ -3122,6 +3212,15 @@ def build_unified_attention_2d_tiled(
     #   6. Yield ``(m, l, acc, nxt_buf)`` so the next iter consumes nxt_buf.
     cur_buf_init = b.const_i32(0)
     iter_args.append(("cur_buf", cur_buf_init))
+    if BLOCK_ID_PREFETCH:
+        # Carry the block ids of tile i (``bid_cur``) and tile i+1
+        # (``bid_nxt``); iteration i loads tile i+2's.
+        _ts1_raw = b.add(tile_start, b.const_i32(1))
+        _ts1 = b.select(b.cmp_lt(_ts1_raw, tile_end), _ts1_raw, tile_start)
+        for _c, _v in enumerate(_load_block_ids(tile_start)):
+            iter_args.append((f"bid_cur{_c}", _v))
+        for _c, _v in enumerate(_load_block_ids(_ts1)):
+            iter_args.append((f"bid_nxt{_c}", _v))
 
     # ---------------- LICM hoist: per-reg invariants ----------------
     # ``qp_r``, ``qh_r``, ``row_ok``, ``causal_lim``, and ``alibi_per_row``
@@ -3242,6 +3341,12 @@ def build_unified_attention_2d_tiled(
             return acc_vals[n * ACC_M_ATOMS + atom]
 
         cur_buf = carry[ml_count + ACC_N_TILES * ACC_M_ATOMS]
+        if BLOCK_ID_PREFETCH:
+            _bid_base = ml_count + ACC_N_TILES * ACC_M_ATOMS + 1
+            bid_cur = list(carry[_bid_base : _bid_base + kv_calls_per_tile])
+            bid_nxt = list(
+                carry[_bid_base + kv_calls_per_tile : _bid_base + 2 * kv_calls_per_tile]
+            )
         if RING3:
             # 3-slot ring: cur_buf holds K[i]; (cur_buf+1)%3 holds K[i+1]
             # (prefetched last iter / prologue); the prefetch target for K[i+2]
@@ -3360,6 +3465,17 @@ def build_unified_attention_2d_tiled(
         else:
             b.s_waitcnt(vmcnt=0, lgkmcnt=0)
         _kv_publish_sync()
+        if BLOCK_ID_PREFETCH:
+            # Ids for tile i+2, issued right after the iteration-start wait so
+            # they are the oldest VMEM ops of this iteration (every counted
+            # vmcnt below only ever leaves newer DMAs pending). Consumed next
+            # iteration, after that iteration's wait has retired them.
+            _t2_raw = b.add(kv_tile_iv, b.const_i32(2))
+            _t2 = b.select(b.cmp_lt(_t2_raw, tile_end), _t2_raw, kv_tile_iv)
+            bid_new = _load_block_ids(_t2)
+            _prefetched_ids.clear()
+            _prefetched_ids[id(kv_tile_iv)] = bid_cur
+            _prefetched_ids[id(safe_next_tile)] = bid_nxt
         # STEP 2 lever (modes 0/1): canned iglp interleave for the whole loop
         # body. Placed once at the top of the main loop body (after the iter-start
         # K drain) per the iglp_opt contract; it owns the schedule, so the manual
@@ -4491,6 +4607,9 @@ def build_unified_attention_2d_tiled(
             yields.append(ring_next_cur)
         else:
             yields.append(cur_buf if GROUPED_KV2 else nxt_buf)
+        if BLOCK_ID_PREFETCH:
+            yields.extend(bid_nxt)
+            yields.extend(bid_new)
         b.scf_yield(*yields)
 
     # ---- drive the (one or two) KV-loop phases ----
