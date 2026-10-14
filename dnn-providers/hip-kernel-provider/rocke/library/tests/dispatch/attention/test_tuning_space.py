@@ -92,12 +92,6 @@ def _sampled(prefix, n, seed=0, **req_kw):
     return tuple(candidate.sample_space(req, n, seed))
 
 
-def _problem_of(req):
-    from dispatch.attention.common import _problem
-
-    return _problem(req)
-
-
 _GEOMETRY_FIELDS = frozenset(
     {
         "num_warps",
@@ -153,27 +147,14 @@ class TestTuningSpace(unittest.TestCase):
         self.assertNotEqual(ids, [s.tuning_id for s in other])
 
     def test_sampling_stops_at_a_small_space(self):
-        prefix = "attention_gfx942_u3d_splitkv_seg64_t1xb"
-        req = dict(arch="gfx942", seqlen_q=1, seqlen_k=4096)
-        specs = _sampled(prefix, 256, **req)
-        # waves_per_eu choices x the hoist / wide-KV axes: the whole space.
-        _candidate, _req, full = _specs_for(prefix, 10_000, **req)
-        self.assertLess(len(full), 256)
-        self.assertEqual(len(specs), len(full))
-        self.assertEqual({s.tuning_id for s in specs}, {s.tuning_id for s in full})
-
-    def test_decode_fast_path_rejects_prefill(self):
-        from dispatch.attention.tuning_specs import (
-            ExplicitAttention3DConfig,
-            make_explicit_attention_3d_specs,
+        specs = _sampled(
+            "attention_gfx950_u3d_splitkv_seg64_t1xb",
+            256,
+            seqlen_q=1,
+            seqlen_k=4096,
         )
-
-        problem = _problem_of(_request(seqlen_q=4))
-        config = ExplicitAttention3DConfig(
-            num_segments=8, knobs=(("decode_fast_path", True),)
-        )
-        with self.assertRaisesRegex(ValueError, "max_seqlen_q == 1"):
-            make_explicit_attention_3d_specs(problem, config, arch="gfx950")
+        # waves_per_eu choices x the use_f32_denormal_flush axis.
+        self.assertEqual(len(specs), 10)
 
     def test_tuning_ids_are_unique_and_hashed(self):
         _candidate, _req, specs = _specs_for(

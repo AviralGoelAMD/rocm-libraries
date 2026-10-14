@@ -171,9 +171,6 @@ typedef struct rocke_gfx950_attn_tiled_3d_config
     int Q_VECS_PER_THREAD; /* (BLOCK_M*Q_VECS_PER_ROW)//THREADS */
     int bm1_div_nqk; /* (BLOCK_M-1)//NQK */
 
-    /* ---- decode-path knobs (spec fields of the same lower-case name) ---- */
-    bool DECODE_FAST_PATH; /* spec.decode_fast_path                 */
-
     const rocke_type_t* dtype; /* F16 / BF16                                 */
     const rocke_type_t* kv_io_dtype; /* FP8E4M3 if KV_FP8 else dtype               */
 

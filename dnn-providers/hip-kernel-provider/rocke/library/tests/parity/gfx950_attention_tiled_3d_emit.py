@@ -126,19 +126,6 @@ _CONFIGS = {
         has_softcap=False,
         use_f32_denormal_flush=True,
     ),
-    7: dict(
-        # decode_fast_path only
-        head_size=128,
-        block_size=16,
-        num_query_heads=32,
-        num_kv_heads=8,
-        dtype="bf16",
-        num_segments=16,
-        use_sinks=False,
-        sliding_window=0,
-        has_softcap=False,
-        decode_fast_path=True,
-    ),
 }
 
 

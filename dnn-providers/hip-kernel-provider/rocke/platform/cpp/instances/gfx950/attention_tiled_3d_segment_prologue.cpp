@@ -337,48 +337,29 @@ void rocke_gfx950_attention_tiled_3d_emit_prologue(rocke_gfx950_attention_tiled_
     ctx->seg_idx = rocke_b_block_id_z(B);
     ctx->tid = rocke_b_thread_id_x(B);
 
-    if(CFG.DECODE_FAST_PATH)
-    {
-        /* One CTA row per sequence: no dependent cu_q search, and the
-         * sequence's single query block is always local block 0. */
-        ctx->seq_idx = ctx->q_block_global_idx;
-    }
-    else
-    {
-        /* binary search seq_idx; per_token=False (the Python helper default
-         * for the block-q search). */
-        ctx->seq_idx = rocke_binary_search_seq_idx(B,
-                                                   ctx->cu_q,
-                                                   ctx->q_block_global_idx,
-                                                   ctx->num_seqs_p,
-                                                   BLOCK_Q,
-                                                   CFG.binary_search_iters,
-                                                   false);
-    }
+    /* binary search seq_idx; per_token=False (the Python helper default for the
+     * block-q search). */
+    ctx->seq_idx = rocke_binary_search_seq_idx(B,
+                                               ctx->cu_q,
+                                               ctx->q_block_global_idx,
+                                               ctx->num_seqs_p,
+                                               BLOCK_Q,
+                                               CFG.binary_search_iters,
+                                               false);
 
     /* ---- cu_q bounds / per-sequence geometry ---- */
     ctx->cu_q_start = rocke_b_global_load_i32(B, ctx->cu_q, ctx->seq_idx, 0);
     ctx->cu_q_stop = rocke_b_global_load_i32(
         B, ctx->cu_q, rocke_b_add(B, ctx->seq_idx, rocke_b_const_i32(B, 1)), 0);
     ctx->cur_batch_q_len = rocke_b_sub(B, ctx->cu_q_stop, ctx->cu_q_start);
-    if(!CFG.DECODE_FAST_PATH)
-    {
-        ctx->q_block_start_idx = rocke_b_add(
-            B, rocke_b_div(B, ctx->cu_q_start, rocke_b_const_i32(B, BLOCK_Q)), ctx->seq_idx);
-        ctx->q_block_local_idx = rocke_b_sub(B, ctx->q_block_global_idx, ctx->q_block_start_idx);
-    }
+    ctx->q_block_start_idx = rocke_b_add(
+        B, rocke_b_div(B, ctx->cu_q_start, rocke_b_const_i32(B, BLOCK_Q)), ctx->seq_idx);
+    ctx->q_block_local_idx = rocke_b_sub(B, ctx->q_block_global_idx, ctx->q_block_start_idx);
     ctx->seq_len = rocke_b_global_load_i32(B, ctx->seq_lens, ctx->seq_idx, 0);
     ctx->context_len = rocke_b_sub(B, ctx->seq_len, ctx->cur_batch_q_len);
 
-    /* qb_start_pos = 0 on the decode fast path, else q_block_local_idx * BLOCK_Q */
-    if(CFG.DECODE_FAST_PATH)
-    {
-        ctx->qb_start_pos = rocke_b_const_i32(B, 0);
-    }
-    else
-    {
-        ctx->qb_start_pos = rocke_b_mul(B, ctx->q_block_local_idx, rocke_b_const_i32(B, BLOCK_Q));
-    }
+    /* qb_start_pos = q_block_local_idx * BLOCK_Q */
+    ctx->qb_start_pos = rocke_b_mul(B, ctx->q_block_local_idx, rocke_b_const_i32(B, BLOCK_Q));
 
     /* early return guard: if qb_start_pos >= cur_batch_q_len: ret() (lines 382-383) */
     {
