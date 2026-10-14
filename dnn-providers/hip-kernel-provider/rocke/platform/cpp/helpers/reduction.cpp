@@ -445,6 +445,96 @@ rocke_value_t* rocke_block_lds_reduce_with_wave_prologue(rocke_ir_builder_t* b,
     return rocke_red_tree_reduce_scalars(b, combine, parts, num_warps);
 }
 
+/* ------------------------- block_lds_reduce_pair_with_wave_prologue */
+
+int rocke_block_lds_reduce_pair_with_wave_prologue(rocke_ir_builder_t* b,
+                                                   rocke_value_t* val_a,
+                                                   rocke_value_t* val_c,
+                                                   rocke_value_t* lds_a,
+                                                   rocke_value_t* lds_c,
+                                                   rocke_value_t* tid,
+                                                   int block_size,
+                                                   rocke_reduce_combine_t combine_a,
+                                                   rocke_reduce_combine_t combine_c,
+                                                   int wave_size,
+                                                   rocke_value_t** out_a,
+                                                   rocke_value_t** out_c)
+{
+    rocke_value_t* part_a;
+    rocke_value_t* part_c;
+    int num_warps;
+    rocke_value_t* c_wave;
+    rocke_value_t* lane;
+    rocke_value_t* warp;
+    rocke_value_t** parts_a;
+    rocke_value_t** parts_c;
+    int w;
+
+    if(!rocke_red_is_f32(val_a) || !rocke_red_is_f32(val_c))
+    {
+        rocke_red_set_err(
+            b, ROCKE_ERR_VALUE, "block_lds_reduce_pair_with_wave_prologue expects f32 inputs");
+        return 0;
+    }
+    if(wave_size <= 0 || (block_size % wave_size) != 0)
+    {
+        rocke_red_set_err(b,
+                          ROCKE_ERR_VALUE,
+                          "block_size %d is not a multiple of wave_size %d",
+                          block_size,
+                          wave_size);
+        return 0;
+    }
+
+    part_a = rocke_red_warp_xor_reduce(b, val_a, combine_a, wave_size);
+    part_c = rocke_red_warp_xor_reduce(b, val_c, combine_c, wave_size);
+
+    num_warps = block_size / wave_size;
+    if(num_warps == 1)
+    {
+        *out_a = part_a;
+        *out_c = part_c;
+        return 1;
+    }
+
+    c_wave = rocke_b_const_i32(b, wave_size);
+    lane = rocke_b_mod(b, tid, c_wave);
+    warp = rocke_b_div(b, tid, c_wave);
+    {
+        rocke_if_t iff = rocke_b_scf_if(b, rocke_b_cmp_eq(b, lane, rocke_b_const_i32(b, 0)));
+        rocke_b_region_enter(b, iff.then_region);
+        {
+            rocke_value_t* idx[1];
+            idx[0] = warp;
+            rocke_b_smem_store_vN_f32(b, lds_a, idx, 1, part_a, 1);
+            rocke_b_smem_store_vN_f32(b, lds_c, idx, 1, part_c, 1);
+        }
+        rocke_b_region_leave(b);
+    }
+    rocke_b_sync(b);
+
+    parts_a = (rocke_value_t**)rocke_arena_alloc(&b->arena, (size_t)num_warps * sizeof(*parts_a));
+    parts_c = (rocke_value_t**)rocke_arena_alloc(&b->arena, (size_t)num_warps * sizeof(*parts_c));
+    if(parts_a == NULL || parts_c == NULL)
+    {
+        rocke_red_set_err(b, ROCKE_ERR_OOM, "pair wave prologue parts alloc failed");
+        return 0;
+    }
+    /* Each load spells a FRESH b.const_i32(w), channel a then channel c. */
+    for(w = 0; w < num_warps; ++w)
+    {
+        rocke_value_t* idx_a[1];
+        rocke_value_t* idx_c[1];
+        idx_a[0] = rocke_b_const_i32(b, w);
+        parts_a[w] = rocke_b_vec_extract(b, rocke_b_smem_load_vN_f32(b, lds_a, idx_a, 1, 1), 0);
+        idx_c[0] = rocke_b_const_i32(b, w);
+        parts_c[w] = rocke_b_vec_extract(b, rocke_b_smem_load_vN_f32(b, lds_c, idx_c, 1, 1), 0);
+    }
+    *out_a = rocke_red_tree_reduce_scalars(b, combine_a, parts_a, num_warps);
+    *out_c = rocke_red_tree_reduce_scalars(b, combine_c, parts_c, num_warps);
+    return 1;
+}
+
 /* ----------------------------------------------------- welford_block_reduce */
 
 int rocke_welford_block_reduce(rocke_ir_builder_t* b,

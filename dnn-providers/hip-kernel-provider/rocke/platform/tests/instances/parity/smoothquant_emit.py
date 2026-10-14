@@ -39,6 +39,24 @@ def _spec(idx: int) -> SmoothQuantSpec:
         return SmoothQuantSpec(
             n_per_block=256, dtype="bf16", out_dtype="fp8e4m3", block_size=256, vec=2
         )
+    if idx == 6:
+        return SmoothQuantSpec(
+            n_per_block=8192,
+            dtype="f16",
+            out_dtype="i8",
+            block_size=256,
+            vec=8,
+            wave_reduce=True,
+        )
+    if idx == 7:
+        return SmoothQuantSpec(
+            n_per_block=2048,
+            dtype="bf16",
+            out_dtype="fp8e4m3",
+            block_size=512,
+            vec=4,
+            wave_reduce=True,
+        )
     raise SystemExit(f"unknown config index {idx}")
 
 
@@ -50,7 +68,7 @@ def main() -> int:
     return run_emit(
         _spec,
         _build,
-        usage="usage: smoothquant_emit.py <config_index 0..5> [mode]\n",
+        usage="usage: smoothquant_emit.py <config_index 0..7> [mode]\n",
     )
 
 

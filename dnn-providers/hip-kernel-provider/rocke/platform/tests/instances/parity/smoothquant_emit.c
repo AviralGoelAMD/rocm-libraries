@@ -68,6 +68,22 @@ static int make_spec(int idx, rocke_smoothquant_spec_t* s)
         s->block_size = 256;
         s->vec = 2;
         break;
+    case 6: /* N8192 f16->i8 b256 v8 wave_reduce */
+        s->n_per_block = 8192;
+        s->dtype = "f16";
+        s->out_dtype = "i8";
+        s->block_size = 256;
+        s->vec = 8;
+        s->wave_reduce = true;
+        break;
+    case 7: /* N2048 bf16->fp8e4m3 b512 v4 wave_reduce */
+        s->n_per_block = 2048;
+        s->dtype = "bf16";
+        s->out_dtype = "fp8e4m3";
+        s->block_size = 512;
+        s->vec = 4;
+        s->wave_reduce = true;
+        break;
     default:
         return -1;
     }
@@ -78,7 +94,7 @@ int main(int argc, char** argv)
 {
     if(argc < 2)
     {
-        fprintf(stderr, "usage: %s <config_index 0..5> [mode]\n", argv[0]);
+        fprintf(stderr, "usage: %s <config_index 0..7> [mode]\n", argv[0]);
         return 2;
     }
     int idx = atoi(argv[1]);

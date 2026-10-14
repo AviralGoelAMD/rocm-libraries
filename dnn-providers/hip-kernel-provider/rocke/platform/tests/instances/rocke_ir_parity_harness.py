@@ -3951,6 +3951,36 @@ def cases():
                 **_over,
             ),
         )
+    for _case_id, _over in (
+        ("default_n8192", {}),
+        ("wave_reduce_n8192", {"wave_reduce": True}),
+    ):
+        add(
+            "add_rmsnorm2d_rdquant",
+            f"add_rmsnorm2d_rdquant/gfx950/{_case_id}",
+            "gfx950",
+            build_row_kernel(
+                "add_rmsnorm2d_rdquant",
+                "AddRmsnorm2DRdquantSpec",
+                "build_add_rmsnorm2d_rdquant",
+                arch="gfx950",
+                n_per_block=8192,
+                **_over,
+            ),
+        )
+        add(
+            "smoothquant",
+            f"smoothquant/gfx950/{_case_id}",
+            "gfx950",
+            build_row_kernel(
+                "smoothquant",
+                "SmoothQuantSpec",
+                "build_smoothquant",
+                arch="gfx950",
+                n_per_block=8192,
+                **_over,
+            ),
+        )
 
     return out
 

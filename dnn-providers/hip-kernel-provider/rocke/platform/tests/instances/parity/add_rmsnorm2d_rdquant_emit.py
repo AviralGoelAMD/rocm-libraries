@@ -91,13 +91,38 @@ def _spec(idx: int) -> AddRmsnorm2DRdquantSpec:
             save_yscale=False,
             wave_size=64,
         )
+    if idx == 6:
+        return AddRmsnorm2DRdquantSpec(
+            n_per_block=8192,
+            dtype="f16",
+            out_dtype="i8",
+            block_size=512,
+            vec=8,
+            save_residual=True,
+            save_yscale=True,
+            wave_size=64,
+            wave_reduce=True,
+        )
+    if idx == 7:
+        # One wave per block: the butterfly alone, no cross-warp LDS round.
+        return AddRmsnorm2DRdquantSpec(
+            n_per_block=1024,
+            dtype="bf16",
+            out_dtype="i8",
+            block_size=64,
+            vec=4,
+            save_residual=True,
+            save_yscale=True,
+            wave_size=64,
+            wave_reduce=True,
+        )
     raise SystemExit(f"unknown config index {idx}")
 
 
 def main() -> int:
     if len(sys.argv) < 2:
         sys.stderr.write(
-            "usage: add_rmsnorm2d_rdquant_emit.py <config_index 0..5> [ll|ir|verify]\n"
+            "usage: add_rmsnorm2d_rdquant_emit.py <config_index 0..7> [ll|ir|verify]\n"
         )
         return 2
     idx = int(sys.argv[1])

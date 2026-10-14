@@ -186,13 +186,16 @@ def cfgs_add_rmsnorm2d_bf16():
 
 
 def cfgs_add_rmsnorm2d_rdquant():
+    # Trailing dict: opt-in knobs on top of the spec defaults.
     rows = [
-        (4096, "f16", "i8", 256, 4, True, True, 64),
-        (8192, "f16", "fp8e4m3", 256, 8, True, True, 64),
-        (2048, "bf16", "bf8e5m2", 128, 4, False, False, 64),
-        (16384, "f16", "i8", 256, 4, True, True, 64),
-        (1024, "bf16", "i8", 64, 4, True, True, 64),
-        (6144, "f16", "fp8e4m3", 256, 2, True, False, 64),
+        (4096, "f16", "i8", 256, 4, True, True, 64, {}),
+        (8192, "f16", "fp8e4m3", 256, 8, True, True, 64, {}),
+        (2048, "bf16", "bf8e5m2", 128, 4, False, False, 64, {}),
+        (16384, "f16", "i8", 256, 4, True, True, 64, {}),
+        (1024, "bf16", "i8", 64, 4, True, True, 64, {}),
+        (6144, "f16", "fp8e4m3", 256, 2, True, False, 64, {}),
+        (8192, "f16", "i8", 512, 8, True, True, 64, {"wave_reduce": True}),
+        (1024, "bf16", "i8", 64, 4, True, True, 64, {"wave_reduce": True}),
     ]
     return [
         dict(
@@ -204,8 +207,9 @@ def cfgs_add_rmsnorm2d_rdquant():
             save_residual=sr,
             save_yscale=sy,
             wave_size=w,
+            **extra,
         )
-        for (n, dt, o, b, v, sr, sy, w) in rows
+        for (n, dt, o, b, v, sr, sy, w, extra) in rows
     ]
 
 
@@ -320,16 +324,18 @@ def cfgs_permute_nd():
 
 def cfgs_smoothquant():
     rows = [
-        (1024, "f16", "i8", 256, 4),
-        (2048, "bf16", "i8", 256, 8),
-        (512, "f16", "fp8e4m3", 128, 4),
-        (1024, "bf16", "bf8e5m2", 64, 2),
-        (2048, "f16", "i8", 512, 4),
-        (256, "bf16", "fp8e4m3", 256, 2),
+        (1024, "f16", "i8", 256, 4, False),
+        (2048, "bf16", "i8", 256, 8, False),
+        (512, "f16", "fp8e4m3", 128, 4, False),
+        (1024, "bf16", "bf8e5m2", 64, 2, False),
+        (2048, "f16", "i8", 512, 4, False),
+        (256, "bf16", "fp8e4m3", 256, 2, False),
+        (8192, "f16", "i8", 256, 8, True),
+        (2048, "bf16", "fp8e4m3", 512, 4, True),
     ]
     return [
-        dict(n_per_block=n, dtype=dt, out_dtype=o, block_size=b, vec=v)
-        for (n, dt, o, b, v) in rows
+        dict(n_per_block=n, dtype=dt, out_dtype=o, block_size=b, vec=v, wave_reduce=wr)
+        for (n, dt, o, b, v, wr) in rows
     ]
 
 

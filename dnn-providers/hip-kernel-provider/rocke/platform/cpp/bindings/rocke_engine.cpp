@@ -2086,6 +2086,7 @@ rocke_add_rmsnorm2d_rdquant_spec_t ard_build_spec(const py::dict& d, std::deque<
     s.save_residual = dict_bool(d, "save_residual", s.save_residual);
     s.save_yscale = dict_bool(d, "save_yscale", s.save_yscale);
     s.wave_size = dict_int(d, "wave_size", s.wave_size);
+    s.wave_reduce = dict_bool(d, "wave_reduce", s.wave_reduce);
     {
         std::string v;
         if(dict_str(d, "dtype", v))
@@ -2655,6 +2656,9 @@ rocke_smoothquant_spec_t sq_build_spec(const py::dict& d, std::deque<std::string
     s.n_per_block = dict_int(d, "n_per_block", s.n_per_block);
     s.block_size = dict_int(d, "block_size", s.block_size);
     s.vec = dict_int(d, "vec", s.vec);
+    /* wave_size is read by the wave_reduce path. */
+    s.wave_size = dict_int(d, "wave_size", s.wave_size);
+    s.wave_reduce = dict_bool(d, "wave_reduce", s.wave_reduce);
     {
         std::string v;
         if(dict_str(d, "dtype", v))

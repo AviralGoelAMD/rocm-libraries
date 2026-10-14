@@ -54,7 +54,11 @@ from ...helpers.quant import (
     quantize_scalar_f32,
     store_packed_chunk_local,
 )
-from ...helpers.reduction import block_lds_reduce_pair, tree_reduce
+from ...helpers.reduction import (
+    block_lds_reduce_pair,
+    block_lds_reduce_pair_with_wave_prologue,
+    tree_reduce,
+)
 from ...helpers.spec import (
     IOSpecRule,
     SignatureBuilder,
@@ -86,6 +90,9 @@ class AddRmsnorm2DRdquantSpec:
     save_residual: bool = True  # write x = a + b to ``X``
     save_yscale: bool = True  # write per-row scale to ``YScale``
     wave_size: int = 64
+    # Fold the sum-of-squares / amax pair with the wave XOR butterfly plus
+    # one cross-warp LDS round instead of the full block-wide LDS tree.
+    wave_reduce: bool = False
     name: str = "rocke_add_rmsnorm2d_rdquant"
 
     @property
@@ -100,7 +107,7 @@ class AddRmsnorm2DRdquantSpec:
             f"N{self.n_per_block}",
             f"b{self.block_size}",
             f"v{self.vec}",
-            flags={"sr": self.save_residual, "ys": self.save_yscale},
+            flags={"sr": self.save_residual, "ys": self.save_yscale, "wr": self.wave_reduce},
         )
 
 
@@ -322,17 +329,31 @@ def build_add_rmsnorm2d_rdquant(
 
     # Twin-channel cross-thread reduction: ``sum`` for the sum-of-squares
     # and ``max`` for the abs-max of ``x * gamma``.
-    total_sq, total_amax_g = block_lds_reduce_pair(
-        b,
-        s_sq,
-        s_amax_g,
-        lds_sum,
-        lds_max,
-        tid,
-        block_size=BS,
-        combine_a="sum",
-        combine_c="max",
-    )
+    if spec.wave_reduce:
+        total_sq, total_amax_g = block_lds_reduce_pair_with_wave_prologue(
+            b,
+            s_sq,
+            s_amax_g,
+            lds_sum,
+            lds_max,
+            tid,
+            block_size=BS,
+            combine_a="sum",
+            combine_c="max",
+            wave_size=spec.wave_size,
+        )
+    else:
+        total_sq, total_amax_g = block_lds_reduce_pair(
+            b,
+            s_sq,
+            s_amax_g,
+            lds_sum,
+            lds_max,
+            tid,
+            block_size=BS,
+            combine_a="sum",
+            combine_c="max",
+        )
 
     rcp_n = b.rcp(b.const_f32(float(N)))
     mean_sq = b.fmul(total_sq, rcp_n)

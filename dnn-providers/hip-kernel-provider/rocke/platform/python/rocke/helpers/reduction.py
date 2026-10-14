@@ -39,6 +39,7 @@ __all__ = [
     "row_norm_needs_two_pass",
     "block_lds_reduce",
     "block_lds_reduce_pair",
+    "block_lds_reduce_pair_with_wave_prologue",
     "block_lds_reduce_with_index",
     "block_lds_reduce_with_wave_prologue",
     "tree_reduce",
@@ -353,6 +354,64 @@ def block_lds_reduce_with_wave_prologue(
             v_vec = b.smem_load_vN_f32(lds_buf, b.const_i32(w), n=1)
         parts.append(b.vec_extract(v_vec, 0))
     return _tree_reduce_scalars(b, combine, parts)
+
+
+def block_lds_reduce_pair_with_wave_prologue(
+    b: IRBuilder,
+    val_a: Value,
+    val_c: Value,
+    lds_a: Value,
+    lds_c: Value,
+    tid: Value,
+    *,
+    block_size: int,
+    combine_a: ReduceCombine = "sum",
+    combine_c: ReduceCombine = "sum",
+    wave_size: int = 64,
+) -> Tuple[Value, Value]:
+    """Twin-channel :func:`block_lds_reduce_with_wave_prologue`.
+
+    Both channels run the wave XOR butterfly, lane 0 of every wave writes
+    its two partials to ``num_warps`` slots of ``lds_a`` / ``lds_c``, and a
+    single ``sync`` publishes them; every thread then folds the
+    ``num_warps`` partials of each channel. For ``block_size = 256`` /
+    wave64 this replaces the 9-``sync`` halving schedule of
+    :func:`block_lds_reduce_pair` with one ``sync``.
+
+    ``block_size`` must be a multiple of ``wave_size``; both LDS buffers
+    need at least ``num_warps`` f32 slots.
+    """
+    if val_a.type.name != "f32" or val_c.type.name != "f32":
+        raise ValueError("block_lds_reduce_pair_with_wave_prologue expects f32 inputs")
+    if block_size % wave_size:
+        raise ValueError(
+            f"block_size {block_size} is not a multiple of wave_size {wave_size}"
+        )
+
+    part_a = _warp_xor_reduce(b, val_a, combine=combine_a, wave_size=wave_size)
+    part_c = _warp_xor_reduce(b, val_c, combine=combine_c, wave_size=wave_size)
+
+    num_warps = block_size // wave_size
+    if num_warps == 1:
+        return part_a, part_c
+
+    c_wave = b.const_i32(wave_size)
+    lane = b.mod(tid, c_wave)
+    warp = b.div(tid, c_wave)
+    with b.scf_if(b.cmp_eq(lane, b.const_i32(0))):
+        b.smem_store_vN_f32(lds_a, [warp], part_a, 1)
+        b.smem_store_vN_f32(lds_c, [warp], part_c, 1)
+    b.sync()
+
+    parts_a: List[Value] = []
+    parts_c: List[Value] = []
+    for w in range(num_warps):
+        parts_a.append(b.vec_extract(b.smem_load_vN_f32(lds_a, b.const_i32(w), n=1), 0))
+        parts_c.append(b.vec_extract(b.smem_load_vN_f32(lds_c, b.const_i32(w), n=1), 0))
+    return (
+        _tree_reduce_scalars(b, combine_a, parts_a),
+        _tree_reduce_scalars(b, combine_c, parts_c),
+    )
 
 
 def welford_block_reduce(

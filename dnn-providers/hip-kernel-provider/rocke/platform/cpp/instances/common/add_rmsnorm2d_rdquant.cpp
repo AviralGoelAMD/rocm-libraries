@@ -362,6 +362,7 @@ rocke_add_rmsnorm2d_rdquant_spec_t rocke_add_rmsnorm2d_rdquant_spec_default(void
     s.save_yscale = true;
     s.wave_size = 64;
     s.name = ROCKE_ADD_RMSNORM2D_RDQUANT_DEFAULT_NAME;
+    s.wave_reduce = false;
     return s;
 }
 
@@ -378,7 +379,8 @@ int rocke_add_rmsnorm2d_rdquant_elems_per_thread(const rocke_add_rmsnorm2d_rdqua
 /* AddRmsnorm2DRdquantSpec.kernel_name():
  *   kernel_name_join(self.name, self.dtype, self.out_dtype,
  *                    f"N{n_per_block}", f"b{block_size}", f"v{vec}",
- *                    flags={"sr": save_residual, "ys": save_yscale}). */
+ *                    flags={"sr": save_residual, "ys": save_yscale,
+ *                           "wr": wave_reduce}). */
 rocke_status_t rocke_add_rmsnorm2d_rdquant_kernel_name(
     const rocke_add_rmsnorm2d_rdquant_spec_t* spec, char* out, size_t out_cap)
 {
@@ -386,8 +388,8 @@ rocke_status_t rocke_add_rmsnorm2d_rdquant_kernel_name(
     char bbuf[32];
     char vbuf[32];
     const char* parts[5];
-    const char* flag_names[2];
-    int flag_on[2];
+    const char* flag_names[3];
+    int flag_on[3];
 
     if(spec == NULL || out == NULL)
     {
@@ -415,8 +417,10 @@ rocke_status_t rocke_add_rmsnorm2d_rdquant_kernel_name(
     flag_on[0] = spec->save_residual ? 1 : 0;
     flag_names[1] = "ys";
     flag_on[1] = spec->save_yscale ? 1 : 0;
+    flag_names[2] = "wr";
+    flag_on[2] = spec->wave_reduce ? 1 : 0;
 
-    return rocke_kernel_name_join(spec->name, parts, 5, flag_names, flag_on, 2, out, out_cap, NULL);
+    return rocke_kernel_name_join(spec->name, parts, 5, flag_names, flag_on, 3, out, out_cap, NULL);
 }
 
 /* ===================================================================== *
@@ -894,20 +898,45 @@ rocke_kernel_def_t* rocke_build_add_rmsnorm2d_rdquant(
                                  &p1,
                                  false /* cache */);
 
-    /* total_sq, total_amax_g = block_lds_reduce_pair(
-     *     b, s_sq, s_amax_g, lds_sum, lds_max, tid, block_size=BS,
-     *     combine_a="sum", combine_c="max") */
-    (void)rocke_block_lds_reduce_pair(b,
-                                      p1.s_sq,
-                                      p1.s_amax_g,
-                                      lds_sum,
-                                      lds_max,
-                                      tid,
-                                      BS,
-                                      ROCKE_REDUCE_SUM,
-                                      ROCKE_REDUCE_MAX,
-                                      &total_sq,
-                                      &total_amax_g);
+    /* Twin-channel cross-thread reduction: sum for the sum-of-squares, max for
+     * the abs-max of x * gamma.
+     *   if spec.wave_reduce:
+     *       total_sq, total_amax_g = block_lds_reduce_pair_with_wave_prologue(
+     *           b, s_sq, s_amax_g, lds_sum, lds_max, tid, block_size=BS,
+     *           combine_a="sum", combine_c="max", wave_size=spec.wave_size)
+     *   else:
+     *       total_sq, total_amax_g = block_lds_reduce_pair(
+     *           b, s_sq, s_amax_g, lds_sum, lds_max, tid, block_size=BS,
+     *           combine_a="sum", combine_c="max") */
+    if(spec->wave_reduce)
+    {
+        (void)rocke_block_lds_reduce_pair_with_wave_prologue(b,
+                                                             p1.s_sq,
+                                                             p1.s_amax_g,
+                                                             lds_sum,
+                                                             lds_max,
+                                                             tid,
+                                                             BS,
+                                                             ROCKE_REDUCE_SUM,
+                                                             ROCKE_REDUCE_MAX,
+                                                             spec->wave_size,
+                                                             &total_sq,
+                                                             &total_amax_g);
+    }
+    else
+    {
+        (void)rocke_block_lds_reduce_pair(b,
+                                          p1.s_sq,
+                                          p1.s_amax_g,
+                                          lds_sum,
+                                          lds_max,
+                                          tid,
+                                          BS,
+                                          ROCKE_REDUCE_SUM,
+                                          ROCKE_REDUCE_MAX,
+                                          &total_sq,
+                                          &total_amax_g);
+    }
 
     /* rcp_n = b.rcp(b.const_f32(float(N))) */
     rcp_n = rocke_b_rcp(b, rocke_b_const_f32(b, (double)N));

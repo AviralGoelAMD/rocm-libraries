@@ -135,6 +135,26 @@ rocke_value_t* rocke_block_lds_reduce_with_wave_prologue(rocke_ir_builder_t* b,
                                                          rocke_reduce_combine_t combine,
                                                          int wave_size);
 
+/* block_lds_reduce_pair_with_wave_prologue(...) analogue: twin-channel
+ * rocke_block_lds_reduce_with_wave_prologue. Both f32 channels run the wave XOR
+ * butterfly, lane 0 of every wave writes its two partials to num_warps slots of
+ * ``lds_a`` / ``lds_c``, one sync publishes them, and every thread folds the
+ * num_warps partials of each channel. Writes the results to *out_a / *out_c.
+ * Returns 1 on success, 0 (sticky ROCKE_ERR_VALUE) on non-f32 input or a
+ * block_size that is not a multiple of wave_size. */
+int rocke_block_lds_reduce_pair_with_wave_prologue(rocke_ir_builder_t* b,
+                                                   rocke_value_t* val_a,
+                                                   rocke_value_t* val_c,
+                                                   rocke_value_t* lds_a,
+                                                   rocke_value_t* lds_c,
+                                                   rocke_value_t* tid,
+                                                   int block_size,
+                                                   rocke_reduce_combine_t combine_a,
+                                                   rocke_reduce_combine_t combine_c,
+                                                   int wave_size,
+                                                   rocke_value_t** out_a,
+                                                   rocke_value_t** out_c);
+
 /* welford_block_reduce(...) analogue: numerically-stable mean/variance via the
  * fused (sum, sum_sq) pair fold. ``count_val`` is the compile-time per-thread
  * element count. Writes mean to *out_mean, var to *out_var. Returns 1 on

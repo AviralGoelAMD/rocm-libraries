@@ -446,6 +446,7 @@ void rocke_smoothquant_spec_init(rocke_smoothquant_spec_t* spec, int n_per_block
     spec->save_yscale = true;
     spec->wave_size = 64;
     spec->name = "rocke_smoothquant";
+    spec->wave_reduce = false;
 }
 
 int rocke_smoothquant_elems_per_thread(const rocke_smoothquant_spec_t* spec)
@@ -464,15 +465,15 @@ rocke_status_t
     char bbuf[32];
     char vbuf[32];
     const char* parts[5];
-    const char* flag_names[1];
-    int flag_on[1];
+    const char* flag_names[2];
+    int flag_on[2];
 
     if(spec == NULL || out == NULL)
     {
         return ROCKE_ERR_VALUE;
     }
     /* kernel_name_join(name, dtype, out_dtype, "N{n}", "b{bs}", "v{vec}",
-     *                  flags={"ys": save_yscale}) */
+     *                  flags={"ys": save_yscale, "wr": wave_reduce}) */
     snprintf(nbuf, sizeof(nbuf), "N%d", spec->n_per_block);
     snprintf(bbuf, sizeof(bbuf), "b%d", spec->block_size);
     snprintf(vbuf, sizeof(vbuf), "v%d", spec->vec);
@@ -483,7 +484,9 @@ rocke_status_t
     parts[4] = vbuf;
     flag_names[0] = "ys";
     flag_on[0] = spec->save_yscale ? 1 : 0;
-    return rocke_kernel_name_join(spec->name, parts, 5, flag_names, flag_on, 1, out, out_cap, NULL);
+    flag_names[1] = "wr";
+    flag_on[1] = spec->wave_reduce ? 1 : 0;
+    return rocke_kernel_name_join(spec->name, parts, 5, flag_names, flag_on, 2, out, out_cap, NULL);
 }
 
 /* --------------------------------------------------------------- valid */
@@ -919,8 +922,17 @@ rocke_kernel_def_t* rocke_build_smoothquant(rocke_ir_builder_t* b,
             s_amax = rocke_b_fmax(b, s_amax, chunk_amax);
         }
 
-        /* total_amax = block_lds_reduce(b, s_amax, lds, tid, block_size=BS, "max") */
-        total_amax = rocke_block_lds_reduce(b, s_amax, lds, tid, BS, ROCKE_REDUCE_MAX);
+        /* if spec.wave_reduce:
+         *     total_amax = block_lds_reduce_with_wave_prologue(
+         *         b, s_amax, lds, tid, block_size=BS, combine="max",
+         *         wave_size=spec.wave_size)
+         * else:
+         *     total_amax = block_lds_reduce(b, s_amax, lds, tid, block_size=BS, "max") */
+        if(spec->wave_reduce)
+            total_amax = rocke_block_lds_reduce_with_wave_prologue(
+                b, s_amax, lds, tid, BS, ROCKE_REDUCE_MAX, spec->wave_size);
+        else
+            total_amax = rocke_block_lds_reduce(b, s_amax, lds, tid, BS, ROCKE_REDUCE_MAX);
         if(total_amax == NULL)
         {
             return NULL;
