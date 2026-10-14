@@ -36,6 +36,7 @@ from ._fmha_warp_body import WARP_SIZE
 __all__ = [
     "FmhaBwdSpec",
     "build_fmha_bwd",
+    "build_fmha_bwd_kernels",
     "build_fmha_bwd_mfma",
     "fmha_bwd_grid",
     "fmha_bwd_signature",
@@ -61,7 +62,9 @@ class FmhaBwdSpec:
     # ``global_atomic_add_pk_bf16`` for halved atomic engine pressure.
     # The bf16 path is a real numerical change so callers gate on
     # parity; H=256 workloads that are atomic-engine-bound see the
-    # biggest relative improvement.
+    # biggest relative improvement. ``bwd_mode="mfma"``: the dtype of the
+    # dQ / dK / dV outputs, ``"f32"`` or the I/O dtype (accumulation stays
+    # f32; the kernels round once at the store).
     output_grad_dtype: str = "f32"
     # ``"atomic"`` (default): one Q-major kernel, dK / dV via f32 atomics
     # (:func:`build_fmha_bwd`). ``"mfma"``: FA2-style MFMA kernels
@@ -77,22 +80,24 @@ class FmhaBwdSpec:
     mfma_dkdv_waves: int = 4
     mfma_dkdv_ktiles: int = 1
     mfma_dq_waves: int = 4
-    mfma_dq_qtiles: int = 1
-    mfma_lds_pad: int = 8
-    mfma_waves_per_eu: int = 0
-    mfma_exp2_fast: bool = False
+    mfma_dq_qtiles: int = 2
+    mfma_lds_pad: int = 16
+    mfma_waves_per_eu: int = 2
+    mfma_exp2_fast: bool = True
     # ``mfma_natural_rows``: Q / K tile rows stay in natural order (a lane
     # group's 8 K slots are rows ``4g + 0..3`` and ``16 + 4g + 0..3``)
-    # instead of being permuted to 8 contiguous rows.
-    mfma_natural_rows: bool = False
+    # instead of being permuted to 8 contiguous rows. With a row stride of
+    # ``32 mod 256`` bytes (``lds_pad=16`` at D=128) the transposed and the
+    # 128-bit LDS reads are bank-conflict free.
+    mfma_natural_rows: bool = True
     # Causal CTA order. ``"none"``: grid order. ``"lpt"``: longest-first
     # across heads (the linear block id picks the tile, heaviest tiles of
     # every head first). ``"pair"``: each CTA walks tile ``j`` and then tile
     # ``n - 1 - j`` so every CTA has the same work (half the grid).
-    mfma_causal_order: str = "none"
+    mfma_causal_order: str = "lpt"
     # ``mfma_causal_split``: causal walks run the tiles that cross the
     # diagonal in a separate loop; only that loop applies the mask.
-    mfma_causal_split: bool = False
+    mfma_causal_split: bool = True
     # ``mfma_fused_dq``: no dQ kernel; the dK/dV kernel also computes
     # dQ = dS.K for its keys per Q tile and adds it with f32 atomics into
     # dQ, which the pre-pass zero-fills. Atomic volume per call is
@@ -204,6 +209,11 @@ def build_fmha_bwd(spec: FmhaBwdSpec, arch: str = "gfx950") -> KernelDef:
     on gfx942 and gfx950 (default ``arch="gfx950"`` is byte-for-byte
     backward-compatible).
     """
+    if spec.bwd_mode != "atomic":
+        raise ValueError(
+            f"build_fmha_bwd builds the bwd_mode='atomic' kernel; bwd_mode={spec.bwd_mode!r} is a multi-kernel "
+            "plan: use build_fmha_bwd_kernels"
+        )
     ok, why = is_valid_spec(spec, arch)
     if not ok:
         raise ValueError(f"invalid fmha_bwd spec: {why}")
@@ -517,10 +527,39 @@ def _mfma_bwd_tr8_at(b, lds, prefix, row0, col0, g, m16, dt, nat: bool):
 
 
 def _mfma_bwd_pack(b, vals, dt):
-    v = b.zero_vec(dt, 8)
+    v = b.zero_vec(dt, len(vals))
     for j, x in enumerate(vals):
         v = b.vec_insert(v, b.cast_f32_to(x, dt), j)
     return v
+
+
+def _mfma_bwd_grad_dtype(spec: FmhaBwdSpec) -> str:
+    """dQ / dK / dV element type of ``bwd_mode="mfma"``: ``"f32"`` or the I/O dtype."""
+    g = spec.output_grad_dtype
+    if g not in ("f32", spec.common.dtype):
+        raise ValueError(f"fmha_bwd mfma: output_grad_dtype must be 'f32' or {spec.common.dtype!r} (got {g!r})")
+    if g != "f32" and spec.mfma_fused_dq:
+        raise ValueError("fmha_bwd mfma_fused_dq accumulates dQ with f32 atomics: output_grad_dtype must be 'f32'")
+    return g
+
+
+def _mfma_bwd_store4(b, ptr, idx, acc, gdt: str, scale=None):
+    """Store the f32x4 accumulator ``acc`` (times ``scale``) as four contiguous ``gdt`` gradients."""
+    if scale is None and gdt == "f32":
+        b.global_store_vN(ptr, idx, acc, 4, align=16)
+        return
+    vals = [b.vec_extract(acc, r) for r in range(4)]
+    if scale is not None:
+        vals = [b.fmul(x, scale) for x in vals]
+    if gdt == "f32":
+        out = b.zero_vec_f32(4)
+        for r, x in enumerate(vals):
+            out = b.vec_insert(out, x, r)
+        b.global_store_vN(ptr, idx, out, 4, align=16)
+    else:
+        from rocke.helpers.io import io_ir_type
+
+        b.global_store_vN(ptr, idx, _mfma_bwd_pack(b, vals, io_ir_type(gdt)), 4, align=8)
 
 
 def _declare_mfma_pre_params(kb: FmhaKernelBuilder, fused: bool = False) -> None:
@@ -538,15 +577,15 @@ def _declare_mfma_pre_params(kb: FmhaKernelBuilder, fused: bool = False) -> None
         kb.add_scalar("stride_dq_token", "i32")
 
 
-def _declare_mfma_dkdv_params(kb: FmhaKernelBuilder, fused: bool = False) -> None:
+def _declare_mfma_dkdv_params(kb: FmhaKernelBuilder, fused: bool = False, gdt: str = "f32") -> None:
     kb.add_tensor("Q", readonly=True)
     kb.add_tensor("K", readonly=True)
     kb.add_tensor("V", readonly=True)
     kb.add_tensor("dO", readonly=True)
     kb.add_ptr("Lse2", dtype="f32", readonly=True)
     kb.add_ptr("Dsum", dtype="f32", readonly=True)
-    kb.add_ptr("dK", dtype="f32", readonly=False)
-    kb.add_ptr("dV", dtype="f32", readonly=False)
+    kb.add_ptr("dK", dtype=gdt, readonly=False)
+    kb.add_ptr("dV", dtype=gdt, readonly=False)
     kb.add_scalar("scale_log2", "f32")
     kb.add_scalar("scale_inv", "f32")
     kb.add_scalar("seqlen_q", "i32")
@@ -559,14 +598,14 @@ def _declare_mfma_dkdv_params(kb: FmhaKernelBuilder, fused: bool = False) -> Non
         kb.add_scalar("stride_dq_token", "i32")
 
 
-def _declare_mfma_dq_params(kb: FmhaKernelBuilder) -> None:
+def _declare_mfma_dq_params(kb: FmhaKernelBuilder, gdt: str = "f32") -> None:
     kb.add_tensor("Q", readonly=True)
     kb.add_tensor("K", readonly=True)
     kb.add_tensor("V", readonly=True)
     kb.add_tensor("dO", readonly=True)
     kb.add_ptr("Lse2", dtype="f32", readonly=True)
     kb.add_ptr("Dsum", dtype="f32", readonly=True)
-    kb.add_ptr("dQ", dtype="f32", readonly=False)
+    kb.add_ptr("dQ", dtype=gdt, readonly=False)
     kb.add_scalar("scale_log2", "f32")
     kb.add_scalar("scale_inv", "f32")
     kb.add_scalar("seqlen_q", "i32")
@@ -640,6 +679,8 @@ def _mfma_bwd_kb(spec: FmhaBwdSpec, which: str, nw: int, declare) -> FmhaKernelB
             tag += "_cs"
     if spec.mfma_fused_dq and which == "dkdv":
         tag += "_fdq"
+    if spec.output_grad_dtype != "f32":
+        tag += f"_g{spec.output_grad_dtype}"
     kb = FmhaKernelBuilder(spec.kernel_name() + tag, spec.common)
     kb.block_size(64 * nw)
     if spec.mfma_waves_per_eu:
@@ -685,7 +726,8 @@ def _build_mfma_dkdv(spec: FmhaBwdSpec, arch: str) -> KernelDef:
     BM = _MFMA_BWD_STEP
     BN = 16 * kpw * nw
     n_a, n_d = D // 32, D // 16
-    kb = _mfma_bwd_kb(spec, "dkdv", nw, lambda k: _declare_mfma_dkdv_params(k, fused))
+    gdt = _mfma_bwd_grad_dtype(spec)
+    kb = _mfma_bwd_kb(spec, "dkdv", nw, lambda k: _declare_mfma_dkdv_params(k, fused, gdt))
     b = kb.builder
     Q, K, V, dO = kb.tensor("Q"), kb.tensor("K"), kb.tensor("V"), kb.tensor("dO")
     Lse2, Dsum = kb.ptr("Lse2"), kb.ptr("Dsum")
@@ -886,12 +928,8 @@ def _build_mfma_dkdv(spec: FmhaBwdSpec, arch: str) -> KernelDef:
             dv_row = b.add(b.mul(key, kb.scalar("stride_dv_token")), b.mul(kvh, kb.stride_head("v")))
             for n in range(n_d):
                 d = b.add(b.const_i32(16 * n), b.mul(g, b.const_i32(4)))
-                dk_acc = state[2 * n_d * i + n]
-                dk_out = b.zero_vec_f32(4)
-                for r in range(4):
-                    dk_out = b.vec_insert(dk_out, b.fmul(b.vec_extract(dk_acc, r), scale_inv), r)
-                b.global_store_vN(kb.ptr("dK"), b.add(dk_row, d), dk_out, 4, align=16)
-                b.global_store_vN(kb.ptr("dV"), b.add(dv_row, d), state[2 * n_d * i + n_d + n], 4, align=16)
+                _mfma_bwd_store4(b, kb.ptr("dK"), b.add(dk_row, d), state[2 * n_d * i + n], gdt, scale_inv)
+                _mfma_bwd_store4(b, kb.ptr("dV"), b.add(dv_row, d), state[2 * n_d * i + n_d + n], gdt)
 
     for p, (kblk, kvh) in enumerate(_mfma_bwd_ctas(b, spec, spec.seqlen_k // BN, s.shape.num_kv_heads, True)):
         if p:
@@ -913,7 +951,8 @@ def _build_mfma_dq(spec: FmhaBwdSpec, arch: str) -> KernelDef:
     BK = _MFMA_BWD_STEP
     BQ = 16 * qpw * nw
     n_a, n_d = D // 32, D // 16
-    kb = _mfma_bwd_kb(spec, "dq", nw, _declare_mfma_dq_params)
+    gdt = _mfma_bwd_grad_dtype(spec)
+    kb = _mfma_bwd_kb(spec, "dq", nw, lambda k: _declare_mfma_dq_params(k, gdt))
     b = kb.builder
     Q, K, V, dO = kb.tensor("Q"), kb.tensor("K"), kb.tensor("V"), kb.tensor("dO")
     scale_log2, seqlen_q = kb.scalar("scale_log2"), kb.scalar("seqlen_q")
@@ -1024,13 +1063,8 @@ def _build_mfma_dq(spec: FmhaBwdSpec, arch: str) -> KernelDef:
         for i in range(qpw):
             row = b.add(b.mul(q_pos[i], kb.scalar("stride_dq_token")), b.mul(h, kb.stride_head("q")))
             for n in range(n_d):
-                acc = state[n_d * i + n]
-                out = b.zero_vec_f32(4)
-                for r in range(4):
-                    out = b.vec_insert(out, b.fmul(b.vec_extract(acc, r), scale_inv), r)
-                b.global_store_vN(
-                    kb.ptr("dQ"), b.add(row, b.add(b.const_i32(16 * n), b.mul(g, b.const_i32(4)))), out, 4, align=16
-                )
+                col = b.add(b.const_i32(16 * n), b.mul(g, b.const_i32(4)))
+                _mfma_bwd_store4(b, kb.ptr("dQ"), b.add(row, col), state[n_d * i + n], gdt, scale_inv)
 
     for p, (qblk, h) in enumerate(_mfma_bwd_ctas(b, spec, spec.seqlen_q // BQ, s.shape.num_query_heads, False)):
         if p:
@@ -1066,6 +1100,7 @@ def build_fmha_bwd_mfma(spec: FmhaBwdSpec, arch: str = "gfx950"):
     if spec.mfma_causal_order not in ("none", "lpt", "pair"):
         raise ValueError(f"fmha_bwd mfma_causal_order: none | lpt | pair (got {spec.mfma_causal_order!r})")
     fused = spec.mfma_fused_dq
+    gdt = _mfma_bwd_grad_dtype(spec)
     pair = causal and spec.mfma_causal_order == "pair"
     nkb, nqb = spec.seqlen_k // bn, spec.seqlen_q // bq
     if pair and (nkb % 2 or (nqb % 2 and not fused)):
@@ -1074,11 +1109,12 @@ def build_fmha_bwd_mfma(spec: FmhaBwdSpec, arch: str = "gfx950"):
     stages = [
         ("pre", _build_mfma_pre, lambda k: _declare_mfma_pre_params(k, fused),
          (spec.seqlen_q // rows_pre, HQ, 1), _MFMA_PRE_THREADS),
-        ("dkdv", _build_mfma_dkdv, lambda k: _declare_mfma_dkdv_params(k, fused),
+        ("dkdv", _build_mfma_dkdv, lambda k: _declare_mfma_dkdv_params(k, fused, gdt),
          (nkb // div, HK, 1), 64 * spec.mfma_dkdv_waves),
     ]
     if not fused:
-        stages.append(("dq", _build_mfma_dq, _declare_mfma_dq_params, (nqb // div, HQ, 1), 64 * spec.mfma_dq_waves))
+        stages.append(("dq", _build_mfma_dq, lambda k: _declare_mfma_dq_params(k, gdt),
+                       (nqb // div, HQ, 1), 64 * spec.mfma_dq_waves))
     out = []
     for which, build, declare, grid, block in stages:
         k = build(spec, arch)
@@ -1086,3 +1122,17 @@ def build_fmha_bwd_mfma(spec: FmhaBwdSpec, arch: str = "gfx950"):
         declare(kb)
         out.append((k, kb.signature(), grid, (block, 1, 1)))
     return out
+
+
+def build_fmha_bwd_kernels(spec: FmhaBwdSpec, arch: str = "gfx950"):
+    """Launch plan of ``spec.bwd_mode``: ``[(kernel, signature, grid, block), ...]``.
+
+    Run the kernels in order on one stream. ``"atomic"`` is the single
+    kernel of :func:`build_fmha_bwd`; ``"mfma"`` is the multi-kernel plan
+    of :func:`build_fmha_bwd_mfma` (documents its extra ABI).
+    """
+    if spec.bwd_mode == "mfma":
+        return build_fmha_bwd_mfma(spec, arch)
+    if spec.bwd_mode == "atomic":
+        return [(build_fmha_bwd(spec, arch), fmha_bwd_signature(spec), fmha_bwd_grid(spec), (64, 1, 1))]
+    raise ValueError(f"fmha_bwd bwd_mode: atomic | mfma (got {spec.bwd_mode!r})")

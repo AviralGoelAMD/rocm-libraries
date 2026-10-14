@@ -4814,6 +4814,28 @@ class TestExtendedAttentionBuilds(unittest.TestCase):
         # 3 atomic accumulators (dQ, dK, dV) per K-step per head dim.
         self.assertGreaterEqual(ll.count("atomicrmw fadd ptr addrspace(1)"), 3)
 
+    def test_fmha_bwd_kernels_routes_mfma_mode(self):
+        from kernels import FmhaBwdSpec, build_fmha_bwd, build_fmha_bwd_kernels
+
+        spec = FmhaBwdSpec(
+            common=self._common(dtype="bf16", mask_mode="causal"),
+            seqlen_q=256,
+            seqlen_k=256,
+            bwd_mode="mfma",
+        )
+        with self.assertRaises(ValueError):
+            build_fmha_bwd(spec)
+        plan = build_fmha_bwd_kernels(spec)
+        self.assertEqual([k.name.rsplit("_mfma_", 1)[1].split("_")[0] for k, *_ in plan], ["pre", "dkdv", "dq"])
+        ll = lower_kernel_to_llvm(plan[1][0])
+        self.assertIn("ds.read.tr16.b64", ll)
+        # bf16 gradients are rounded at the store: dQ / dK / dV are bf16 pointers.
+        bf = FmhaBwdSpec(
+            common=self._common(dtype="bf16"), seqlen_q=256, seqlen_k=256, bwd_mode="mfma", output_grad_dtype="bf16"
+        )
+        sig = [p for _, s, _, _ in build_fmha_bwd_kernels(bf)[1:] for p in s if p["name"] in ("dQ", "dK", "dV")]
+        self.assertEqual(sorted(p["type"] for p in sig), ["ptr<bf16, global>"] * 3)
+
     def test_fmha_fwd_fp8_emits_cvt_fp8_intrinsic(self):
         from kernels import FmhaFwdFp8Spec, build_fmha_fwd_fp8
 

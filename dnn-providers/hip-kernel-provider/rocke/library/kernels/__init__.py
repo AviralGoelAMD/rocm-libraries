@@ -139,6 +139,8 @@ from .common.fmha_head_grouping import (  # noqa: F401
 from .common.fmha_bwd import (  # noqa: F401
     FmhaBwdSpec,
     build_fmha_bwd,
+    build_fmha_bwd_kernels,
+    build_fmha_bwd_mfma,
     fmha_bwd_grid,
     fmha_bwd_signature,
     is_valid_spec as is_valid_fmha_bwd_spec,
