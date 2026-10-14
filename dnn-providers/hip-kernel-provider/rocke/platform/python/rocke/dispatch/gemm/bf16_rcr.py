@@ -20,7 +20,7 @@ warp grid rather than fp16's 32x32 / 2x2.
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Callable, Sequence, Tuple
 
 from ...core.arch import ArchTarget
@@ -256,6 +256,15 @@ def _spec_cdna4_dtl128(req: GemmRequest, name: str) -> UniversalGemmSpec:
     )
 
 
+def _split_dtl128(req: GemmRequest, spec: UniversalGemmSpec) -> UniversalGemmSpec:
+    # A split-K slice is only a few K-tiles deep; the depth-2 ring's longer
+    # prologue does not pay there, so split specs keep the ping-pong.
+    spec = apply_split_k(req, spec)
+    if spec.trait.split_k > 1 and spec.trait.dtl_prefetch_depth > 1:
+        spec = replace(spec, trait=replace(spec.trait, dtl_prefetch_depth=1))
+    return spec
+
+
 def _gate_dtl256(req: GemmRequest) -> Tuple[bool, str]:
     tiles = (req.M // 256) * (req.N // 256)
     if tiles < _DTL256_MIN_TILES:
@@ -366,6 +375,7 @@ GEMM_BF16_REGISTRY.extend(
             priority=5,
             spec_fn=_spec_cdna4_dtl128,
             arches=_CDNA4_DTL_BF16,
+            split=_split_dtl128,
         ),
         _make_candidate(
             name="universal_gemm_bf16_cdna_cshuffle",
