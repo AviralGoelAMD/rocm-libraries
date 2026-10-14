@@ -47,7 +47,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence
 
-from ..core.ir import IRBuilder, Value
+from ..core.ir import IRBuilder, TemporalHint, Value
 from .tensor_view import TileWindow
 
 
@@ -88,6 +88,7 @@ def sweep_row_chunks(
     row: Optional[Value] = None,
     body: Optional[Callable[[Value, List[Value]], None]] = None,
     cache: bool = False,
+    temporal_hint: TemporalHint = TemporalHint.DEFAULT,
 ) -> RowChunkSweepResult:
     """Sweep one block's worth of ``(block_size * vec)``-element chunks
     along the row at ``row``, invoking ``body(n_off, x_scalars)`` per
@@ -112,6 +113,9 @@ def sweep_row_chunks(
 
     ``body`` may be omitted entirely when the caller just wants to
     populate ``cached`` and the body is empty.
+
+    ``temporal_hint`` is forwarded to every per-chunk vector load
+    (``TemporalHint.STREAMING`` for read-once rows).
     """
     if tile.rank != 2:
         raise ValueError(
@@ -144,7 +148,9 @@ def sweep_row_chunks(
         if tile.dtype.name == "f64":
             x_scalars = tile.load_vec_scalars(b, b.const_i32(0), n_off, n=vec)
         else:
-            x_scalars = tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=vec)
+            x_scalars = tile.load_vec_as_f32(
+                b, b.const_i32(0), n_off, n=vec, temporal_hint=temporal_hint
+            )
         if cache:
             cached.extend(x_scalars)
         if body is not None:
@@ -163,6 +169,7 @@ def pass2_row_chunks(
     row: Optional[Value] = None,
     body: Optional[Callable[[Value, int, List[Value]], List[Value]]] = None,
     cached_f32: Sequence[Value] = (),
+    temporal_hint: TemporalHint = TemporalHint.DEFAULT,
 ) -> None:
     """Second-pass sweep that *writes* one block's worth of chunks.
 
@@ -176,7 +183,8 @@ def pass2_row_chunks(
     it via the k/chunk position so the body can read the pre-loaded
     scalar for the i-th lane as ``cached_f32[k * vec + i]``. This
     matches CK Tile's "load X once / sweep Y positions" idiom on the
-    write side.
+    write side. ``temporal_hint`` is forwarded to every per-chunk vector
+    store (``TemporalHint.STREAMING`` for write-once rows).
     """
     if tile.rank != 2:
         raise ValueError(
@@ -213,4 +221,6 @@ def pass2_row_chunks(
             raise ValueError(
                 f"pass2_row_chunks body must return {vec} f32 scalars (got {len(out)})"
             )
-        tile.store_vec_from_f32(b, b.const_i32(0), n_off, values=out)
+        tile.store_vec_from_f32(
+            b, b.const_i32(0), n_off, values=out, temporal_hint=temporal_hint
+        )

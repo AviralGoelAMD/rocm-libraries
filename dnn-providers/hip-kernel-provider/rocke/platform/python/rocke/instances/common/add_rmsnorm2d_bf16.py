@@ -33,7 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Literal, Tuple
 
-from ...core.ir import F32, I32, IRBuilder, KernelDef, PtrType, Value
+from ...core.ir import F32, I32, IRBuilder, KernelDef, PtrType, TemporalHint, Value
 from ...helpers.io import io_ir_type
 from ...helpers.reduction import (
     block_lds_reduce,
@@ -68,6 +68,9 @@ class AddRMSNorm2DBF16Spec:
     dtype: DType = "bf16"
     save_residual: bool = True  # write x = a + b to ``X``
     wave_size: int = 64
+    # Streaming (``nt``) cache hint on the read-once A/B loads and the
+    # write-once X/Y stores; gamma keeps the default policy.
+    streaming: bool = False
     name: str = "rocke_add_rmsnorm2d_bf16"
 
     @property
@@ -81,7 +84,7 @@ class AddRMSNorm2DBF16Spec:
             f"N{self.n_per_block}",
             f"b{self.block_size}",
             f"v{self.vec}",
-            flags={"sr": self.save_residual},
+            flags={"sr": self.save_residual, "nt": self.streaming},
         )
 
 
@@ -203,6 +206,7 @@ def build_add_rmsnorm2d_bf16(
     # gamma load on the L1-hot path -- we save one HBM round-trip on
     # gamma at the cost of one f32 register per cached element, same
     # register footprint as the rdquant variant.)
+    stream = TemporalHint.STREAMING if spec.streaming else TemporalHint.DEFAULT
     s_sq = b.const_f32(0.0)
     cached_x: List[Value] = []
     chunks_per_thread = spec.elems_per_thread // VEC
@@ -213,8 +217,12 @@ def build_add_rmsnorm2d_bf16(
             b.mul(b.const_i32(k * BS), c_vec),
             b.mul(tid, c_vec),
         )
-        a_scalars = a_tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=VEC)
-        b_scalars = bt_tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=VEC)
+        a_scalars = a_tile.load_vec_as_f32(
+            b, b.const_i32(0), n_off, n=VEC, temporal_hint=stream
+        )
+        b_scalars = bt_tile.load_vec_as_f32(
+            b, b.const_i32(0), n_off, n=VEC, temporal_hint=stream
+        )
         chunk_x: List[Value] = []
         chunk_sq: List[Value] = []
         for i in range(VEC):
@@ -227,7 +235,9 @@ def build_add_rmsnorm2d_bf16(
             # Write x = a + b back to the residual buffer in vec stores
             # so the next layer's residual add can pick it up without
             # re-computing.
-            x_tile.store_vec_from_f32(b, b.const_i32(0), n_off, values=chunk_x)
+            x_tile.store_vec_from_f32(
+                b, b.const_i32(0), n_off, values=chunk_x, temporal_hint=stream
+            )
 
     # Cross-thread reduction. On a wave64 target whose ``wave_size``
     # matches the spec and a block size that is a clean multiple of it,
@@ -274,7 +284,9 @@ def build_add_rmsnorm2d_bf16(
         y_vec = [
             b.fmul(cached_x[k * VEC + i], b.fmul(inv_rms, gv[i])) for i in range(VEC)
         ]
-        y_tile.store_vec_from_f32(b, b.const_i32(0), n_off, values=y_vec)
+        y_tile.store_vec_from_f32(
+            b, b.const_i32(0), n_off, values=y_vec, temporal_hint=stream
+        )
 
     return b.kernel
 

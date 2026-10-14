@@ -27,7 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Tuple
 
-from ...core.ir import F32, I32, IRBuilder, KernelDef, PtrType
+from ...core.ir import F32, I32, IRBuilder, KernelDef, PtrType, TemporalHint
 from ...helpers.io import io_ir_type, store_scalar_from_f32
 from ...helpers.reduction import (
     REGISTER_TILE_MAX_ELEMS_PER_THREAD,
@@ -65,6 +65,9 @@ class RMSNorm2DSpec:
     dtype: DType = "f16"
     save_inv_rms: bool = False
     wave_size: int = 64
+    # Streaming (``nt``) cache hint on the read-once X row loads (single-pass
+    # path only) and the write-once Y stores; gamma keeps the default policy.
+    streaming: bool = False
     name: str = "rocke_rmsnorm2d_fwd"
 
     @property
@@ -78,7 +81,7 @@ class RMSNorm2DSpec:
             f"N{self.n_per_block}",
             f"b{self.block_size}",
             f"v{self.vec}",
-            flags={"sr": self.save_inv_rms},
+            flags={"sr": self.save_inv_rms, "nt": self.streaming},
         )
 
 
@@ -205,6 +208,9 @@ def build_rmsnorm2d(spec: RMSNorm2DSpec) -> KernelDef:
     # config ``two_pass`` is False and the cached single-pass path below is
     # byte-identical to the pre-two-pass kernel.
     two_pass = row_norm_needs_two_pass(spec.elems_per_thread)
+    stream = TemporalHint.STREAMING if spec.streaming else TemporalHint.DEFAULT
+    # The two-pass path re-reads X in pass 2, so its pass-1 loads stay default.
+    x_hint = TemporalHint.DEFAULT if two_pass else stream
 
     s2 = b.const_f32(0.0)
 
@@ -222,6 +228,7 @@ def build_rmsnorm2d(spec: RMSNorm2DSpec) -> KernelDef:
         elems_per_thread=spec.elems_per_thread,
         body=pass1_body,
         cache=not two_pass,
+        temporal_hint=x_hint,
     )
 
     # Cross-thread reduction. The wave-aligned path is the CK Tile
@@ -267,7 +274,9 @@ def build_rmsnorm2d(spec: RMSNorm2DSpec) -> KernelDef:
     # HBM (the same ``x_tile`` window) before scaling.
     def pass2_body(n_off, _k, x_scalars):
         if two_pass:
-            x_scalars = x_tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=VEC)
+            x_scalars = x_tile.load_vec_as_f32(
+                b, b.const_i32(0), n_off, n=VEC, temporal_hint=stream
+            )
         gv = g_view.load_vec_as_f32(b, [n_off], n=VEC)
         return [b.fmul(x_scalars[i], b.fmul(inv_rms, gv[i])) for i in range(VEC)]
 
@@ -280,6 +289,7 @@ def build_rmsnorm2d(spec: RMSNorm2DSpec) -> KernelDef:
         elems_per_thread=spec.elems_per_thread,
         body=pass2_body,
         cached_f32=sweep_res.cached,
+        temporal_hint=stream,
     )
 
     return b.kernel
