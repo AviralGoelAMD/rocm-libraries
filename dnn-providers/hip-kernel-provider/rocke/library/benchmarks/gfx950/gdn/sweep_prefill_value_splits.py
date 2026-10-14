@@ -45,8 +45,14 @@ from builders.gfx950.kda import gdn_prefill as gp
 from builders.gfx950.kda import kda_chunk_split as split_mod
 from kernels.gfx950.kda_chunkwise import is_valid_scan_spec
 
-# the shipped selector, so the sweep can print what dispatch WOULD pick
-from dispatch.gdn.prefill_gfx950 import value_splits_for
+# the shipped selector, so the sweep can print what dispatch WOULD pick, and the
+# per-split scan geometry and latency-hiding knobs dispatch ships with each split
+from dispatch.gdn.prefill_gfx950 import (
+    _NUM_XCDS,
+    _SPLIT_TILE,
+    _WAVE_SPLIT,
+    value_splits_for,
+)
 
 DK = DV = 128
 HV = 8  # value heads; BH = batch * HV
@@ -56,9 +62,20 @@ WARMUP, ITERS = 10, 50
 
 
 def _specs_for(value_splits: int, kv_group: int):
-    """A GDN scan + raw prep spec pair for one ``value_splits`` geometry."""
+    """The GDN scan + raw prep spec pair dispatch would ship for one split."""
     scan, prep = split_mod.aligned_split_specs(value_splits)
-    scan = dataclasses.replace(scan, head_k=DK, head_v=DV)
+    scan = dataclasses.replace(
+        scan,
+        head_k=DK,
+        head_v=DV,
+        tile=dataclasses.replace(scan.tile, **_SPLIT_TILE[value_splits]),
+        token_major_io=True,
+        min_occupancy=1,
+        prefetch_tiles=True,
+        v_prefetch=True,
+        wave_split=_WAVE_SPLIT[value_splits],
+        xcd_remap=_NUM_XCDS if value_splits > 1 else 0,
+    )
     prep = dataclasses.replace(
         prep, head_k=DK, head_v=DV, gate_kind="gdn", kv_group=kv_group
     )

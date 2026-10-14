@@ -94,8 +94,9 @@ def test_dispatched_prep_matches_the_builder_prep_spec():
 @pytest.mark.parametrize(
     "num_v_heads,batch_heads",
     [
-        (8, 64),  # BH=64  -> first band
-        (16, 128),  # BH=128 -> second band
+        (2, 16),  # BH=16  -> vs=8 band
+        (8, 64),  # BH=64  -> vs=4 band
+        (16, 128),  # BH=128 -> vs=2 band
         (32, 256),  # BH=256 -> past the bands (default)
     ],
 )
@@ -108,7 +109,7 @@ def test_scan_value_splits_table(num_v_heads, batch_heads):
     expected_vs = value_splits_for(batch_heads)
     expected_block = _SPLIT_TILE[expected_vs]["block_size"]
     result = dispatch_gdn_prefill(
-        _req(num_k_heads=8, num_v_heads=num_v_heads, algorithm="chunk_scan")
+        _req(num_k_heads=2, num_v_heads=num_v_heads, algorithm="chunk_scan")
     )
     assert result.candidate.name == "gdn_prefill_gfx950_chunk_scan"
     assert result.request.batch_heads == batch_heads
@@ -118,12 +119,13 @@ def test_scan_value_splits_table(num_v_heads, batch_heads):
     assert spec.token_major_io
 
 
-def test_scan_vs8_uses_m16_atom():
-    spec = dispatch_gdn_prefill(
-        _req(num_k_heads=8, num_v_heads=8, algorithm="chunk_scan")
-    ).spec
-    assert spec.value_splits == 8
-    assert spec.tile.scan_atom_m == 16
+def test_split_bands_use_m16_atom():
+    for num_v_heads, vs in ((4, 8), (8, 4), (16, 2)):
+        spec = dispatch_gdn_prefill(
+            _req(num_k_heads=4, num_v_heads=num_v_heads, algorithm="chunk_scan")
+        ).spec
+        assert spec.value_splits == vs
+        assert spec.tile.scan_atom_m == 16
 
 
 def test_value_splits_bands():
@@ -131,43 +133,48 @@ def test_value_splits_bands():
     derived from ``_VALUE_SPLIT_BANDS``, so a wrong edit to that table is caught
     here instead of the test silently agreeing with it."""
     assert value_splits_for(1) == 8
-    assert value_splits_for(64) == 8  # band edge
-    assert value_splits_for(65) == 2  # just past -> next band
+    assert value_splits_for(32) == 8  # band edge
+    assert value_splits_for(33) == 4  # just past -> next band
+    assert value_splits_for(64) == 4
+    assert value_splits_for(65) == 2
     assert value_splits_for(128) == 2
     assert value_splits_for(129) == 1  # past the last band -> default
     assert value_splits_for(4096) == 1
 
 
 @pytest.mark.parametrize(
-    "num_v_heads,batch_heads,value_splits,prefetch",
+    "num_v_heads,batch_heads,value_splits,wave_split,xcd",
     [
-        (1, 8, 8, True),  # TP=4 production shard: BH=8, 0.25 waves/CU
-        (2, 16, 8, True),
-        (4, 32, 8, True),
-        (8, 64, 8, True),  # band edge: BH*8/256 == 2 WGs/CU exactly
-        (16, 128, 2, False),
-        (32, 256, 1, False),
+        (1, 8, 8, 2, 8),  # TP=4 production shard
+        (4, 32, 8, 2, 8),
+        (8, 64, 4, 2, 8),
+        (16, 128, 2, 2, 8),
+        (32, 256, 1, 1, 0),
     ],
 )
-def test_scan_prefetch_follows_the_vs8_band(
-    num_v_heads, batch_heads, value_splits, prefetch
+def test_scan_latency_hiding_knobs_per_band(
+    num_v_heads, batch_heads, value_splits, wave_split, xcd
 ):
-    """Tile prefetch is selected exactly where it is both legal and a win.
-
-    It doubles the staged tiles, so it only pays where the scan cannot already
-    hide HBM latency behind a second resident workgroup -- the ``vs=8`` band,
-    where ``BH <= 64`` caps demand at 2 WGs/CU. Outside it the doubled footprint
-    is rejected outright by the LDS budget, so this is a legality gate as much
-    as a tuning one.
-    """
+    """Every band stages tiles and V one chunk ahead; the split bands also split
+    each state band across two waves and keep a head's splits on one XCD."""
     spec = dispatch_gdn_prefill(
         _req(num_k_heads=1, num_v_heads=num_v_heads, algorithm="chunk_scan")
     ).spec
     assert spec.value_splits == value_splits
-    assert spec.prefetch_tiles is prefetch
-    # The flag must reach the cache key, or a prefetch build could be served
-    # from a non-prefetch entry (and the reverse).
-    assert spec.kernel_name().endswith("_pf") is prefetch
+    assert spec.prefetch_tiles and spec.v_prefetch
+    assert spec.min_occupancy == 1
+    assert spec.wave_split == wave_split
+    assert spec.xcd_remap == xcd
+    # Every knob must reach the cache key, or one build could be served from
+    # another's entry.
+    name = spec.kernel_name()
+    assert "_pf" in name and "_vp" in name
+    assert ("_ws2" in name) is (wave_split == 2)
+    assert ("_x8" in name) is (xcd == 8)
+    # The block covers (head_v / value_splits / atom_m) row bands, wave_split
+    # waves each.
+    bands = spec.head_v // value_splits // spec.scan_atom.m
+    assert spec.tile.block_size == 64 * bands * wave_split
 
 
 def test_dispatched_scan_is_always_lds_legal():
@@ -263,44 +270,9 @@ def test_float_batch_is_rejected():
 
 
 def test_retuning_onto_an_unlisted_split_fails_by_name():
-    """A band selecting a split with no tile entry must say what to do.
-
-    _VALUE_SPLIT_BANDS is regenerated by a sweep that measures vs=4 -- legal in
-    the builder, selected by no band today. Before this, dispatch raised a bare
-    ``KeyError: 4``, which reads as a dispatcher bug rather than "this tile is
-    not wired up yet".
-    """
+    """A band selecting a split with no tile entry must say what to do, rather
+    than raise a bare ``KeyError`` that reads as a dispatcher bug."""
     from dispatch.gdn import prefill_gfx950 as pg
 
     with pytest.raises(ValueError, match="no _SPLIT_TILE entry"):
-        pg._scan_tile(_req(algorithm="chunk_scan"), 4)
-
-
-def test_split_tile_agrees_with_the_builder_it_mirrors():
-    """_SPLIT_TILE is a hand copy; assert against the ORIGINAL, not itself.
-
-    The dispatcher's table mirrors the builder's ``aligned_split_specs``. The
-    other tests in this file read ``_SPLIT_TILE`` to build their expectations,
-    so they compare the copy to the copy: change the builder's geometry and they
-    still pass while dispatch ships the stale numbers. This reads both sources.
-    """
-    # the builder module imports torch at module scope; skip rather than error
-    # where torch is absent -- this is a source-agreement check, not a kernel run
-    pytest.importorskip("torch", reason="builders.kda_chunk_split imports torch")
-
-    from builders.gfx950.kda.kda_chunk_split import aligned_split_specs
-    from kernels.gfx950.kda_chunkwise import KdaTileSpec
-    from dispatch.gdn.prefill_gfx950 import _SPLIT_TILE
-
-    for vs, listed in sorted(_SPLIT_TILE.items()):
-        scan, _ = aligned_split_specs(vs)
-        assert scan.tile.block_size == listed["block_size"], (
-            f"value_splits={vs}: dispatch says block_size="
-            f"{listed['block_size']}, builder says {scan.tile.block_size}"
-        )
-        # scan_atom_m is listed only where it differs from the tile default
-        want_atom = listed.get("scan_atom_m", KdaTileSpec(chunk=32).scan_atom_m)
-        assert scan.tile.scan_atom_m == want_atom, (
-            f"value_splits={vs}: dispatch says scan_atom_m={want_atom}, "
-            f"builder says {scan.tile.scan_atom_m}"
-        )
+        pg._scan_tile(_req(algorithm="chunk_scan"), 16)

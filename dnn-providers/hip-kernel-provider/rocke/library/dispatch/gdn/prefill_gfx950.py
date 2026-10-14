@@ -62,27 +62,35 @@ from .prefill_common import (
 ARCH = "gfx950"
 
 # (max_batch_heads, value_splits). BH = batch * num_v_heads. The final band is
-# open-ended (value_splits=1, natural parallelism fills the GPU). Measured
-# anchors: BH<=64 -> value_splits=8, BH<=128 -> 2. Ratios in the internal perf repo.
+# open-ended (value_splits=1, natural parallelism fills the GPU). Measured on
+# gfx950 against the fp64 oracle with the split geometries below; ratios in the
+# internal perf repo.
 # Snapshot: regenerate with
 # ``python -m benchmarks.gfx950.gdn.sweep_prefill_value_splits`` after any
 # kernel, compiler, or shape change -- a baked table drifts otherwise.
 _VALUE_SPLIT_BANDS = (
-    (64, 8),
+    (32, 8),
+    (64, 4),
     (128, 2),
 )
 _DEFAULT_VALUE_SPLITS = 1
 
-# Each value_splits fixes the scan tile: the scan block must cover the split V
-# extent, and vs=8 additionally needs the M16 scan atom. Mirrors the builder's
-# ``aligned_split_specs``. Raw prep overrides block_size back to 256. Only the
-# splits the bands actually select (8/2/1) are listed; the builder also defines
-# vs=4, but no band picks it here so it is intentionally absent.
+# Each value_splits fixes the scan tile. The split bands run the M16 scan atom
+# with two waves per 16-row state band (``wave_split=2``), so the block is
+# ``2 * (head_v / value_splits / 16)`` waves. vs=1 keeps the wide atom: there
+# the grid already supplies the parallelism and the wave split measured slower.
+# Raw prep overrides block_size back to 256 (its emitted code does not depend
+# on the scan atom).
 _SPLIT_TILE = {
-    8: dict(block_size=64, scan_atom_m=16),
-    2: dict(block_size=128),
+    8: dict(block_size=128, scan_atom_m=16),
+    4: dict(block_size=256, scan_atom_m=16),
+    2: dict(block_size=512, scan_atom_m=16),
     1: dict(block_size=256),
 }
+_WAVE_SPLIT = {8: 2, 4: 2, 2: 2, 1: 1}
+# MI355X deals workgroups round-robin across 8 XCDs; co-locate the value splits
+# of one head on one XCD so their identical tile reads share its L2.
+_NUM_XCDS = 8
 
 
 def value_splits_for(batch_heads: int) -> int:
@@ -97,18 +105,15 @@ def _scan_tile(req: GdnPrefillRequest, value_splits: int) -> KdaTileSpec:
     tile = _SPLIT_TILE.get(value_splits)
     if tile is None:
         # Reached only by retuning _VALUE_SPLIT_BANDS onto a split with no tile
-        # entry -- the sweep measures vs=4, which the builder defines but no
-        # band selects, so this is a real path for whoever re-runs the tuner.
-        # A bare KeyError here would read as a dispatcher bug; name the repair
-        # instead. The entry is deliberately NOT pre-added: a split the bands
-        # never select has never been through the on-device numeric gate
-        # (test_gdn_prefill_dispatched_value_splits covers 8/2/1), so adding one
-        # and verifying it belong to the same change.
+        # entry. A bare KeyError here would read as a dispatcher bug; name the
+        # repair instead. A split the bands never select has never been through
+        # the on-device numeric gate, so adding one and verifying it belong to
+        # the same change.
         raise ValueError(
             f"value_splits={value_splits} has no _SPLIT_TILE entry (have "
-            f"{sorted(_SPLIT_TILE)}). Copy its geometry from the builder's "
-            f"aligned_split_specs and add an on-device numeric case for it "
-            f"before shipping a table that selects it."
+            f"{sorted(_SPLIT_TILE)}). Add its block/atom geometry and "
+            f"_WAVE_SPLIT entry, plus an on-device numeric case for it, before "
+            f"shipping a table that selects it."
         )
     return KdaTileSpec(chunk=req.effective_chunk_size, **tile)
 
@@ -116,14 +121,12 @@ def _scan_tile(req: GdnPrefillRequest, value_splits: int) -> KdaTileSpec:
 def _scan_spec(req: OperatorRequest) -> KdaChunkScanSpec:
     assert isinstance(req, GdnPrefillRequest)
     value_splits = value_splits_for(req.batch_heads)
-    # Double-buffered per-chunk tile staging. Prefetch doubles the staged tiles,
-    # halving resident workgroups per CU, so it only pays where the scan cannot
-    # already hide its HBM latency behind a second resident workgroup. That is
-    # the ``value_splits=8`` band: ``BH <= 64`` caps demand at
-    # ``BH * 8 / num_CUs <= 2`` workgroups per CU, which the prefetch footprint
-    # still supplies. Outside the band the flag is illegal, not merely slower: at
-    # vs=2/vs=1 the wider state slice pushes prefetch LDS over the
-    # min_occupancy=2 budget and ``is_valid_scan_spec`` rejects it.
+    # Every band double-buffers the per-chunk tiles and V (prefetch_tiles,
+    # v_prefetch), so no HBM load is waited on mid-recurrence. That doubles the
+    # staged LDS, which the default two-workgroups-per-CU budget would refuse
+    # outside vs=8; the budget is relaxed to one because hiding the staging
+    # latency in-workgroup measured faster than a second resident workgroup in
+    # every band, including BH large enough to want two per CU.
     return KdaChunkScanSpec(
         head_k=int(req.head_k_dim),
         head_v=int(req.head_v_dim),
@@ -133,7 +136,11 @@ def _scan_spec(req: OperatorRequest) -> KdaChunkScanSpec:
         token_major_io=True,
         has_initial_state=bool(req.has_initial_state),
         store_final_state=bool(req.store_final_state),
-        prefetch_tiles=value_splits == 8,
+        min_occupancy=1,
+        prefetch_tiles=True,
+        v_prefetch=True,
+        wave_split=_WAVE_SPLIT[value_splits],
+        xcd_remap=_NUM_XCDS if value_splits > 1 else 0,
     )
 
 
