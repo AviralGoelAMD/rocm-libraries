@@ -21,7 +21,7 @@ from rocke.core.ir_serialize import serialize
 from rocke.core.verify import verify
 
 
-# (n_per_block, block_size, vec, dtype, save_mean_invstd)
+# (n_per_block, block_size, vec, dtype, save_mean_invstd[, streaming])
 CONFIGS = [
     # --- original 6 sampled configs (regression anchor) ---
     (4096, 256, 4, "f16", False),  # 0
@@ -67,15 +67,24 @@ CONFIGS = [
     # --- block 512 + two-pass ---
     (66560, 512, 2, "f16", False),  # 33  elems=130 two-pass, block 512 (512*2*65)
     (133120, 512, 4, "bf16", True),  # 34  elems=260 two-pass + save mv (512*4*65)
+    # --- streaming (nt): single-pass, save mv, two-pass ---
+    (8192, 256, 8, "f16", False, True),  # 35
+    (4096, 512, 8, "bf16", True, True),  # 36
+    (33280, 256, 2, "f16", False, True),  # 37  two-pass: pass-1 loads stay default
 ]
 
 
 def _spec(idx: int) -> LayerNorm2DSpec:
     if idx < 0 or idx >= len(CONFIGS):
         raise SystemExit(f"unknown config index {idx}")
-    n, bs, v, dt, smv = CONFIGS[idx]
+    n, bs, v, dt, smv, *nt = CONFIGS[idx]
     return LayerNorm2DSpec(
-        n_per_block=n, block_size=bs, vec=v, dtype=dt, save_mean_invstd=smv
+        n_per_block=n,
+        block_size=bs,
+        vec=v,
+        dtype=dt,
+        save_mean_invstd=smv,
+        streaming=bool(nt and nt[0]),
     )
 
 

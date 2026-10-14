@@ -135,10 +135,20 @@ def cfgs_layernorm2d():
         (8192, 256, 8, "bf16", True),
         (66560, 512, 2, "f16", False),
         (133120, 512, 4, "bf16", True),
+        (8192, 256, 8, "f16", False, True),
+        (4096, 512, 8, "bf16", True, True),
+        (33280, 256, 2, "f16", False, True),
     ]
     return [
-        dict(n_per_block=n, block_size=b, vec=v, dtype=d, save_mean_invstd=s)
-        for (n, b, v, d, s) in rows
+        dict(
+            n_per_block=n,
+            block_size=b,
+            vec=v,
+            dtype=d,
+            save_mean_invstd=s,
+            streaming=bool(nt and nt[0]),
+        )
+        for (n, b, v, d, s, *nt) in rows
     ]
 
 

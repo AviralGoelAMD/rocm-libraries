@@ -4018,6 +4018,24 @@ def cases():
             ),
         )
 
+    for _case_id, _over in (
+        ("default_n8192", {}),
+        ("streaming_v8_n8192", {"vec": 8, "streaming": True}),
+    ):
+        add(
+            "layernorm2d",
+            f"layernorm2d/gfx950/{_case_id}",
+            "gfx950",
+            build_row_kernel(
+                "layernorm2d",
+                "LayerNorm2DSpec",
+                "build_layernorm2d",
+                n_per_block=8192,
+                dtype="bf16",
+                **_over,
+            ),
+        )
+
     # ResNet-style 3x3/s2 max pool, C=256: the spec default and vec=0 (the
     # widest C pack dividing C).
     for _case_id, _over in (("default_c256", {}), ("vec_auto_c256", {"vec": 0})):

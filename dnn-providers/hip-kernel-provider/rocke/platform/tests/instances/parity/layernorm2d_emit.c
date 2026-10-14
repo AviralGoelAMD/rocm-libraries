@@ -31,6 +31,7 @@ typedef struct
     int vec;
     const char* dtype;
     bool save_mean_invstd;
+    bool streaming; /* omitted entries: false */
 } ln_cfg_t;
 
 /* MUST match CONFIGS in layernorm2d_emit.py (index for index). */
@@ -79,6 +80,10 @@ static const ln_cfg_t CONFIGS[] = {
     /* 33..34 block 512 two-pass */
     {66560, 512, 2, "f16", false},
     {133120, 512, 4, "bf16", true},
+    /* 35..37 streaming (nt): single-pass, save mv, two-pass */
+    {8192, 256, 8, "f16", false, true},
+    {4096, 512, 8, "bf16", true, true},
+    {33280, 256, 2, "f16", false, true},
 };
 
 #define NCFG ((int)(sizeof(CONFIGS) / sizeof(CONFIGS[0])))
@@ -93,6 +98,7 @@ static int make_spec(int idx, rocke_layernorm2d_spec_t* spec)
     spec->vec = CONFIGS[idx].vec;
     spec->dtype = CONFIGS[idx].dtype;
     spec->save_mean_invstd = CONFIGS[idx].save_mean_invstd;
+    spec->streaming = CONFIGS[idx].streaming;
     return 0;
 }
 

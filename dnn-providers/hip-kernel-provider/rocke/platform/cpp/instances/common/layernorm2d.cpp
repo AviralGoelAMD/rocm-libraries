@@ -46,6 +46,7 @@ rocke_layernorm2d_spec_t rocke_layernorm2d_spec_default(void)
     s.save_mean_invstd = false;
     s.wave_size = 64;
     s.name = "rocke_layernorm2d_fwd";
+    s.streaming = false;
     return s;
 }
 
@@ -68,8 +69,8 @@ rocke_status_t
     char part_b[32];
     char part_v[32];
     const char* parts[4];
-    const char* flag_names[1];
-    int flag_on[1];
+    const char* flag_names[2];
+    int flag_on[2];
 
     if(spec == NULL || out == NULL)
     {
@@ -87,8 +88,10 @@ rocke_status_t
 
     flag_names[0] = "smv";
     flag_on[0] = spec->save_mean_invstd ? 1 : 0;
+    flag_names[1] = "nt";
+    flag_on[1] = spec->streaming ? 1 : 0;
 
-    return rocke_kernel_name_join(spec->name, parts, 4, flag_names, flag_on, 1, out, out_cap, NULL);
+    return rocke_kernel_name_join(spec->name, parts, 4, flag_names, flag_on, 2, out, out_cap, NULL);
 }
 
 /* ------------------------------------------------------------------ *
@@ -261,11 +264,13 @@ typedef struct ln_pass2_ctx
     const rocke_tensor_view_t* b_view;
     rocke_value_t* mean;
     rocke_value_t* inv_std;
+    const rocke_mem_opts_t* stream; /* spec.streaming hint */
 } ln_pass2_ctx_t;
 
 /* pass2_body(n_off, _k, x_scalars):
  *     if two_pass:
- *         x_scalars = x_tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=VEC)
+ *         x_scalars = x_tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=VEC,
+ *                                            temporal_hint=stream)
  *     gv = g_view.load_vec_as_f32(b, [n_off], n=VEC)
  *     bv = b_view.load_vec_as_f32(b, [n_off], n=VEC)
  *     return [ b.fadd(
@@ -296,11 +301,12 @@ static void ln_pass2_body(rocke_ir_builder_t* b,
 
     if(ctx->two_pass)
     {
-        /* x_scalars = x_tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=VEC) */
+        /* x_scalars = x_tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=VEC,
+         *                                    temporal_hint=stream) */
         rocke_value_t* li[2];
         li[0] = rocke_b_const_i32(b, 0);
         li[1] = n_off;
-        rocke_tile_window_load_vec_as_f32(b, ctx->x_tile, li, 2, vec, xs);
+        rocke_tile_window_load_vec_as_f32_ex(b, ctx->x_tile, li, 2, vec, xs, ctx->stream);
     }
     else
     {
@@ -488,23 +494,32 @@ rocke_kernel_def_t* rocke_build_layernorm2d(rocke_ir_builder_t* b,
 
     /* two_pass = row_norm_needs_two_pass(elems) */
     two_pass = rocke_row_norm_needs_two_pass(elems, ROCKE_REGISTER_TILE_MAX_ELEMS_PER_THREAD);
+    /* stream = TemporalHint.STREAMING if spec.streaming else DEFAULT
+     * The two-pass path re-reads X in pass 2, so its pass-1 loads stay
+     * default: x_hint = DEFAULT if two_pass else stream. */
+    rocke_mem_opts_t stream = ROCKE_MEM_OPTS_INIT;
+    stream.temporal_hint = spec->streaming ? ROCKE_TEMPORAL_STREAMING : ROCKE_TEMPORAL_DEFAULT;
+    rocke_mem_opts_t x_hint = ROCKE_MEM_OPTS_INIT;
+    x_hint.temporal_hint = two_pass ? ROCKE_TEMPORAL_DEFAULT : stream.temporal_hint;
 
     /* sum_p = b.const_f32(0.0); sumsq_p = b.const_f32(0.0) */
     p1.sum_p = rocke_b_const_f32(b, 0.0);
     p1.sumsq_p = rocke_b_const_f32(b, 0.0);
 
     /* Pass 1: sweep_row_chunks(b, x_tile, tid, BS, VEC, elems,
-     *                          body=pass1_body, cache=not two_pass) */
-    sweep_res = rocke_sweep_row_chunks(b,
-                                       &x_tile,
-                                       tid,
-                                       BS,
-                                       VEC,
-                                       elems,
-                                       NULL, /* row=None */
-                                       ln_pass1_body,
-                                       &p1,
-                                       !two_pass); /* cache */
+     *                          body=pass1_body, cache=not two_pass,
+     *                          temporal_hint=x_hint) */
+    sweep_res = rocke_sweep_row_chunks_ex(b,
+                                          &x_tile,
+                                          tid,
+                                          BS,
+                                          VEC,
+                                          elems,
+                                          NULL, /* row=None */
+                                          ln_pass1_body,
+                                          &p1,
+                                          !two_pass, /* cache */
+                                          &x_hint);
 
     /* --- per-thread Welford triple from sum_p / sumsq_p --- */
     /* count_p = float(elems); inv_count_p = b.const_f32(1.0 / count_p) */
@@ -549,7 +564,8 @@ rocke_kernel_def_t* rocke_build_layernorm2d(rocke_ir_builder_t* b,
     }
 
     /* Pass 2: pass2_row_chunks(b, y_tile, tid, BS, VEC, elems,
-     *                          body=pass2_body, cached_f32=sweep_res.cached) */
+     *                          body=pass2_body, cached_f32=sweep_res.cached,
+     *                          temporal_hint=stream) */
     p2.two_pass = two_pass;
     p2.vec = VEC;
     p2.x_tile = &x_tile;
@@ -557,18 +573,20 @@ rocke_kernel_def_t* rocke_build_layernorm2d(rocke_ir_builder_t* b,
     p2.b_view = &b_view;
     p2.mean = mean;
     p2.inv_std = inv_std;
+    p2.stream = &stream;
 
-    rocke_pass2_row_chunks(b,
-                           &y_tile,
-                           tid,
-                           BS,
-                           VEC,
-                           elems,
-                           NULL, /* row=None */
-                           ln_pass2_body,
-                           &p2,
-                           sweep_res.cached,
-                           sweep_res.num_cached);
+    rocke_pass2_row_chunks_ex(b,
+                              &y_tile,
+                              tid,
+                              BS,
+                              VEC,
+                              elems,
+                              NULL, /* row=None */
+                              ln_pass2_body,
+                              &p2,
+                              sweep_res.cached,
+                              sweep_res.num_cached,
+                              &stream);
 
     /* return b.kernel */
     if(!rocke_ir_builder_ok(b))

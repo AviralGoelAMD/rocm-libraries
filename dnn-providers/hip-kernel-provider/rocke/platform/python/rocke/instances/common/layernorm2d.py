@@ -42,7 +42,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Tuple
 
-from ...core.ir import F32, I32, IRBuilder, KernelDef, PtrType
+from ...core.ir import F32, I32, IRBuilder, KernelDef, PtrType, TemporalHint
 from ...helpers.io import io_ir_type, store_scalar_from_f32
 from ...helpers.reduction import (
     REGISTER_TILE_MAX_ELEMS_PER_THREAD,
@@ -79,6 +79,9 @@ class LayerNorm2DSpec:
     dtype: DType = "f16"
     save_mean_invstd: bool = False
     wave_size: int = 64
+    # Streaming (``nt``) cache hint on the read-once X row loads (single-pass
+    # path only) and the write-once Y stores; gamma/beta keep the default policy.
+    streaming: bool = False
     name: str = "rocke_layernorm2d_fwd"
 
     @property
@@ -92,7 +95,7 @@ class LayerNorm2DSpec:
             f"N{self.n_per_block}",
             f"b{self.block_size}",
             f"v{self.vec}",
-            flags={"smv": self.save_mean_invstd},
+            flags={"smv": self.save_mean_invstd, "nt": self.streaming},
         )
 
 
@@ -245,6 +248,9 @@ def build_layernorm2d(spec: LayerNorm2DSpec) -> KernelDef:
     # config ``two_pass`` is False and the cached single-pass path below is
     # byte-identical to the pre-two-pass kernel.
     two_pass = row_norm_needs_two_pass(spec.elems_per_thread)
+    stream = TemporalHint.STREAMING if spec.streaming else TemporalHint.DEFAULT
+    # The two-pass path re-reads X in pass 2, so its pass-1 loads stay default.
+    x_hint = TemporalHint.DEFAULT if two_pass else stream
 
     sum_p = b.const_f32(0.0)
     sumsq_p = b.const_f32(0.0)
@@ -264,6 +270,7 @@ def build_layernorm2d(spec: LayerNorm2DSpec) -> KernelDef:
         elems_per_thread=spec.elems_per_thread,
         body=pass1_body,
         cache=not two_pass,
+        temporal_hint=x_hint,
     )
 
     # Numerically-stable Welford block merge. Each thread reads exactly
@@ -322,7 +329,9 @@ def build_layernorm2d(spec: LayerNorm2DSpec) -> KernelDef:
     # HBM (the same ``x_tile`` window) before normalising.
     def pass2_body(n_off, _k, x_scalars):
         if two_pass:
-            x_scalars = x_tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=VEC)
+            x_scalars = x_tile.load_vec_as_f32(
+                b, b.const_i32(0), n_off, n=VEC, temporal_hint=stream
+            )
         gv = g_view.load_vec_as_f32(b, [n_off], n=VEC)
         bv = b_view.load_vec_as_f32(b, [n_off], n=VEC)
         return [
@@ -342,6 +351,7 @@ def build_layernorm2d(spec: LayerNorm2DSpec) -> KernelDef:
         elems_per_thread=spec.elems_per_thread,
         body=pass2_body,
         cached_f32=sweep_res.cached,
+        temporal_hint=stream,
     )
 
     return b.kernel

@@ -1909,6 +1909,7 @@ rocke_layernorm2d_spec_t ln_build_spec(const py::dict& d, std::deque<std::string
     s.block_size = dict_int(d, "block_size", s.block_size);
     s.vec = dict_int(d, "vec", s.vec);
     s.save_mean_invstd = dict_bool(d, "save_mean_invstd", s.save_mean_invstd);
+    s.streaming = dict_bool(d, "streaming", s.streaming);
     {
         std::string v;
         if(dict_str(d, "dtype", v))

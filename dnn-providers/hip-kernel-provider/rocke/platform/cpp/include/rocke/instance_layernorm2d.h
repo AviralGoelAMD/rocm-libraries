@@ -51,7 +51,10 @@ extern "C" {
  * Mirror of Python LayerNorm2DSpec. ``dtype`` is the Literal["f16","bf16"]
  * string (compared by strcmp like Python). The computed @property
  * ``elems_per_thread`` (n_per_block // block_size) is NOT stored; use
- * rocke_layernorm2d_elems_per_thread(). */
+ * rocke_layernorm2d_elems_per_thread(). ``streaming`` puts the
+ * TemporalHint.STREAMING (``nt``) hint on the read-once X loads (single-pass
+ * path only) and the write-once Y stores; it is appended last so existing
+ * offsets hold. */
 typedef struct rocke_layernorm2d_spec
 {
     int n_per_block;
@@ -61,6 +64,7 @@ typedef struct rocke_layernorm2d_spec
     bool save_mean_invstd; /* default false                     */
     int wave_size; /* default 64                        */
     const char* name; /* default "rocke_layernorm2d_fwd"  */
+    bool streaming; /* default false                     */
 } rocke_layernorm2d_spec_t;
 
 /* Default-constructed spec (every field == Python dataclass default). The

@@ -1514,6 +1514,22 @@
           "sha256": "0b397b8339942ebdd73cdb99e4316c2f5abab915c071f5d2621941b77fc6766f",
           "status": "ok"
         },
+        "layernorm2d/gfx950/default_n8192": {
+          "arch": "gfx950",
+          "bytes": 61756,
+          "family": "layernorm2d",
+          "kernel_name": "rocke_layernorm2d_fwd_bf16_N8192_b256_v4",
+          "sha256": "993cefee1eb734781fb68fa7ff19afbc277ca57dcc66da05a20d935c416a2a40",
+          "status": "ok"
+        },
+        "layernorm2d/gfx950/streaming_v8_n8192": {
+          "arch": "gfx950",
+          "bytes": 57730,
+          "family": "layernorm2d",
+          "kernel_name": "rocke_layernorm2d_fwd_bf16_N8192_b256_v8_nt",
+          "sha256": "54dbd4270f785091e2027cf0feff54bdf69f4ce3e63e1d1b264aaed21065ea56",
+          "status": "ok"
+        },
         "moe_sort/gfx1151/hist_t32_k2_e8": {
           "arch": "gfx1151",
           "bytes": 3011,
@@ -1661,7 +1677,7 @@
           "gfx1250": 4,
           "gfx90a": 5,
           "gfx942": 40,
-          "gfx950": 137
+          "gfx950": 139
         },
         "expected_failures": 4,
         "families": {
@@ -1684,13 +1700,14 @@
           "gemm": 13,
           "grouped_gemm": 1,
           "kda_chunkwise": 13,
+          "layernorm2d": 2,
           "moe": 9,
           "nontemporal": 2,
           "pooling": 2,
           "rmsnorm2d": 3,
           "smoothquant": 2
         },
-        "ok_cases": 204
+        "ok_cases": 206
       }
     },
     "llvm22": {
@@ -3207,6 +3224,22 @@
           "sha256": "788425adf2304fc0a9fdffb293c8afff7732a0df85019314e8a0096c8e7ba5d1",
           "status": "ok"
         },
+        "layernorm2d/gfx950/default_n8192": {
+          "arch": "gfx950",
+          "bytes": 61763,
+          "family": "layernorm2d",
+          "kernel_name": "rocke_layernorm2d_fwd_bf16_N8192_b256_v4",
+          "sha256": "1b35c1fb25ddb0dc85d46326134bf59ced0cae77718b5ef0cfbb3df843d20650",
+          "status": "ok"
+        },
+        "layernorm2d/gfx950/streaming_v8_n8192": {
+          "arch": "gfx950",
+          "bytes": 57737,
+          "family": "layernorm2d",
+          "kernel_name": "rocke_layernorm2d_fwd_bf16_N8192_b256_v8_nt",
+          "sha256": "77c8108b61e42de11e3afdb70cf815eaca14f81c957c439110e6753c961e2ed2",
+          "status": "ok"
+        },
         "moe_sort/gfx1151/hist_t32_k2_e8": {
           "arch": "gfx1151",
           "bytes": 3018,
@@ -3354,7 +3387,7 @@
           "gfx1250": 4,
           "gfx90a": 5,
           "gfx942": 40,
-          "gfx950": 137
+          "gfx950": 139
         },
         "expected_failures": 4,
         "families": {
@@ -3377,13 +3410,14 @@
           "gemm": 13,
           "grouped_gemm": 1,
           "kda_chunkwise": 13,
+          "layernorm2d": 2,
           "moe": 9,
           "nontemporal": 2,
           "pooling": 2,
           "rmsnorm2d": 3,
           "smoothquant": 2
         },
-        "ok_cases": 204
+        "ok_cases": 206
       }
     },
     "llvm23": {
@@ -4932,6 +4966,22 @@
           "sha256": "f7bcbec6aaa73d5eacb821bf69ce6619101535d9135c27ecfd3f13c1105828f8",
           "status": "ok"
         },
+        "layernorm2d/gfx950/default_n8192": {
+          "arch": "gfx950",
+          "bytes": 61827,
+          "family": "layernorm2d",
+          "kernel_name": "rocke_layernorm2d_fwd_bf16_N8192_b256_v4",
+          "sha256": "ab03f8367fc8fa7eaac06ace055699f0e1fbadc10e7fb626f40b4d35f99006b0",
+          "status": "ok"
+        },
+        "layernorm2d/gfx950/streaming_v8_n8192": {
+          "arch": "gfx950",
+          "bytes": 57801,
+          "family": "layernorm2d",
+          "kernel_name": "rocke_layernorm2d_fwd_bf16_N8192_b256_v8_nt",
+          "sha256": "6eaa42d7bab3b932471501fd5c4442c58a05159e6d0b5f64a3e7eaf95e544a55",
+          "status": "ok"
+        },
         "moe_sort/gfx1151/hist_t32_k2_e8": {
           "arch": "gfx1151",
           "bytes": 3082,
@@ -5062,7 +5112,7 @@
           "gfx1250": 8,
           "gfx90a": 5,
           "gfx942": 40,
-          "gfx950": 137
+          "gfx950": 139
         },
         "expected_failures": 0,
         "families": {
@@ -5085,13 +5135,14 @@
           "gemm": 17,
           "grouped_gemm": 1,
           "kda_chunkwise": 13,
+          "layernorm2d": 2,
           "moe": 9,
           "nontemporal": 2,
           "pooling": 2,
           "rmsnorm2d": 3,
           "smoothquant": 2
         },
-        "ok_cases": 208
+        "ok_cases": 210
       }
     }
   },
