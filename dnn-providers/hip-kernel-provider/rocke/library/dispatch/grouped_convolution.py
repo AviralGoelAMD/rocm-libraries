@@ -162,15 +162,25 @@ from kernels.common.conv_implicit_gemm_dgrad import (
     DgradConvSpec,
     is_valid_dgrad_spec as _dgrad_is_valid_spec,
 )
+from kernels.common.conv_channel_pad import (
+    ChannelPadSpec,
+    build_conv_channel_pad,
+    channel_pad_grid,
+    channel_pad_signature,
+)
 from kernels.common.conv_direct_grouped import (
     DirectConvProblem,
     DirectConvSpec,
     DirectDepthwiseDgradStreamSpec,
     DirectDepthwiseTiledSpec,
+    DirectTransposeWeightsDgradSpec,
+    build_direct_transpose_weights_dgrad,
+    direct_dgrad_workspace_bytes,
     direct_launch_geometry,
     is_valid_depthwise_dgrad_stream_spec,
     is_valid_depthwise_tiled_spec,
     is_valid_spec as _direct_is_valid_spec,
+    make_dgrad_fprop_spec,
 )
 from rocke.dispatch.core import (
     Capability,
@@ -545,6 +555,25 @@ class ConvGroupedSpec:
     # (see :meth:`to_direct_spec`); the GEMM fields are then unused.
     direct_kind: str = ""
     direct_tile: Tuple[int, ...] = ()
+    # fwd implicit GEMM only: when non-zero, the conv runs on the problem with
+    # the input-channel axis zero-padded to ``pad_c`` (a C=3 stem padded to 8),
+    # fed by the channel-pad pre-pass. See :func:`conv_grouped_prepass`.
+    pad_c: int = 0
+
+    @property
+    def prepass(self) -> str:
+        """The pre-pass this spec needs before its main kernel, or "".
+
+        * ``"channel_pad"`` -- copy X and W into a workspace with the channel
+          axis zero-padded to ``pad_c``; the implicit GEMM reads the workspace.
+        * ``"weight_transpose"`` -- the grouped dgrad direct kind: transpose W
+          into a workspace; the direct forward kernel reads it as its filter.
+        """
+        if self.pad_c:
+            return "channel_pad"
+        if self.direct_kind == "grouped_dgrad":
+            return "weight_transpose"
+        return ""
 
     def kernel_name(self) -> str:
         from rocke.helpers.spec import kernel_name_join
@@ -579,12 +608,22 @@ class ConvGroupedSpec:
             parts.append("kouter")
         if self.direction in ("fwd", "wgrad") and self.group_merge > 1:
             parts.append(f"gm{self.group_merge}")
+        # A different problem (C = pad_c) and a different launch contract (a
+        # workspace and a pre-pass), so it has to key the cache separately.
+        if self.pad_c:
+            parts.append(f"padc{self.pad_c}")
         return kernel_name_join(self.name, *parts)
 
     def to_fwd_spec(self, problem: "ConvProblem") -> "ImplicitGemmConvSpec":
-        """Build an ImplicitGemmConvSpec from this dispatcher spec and a ConvProblem."""
+        """Build an ImplicitGemmConvSpec from this dispatcher spec and a ConvProblem.
+
+        ``problem`` is the request's problem; a ``pad_c`` spec builds the kernel
+        for the channel-padded one, which is what its main kernel computes.
+        """
         assert self.direction == "fwd", "to_fwd_spec is only valid for fwd specs"
         target = ArchTarget.from_gfx(self.arch)
+        if self.pad_c:
+            problem = replace(problem, C=self.pad_c)
         return ImplicitGemmConvSpec(
             problem=problem,
             name=self.name,
@@ -709,6 +748,16 @@ class ConvGroupedSpec:
                 block_q=t[0],
                 block_groups=t[1],
                 double_buffer=bool(t[2]),
+            )
+        if self.direct_kind == "grouped_dgrad":
+            # dgrad as the forward direct kernel over (dY, W^T): the spec
+            # describes the transposed problem, and the weight-transpose
+            # pre-pass supplies W^T in the workspace.
+            return replace(
+                make_dgrad_fprop_spec(
+                    p, block_q=t[0], block_groups=t[1], block_h=t[2]
+                ),
+                name=self.name,
             )
         raise ValueError(f"unknown direct_kind {self.direct_kind!r}")
 
@@ -934,6 +983,28 @@ def _fwd_merge_degree(req: "ConvGroupedRequest", spec: ImplicitGemmConvSpec) -> 
     return 1
 
 
+# Small-channel (stem) forward convs: the channel count a C-odd, C<8 input is
+# zero-padded to before the implicit GEMM runs. An odd C makes every A-operand
+# tap a scalar load with its own coordinate decode; padded to 8 the tap is one
+# 16-byte load and the conv runs the dense C=8 kernel. The pad pre-pass copies
+# X (and the tiny W) once per call into a workspace.
+_GFX950_STEM_PAD_C = 8
+
+
+def _stem_pad_c(req: "ConvGroupedRequest") -> int:
+    """``pad_c`` for a gfx950 forward request: :data:`_GFX950_STEM_PAD_C` for
+    an ungrouped 2-D conv with an odd input-channel count below it, else 0."""
+    if (
+        req.direction != "fwd"
+        or int(req.G) != 1
+        or req.Di is not None
+        or int(req.C) >= _GFX950_STEM_PAD_C
+        or int(req.C) % 2 == 0
+    ):
+        return 0
+    return _GFX950_STEM_PAD_C
+
+
 # ---------------------------------------------------------------------------
 # gfx950 forward candidate (wave64, MFMA 32×32×16)
 # ---------------------------------------------------------------------------
@@ -958,8 +1029,10 @@ def _make_gfx950_fwd_candidate() -> KernelCandidate:
 
     def _build_unmerged_spec(req: ConvGroupedRequest) -> ImplicitGemmConvSpec:
         tm, tn, tk, wm, wn, wtmn, wtk = _tile(req)
+        p = _problem(req)
+        pad_c = _stem_pad_c(req)
         return ImplicitGemmConvSpec(
-            problem=_problem(req),
+            problem=replace(p, C=pad_c) if pad_c else p,
             name=name,
             data=_data_spec(req),
             tile_m=tm,
@@ -1022,6 +1095,7 @@ def _make_gfx950_fwd_candidate() -> KernelCandidate:
             arch=req.arch,
             group_merge=_group_merge(req),
             name=name,
+            pad_c=_stem_pad_c(req),
         )
 
     candidate = KernelCandidate(
@@ -1446,6 +1520,13 @@ def _wgrad_b_is_scalar(req: "ConvGroupedRequest") -> bool:
 _WGRAD_DW_TILE_N_LADDER = (64, 128, 256)
 _WGRAD_DW_TARGET_MERGE = 8
 _WGRAD_DW_MIN_WIDE_MERGE = 4
+# Below this many reduction rows (N*Ho*Wo) a depthwise wgrad that already
+# merges groups at the shipped tile keeps it: the per-CTA reduction is too
+# short to repay the wider tile, and halving the CTA count on an already
+# small grid costs more than the wider loads save (batch-1 late-stage maps,
+# e.g. 14x14). A filter that cannot merge at all at the shipped tile (7x7)
+# still widens: there the wide tile is what turns scalar loads into vectors.
+_WGRAD_DW_SMALL_REDUCTION = 1024
 
 
 def _wgrad_merge_degree_at(req: "ConvGroupedRequest", tile_n: int) -> int:
@@ -1504,6 +1585,11 @@ def _wgrad_dw_tile_n(req: "ConvGroupedRequest") -> int:
     p = _problem(req)
     if p.cpg != 1 or p.kpg != 1 or p.groups <= 1:
         return _GFX950_TILE_N
+    if (
+        p.N * p.Ho * p.Wo < _WGRAD_DW_SMALL_REDUCTION
+        and _wgrad_merge_degree_at(req, _GFX950_TILE_N) > 1
+    ):
+        return _GFX950_TILE_N
     for tile_n in _WGRAD_DW_TILE_N_LADDER:
         if _wgrad_merge_degree_at(req, tile_n) >= _WGRAD_DW_TARGET_MERGE:
             return tile_n
@@ -1520,13 +1606,6 @@ def _wgrad_merge_degree(req: "ConvGroupedRequest") -> int:
 
 
 def _make_gfx950_wgrad_candidate() -> KernelCandidate:
-# Below this many reduction rows (N*Ho*Wo) a depthwise wgrad that already
-# merges groups at the shipped tile keeps it: the per-CTA reduction is too
-# short to repay the wider tile, and halving the CTA count on an already
-# small grid costs more than the wider loads save (batch-1 late-stage maps,
-# e.g. 14x14). A filter that cannot merge at all at the shipped tile (7x7)
-# still widens: there the wide tile is what turns scalar loads into vectors.
-_WGRAD_DW_SMALL_REDUCTION = 1024
     """Backward-weight conv for gfx950: 64×64×64, 2×2, 32×32×16 MFMA.
 
     Epilogue derived from vec_size_c (cshuffle when >1, default otherwise).
@@ -1585,11 +1664,6 @@ _WGRAD_DW_SMALL_REDUCTION = 1024
         _ep, _sk = _wgrad_grouped_overrides(req)
         return WgradConvSpec(
             group_merge=_group_merge(req),
-    if (
-        p.N * p.Ho * p.Wo < _WGRAD_DW_SMALL_REDUCTION
-        and _wgrad_merge_degree_at(req, _GFX950_TILE_N) > 1
-    ):
-        return _GFX950_TILE_N
             problem=_problem(req),
             name=name,
             lds_k_outer=_wgrad_lds_k_outer(req, wtmn),
@@ -1934,13 +2008,14 @@ def _make_gfx1250_wgrad_candidate() -> KernelCandidate:
 # still reaches the implicit GEMM.
 
 _DIRECT_PRIORITY = 5
-_DIRECT_KINDS = ("dw_tiled", "dw_dgrad_stream", "grouped")
+_DIRECT_KINDS = ("dw_tiled", "dw_dgrad_stream", "grouped", "grouped_dgrad")
 
 
 def _direct_block(spec: ConvGroupedSpec) -> Tuple[int, int, int]:
     """Threads per CTA of a direct spec: the last ``direct_tile`` knob is the
     wave count (depthwise) or the groups-per-block wave count (grouped)."""
-    return (spec.direct_tile[-1 if spec.direct_kind != "grouped" else 1] * 64, 1, 1)
+    grouped = spec.direct_kind in ("grouped", "grouped_dgrad")
+    return (spec.direct_tile[1 if grouped else -1] * 64, 1, 1)
 
 
 def _direct_grid(spec: ConvGroupedSpec, req: OperatorRequest) -> Tuple[int, int, int]:
@@ -1964,6 +2039,13 @@ def _grouped_direct_tile(p: DirectConvProblem) -> Tuple[int, int, int]:
     return (16, 4 if p.cpg <= 8 else 2, 1)
 
 
+def _grouped_dgrad_tile(p: DirectConvProblem) -> Tuple[int, int, int]:
+    """(block_q, block_groups, block_h) for grouped dgrad as the forward direct
+    kernel over (dY, W^T): 8-row H tiles, a 32-wide Q strip and 4 groups per
+    CTA up to cpg 8, a 16-wide strip and 2 groups at cpg 16."""
+    return (32, 4, 8) if p.cpg <= 8 else (16, 2, 8)
+
+
 def _make_gfx950_direct_candidate(kind: str) -> KernelCandidate:
     """A direct-conv candidate for gfx950: ``kind`` is one of _DIRECT_KINDS.
 
@@ -1974,8 +2056,13 @@ def _make_gfx950_direct_candidate(kind: str) -> KernelCandidate:
     * ``grouped`` -- grouped forward with ``cpg == kpg`` in 4..16,
       :class:`DirectConvSpec`. Wider groups stay on the implicit GEMM, whose
       tile is dense enough there.
+    * ``grouped_dgrad`` -- grouped backward-data for the same ``cpg`` range at
+      stride 1: dX is the forward conv of dY with the transposed filter, so it
+      runs :class:`DirectConvSpec` on the transposed problem
+      (:func:`make_dgrad_fprop_spec`) after a weight-transpose pre-pass (see
+      :func:`conv_grouped_prepass`). Stride > 1 stays on the implicit GEMM.
     """
-    direction = "dgrad" if kind == "dw_dgrad_stream" else "fwd"
+    direction = "dgrad" if kind in ("dw_dgrad_stream", "grouped_dgrad") else "fwd"
     name = f"direct_conv_{kind}"
     spec_id = f"direct_{kind}"
     algorithm = f"direct_{kind}"
@@ -1985,6 +2072,8 @@ def _make_gfx950_direct_candidate(kind: str) -> KernelCandidate:
             return _dw_tiled_tile(p)
         if kind == "dw_dgrad_stream":
             return (4, 1)
+        if kind == "grouped_dgrad":
+            return _grouped_dgrad_tile(p)
         return _grouped_direct_tile(p)
 
     def _spec(req: ConvGroupedRequest, p: DirectConvProblem) -> ConvGroupedSpec:
@@ -2027,7 +2116,9 @@ def _make_gfx950_direct_candidate(kind: str) -> KernelCandidate:
             if p.cpg != 1 or p.kpg != 1:
                 return False, f"{kind} is depthwise only (cpg=kpg=1)"
         elif p.cpg != p.kpg or p.cpg % 4 or not 4 <= p.cpg <= 16:
-            return False, "grouped direct needs cpg == kpg in 4..16 (multiple of 4)"
+            return False, f"{kind} needs cpg == kpg in 4..16 (multiple of 4)"
+        if kind == "grouped_dgrad" and (p.stride != 1 or p.PAD > p.KH - 1):
+            return False, "grouped_dgrad needs stride 1 and pad <= KH - 1"
         inst = _spec(req, p).to_direct_spec(req)
         if kind == "dw_tiled":
             return is_valid_depthwise_tiled_spec(inst, arch=req.arch)
@@ -2099,6 +2190,7 @@ CONV_DGRAD_REGISTRY = CandidateRegistry(
 )
 CONV_DGRAD_REGISTRY.register(_make_gfx950_dgrad_candidate())
 CONV_DGRAD_REGISTRY.register(_make_gfx950_direct_candidate("dw_dgrad_stream"))
+CONV_DGRAD_REGISTRY.register(_make_gfx950_direct_candidate("grouped_dgrad"))
 
 CONV_FWD_REGISTRY = CandidateRegistry(_FAMILY_FWD, dim_vocabulary=_CONV_DIM_VOCABULARY)
 CONV_FWD_REGISTRY.register(_make_gfx942_fwd_candidate())
@@ -2200,7 +2292,9 @@ def _signature_for(req: ConvGroupedRequest, spec: ConvGroupedSpec) -> tuple:
     from kernels.common.conv_abi import conv_args_signature, conv_direct_args_signature
 
     if spec.direct_kind:
-        if req.direction == "fwd":
+        # grouped_dgrad's main kernel is the forward direct kernel run on the
+        # transposed problem, so it takes the forward kernarg block.
+        if req.direction == "fwd" or spec.direct_kind == "grouped_dgrad":
             return tuple(conv_direct_args_signature(req.dtype))
         return tuple(conv_direct_args_signature(req.dtype, direction=req.direction))
 
@@ -2248,9 +2342,27 @@ def launch_values_for(
 
     The tile size comes from ``spec`` because the chiplet-swizzle path decodes
     the workgroup id against ``p_num_pid_m/n``, which are tile-count values.
+
+    A spec with a :attr:`ConvGroupedSpec.prepass` reads (part of) its operands
+    from the pre-pass workspace, so ``ws_ptr``/``ws_bytes`` are required and
+    the values point the main kernel there; ``A``/``B``/``D`` stay the caller's
+    tensors (see :func:`conv_grouped_prepass`).
     """
     from kernels.common.conv_args import ConvArgs
 
+    if spec.prepass:
+        pre = conv_grouped_prepass(req, spec)
+        if ws_ptr is None or ws_bytes is None or ws_bytes < pre.workspace_bytes:
+            raise ValueError(
+                f"{spec.kernel_name()} reads the {spec.prepass} pre-pass workspace: "
+                f"pass ws_ptr and ws_bytes >= {pre.workspace_bytes}"
+            )
+    if spec.direct_kind == "grouped_dgrad":
+        # dX = conv(dY, W^T) on the transposed problem; W^T is the workspace.
+        fp = spec.to_direct_spec(req).problem
+        return ConvArgs.from_problem(fp).to_launch_values(
+            A_ptr, ws_ptr, D_ptr, A_bytes, pre.workspace_bytes, D_bytes
+        )
     if spec.direct_kind:
         # The direct kernels take the conv_direct kernarg block: the problem
         # extents and strides, with no tile counts.
@@ -2326,9 +2438,133 @@ def launch_values_for(
             sub_gemm_buf=sub_gemm_buf,
             num_sub_gemms=num_sub_gemms,
         )
+    if spec.pad_c:
+        # The implicit GEMM runs on the channel-padded problem, reading the
+        # padded activation and filter from the two workspace segments.
+        _x_rows, _w_rows, xp_bytes, wp_bytes = _channel_pad_segments(req, spec)
+        p = replace(p, C=spec.pad_c)
+        A_ptr, B_ptr = ws_ptr, ws_ptr + xp_bytes
+        A_bytes, B_bytes = xp_bytes, wp_bytes
     return ConvArgs.from_problem(p, tile_m=tile_m, tile_n=tile_n).to_launch_values(
         A_ptr, B_ptr, D_ptr, A_bytes, B_bytes, D_bytes
     )
+
+
+# ---------------------------------------------------------------------------
+# Pre-pass (a second kernel launched before the dispatched one)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ConvGroupedPrepass:
+    """The kernel a :attr:`ConvGroupedSpec.prepass` spec needs launched first,
+    on the same stream, before the dispatched kernel.
+
+    The caller allocates ``workspace_bytes`` (no initialisation needed: the
+    pre-pass writes every byte the main kernel reads), launches
+    :meth:`build` with ``grid``/``block``/``signature`` and the values from
+    :func:`prepass_launch_values_for`, then launches the dispatched kernel with
+    :func:`launch_values_for` given the same ``ws_ptr``/``ws_bytes``.
+    """
+
+    kind: str  # "channel_pad" | "weight_transpose"
+    kernel_spec: object
+    grid: Tuple[int, int, int]
+    block: Tuple[int, int, int]
+    signature: tuple
+    workspace_bytes: int
+
+    def build(self, arch: str):
+        if self.kind == "channel_pad":
+            return build_conv_channel_pad(self.kernel_spec, arch=arch)
+        return build_direct_transpose_weights_dgrad(self.kernel_spec, arch=arch)
+
+
+def _channel_pad_segments(
+    req: ConvGroupedRequest, spec: ConvGroupedSpec
+) -> Tuple[int, int, int, int]:
+    """``(x_rows, w_rows, xp_bytes, wp_bytes)`` of the channel-pad workspace:
+    the padded activation segment first, the padded filter right after it."""
+    x_rows = int(req.N) * int(req.Hi) * int(req.Wi)
+    w_rows = int(req.K) * int(req.Y) * int(req.X)
+    return x_rows, w_rows, x_rows * spec.pad_c * 2, w_rows * spec.pad_c * 2
+
+
+def conv_grouped_prepass(
+    req: ConvGroupedRequest, spec: ConvGroupedSpec
+) -> Optional[ConvGroupedPrepass]:
+    """The pre-pass ``spec`` needs before its main kernel, or None."""
+    if spec.prepass == "channel_pad":
+        ks = ChannelPadSpec(c_in=int(req.C), c_pad=spec.pad_c, dtype=req.dtype.lower())
+        x_rows, w_rows, xp_bytes, wp_bytes = _channel_pad_segments(req, spec)
+        return ConvGroupedPrepass(
+            kind="channel_pad",
+            kernel_spec=ks,
+            grid=channel_pad_grid(ks, x_rows, w_rows),
+            block=(ks.block_size, 1, 1),
+            signature=tuple(channel_pad_signature(ks)),
+            workspace_bytes=xp_bytes + wp_bytes,
+        )
+    if spec.prepass == "weight_transpose":
+        from rocke.helpers.spec import SignatureBuilder
+
+        p = _direct_problem(req)
+        ks = DirectTransposeWeightsDgradSpec(problem=p)
+        grid, block = direct_launch_geometry(ks)
+        dtype = req.dtype.lower()
+        sig = (
+            SignatureBuilder()
+            .ptr("A", dtype)
+            .ptr("D", dtype)
+            .scalar("A_bytes", "i32")
+            .scalar("D_bytes", "i32")
+            .build()
+        )
+        return ConvGroupedPrepass(
+            kind="weight_transpose",
+            kernel_spec=ks,
+            grid=tuple(grid),
+            block=tuple(block),
+            signature=tuple(sig),
+            workspace_bytes=direct_dgrad_workspace_bytes(p),
+        )
+    return None
+
+
+def prepass_launch_values_for(
+    req: ConvGroupedRequest,
+    spec: ConvGroupedSpec,
+    *,
+    A_ptr: int,
+    B_ptr: int,
+    A_bytes: int,
+    B_bytes: int,
+    ws_ptr: int,
+    ws_bytes: int,
+) -> dict:
+    """Kernarg values of the pre-pass, with the operand roles of
+    :func:`launch_values_for` (fwd: A = X, B = W; dgrad: A = dY, B = W)."""
+    pre = conv_grouped_prepass(req, spec)
+    if pre is None:
+        raise ValueError(f"{spec.kernel_name()} has no pre-pass")
+    if ws_bytes < pre.workspace_bytes:
+        raise ValueError(f"workspace {ws_bytes} B < required {pre.workspace_bytes} B")
+    if pre.kind == "channel_pad":
+        x_rows, w_rows, xp_bytes, _wp = _channel_pad_segments(req, spec)
+        return {
+            "X": A_ptr,
+            "W": B_ptr,
+            "Xp": ws_ptr,
+            "Wp": ws_ptr + xp_bytes,
+            "x_rows": x_rows,
+            "w_rows": w_rows,
+        }
+    return {
+        "A": B_ptr,
+        "D": ws_ptr,
+        "A_bytes": B_bytes,
+        "D_bytes": pre.workspace_bytes,
+    }
 
 
 def dispatch_conv_grouped(
@@ -2355,6 +2591,12 @@ def dispatch_conv_grouped(
                 f"exceed the {_MAX_WGRAD_WS_BYTES}-byte i32 limit, so the "
                 f"plain store is used instead"
             )
+    if spec.prepass:
+        pre = conv_grouped_prepass(req, spec)
+        explanation.append(
+            f"prepass={spec.prepass}: launch it first with a "
+            f"{pre.workspace_bytes}-byte workspace (conv_grouped_prepass)"
+        )
     # AOT: signature includes all runtime problem-dim args.
     _sig = _signature_for(req, spec)
     return DispatchResult(
