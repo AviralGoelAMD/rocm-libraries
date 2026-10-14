@@ -63,6 +63,10 @@ from .ir import (
     split_loc,
 )
 
+# FP binops that take the ``contract`` fast-math flag under
+# ``CodegenPolicy.fp_contract`` (fdiv is excluded: it never contracts).
+_CONTRACTIBLE_FP_OPS = frozenset(("fadd", "fsub", "fmul"))
+
 
 # Datalayout / triple. Copied verbatim from clang's output for the same
 # target on this box: clang -target amdgcn-amd-amdhsa -mcpu=gfx950
@@ -1564,6 +1568,9 @@ class _Lowerer:
         arch: Optional[str] = None,
     ) -> None:
         self.kernel = kernel
+        # Kernel opt-in (CodegenPolicy.fp_contract): mark fadd/fsub/fmul
+        # ``contract`` so the backend may fuse them into v_fma / v_pk_fma.
+        self._fp_contract = codegen_policy_for_kernel(kernel).fp_contract
         # ISA backend selects the gfx-keyed LLVM details (datalayout, triple,
         # waitcnt encoding). Defaults to gfx950 so existing callers and the
         # gfx950 byte-identical baseline are preserved.
@@ -2173,7 +2180,7 @@ class _Lowerer:
     def _binop(self, op: Op, llvm_op: str) -> None:
         a, b = op.operands
         self._current().emit(
-            f"  {op.result.name} = {llvm_op} {_llvm_type(op.result.type)} "
+            f"  {op.result.name} = {self._fp_op(llvm_op)} {_llvm_type(op.result.type)} "
             f"{self._operand(a)}, {self._operand(b)}"
         )
 
@@ -5962,8 +5969,15 @@ class _Lowerer:
     def _vector_binop(self, op: Op, llvm_op: str) -> None:
         a, b = op.operands
         self._current().emit(
-            f"  {op.result.name} = {llvm_op} {_llvm_type(a.type)} {self._operand(a)}, {self._operand(b)}"
+            f"  {op.result.name} = {self._fp_op(llvm_op)} {_llvm_type(a.type)} "
+            f"{self._operand(a)}, {self._operand(b)}"
         )
+
+    def _fp_op(self, llvm_op: str) -> str:
+        """``llvm_op`` plus ``contract`` for fadd/fsub/fmul under fp_contract."""
+        if self._fp_contract and llvm_op in _CONTRACTIBLE_FP_OPS:
+            return f"{llvm_op} contract"
+        return llvm_op
 
     def _op_vector_add(self, op: Op) -> None:
         elem = op.result.type.elem.name  # type: ignore[attr-defined]
@@ -6580,9 +6594,12 @@ class _Lowerer:
             '"uniform-work-group-size"="true"',
             f'"amdgpu-flat-work-group-size"="64,{max_wg}"',
         ]
-        scheduler_strategy = codegen_policy_for_kernel(self.kernel).scheduler_strategy
-        if scheduler_strategy is not None:
-            attr_parts.append(f'"amdgpu-sched-strategy"="{scheduler_strategy}"')
+        policy = codegen_policy_for_kernel(self.kernel)
+        if policy.scheduler_strategy is not None:
+            attr_parts.append(f'"amdgpu-sched-strategy"="{policy.scheduler_strategy}"')
+        if policy.f32_denormal_mode is not None:
+            mode = policy.f32_denormal_mode
+            attr_parts.append(f'"denormal-fp-math-f32"="{mode},{mode}"')
         # Optional explicit waves-per-EU occupancy hint, the AMDGPU
         # equivalent of CUDA's ``__launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)``.
         # The AMDGPU backend reads this to size the register file

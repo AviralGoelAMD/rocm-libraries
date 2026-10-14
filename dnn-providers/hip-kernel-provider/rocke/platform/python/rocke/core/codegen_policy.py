@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from .ir import KernelDef
 
 SCHEDULER_STRATEGY_ATTR = "scheduler_strategy"
+F32_DENORMAL_MODE_ATTR = "f32_denormal_mode"
+FP_CONTRACT_ATTR = "fp_contract"
 
 
 class SchedulerStrategy(str, Enum):
@@ -48,11 +50,44 @@ def normalize_scheduler_strategy(value: object) -> str | None:
     )
 
 
+class F32DenormalMode(str, Enum):
+    """f32 denormal handling the kernel may assume (``denormal-fp-math-f32``).
+
+    ``PRESERVE_SIGN`` flushes f32 denormal inputs/outputs to signed zero. The
+    AMDGPU backend then lowers ``llvm.exp2`` / ``llvm.log2`` / ``llvm.sqrt`` /
+    ``fdiv`` without the denormal range-scaling sequences it needs under IEEE.
+    ``IEEE`` is the LLVM default and is never emitted explicitly.
+    """
+
+    IEEE = "ieee"
+    PRESERVE_SIGN = "preserve-sign"
+
+
+_F32_DENORMAL_MODE_VALUES = frozenset(mode.value for mode in F32DenormalMode)
+
+
+def normalize_f32_denormal_mode(value: object) -> str | None:
+    """Return the canonical f32 denormal mode, ``None`` for the default."""
+
+    if value is None:
+        return None
+    if isinstance(value, F32DenormalMode):
+        value = value.value
+    if isinstance(value, str) and value in _F32_DENORMAL_MODE_VALUES:
+        return None if value == F32DenormalMode.IEEE.value else value
+    choices = ", ".join(sorted(_F32_DENORMAL_MODE_VALUES))
+    raise ValueError(
+        f"unsupported f32_denormal_mode {value!r}; expected one of: {choices}, or None"
+    )
+
+
 @dataclass(frozen=True)
 class CodegenPolicy:
     """Validated code-generation choices belonging to one compiled kernel."""
 
     scheduler_strategy: str | SchedulerStrategy | None = None
+    f32_denormal_mode: str | F32DenormalMode | None = None
+    fp_contract: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -60,12 +95,23 @@ class CodegenPolicy:
             "scheduler_strategy",
             normalize_scheduler_strategy(self.scheduler_strategy),
         )
+        object.__setattr__(
+            self,
+            "f32_denormal_mode",
+            normalize_f32_denormal_mode(self.f32_denormal_mode),
+        )
+        if not isinstance(self.fp_contract, bool):
+            raise ValueError(f"fp_contract must be a bool, got {self.fp_contract!r}")
 
 
 def codegen_policy_from_attrs(attrs: Mapping[str, Any]) -> CodegenPolicy:
     """Construct and validate policy from a kernel attribute mapping."""
 
-    return CodegenPolicy(scheduler_strategy=attrs.get(SCHEDULER_STRATEGY_ATTR))
+    return CodegenPolicy(
+        scheduler_strategy=attrs.get(SCHEDULER_STRATEGY_ATTR),
+        f32_denormal_mode=attrs.get(F32_DENORMAL_MODE_ATTR),
+        fp_contract=attrs.get(FP_CONTRACT_ATTR, False),
+    )
 
 
 def codegen_policy_for_kernel(kernel: KernelDef) -> CodegenPolicy:
@@ -79,18 +125,27 @@ def apply_codegen_policy(kernel: KernelDef, policy: CodegenPolicy) -> None:
 
     if not isinstance(policy, CodegenPolicy):
         raise TypeError(f"policy must be CodegenPolicy, got {type(policy).__name__}")
-    if policy.scheduler_strategy is None:
-        kernel.attrs.pop(SCHEDULER_STRATEGY_ATTR, None)
-    else:
-        kernel.attrs[SCHEDULER_STRATEGY_ATTR] = policy.scheduler_strategy
+    for attr, value in (
+        (SCHEDULER_STRATEGY_ATTR, policy.scheduler_strategy),
+        (F32_DENORMAL_MODE_ATTR, policy.f32_denormal_mode),
+        (FP_CONTRACT_ATTR, policy.fp_contract or None),
+    ):
+        if value is None:
+            kernel.attrs.pop(attr, None)
+        else:
+            kernel.attrs[attr] = value
 
 
 __all__ = [
     "CodegenPolicy",
+    "F32_DENORMAL_MODE_ATTR",
+    "F32DenormalMode",
+    "FP_CONTRACT_ATTR",
     "SCHEDULER_STRATEGY_ATTR",
     "SchedulerStrategy",
     "apply_codegen_policy",
     "codegen_policy_for_kernel",
     "codegen_policy_from_attrs",
+    "normalize_f32_denormal_mode",
     "normalize_scheduler_strategy",
 ]
