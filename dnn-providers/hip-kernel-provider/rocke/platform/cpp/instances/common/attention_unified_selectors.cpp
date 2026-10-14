@@ -274,7 +274,8 @@ static bool enable_i64_kv_addr(const rocke_unified_attn_problem_t* p)
 /* Python: _d256_gfx950_cohort(problem). */
 static bool d256_gfx950_cohort(const rocke_unified_attn_problem_t* p)
 {
-    return p->head_size == 256 && strcmp(p->dtype, "bf16") == 0 && !p->use_fp8
+    return p->head_size == 256 && (strcmp(p->dtype, "bf16") == 0 || strcmp(p->dtype, "fp16") == 0)
+           && !p->use_fp8
            && p->sliding_window == 0 && p->softcap == 0 && !p->use_sinks && !p->use_alibi
            && !p->use_qq_bias && p->max_seqlen_q > 1;
 }
