@@ -506,7 +506,7 @@ void rocke_gfx950_attention_tiled_3d_emit_async_infra(
     rocke_gfx950_attention_tiled_3d_build_ctx_t* ctx)
 {
     const int HD = CFG.HD;
-    const int BS = CFG.BS;
+    const int T = CFG.T;
     const int NUM_KV = CFG.NUM_KV;
 
     /* ---- async DMA infra (lines 565-585) ---- */
@@ -540,18 +540,16 @@ void rocke_gfx950_attention_tiled_3d_emit_async_infra(
     ctx->seq_base = rocke_b_mul(B, ctx->seq_idx, ctx->bt_stride_p);
 
     /* paged_kv_desc = TensorDescriptor.naive("paged_kv_bytes",
-     *   lengths=[1<<24, BS, NUM_KV, HD],
+     *   lengths=[1<<24, T, NUM_KV, HD],
      *   strides=[kv_stride_blk_b, kv_stride_tok_b, kv_stride_h_b, KV_BYTES],
      *   coord_names=("physical_block","token","kv_head","dim")
      * ).transform(
      *   indirect("tile_idx", into="physical_block", table=block_tables,
      *            base=seq_base),
-     *   unmerge("linear_half", into=("token","dim"), dims=(BS, HD)),
-     * )
-     * The descriptor addresses ONE page (BS tokens); a tile of kv_tile_mult
-     * pages resolves each DMA call's page separately (T == BS when 1). */
+     *   unmerge("linear_half", into=("token","dim"), dims=(T, HD)),
+     * )  (lines 593-601) */
     {
-        const int lengths[4] = {1 << 24, BS, NUM_KV, HD};
+        const int lengths[4] = {1 << 24, T, NUM_KV, HD};
         const int strides[4]
             = {CFG.kv_stride_blk_b, CFG.kv_stride_tok_b, CFG.kv_stride_h_b, CFG.KV_BYTES};
         const char* coords[4] = {"physical_block", "token", "kv_head", "dim"};
@@ -560,20 +558,11 @@ void rocke_gfx950_attention_tiled_3d_emit_async_infra(
 
         const rocke_transform_t* chain[2];
         const char* into_td[2] = {"token", "dim"};
-        const int dims_td[2] = {BS, HD};
+        const int dims_td[2] = {T, HD};
         chain[0] = rocke_indirect(
             B, "tile_idx", "physical_block", ctx->block_tables, ctx->seq_base, NULL, 0);
         chain[1] = rocke_unmerge(B, "linear_half", into_td, 2, dims_td);
         ctx->paged_kv_desc = rocke_tensor_descriptor_transform(B, base, chain, 2);
-    }
-
-    if(CFG.TILE_MULT > 1)
-    {
-        /* Clamp page lookups of the (masked) tail tile to the sequence's last
-         * valid page so the block-table read never leaves the sequence's row. */
-        rocke_value_t* pg_num = rocke_b_add(B, ctx->seq_len, rocke_b_const_i32(B, BS - 1));
-        rocke_value_t* n_pages = rocke_b_div(B, pg_num, rocke_b_const_i32(B, BS));
-        ctx->last_page = rocke_b_sub(B, n_pages, rocke_b_const_i32(B, 1));
     }
 }
 
@@ -704,8 +693,8 @@ void rocke_gfx950_attention_tiled_3d_emit_q_to_lds(rocke_gfx950_attention_tiled_
 }
 
 /* ============================================================ *
- * Load issuers (Python closures _paged_coords / _kv_offset / _issue_kv_async /
- * _fp8_chunk_* / _issue_k / _issue_v).
+ * Load issuers (Python closures _kv_offset / _issue_kv_async / _fp8_chunk_* /
+ * _issue_k / _issue_v).
  * ============================================================ */
 
 /* desc.offset(b, **coords) -> i32 offset (validity discarded). */
@@ -724,36 +713,11 @@ static rocke_value_t* rocke__desc_offset(rocke_gfx950_attention_tiled_3d_build_c
     return off;
 }
 
-/* _paged_coords(kv_tile_idx, first_half, lane_half): (block-table index,
- * within-page half offset) of one DMA call. first_half is the call's
- * tile-relative half offset; a call never straddles a page. */
-static void rocke__paged_coords(rocke_gfx950_attention_tiled_3d_build_ctx_t* ctx,
-                                rocke_value_t* kv_tile_idx,
-                                int first_half,
-                                rocke_value_t* lane_half,
-                                rocke_value_t** page_out,
-                                rocke_value_t** linear_half_out)
-{
-    rocke_value_t* page;
-    if(CFG.TILE_MULT == 1)
-    {
-        *page_out = kv_tile_idx;
-        *linear_half_out = rocke_b_add(B, rocke_b_const_i32(B, first_half), lane_half);
-        return;
-    }
-    page = rocke_b_mul(B, kv_tile_idx, rocke_b_const_i32(B, CFG.TILE_MULT));
-    page = rocke_b_add(B, page, rocke_b_const_i32(B, first_half / CFG.PAGE_HALVES));
-    page = rocke_b_select(B, rocke_b_cmp_lt(B, page, ctx->last_page), page, ctx->last_page);
-    *page_out = page;
-    *linear_half_out
-        = rocke_b_add(B, rocke_b_const_i32(B, first_half % CFG.PAGE_HALVES), lane_half);
-}
-
-/* _kv_offset(src, page_idx, linear_half): voffset of one paged K/V access,
+/* _kv_offset(src, kv_tile_idx, linear_half): voffset of one paged K/V access,
  * plus (I64_KV_ADDR) the per-block buffer resource in *own_rsrc. */
 static rocke_value_t* rocke__kv_offset(rocke_gfx950_attention_tiled_3d_build_ctx_t* ctx,
                                        rocke_value_t* src,
-                                       rocke_value_t* page_idx,
+                                       rocke_value_t* kv_tile_idx,
                                        rocke_value_t* linear_half,
                                        rocke_value_t** own_rsrc)
 {
@@ -762,7 +726,7 @@ static rocke_value_t* rocke__kv_offset(rocke_gfx950_attention_tiled_3d_build_ctx
     rocke_value_t* vals[3];
     *own_rsrc = NULL;
     names[0] = "tile_idx";
-    vals[0] = page_idx;
+    vals[0] = kv_tile_idx;
     names[1] = "linear_half";
     vals[1] = linear_half;
     names[2] = "kv_head";
@@ -805,14 +769,11 @@ static void rocke__issue_kv_async(rocke_gfx950_attention_tiled_3d_build_ctx_t* c
 
     for(call = 0; call < CFG.kv_calls_per_tile; ++call)
     {
-        const int first_half = call * CFG.KV_HALVES_PER_CALL;
-        rocke_value_t* page_idx = NULL;
-        rocke_value_t* linear_half = NULL;
+        rocke_value_t* half_c = rocke_b_const_i32(B, call * CFG.KV_HALVES_PER_CALL);
+        rocke_value_t* linear_half = rocke_b_add(B, half_c, ctx->lane_half_base);
         rocke_value_t* call_rsrc = rsrc;
         rocke_value_t* voff;
         rocke_value_t* dst;
-        rocke__paged_coords(
-            ctx, kv_tile_idx, first_half, ctx->lane_half_base, &page_idx, &linear_half);
         if(ctx->strided_kv)
         {
             voff = rocke_strided_kv_offset(
@@ -821,7 +782,7 @@ static void rocke__issue_kv_async(rocke_gfx950_attention_tiled_3d_build_ctx_t* c
         else
         {
             rocke_value_t* own_rsrc = NULL;
-            voff = rocke__kv_offset(ctx, src, page_idx, linear_half, &own_rsrc);
+            voff = rocke__kv_offset(ctx, src, kv_tile_idx, linear_half, &own_rsrc);
             if(own_rsrc != NULL)
             {
                 call_rsrc = own_rsrc;
@@ -877,12 +838,10 @@ static rocke_value_t* rocke__fp8_chunk_load(rocke_gfx950_attention_tiled_3d_buil
                                             rocke_value_t** col_out)
 {
     rocke_value_t* src = is_value ? ctx->value : ctx->key;
-    const int first_half = call * CFG.THREADS * CFG.fp8_elems_per_chunk;
     rocke_value_t* row;
     rocke_value_t* col;
     rocke_value_t* lhf_mul;
     rocke_value_t* linear_half_first;
-    rocke_value_t* page_idx = kv_tile_idx;
     const rocke_tensor_descriptor_t* desc;
     const char* names[3];
     rocke_value_t* vals[3];
@@ -891,15 +850,9 @@ static rocke_value_t* rocke__fp8_chunk_load(rocke_gfx950_attention_tiled_3d_buil
     rocke__fp8_chunk_coords(ctx, call, &row, &col);
     lhf_mul = rocke_b_mul(B, row, rocke_b_const_i32(B, CFG.HD));
     linear_half_first = rocke_b_add(B, lhf_mul, col);
-    if(CFG.TILE_MULT > 1)
-    {
-        /* chunk_id * 8 == call * 512 + tid * 8: one page per call. */
-        rocke__paged_coords(
-            ctx, kv_tile_idx, first_half, ctx->lane_half_base, &page_idx, &linear_half_first);
-    }
     desc = ctx->paged_kv_desc;
     names[0] = "tile_idx";
-    vals[0] = page_idx;
+    vals[0] = kv_tile_idx;
     names[1] = "linear_half";
     vals[1] = linear_half_first;
     names[2] = "kv_head";

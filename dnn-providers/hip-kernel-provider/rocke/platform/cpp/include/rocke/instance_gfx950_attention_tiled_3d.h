@@ -199,8 +199,6 @@ typedef struct rocke_unified_attention_3d_tiled_spec
     /* All-decode launch: grid x == num_seqs, CTA x owns sequence x (no cu_q
      * binary search). */
     bool decode_fast_path; /* False */
-    /* KV tile = kv_tile_mult paged blocks (1, 2, 4 or 8). */
-    int kv_tile_mult; /* 1 */
 } rocke_unified_attention_3d_tiled_spec_t;
 
 rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_default(void);

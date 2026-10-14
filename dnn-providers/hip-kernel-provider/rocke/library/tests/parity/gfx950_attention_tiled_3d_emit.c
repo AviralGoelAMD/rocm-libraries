@@ -141,33 +141,6 @@ static int make_spec(int idx, rocke_unified_attention_3d_tiled_spec_t* s)
         s->has_softcap = false;
         s->decode_fast_path = true;
         break;
-    case 8:
-        /* kv_tile_mult=2 only */
-        s->head_size = 128;
-        s->block_size = 16;
-        s->num_query_heads = 32;
-        s->num_kv_heads = 8;
-        s->dtype = "bf16";
-        s->num_segments = 16;
-        s->use_sinks = false;
-        s->sliding_window = 0;
-        s->has_softcap = false;
-        s->kv_tile_mult = 2;
-        break;
-    case 9:
-        /* fp8 K/V + kv_tile_mult=2 (no prefetch) */
-        s->head_size = 128;
-        s->block_size = 16;
-        s->num_query_heads = 32;
-        s->num_kv_heads = 8;
-        s->dtype = "bf16";
-        s->num_segments = 16;
-        s->use_sinks = false;
-        s->sliding_window = 0;
-        s->has_softcap = false;
-        s->kv_storage_dtype = "fp8e4m3";
-        s->kv_tile_mult = 2;
-        break;
     default:
         return -1;
     }

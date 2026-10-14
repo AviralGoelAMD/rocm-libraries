@@ -125,7 +125,7 @@ def test_production_3d_path_ignores_nan_slack(gpu, fp8):
     _check(torch, out, inp, fp8)
 
 
-_FAST = {"decode_fast_path": True, "kv_tile_mult": 2}
+_FAST = {"decode_fast_path": True}
 _KNOBS = [
     ({}, False),
     (_FAST, False),

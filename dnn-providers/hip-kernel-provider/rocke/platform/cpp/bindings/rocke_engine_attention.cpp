@@ -1068,7 +1068,6 @@ rocke_unified_attention_3d_tiled_spec_t t3d_build(const py::dict& d, Store& st)
     s.use_i64_kv_addr = a_bool(d, "use_i64_kv_addr", s.use_i64_kv_addr);
     s.use_f32_denormal_flush = a_bool(d, "use_f32_denormal_flush", s.use_f32_denormal_flush);
     s.decode_fast_path = a_bool(d, "decode_fast_path", s.decode_fast_path);
-    s.kv_tile_mult = a_int(d, "kv_tile_mult", s.kv_tile_mult);
     if(d.contains("waves_per_eu") && !d["waves_per_eu"].is_none())
     {
         s.has_waves_per_eu = true;

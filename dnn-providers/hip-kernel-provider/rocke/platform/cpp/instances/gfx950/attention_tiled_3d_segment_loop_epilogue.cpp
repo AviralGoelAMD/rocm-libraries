@@ -485,7 +485,7 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
         }
 
         /* Keys >= seq_len in the sequence's last tile hold whatever the cache
-         * has in the page slack (or a clamped page). Their P is 0, but
+         * has in the page slack. Their P is 0, but
          * 0 * NaN = NaN inside the PV MFMA, so zero those V rows in LDS before
          * PV. Uniform branch, taken only on the tile that crosses seq_len. */
         {

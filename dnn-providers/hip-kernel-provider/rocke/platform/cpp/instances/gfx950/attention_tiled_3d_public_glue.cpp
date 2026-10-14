@@ -203,7 +203,6 @@ rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_de
     s.use_i64_kv_addr = false;
     s.use_f32_denormal_flush = false;
     s.decode_fast_path = false;
-    s.kv_tile_mult = 1;
     return s;
 }
 
@@ -241,20 +240,6 @@ bool rocke_gfx950_unified_attention_3d_tiled_spec_validate(
                         s->kv_storage_dtype);
         return false;
     }
-    if(s->kv_tile_mult != 1 && s->kv_tile_mult != 2 && s->kv_tile_mult != 4 && s->kv_tile_mult != 8)
-    {
-        rocke_i_set_err(
-            b, ROCKE_ERR_VALUE, "kv_tile_mult must be 1, 2, 4 or 8 (got %d)", s->kv_tile_mult);
-        return false;
-    }
-    if(s->kv_tile_mult > 1
-       && ((s->block_size * s->head_size) % 512 != 0 || s->block_size * s->kv_tile_mult > 128))
-    {
-        rocke_i_set_err(b,
-                        ROCKE_ERR_VALUE,
-                        "kv_tile_mult needs block_size*head_size %% 512 == 0 and a tile <= 128");
-        return false;
-    }
     return true;
 }
 
@@ -289,14 +274,13 @@ int rocke_gfx950_unified_attention_3d_tiled_spec_block_q(
 int rocke_gfx950_unified_attention_3d_tiled_spec_tile_size(
     const rocke_unified_attention_3d_tiled_spec_t* s)
 {
-    /* gfx950 @property: tile_size == block_size * kv_tile_mult
-     * (tile_size_override is ignored; the gfx950 spec accepts the knob only for
-     * signature parity). */
+    /* gfx950 @property: tile_size == block_size (tile_size_override is ignored;
+     * the gfx950 spec accepts the knob only for signature parity). */
     if(s == NULL)
     {
         return -1;
     }
-    return s->block_size * s->kv_tile_mult;
+    return s->block_size;
 }
 
 const rocke_type_t* rocke_gfx950_unified_attention_3d_tiled_spec_dtype_ir(
@@ -338,8 +322,8 @@ static int rocke_attn3d950_kernel_name(const rocke_unified_attention_3d_tiled_sp
 {
     /* kernel_name_join("rocke_uattn3d_tiled", d.., b.., h..kv.., seg.., dtype,
      *   kv<...> if kv_storage_dtype else "", "i64kv", "sinks", "sw<sw>",
-     *   "softcap", "alibi", "qqb", "ftz", "stridedkv", "dec", "t<T>" (kv_tile_mult
-     *   > 1)) -- each only when its knob is set.
+     *   "softcap", "alibi", "qqb", "ftz", "stridedkv", "dec") -- each only when
+     *   its knob is set.
      *
      * Positional parts list (NOT flags=...): empty parts are skipped by
      * kernel_name_join. We materialise each part and feed the non-empty ones in
@@ -351,7 +335,6 @@ static int rocke_attn3d950_kernel_name(const rocke_unified_attention_3d_tiled_sp
     char seg_part[32];
     char kv_part[32];
     char sw_part[32];
-    char t_part[32];
     const char* parts[32];
     size_t np = 0;
     size_t out_len = 0;
@@ -414,11 +397,6 @@ static int rocke_attn3d950_kernel_name(const rocke_unified_attention_3d_tiled_sp
     if(s->decode_fast_path)
     {
         parts[np++] = "dec";
-    }
-    if(s->kv_tile_mult > 1)
-    {
-        snprintf(t_part, sizeof(t_part), "t%d", s->block_size * s->kv_tile_mult);
-        parts[np++] = t_part;
     }
 
     st = rocke_kernel_name_join("", parts, np, NULL, NULL, 0, buf, cap, &out_len);
@@ -746,11 +724,8 @@ bool rocke_gfx950_attn_tiled_3d_config_from_spec(
     out->Q_VECS_PER_THREAD = (out->BLOCK_M * out->Q_VECS_PER_ROW) / out->THREADS;
     out->bm1_div_nqk = nqk > 0 ? (out->BLOCK_M - 1) / nqk : -1;
 
-    /* decode-path knobs. TILE_MULT defaults to the paged layout; the strided
-     * build entry overrides it after ctx_init. */
+    /* decode-path knobs. */
     out->DECODE_FAST_PATH = spec->decode_fast_path;
-    out->TILE_MULT = spec->kv_tile_mult;
-    out->PAGE_HALVES = out->BS * out->HD;
 
     /* reduce-kernel-only fields stay 0 for the segment kind. */
     out->HALFS_PER_THREAD = 0;
@@ -968,9 +943,6 @@ static rocke_kernel_def_t* build_segment_gfx950(rocke_ir_builder_t* b,
         }
 
         ctx.strided_kv = strided_kv;
-        /* Layout-dependent knobs: strided KV addresses one contiguous tile, so a
-         * tile is never split into pages. */
-        ctx.cfg.TILE_MULT = strided_kv ? 1 : spec->kv_tile_mult;
 
         /* b.kernel.attrs["max_workgroup_size"] = THREADS (line 303). */
         if(b->kernel != NULL)
