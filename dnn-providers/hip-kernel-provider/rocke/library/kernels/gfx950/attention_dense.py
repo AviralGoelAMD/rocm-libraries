@@ -230,11 +230,13 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # Combine the two 32-lane halves of the row max (and, under qk_lookahead,
     # the row sum) with v_permlane32_swap_b32 instead of a ds_bpermute shuffle.
     permlane32_reduce: bool = field(default=False, kw_only=True)
-    # Grid body only: tag LDS-DMA writes and LDS reads with disjoint alias
-    # scopes so the backend's waitcnt pass no longer drains every in-flight
-    # K/V DMA (vmcnt(0)) before the first LDS read after it. The body's own
-    # s_waitcnt + s_barrier already order each DMA before its reads.
-    lds_dma_manual_wait: bool = field(default=False, kw_only=True)
+    # qk_lookahead_unroll=2 + wide_lds_dma only: declare the K and V double
+    # buffers as LDS alias rings and tag every DMA write and LDS read with the
+    # static slot (tile parity) it touches, so the backend's waitcnt pass makes
+    # a read wait only for in-flight DMA into its own slot instead of draining
+    # every K/V DMA (vmcnt(0)). The prologue barrier keeps the DMA not yet
+    # read in flight (sync(keep_lds_dma=N)).
+    lds_dma_alias_ring: bool = field(default=False, kw_only=True)
     # qk_lookahead only: split the waves into two halves that run one barrier
     # apart (two barriers per KV tile), so while one half is in its QK phase
     # the other is in its PV phase; the lagging half runs at s_setprio 1.
@@ -505,6 +507,16 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
             raise ValueError(
                 "bulk_operand_reads requires qk_lookahead (D128 or wide_lds_dma)"
             )
+        if self.lds_dma_alias_ring and (
+            not self.qk_lookahead
+            or self.qk_lookahead_unroll != 2
+            or not self.wide_lds_dma
+            or self.lds_num_buffers != 2
+        ):
+            raise ValueError(
+                "lds_dma_alias_ring requires qk_lookahead, qk_lookahead_unroll=2, "
+                "wide_lds_dma and lds_num_buffers=2 (static slot = tile parity)"
+            )
         if self.lds_read_base and (not self.wide_lds_dma or self.persistent):
             raise ValueError("lds_read_base requires wide_lds_dma on the grid body")
         if self.scalar_uniforms and self.persistent:
@@ -537,14 +549,14 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
             not (
                 self.wave_group_pingpong
                 and self.lds_read_base
-                and self.lds_dma_manual_wait
+                and self.lds_dma_alias_ring
             )
             or self.bulk_operand_reads
             or self.operand_read_ahead
         ):
             raise ValueError(
                 "mfma_windows needs wave_group_pingpong, lds_read_base and "
-                "lds_dma_manual_wait, and excludes bulk_operand_reads and "
+                "lds_dma_alias_ring, and excludes bulk_operand_reads and "
                 "operand_read_ahead"
             )
         if self.pv_window_exp and (
@@ -698,7 +710,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "defer_row_sum",
             "qk_lookahead",
             "permlane32_reduce",
-            "lds_dma_manual_wait",
+            "lds_dma_alias_ring",
             "wave_group_pingpong",
             "qk_lookahead_unroll",
             "bulk_operand_reads",
@@ -863,8 +875,6 @@ def build_attention_dense(
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = WAVES * 64
     b.kernel.attrs["waves_per_eu"] = int(spec.waves_per_eu)
-    if spec.lds_dma_manual_wait:
-        b.kernel.attrs["lds_dma_alias_scopes"] = True
 
     q = b.param(
         "q_ptr", PtrType(dtype, "global"), noalias=True, readonly=True, align=16
@@ -1037,9 +1047,10 @@ def build_attention_dense(
         V_LINE_STRIDE = 64 * 8 + spec.lds_v_row_pad
         WIDE_LINE_PASSES = 8 // WAVES
         assert 8 % WAVES == 0
-        # mfma_windows: one K or V tile is this many DMA instructions per wave;
-        # each window wait leaves the two newest tiles in flight.
-        WIN_VMCNT = 2 * WIDE_LINE_PASSES * (D // 64)
+        # One K or V tile is N_DMA LDS-DMA instructions per wave; each
+        # mfma_windows wait leaves the two newest tiles in flight.
+        N_DMA = WIDE_LINE_PASSES * (D // 64)
+        WIN_VMCNT = 2 * N_DMA
         K_lds = b.smem_alloc(
             dtype, [NBUF, K_D_RPT, K_N_RPT, K_LINE_STRIDE], name_hint="Klds"
         )
@@ -1109,6 +1120,10 @@ def build_attention_dense(
     zero_soff = b.const_i32(0)
     K_lds_addr = b.smem_addr_of(K_lds)
     V_lds_addr = b.smem_addr_of(V_lds)
+    # lds_dma_alias_ring: buffer t % 2 of each double buffer is ring slot t % 2.
+    K_RING = b.lds_alias_ring(K_lds, NBUF) if spec.lds_dma_alias_ring else None
+    V_RING = b.lds_alias_ring(V_lds, NBUF) if spec.lds_dma_alias_ring else None
+    RING = K_RING is not None
     # Emit a SEPARATE num_records IR node per buffer_rsrc (NOT one shared node):
     # develop emits two here, so sharing one silently breaks byte-identity (the
     # attention_dense representative-IR golden).
@@ -1236,10 +1251,11 @@ def build_attention_dense(
                 )
 
     def _async_load_wide(
-        rsrc, lds_base, buf_val, tile_key0, bytes_per_buf, line_stride
+        rsrc, lds_base, buf_val, tile_key0, bytes_per_buf, line_stride, alias=None
     ):
         """Two 128-bit-per-lane DMAs fill one slab-padded K or V tile per line pass
-        (the persistent wide path's layout)."""
+        (the persistent wide path's layout). Issues ``WIDE_LINE_PASSES * D // 64``
+        LDS-DMA ops per wave; ``alias`` is the ring slot written."""
         buf_off = b.mul(b.zext(buf_val, I64), b.const_i64(bytes_per_buf))
         n_in_wave = b.div(lane, b.const_i32(8))
         d_bucket = b.mod(lane, b.const_i32(8))
@@ -1259,23 +1275,40 @@ def build_attention_dense(
                 row_base = b.smem_ptr_add(lds_base, b.add(buf_off, b.zext(line, I64)))
                 voff = b.add(src_base, b.const_i32(d_rpt * 64))
                 b.async_buffer_load_lds_addr(
-                    rsrc, row_base, b.mul(voff, b.const_i32(2)), zero_soff, 4
+                    rsrc,
+                    row_base,
+                    b.mul(voff, b.const_i32(2)),
+                    zero_soff,
+                    4,
+                    lds_alias=alias,
                 )
 
-    def async_load_k(lds_base, buf_val, tile_key0):
+    def async_load_k(lds_base, buf_val, tile_key0, alias=None):
         if WIDE_DMA:
             _async_load_wide(
-                k_rsrc, lds_base, buf_val, tile_key0, K_BYTES_PER_BUF, K_LINE_STRIDE
+                k_rsrc,
+                lds_base,
+                buf_val,
+                tile_key0,
+                K_BYTES_PER_BUF,
+                K_LINE_STRIDE,
+                alias,
             )
             return
         _async_load(
             k_rsrc, lds_base, buf_val, tile_key0, K_BYTES_PER_BUF, K_GROUP_BYTES
         )
 
-    def async_load_v(lds_base, buf_val, tile_key0):
+    def async_load_v(lds_base, buf_val, tile_key0, alias=None):
         if WIDE_DMA:
             _async_load_wide(
-                v_rsrc, lds_base, buf_val, tile_key0, V_BYTES_PER_BUF, V_LINE_STRIDE
+                v_rsrc,
+                lds_base,
+                buf_val,
+                tile_key0,
+                V_BYTES_PER_BUF,
+                V_LINE_STRIDE,
+                alias,
             )
             return
         _async_load(
@@ -1305,13 +1338,20 @@ def build_attention_dense(
     def k_tile_base(kbuf):
         return b.add(k_lane_elem, b.mul(kbuf, b.const_i32(K_BYTES_PER_BUF // 2)))
 
-    def read_k_at(kt, nsub, ks):
+    def read_k_at(kt, nsub, ks, alias=None):
         off = (ks // 4) * K_N_RPT * K_LINE_STRIDE + nsub * 256 + (ks % 4) * 16
         return b.smem_load_vN(
-            K_lds, _z, _z, _z, b.add(kt, b.const_i32(off)), dtype=dtype, n=8
+            K_lds,
+            _z,
+            _z,
+            _z,
+            b.add(kt, b.const_i32(off)),
+            dtype=dtype,
+            n=8,
+            lds_alias=alias,
         )
 
-    def _do_qk_read_ahead(kbuf, after_mfma, accs, tail_read=None):
+    def _do_qk_read_ahead(kbuf, after_mfma, accs, tail_read=None, alias=None):
         """``operand_read_ahead``: each K operand read runs READ_AHEAD MFMAs
         ahead of its use, fenced like the PV run (see ``do_pv``). Once the K
         reads run out, ``tail_read`` (optional) fills the same slots, so the
@@ -1320,7 +1360,7 @@ def build_attention_dense(
         steps = [(nsub, ks) for nsub in range(N_SUB) for ks in range(K_STEPS)]
         packs = [None] * len(steps)
         for k in range(min(READ_AHEAD, len(steps))):
-            packs[k] = read_k_at(kt, *steps[k])
+            packs[k] = read_k_at(kt, *steps[k], alias)
         s_reg = []
         acc = None
         for idx, (nsub, ks) in enumerate(steps):
@@ -1328,7 +1368,7 @@ def build_attention_dense(
                 acc = b.zero_vec_f32(16)
             acc = mfma_32x32x16_for_dtype(b, dtype, packs[idx], q_packs[ks], acc)
             if idx + READ_AHEAD < len(steps):
-                packs[idx + READ_AHEAD] = read_k_at(kt, *steps[idx + READ_AHEAD])
+                packs[idx + READ_AHEAD] = read_k_at(kt, *steps[idx + READ_AHEAD], alias)
             elif tail_read is not None:
                 tail_read()
             b.sched_barrier(_SCHED_ALU_ONLY)
@@ -1340,7 +1380,7 @@ def build_attention_dense(
                 s_reg.append([b.vec_extract(acc, i) for i in range(16)])
         return s_reg
 
-    def do_qk(kbuf, after_mfma=None, accs=None, tail_read=None):
+    def do_qk(kbuf, after_mfma=None, accs=None, tail_read=None, alias=None):
         """QK MFMA: S^T = K@Q^T. mfma(a=K, bv=Q) => key on the 16 per-lane accumulator
         regs (+lane^32), query on lane%32 -- the layout that keeps softmax a cheap
         in-lane reduce + one lane^32 exchange, and lets CK-1's transposed PV consume P
@@ -1348,11 +1388,12 @@ def build_attention_dense(
 
         ``after_mfma`` (optional) is called after every MFMA so a caller can place
         independent softmax work in program order between them; ``accs`` (optional
-        list) receives each nsub's raw accumulator vector."""
+        list) receives each nsub's raw accumulator vector. ``alias``: the K ring
+        slot read (wide path only)."""
         if BULK_K:
-            return _do_qk_bulk(kbuf, after_mfma, accs)
+            return _do_qk_bulk(kbuf, after_mfma, accs, alias)
         if READ_AHEAD:
-            return _do_qk_read_ahead(kbuf, after_mfma, accs, tail_read)
+            return _do_qk_read_ahead(kbuf, after_mfma, accs, tail_read, alias)
         s_reg = []
         kt = k_tile_base(kbuf) if LDS_READ_BASE else None
         for nsub in range(N_SUB):
@@ -1374,7 +1415,7 @@ def build_attention_dense(
                 krow = b.add(b.const_i32(nsub * (32 // K_GROUP)), k_lane_grp)
             for ks in range(K_STEPS):
                 if LDS_READ_BASE:
-                    k_pack = read_k_at(kt, nsub, ks)
+                    k_pack = read_k_at(kt, nsub, ks, alias)
                     acc = mfma_32x32x16_for_dtype(b, dtype, k_pack, q_packs[ks], acc)
                     if after_mfma is not None:
                         after_mfma()
@@ -1389,6 +1430,7 @@ def build_attention_dense(
                         kelem,
                         dtype=dtype,
                         n=8,
+                        lds_alias=alias,
                     )
                     acc = mfma_32x32x16_for_dtype(b, dtype, k_pack, q_packs[ks], acc)
                     if after_mfma is not None:
@@ -1411,7 +1453,7 @@ def build_attention_dense(
             s_reg.append([b.vec_extract(acc, i) for i in range(16)])
         return s_reg
 
-    def _do_qk_bulk(kbuf, after_mfma, accs):
+    def _do_qk_bulk(kbuf, after_mfma, accs, alias=None):
         """``bulk_operand_reads``: issue every K operand read of the tile before
         the first QK MFMA (one LDS wait), so the MFMA run has no LDS waits."""
         packs = []
@@ -1432,7 +1474,7 @@ def build_attention_dense(
                 krow = b.add(b.const_i32(nsub * 32), lane_m)
             for ks in range(K_STEPS):
                 if LDS_READ_BASE:
-                    packs.append(read_k_at(kt, nsub, ks))
+                    packs.append(read_k_at(kt, nsub, ks, alias))
                 elif WIDE_DMA:
                     kelem = b.add(kelem_base, b.const_i32((ks % 4) * 16))
                     packs.append(
@@ -1444,6 +1486,7 @@ def build_attention_dense(
                             kelem,
                             dtype=dtype,
                             n=8,
+                            lds_alias=alias,
                         )
                     )
                 else:
@@ -1471,10 +1514,12 @@ def build_attention_dense(
             s_reg.append([b.vec_extract(acc, i) for i in range(16)])
         return s_reg
 
-    def read_k_tile(kbuf):
+    def read_k_tile(kbuf, alias=None):
         """Every K operand of one tile (lds_read_base addressing)."""
         kt = k_tile_base(kbuf)
-        return [read_k_at(kt, n, ks) for n in range(N_SUB) for ks in range(K_STEPS)]
+        return [
+            read_k_at(kt, n, ks, alias) for n in range(N_SUB) for ks in range(K_STEPS)
+        ]
 
     def do_mask(s_reg, tile_idx, lower=False, upper=True):
         """Apply causal (upper: ktok<=q) and/or sliding-window (lower:
@@ -1593,22 +1638,41 @@ def build_attention_dense(
             return vbuf
         return b.add(v_lane_elem, b.mul(vbuf, b.const_i32(V_BYTES_PER_BUF // 2)))
 
-    def read_v(dt, kk_step, vbuf):
+    def read_v(dt, kk_step, vbuf, alias=None):
         """CK-1 half-local transposed V A-operand (matches ``relayout_p``).
-        Under lds_read_base ``vbuf`` is the tile base from ``v_operand_base``."""
+        Under lds_read_base ``vbuf`` is the tile base from ``v_operand_base``.
+        ``alias``: the V ring slot read (wide path only)."""
         if LDS_READ_BASE:
             off = (dt // 2) * V_N_RPT * V_LINE_STRIDE + (dt % 2) * 32 + kk_step * 128
             a0 = b.ds_read_tr16_b64(
-                V_lds, _z, _z, _z, b.add(vbuf, b.const_i32(off)), dtype=dtype
+                V_lds,
+                _z,
+                _z,
+                _z,
+                b.add(vbuf, b.const_i32(off)),
+                dtype=dtype,
+                lds_alias=alias,
             )
             a1 = b.ds_read_tr16_b64(
-                V_lds, _z, _z, _z, b.add(vbuf, b.const_i32(off + 64)), dtype=dtype
+                V_lds,
+                _z,
+                _z,
+                _z,
+                b.add(vbuf, b.const_i32(off + 64)),
+                dtype=dtype,
+                lds_alias=alias,
             )
             return b.vec_concat(a0, a1)
         if WIDE_DMA:
             velem = b.add(velem_lane, b.const_i32((dt % 2) * 32 + kk_step * 128))
             a0 = b.ds_read_tr16_b64(
-                V_lds, vbuf, b.const_i32(dt // 2), vline, velem, dtype=dtype
+                V_lds,
+                vbuf,
+                b.const_i32(dt // 2),
+                vline,
+                velem,
+                dtype=dtype,
+                lds_alias=alias,
             )
             a1 = b.ds_read_tr16_b64(
                 V_lds,
@@ -1617,6 +1681,7 @@ def build_attention_dense(
                 vline,
                 b.add(velem, b.const_i32(64)),
                 dtype=dtype,
+                lds_alias=alias,
             )
             return b.vec_concat(a0, a1)
         return pv32_v_load_paired(
@@ -1630,7 +1695,7 @@ def build_attention_dense(
             dtype=dtype,
         )
 
-    def v_prefetch(vbuf):
+    def v_prefetch(vbuf, alias=None):
         """operand_read_ahead: lets an earlier MFMA run (do_qk's ``tail_read``)
         start this tile's first PV operand reads. Returns (read_one, state);
         pass ``state`` to do_pv as ``pre``."""
@@ -1639,17 +1704,19 @@ def build_attention_dense(
         def read_one():
             k = len(st["ops"])
             if k < min(READ_AHEAD, len(PV_STEPS)):
-                st["ops"].append(read_v(*PV_STEPS[k], st["base"]))
+                st["ops"].append(read_v(*PV_STEPS[k], st["base"], alias))
 
         return read_one, st
 
-    def do_pv(o_acc_in, p_packs, vbuf, after_mfma=None, bulk=False, pre=None):
+    def do_pv(
+        o_acc_in, p_packs, vbuf, after_mfma=None, bulk=False, pre=None, alias=None
+    ):
         out = list(o_acc_in)
         vbuf = pre["base"] if pre is not None else v_operand_base(vbuf)
         n_steps = len(PV_STEPS)
         if bulk:
             # bulk_operand_reads: all V operand reads ahead of the PV MFMA run.
-            vops = [read_v(dt, kk_step, vbuf) for dt, kk_step in PV_STEPS]
+            vops = [read_v(dt, kk_step, vbuf, alias) for dt, kk_step in PV_STEPS]
             b.sched_barrier(0)
         elif READ_AHEAD:
             # operand_read_ahead: V operand reads run READ_AHEAD MFMAs ahead of
@@ -1659,25 +1726,27 @@ def build_attention_dense(
             done = list(pre["ops"]) if pre is not None else []
             vops[: len(done)] = done
             for k in range(len(done), min(READ_AHEAD, n_steps)):
-                vops[k] = read_v(*PV_STEPS[k], vbuf)
+                vops[k] = read_v(*PV_STEPS[k], vbuf, alias)
         for idx, (dt, kk_step) in enumerate(PV_STEPS):
             if bulk or READ_AHEAD:
                 vop = vops[idx]
             else:
-                vop = read_v(dt, kk_step, vbuf)
+                vop = read_v(dt, kk_step, vbuf, alias)
             out[dt] = mfma_32x32x16_for_dtype(b, dtype, vop, p_packs[kk_step], out[dt])
             if READ_AHEAD and not bulk:
                 if idx + READ_AHEAD < n_steps:
-                    vops[idx + READ_AHEAD] = read_v(*PV_STEPS[idx + READ_AHEAD], vbuf)
+                    vops[idx + READ_AHEAD] = read_v(
+                        *PV_STEPS[idx + READ_AHEAD], vbuf, alias
+                    )
                 b.sched_barrier(_SCHED_ALU_ONLY)
             if after_mfma is not None:
                 after_mfma()
         return out
 
-    def read_v_tile(vbuf):
+    def read_v_tile(vbuf, alias=None):
         """Every V operand of one tile, in PV_STEPS order."""
         base = v_operand_base(vbuf)
-        return [read_v(dt, kk_step, base) for dt, kk_step in PV_STEPS]
+        return [read_v(dt, kk_step, base, alias) for dt, kk_step in PV_STEPS]
 
     def rescale_o(o_acc, alpha):
         return [
@@ -1790,28 +1859,53 @@ def build_attention_dense(
         of iteration j every wave has finished QK(j) and PV(j-1), so K(j+2)
         refills K buffer j % 2 and V(j+1) refills V buffer (j+1) % 2; both have a
         whole iteration to land before the next top-of-loop wait.
+        ``lds_dma_alias_ring``: tile t's buffer is ring slot t % 2, a static
+        fact because every loop below starts on an even tile and unrolls by 2;
+        the reads of slot s then carry no wait for the in-flight DMA into the
+        other slot.
         Returns (m, l, o_acc) for the shared epilogue."""
-        sb = start_buf
-        sb1 = start_buf1
         tk_s = b.mul(start_tile, b.const_i32(BN))
-        async_load_k(K_lds_addr, sb, tk_s)
-        async_load_v(V_lds_addr, sb, tk_s)
-        async_load_k(
-            K_lds_addr, sb1, b.mul(b.add(start_tile, b.const_i32(1)), b.const_i32(BN))
-        )
-        b.s_waitcnt(vmcnt=0)
-        b.s_barrier_bare()
+        if RING:
+            # start_tile is 0 (qk_lookahead rejects sliding_window).
+            sb = b.const_i32(0)
+            sb1 = b.const_i32(1)
+            async_load_k(K_lds_addr, sb, tk_s, K_RING.slot(0))
+            # Pin K(0) ahead of the rest: the counted wait below assumes it is
+            # the oldest of the three in-flight tiles (slot-disjoint DMA writes
+            # are otherwise free to reorder).
+            b.sched_barrier(0)
+            async_load_v(V_lds_addr, sb, tk_s, V_RING.slot(0))
+            async_load_k(K_lds_addr, sb1, b.const_i32(BN), K_RING.slot(1))
+            # QK(0) needs only K(0); V(0) and K(1) stay in flight until the
+            # next barrier.
+            b.sync(keep_lds_dma=2 * N_DMA)
+        else:
+            sb = start_buf
+            sb1 = start_buf1
+            async_load_k(K_lds_addr, sb, tk_s)
+            async_load_v(V_lds_addr, sb, tk_s)
+            async_load_k(
+                K_lds_addr,
+                sb1,
+                b.mul(b.add(start_tile, b.const_i32(1)), b.const_i32(BN)),
+            )
+            b.s_waitcnt(vmcnt=0)
+            b.s_barrier_bare()
         acc0 = []
-        s0 = do_qk(sb, accs=acc0)
+        s0 = do_qk(sb, accs=acc0, alias=K_RING.slot(0) if RING else None)
         do_mask(s0, start_tile)
         if WINDOWS:
-            # mfma_windows prefetches K two tiles ahead: once every wave is
-            # done reading K(start) it refills that buffer with K(start + 2).
-            window_barrier(lgkmcnt=0)
+            # mfma_windows (always on the ring) prefetches K two tiles ahead:
+            # once every wave is done reading K(start) it refills that buffer
+            # with K(start + 2). Window 1 reads K(start + 1) and window 3
+            # V(start) with no wait of their own, so this boundary lands both
+            # (the prologue left them in flight).
+            window_barrier(lgkmcnt=0, vmcnt=0)
             async_load_k(
                 K_lds_addr,
                 sb,
                 b.mul(b.add(start_tile, b.const_i32(2)), b.const_i32(BN)),
+                K_RING.slot(0),
             )
         if use_sinks:
             sink_h = b.global_load(sinks, hq, dtype, align=2)
@@ -1848,7 +1942,8 @@ def build_attention_dense(
                 row.append((key_idx // 32, (rs // 8) * 4 + rs % 4))
             _P_ORDER.append(row)
 
-        def la_body(j, carry, mask_next):
+        def la_body(j, carry, mask_next, par=None):
+            """One KV tile. ``par`` (ring path): j % 2 as a Python int."""
             # pv_window_exp and window_fence shape the unmasked KV loop only:
             # the masked (causal diagonal) tail keeps the plain windows, whose
             # mask arithmetic leaves no registers for the deferred exp work.
@@ -1868,8 +1963,15 @@ def build_attention_dense(
                 for n in range(N_SUB)
             ]
             j1 = b.add(j, b.const_i32(1))
-            buf_j = b.mod(j, b.const_i32(NBUF))
-            buf_j1 = b.mod(j1, b.const_i32(NBUF))
+            if RING:
+                buf_j = b.const_i32(par)
+                buf_j1 = b.const_i32(1 - par)
+                k_rd, k_wr = K_RING.slot(1 - par), K_RING.slot(par)
+                v_rd, v_wr = V_RING.slot(par), V_RING.slot(1 - par)
+            else:
+                buf_j = b.mod(j, b.const_i32(NBUF))
+                buf_j1 = b.mod(j1, b.const_i32(NBUF))
+                k_rd = k_wr = v_rd = v_wr = None
             if WINDOWS:
                 # Window 1 (operands; opened by the previous tile's last
                 # boundary, or the prologue): refill V buffer (j+1) % 2, whose
@@ -1877,18 +1979,25 @@ def build_attention_dense(
                 # K(j+1) operand. The previous tile's softmax finish and O
                 # rescale also run here. The closing wait makes V(j) land one
                 # boundary ahead of its reads in window 3.
-                async_load_v(V_lds_addr, buf_j1, b.mul(j1, b.const_i32(BN)))
-                kops = read_k_tile(buf_j1)
+                async_load_v(V_lds_addr, buf_j1, b.mul(j1, b.const_i32(BN)), v_wr)
+                kops = read_k_tile(buf_j1, k_rd)
                 window_barrier(lgkmcnt=0, vmcnt=WIN_VMCNT, opens="mfma")
             else:
                 kops = None
-                b.s_waitcnt(vmcnt=0)
-                b.s_barrier_bare()
+                if RING:
+                    # Every in-flight DMA (K(j+1), V(j)) is read this iteration.
+                    b.sync()
+                else:
+                    b.s_waitcnt(vmcnt=0)
+                    b.s_barrier_bare()
                 async_load_k(
-                    K_lds_addr, buf_j, b.mul(b.add(j, b.const_i32(2)), b.const_i32(BN))
+                    K_lds_addr,
+                    buf_j,
+                    b.mul(b.add(j, b.const_i32(2)), b.const_i32(BN)),
+                    k_wr,
                 )
             if not PINGPONG:
-                async_load_v(V_lds_addr, buf_j1, b.mul(j1, b.const_i32(BN)))
+                async_load_v(V_lds_addr, buf_j1, b.mul(j1, b.const_i32(BN)), v_wr)
 
             # Phase A: QK(j+1) with the exp2 of tile j in its shadow. The exps
             # run in PV-operand order so each bf16 P pack, and the two partial
@@ -1926,12 +2035,14 @@ def build_attention_dense(
 
             # V(j) landed before this iteration's top barrier, so the first PV
             # operand reads may already run in the QK MFMA shadow.
-            pv_read, pv_pre = v_prefetch(buf_j) if READ_AHEAD else (None, None)
+            pv_read, pv_pre = v_prefetch(buf_j, v_rd) if READ_AHEAD else (None, None)
             if WINDOWS:
                 # Window 2 (MFMA): QK(j+1) from the K operands of window 1.
                 s_next = _qk_mfma_run(kops, exp_hook, None)
             else:
-                s_next = do_qk(buf_j1, after_mfma=exp_hook, tail_read=pv_read)
+                s_next = do_qk(
+                    buf_j1, after_mfma=exp_hook, tail_read=pv_read, alias=k_rd
+                )
             for slot in slots:
                 emit_exp(*slot)
 
@@ -1952,17 +2063,25 @@ def build_attention_dense(
                 # operand is read; K(j+2) must land one boundary early.
                 window_barrier(opens="read")
                 async_load_k(
-                    K_lds_addr, buf_j1, b.mul(b.add(j, b.const_i32(3)), b.const_i32(BN))
+                    K_lds_addr,
+                    buf_j1,
+                    b.mul(b.add(j, b.const_i32(3)), b.const_i32(BN)),
+                    k_rd,
                 )
-                vops = read_v_tile(buf_j)
+                vops = read_v_tile(buf_j, v_rd)
                 window_barrier(lgkmcnt=0, vmcnt=WIN_VMCNT, opens="mfma")
             elif PINGPONG:
                 # Second barrier: the lagging group runs phase A of this tile
                 # while the leading group runs phase B. V(j+1) refills V buffer
                 # (j+1) % 2 only after both groups are past PV(j-1).
-                b.s_waitcnt(vmcnt=0)
-                b.s_barrier_bare()
-                async_load_v(V_lds_addr, buf_j1, b.mul(j1, b.const_i32(BN)))
+                if RING:
+                    # Only K(j+2) is in flight and nothing reads it before
+                    # the next loop top: the barrier needs no DMA wait.
+                    b.sync(keep_lds_dma=N_DMA)
+                else:
+                    b.s_waitcnt(vmcnt=0)
+                    b.s_barrier_bare()
+                async_load_v(V_lds_addr, buf_j1, b.mul(j1, b.const_i32(BN)), v_wr)
             if mask_next:
                 do_mask(s_next, j1)
             maxes = [neg_inf]
@@ -2017,7 +2136,13 @@ def build_attention_dense(
                 window_barrier(opens="read")
             else:
                 o_acc = do_pv(
-                    o_acc, p_packs, buf_j, after_mfma=max_hook, bulk=BULK_V, pre=pv_pre
+                    o_acc,
+                    p_packs,
+                    buf_j,
+                    after_mfma=max_hook,
+                    bulk=BULK_V,
+                    pre=pv_pre,
+                    alias=v_rd,
                 )
             if PV_PRIORITY and not PINGPONG:
                 b.s_setprio(0)
@@ -2048,7 +2173,8 @@ def build_attention_dense(
             """KV loop over [lo, hi). ``qk_lookahead_unroll=2`` emits two tiles per
             trip, so the carried scores alternate between two register sets
             instead of being copied back at every back edge, plus a 0/1-trip
-            remainder loop."""
+            remainder loop. Ring path: ``lo`` is even, so the unrolled trip runs
+            tiles of parity 0 then 1 and the remainder (from even ``hi2``) parity 0."""
             if UNROLL == 1:
                 lp = b.scf_for_iter(lo, hi, b.const_i32(1), args, iv_name=tag)
                 with lp as (j, carry):
@@ -2059,12 +2185,12 @@ def build_attention_dense(
             hi2 = b.add(lo, b.mul(b.div(span, b.const_i32(2)), b.const_i32(2)))
             lp2 = b.scf_for_iter(lo, hi2, b.const_i32(2), args, iv_name=tag + "2")
             with lp2 as (j, carry):
-                c1 = la_body(j, carry, mask_next)
-                b.scf_yield(*la_body(b.add(j, b.const_i32(1)), c1, mask_next))
+                c1 = la_body(j, carry, mask_next, 0)
+                b.scf_yield(*la_body(b.add(j, b.const_i32(1)), c1, mask_next, 1))
             rem_args = [(name + "_r", val) for (name, _), val in zip(args, lp2.results)]
             lp1 = b.scf_for_iter(hi2, hi, b.const_i32(1), rem_args, iv_name=tag + "1")
             with lp1 as (j, carry):
-                b.scf_yield(*la_body(j, carry, mask_next))
+                b.scf_yield(*la_body(j, carry, mask_next, 0))
             return lp1
 
         last = b.sub(n_upper, b.const_i32(1))
@@ -2085,6 +2211,10 @@ def build_attention_dense(
             body_hi = b.sub(diag_start, b.const_i32(1))
             body_hi = b.select(b.cmp_lt(body_hi, last), body_hi, last)
             body_hi = b.select(b.cmp_lt(body_hi, start_tile), start_tile, body_hi)
+            if RING:
+                # Even, so the tail loop's tile parity stays static; a tile that
+                # moves into the masked tail keeps every key under its mask.
+                body_hi = b.mul(b.div(body_hi, b.const_i32(2)), b.const_i32(2))
             body = la_loop(start_tile, body_hi, la_args, False, "lab")
             tail_args = [
                 (name + "_t", val) for (name, _), val in zip(la_args, body.results)
@@ -2123,9 +2253,18 @@ def build_attention_dense(
             elif WIN_PRIO in (1, 2):
                 b.s_setprio(0)
         # V(last) was issued at the top of the final iteration (or the prologue).
-        b.s_waitcnt(vmcnt=0)
-        b.s_barrier_bare()
-        o_acc = do_pv(o_acc, relayout_p(p_last), b.mod(last, b.const_i32(NBUF)))
+        if RING:
+            b.sync()
+        else:
+            b.s_waitcnt(vmcnt=0)
+            b.s_barrier_bare()
+        # Ring path: the last tile's parity is a run-time value, so any_slot.
+        o_acc = do_pv(
+            o_acc,
+            relayout_p(p_last),
+            b.mod(last, b.const_i32(NBUF)),
+            alias=V_RING.any_slot if RING else None,
+        )
         return m_fin, l_i, o_acc
 
     def _emit_epilogue(m_fin, l_i, o_acc):

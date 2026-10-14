@@ -2912,7 +2912,8 @@ class TestAttentionDenseGfx950CodegenKnobs(unittest.TestCase):
         windows = dict(
             self._GRID,
             wide_lds_dma=True,
-            lds_dma_manual_wait=True,
+            lds_dma_alias_ring=True,
+            qk_lookahead_unroll=2,
             qk_lookahead=True,
             block_m=256,
             lds_read_base=True,
@@ -2928,6 +2929,26 @@ class TestAttentionDenseGfx950CodegenKnobs(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pv_window_exp"):
             self._spec(windows, pv_window_exp=2, pv_loop_order="d_major")
         self._spec(windows, window_fence=True, pv_window_exp=2)
+        with self.assertRaisesRegex(ValueError, "mfma_windows"):
+            self._spec(dict(windows, lds_dma_alias_ring=False))
+
+    def test_alias_ring_needs_its_static_parity_loop(self):
+        ring = dict(
+            self._GRID,
+            wide_lds_dma=True,
+            qk_lookahead=True,
+            qk_lookahead_unroll=2,
+            lds_dma_alias_ring=True,
+        )
+        self._spec(ring)
+        for name, value in (
+            ("qk_lookahead", False),
+            ("qk_lookahead_unroll", 1),
+            ("wide_lds_dma", False),
+        ):
+            with self.subTest(**{name: value}):
+                with self.assertRaisesRegex(ValueError, "lds_dma_alias_ring"):
+                    self._spec(dict(ring, **{name: value}))
 
     def test_wide_output_store_builds_with_lse(self):
         for persistent in (False, True):
@@ -2958,19 +2979,14 @@ class TestAttentionDenseGfx950CodegenKnobs(unittest.TestCase):
         la = dict(
             self._GRID,
             wide_lds_dma=True,
-            lds_dma_manual_wait=True,
             qk_lookahead=True,
             block_m=256,
         )
-        win = dict(lds_read_base=True, wave_group_pingpong=True)
+        ring = dict(qk_lookahead_unroll=2, lds_dma_alias_ring=True)
+        win = dict(ring, lds_read_base=True, wave_group_pingpong=True)
         windows = dict(la, mfma_windows=4, **win)
         cases = (
-            (
-                "wide_grid",
-                dict(self._GRID, wide_lds_dma=True),
-                dict(lds_dma_manual_wait=True),
-                ("!alias.scope", True),
-            ),
+            ("lookahead", la, ring, ("!alias.scope", True)),
             ("wide_grid", dict(self._GRID, wide_lds_dma=True), dict(lds_read_base=True), None),
             ("wide_grid", dict(self._GRID, wide_lds_dma=True), dict(scalar_uniforms=True), None),
             (

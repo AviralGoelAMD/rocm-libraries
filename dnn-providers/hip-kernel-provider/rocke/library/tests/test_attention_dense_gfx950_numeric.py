@@ -978,7 +978,7 @@ class TestWideDmaFeatures:
 # qk_lookahead loop knob sets on the wide-DMA grid body (block_m, knobs).
 _LOOKAHEAD_BASE = dict(
     wide_lds_dma=True,
-    lds_dma_manual_wait=True,
+    lds_dma_alias_ring=True,
     qk_lookahead=True,
     qk_lookahead_unroll=2,
     permlane32_reduce=True,
@@ -986,7 +986,11 @@ _LOOKAHEAD_BASE = dict(
 )
 _LOOKAHEAD_ARMS = {
     "lookahead": (128, dict(_LOOKAHEAD_BASE, o_store_width=8)),
-    "unroll1": (256, dict(_LOOKAHEAD_BASE, qk_lookahead_unroll=1)),
+    "unroll1": (
+        256,
+        dict(_LOOKAHEAD_BASE, qk_lookahead_unroll=1, lds_dma_alias_ring=False),
+    ),
+    "no_ring": (128, dict(_LOOKAHEAD_BASE, lds_dma_alias_ring=False)),
     "read_base": (256, dict(_LOOKAHEAD_BASE, lds_read_base=True, scalar_uniforms=True)),
     "read_ahead": (
         256,
@@ -1025,6 +1029,31 @@ _LOOKAHEAD_ARMS = {
             mfma_windows=4,
             window_fence=True,
             pv_window_exp=2,
+        ),
+    ),
+    "windows4_fence": (
+        256,
+        dict(
+            _LOOKAHEAD_BASE,
+            lds_read_base=True,
+            scalar_uniforms=True,
+            wave_group_pingpong=True,
+            mfma_windows=4,
+            window_fence=True,
+            o_store_width=8,
+        ),
+    ),
+    "windows4_fence_pvexp1": (
+        256,
+        dict(
+            _LOOKAHEAD_BASE,
+            lds_read_base=True,
+            scalar_uniforms=True,
+            wave_group_pingpong=True,
+            mfma_windows=4,
+            window_fence=True,
+            pv_window_exp=1,
+            o_store_width=8,
         ),
     ),
     "windows4_pvexp1": (
