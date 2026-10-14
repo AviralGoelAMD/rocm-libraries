@@ -69,6 +69,9 @@ def gemm_rcr_binding(result: Any, verify: bool, *, dtype: str) -> ProblemBinding
         def decode(buf):
             return buf.astype(np.float32)
 
+        def encode(x):
+            return x.astype(np.float16)
+
     else:
         a_host = _bf16_from_f32(np, a_int.astype(np.float32))
         b_host = _bf16_from_f32(np, b_int.astype(np.float32))
@@ -77,13 +80,30 @@ def gemm_rcr_binding(result: Any, verify: bool, *, dtype: str) -> ProblemBinding
         def decode(buf):
             return _f32_from_bf16(np, buf)
 
+        def encode(x):
+            return _bf16_from_f32(np, x)
+
+    # Split-K replaces C with an f32 ``Cf32[M, N]`` workspace the kernel
+    # atomic-adds into; the caller zero-inits it and casts it to the output
+    # dtype afterwards. A storage-dtype C would be half the size the kernel
+    # writes. ``check`` applies that finalisation cast on the host.
+    if int(result.spec.trait.split_k) > 1:
+        out_host = np.empty((M, N), dtype=np.float32)
+
+        def finalize(buf):
+            return decode(encode(buf))
+
+    else:
+        out_host = c_host
+        finalize = decode
+
     def make_args(rt: Any) -> Tuple[bytes, Tuple[int, ...]]:
         a_dev = rt.alloc(nbytes(a_host))
         b_dev = rt.alloc(nbytes(b_host))
-        c_dev = rt.alloc(nbytes(c_host))
+        c_dev = rt.alloc(nbytes(out_host))
         rt.memcpy_h2d(a_dev, as_u8_buffer(a_host), nbytes(a_host))
         rt.memcpy_h2d(b_dev, as_u8_buffer(b_host), nbytes(b_host))
-        rt.memset(c_dev, 0, nbytes(c_host))
+        rt.memset(c_dev, 0, nbytes(out_host))
         return (
             struct.pack("<QQQiii", a_dev, b_dev, c_dev, M, N, K),
             (a_dev, b_dev, c_dev),
@@ -91,14 +111,14 @@ def gemm_rcr_binding(result: Any, verify: bool, *, dtype: str) -> ProblemBinding
 
     def check(rt: Any, ptrs: Tuple[int, ...]) -> Tuple[float, int, int]:
         if not verify:
-            return 0.0, 0, c_host.size
-        rt.memcpy_d2h(as_u8_buffer(c_host), ptrs[2], nbytes(c_host))
+            return 0.0, 0, out_host.size
+        rt.memcpy_d2h(as_u8_buffer(out_host), ptrs[2], nbytes(out_host))
         ref = a_int.astype(np.float32) @ b_int.astype(np.float32).T
-        got = decode(c_host)
+        got = finalize(out_host)
         tol = _TOLERANCE[dtype]
         err = np.abs(got - ref)
         bad = err > tol + tol * np.abs(ref)
-        return float(err.max()), int(np.count_nonzero(bad)), c_host.size
+        return float(err.max()), int(np.count_nonzero(bad)), out_host.size
 
     return ProblemBinding(
         grid=tuple(int(x) for x in result.grid),
