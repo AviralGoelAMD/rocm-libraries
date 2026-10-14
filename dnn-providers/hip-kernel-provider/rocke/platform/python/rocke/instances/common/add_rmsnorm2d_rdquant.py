@@ -95,7 +95,8 @@ class AddRmsnorm2DRdquantSpec:
     wave_reduce: bool = False
     # Streaming (``nt``) cache hint on the read-once A/B loads and the
     # write-once residual X stores; gamma and QY keep the default policy.
-    streaming: bool = False
+    # Only gfx942/gfx950 lower it; other targets must pass ``streaming=False``.
+    streaming: bool = True
     name: str = "rocke_add_rmsnorm2d_rdquant"
 
     @property
@@ -133,11 +134,14 @@ def is_valid_spec(
     and gfx950 (160 KiB), so gfx950 behavior is unchanged.
     """
     from ...core.arch import ArchTarget
+    from ...core.ir import STREAMING_ARCHS
 
     try:
         target = ArchTarget.from_gfx(arch)
     except KeyError as e:
         return False, str(e)
+    if spec.streaming and arch not in STREAMING_ARCHS:
+        return False, f"streaming (nt) hint is not supported on {arch}"
 
     if spec.out_dtype not in ("i8", "fp8e4m3", "bf8e5m2"):
         return False, f"unsupported out_dtype {spec.out_dtype!r}"

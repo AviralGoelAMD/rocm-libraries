@@ -218,14 +218,16 @@ def make_cases(*, arch: str = "gfx950") -> List[Case]:
             "layernorm2d",
             "small",
             lambda: build_layernorm2d(
-                LayerNorm2DSpec(n_per_block=2048, block_size=256, vec=8)
+                LayerNorm2DSpec(
+                    n_per_block=2048, block_size=256, vec=8, streaming=False
+                )
             ),
         ),
         Case(
             "rmsnorm2d",
             "small",
             lambda: build_rmsnorm2d(
-                RMSNorm2DSpec(n_per_block=2048, block_size=256, vec=8)
+                RMSNorm2DSpec(n_per_block=2048, block_size=256, vec=8, streaming=False)
             ),
         ),
         Case(
@@ -291,7 +293,13 @@ def make_cases(*, arch: str = "gfx950") -> List[Case]:
             "smoothquant.i8",
             "quant",
             lambda: build_smoothquant(
-                SmoothQuantSpec(n_per_block=2048, out_dtype="i8", block_size=256, vec=8)
+                SmoothQuantSpec(
+                    n_per_block=2048,
+                    out_dtype="i8",
+                    block_size=256,
+                    vec=8,
+                    wave_reduce=False,
+                )
             ),
         ),
         Case(
@@ -299,7 +307,11 @@ def make_cases(*, arch: str = "gfx950") -> List[Case]:
             "quant",
             lambda: build_smoothquant(
                 SmoothQuantSpec(
-                    n_per_block=2048, out_dtype="fp8e4m3", block_size=256, vec=8
+                    n_per_block=2048,
+                    out_dtype="fp8e4m3",
+                    block_size=256,
+                    vec=8,
+                    wave_reduce=False,
                 )
             ),
         ),
@@ -322,7 +334,11 @@ def make_cases(*, arch: str = "gfx950") -> List[Case]:
             "quant",
             lambda: build_add_rmsnorm2d_rdquant(
                 AddRmsnorm2DRdquantSpec(
-                    n_per_block=2048, out_dtype="i8", block_size=256, vec=8
+                    n_per_block=2048,
+                    out_dtype="i8",
+                    block_size=256,
+                    vec=8,
+                    streaming=False,
                 )
             ),
         ),
@@ -550,7 +566,11 @@ def make_cases(*, arch: str = "gfx950") -> List[Case]:
                     "small",
                     lambda dtype=dtype: build_layernorm2d(
                         LayerNorm2DSpec(
-                            n_per_block=2048, dtype=dtype, block_size=256, vec=8
+                            n_per_block=2048,
+                            dtype=dtype,
+                            block_size=256,
+                            vec=8,
+                            streaming=False,
                         )
                     ),
                 ),
@@ -559,7 +579,11 @@ def make_cases(*, arch: str = "gfx950") -> List[Case]:
                     "small",
                     lambda dtype=dtype: build_rmsnorm2d(
                         RMSNorm2DSpec(
-                            n_per_block=2048, dtype=dtype, block_size=256, vec=8
+                            n_per_block=2048,
+                            dtype=dtype,
+                            block_size=256,
+                            vec=8,
+                            streaming=False,
                         )
                     ),
                 ),
@@ -661,7 +685,11 @@ def make_cases(*, arch: str = "gfx950") -> List[Case]:
                     "quant",
                     lambda out_dtype=out_dtype: build_smoothquant(
                         SmoothQuantSpec(
-                            n_per_block=2048, out_dtype=out_dtype, block_size=256, vec=8
+                            n_per_block=2048,
+                            out_dtype=out_dtype,
+                            block_size=256,
+                            vec=8,
+                            wave_reduce=False,
                         )
                     ),
                 ),
@@ -684,7 +712,11 @@ def make_cases(*, arch: str = "gfx950") -> List[Case]:
                     "quant",
                     lambda out_dtype=out_dtype: build_add_rmsnorm2d_rdquant(
                         AddRmsnorm2DRdquantSpec(
-                            n_per_block=2048, out_dtype=out_dtype, block_size=256, vec=8
+                            n_per_block=2048,
+                            out_dtype=out_dtype,
+                            block_size=256,
+                            vec=8,
+                            streaming=False,
                         )
                     ),
                 ),

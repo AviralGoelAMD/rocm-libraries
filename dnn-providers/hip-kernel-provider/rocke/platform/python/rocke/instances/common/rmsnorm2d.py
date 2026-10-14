@@ -41,6 +41,7 @@ from ...helpers.spec import (
     SignatureBuilder,
     ceil_div_grid,
     kernel_name_join,
+    row_auto_vec,
     validate_io,
 )
 from ...helpers.sweep import pass2_row_chunks, sweep_row_chunks
@@ -61,18 +62,25 @@ class RMSNorm2DSpec:
 
     n_per_block: int
     block_size: int = 256
-    vec: int = 4
+    # 0 = auto (``row_auto_vec``): 8 with ``streaming``, else 4, narrowed to
+    # the widest width that divides the row.
+    vec: int = 0
     dtype: DType = "f16"
     save_inv_rms: bool = False
     wave_size: int = 64
     # Streaming (``nt``) cache hint on the read-once X row loads (single-pass
     # path only) and the write-once Y stores; gamma keeps the default policy.
-    streaming: bool = False
+    # Only gfx942/gfx950 lower it; other targets must pass ``streaming=False``.
+    streaming: bool = True
     name: str = "rocke_rmsnorm2d_fwd"
 
     @property
     def elems_per_thread(self) -> int:
         return self.n_per_block // self.block_size
+
+    @property
+    def resolved_vec(self) -> int:
+        return row_auto_vec(self.vec, self.n_per_block, self.block_size, self.streaming)
 
     def kernel_name(self) -> str:
         return kernel_name_join(
@@ -80,7 +88,7 @@ class RMSNorm2DSpec:
             self.dtype,
             f"N{self.n_per_block}",
             f"b{self.block_size}",
-            f"v{self.vec}",
+            f"v{self.resolved_vec}",
             flags={"sr": self.save_inv_rms, "nt": self.streaming},
         )
 
@@ -106,11 +114,14 @@ def is_valid_spec(spec: RMSNorm2DSpec, arch: str = "gfx950") -> Tuple[bool, str]
     large-N shapes that don't fit in VGPRs are still supported.
     """
     from ...core.arch import ArchTarget
+    from ...core.ir import STREAMING_ARCHS
 
     try:
         target = ArchTarget.from_gfx(arch)
     except KeyError as e:
         return False, str(e)
+    if spec.streaming and arch not in STREAMING_ARCHS:
+        return False, f"streaming (nt) hint is not supported on {arch}"
 
     # Cap ``elems_per_thread`` only when the cached single-pass path would
     # be used; the two-pass path streams X twice and carries no per-row
@@ -124,7 +135,7 @@ def is_valid_spec(spec: RMSNorm2DSpec, arch: str = "gfx950") -> Tuple[bool, str]
         IOSpecRule(
             dtype=spec.dtype,
             block_size=spec.block_size,
-            vec=spec.vec,
+            vec=spec.resolved_vec,
             n_per_block=spec.n_per_block,
             max_elems_per_thread=cap,
         )
@@ -161,7 +172,7 @@ def build_rmsnorm2d(spec: RMSNorm2DSpec) -> KernelDef:
         raise ValueError(f"invalid rmsnorm2d spec: {why}")
 
     io_ty = io_ir_type(spec.dtype)
-    BS, VEC, N = spec.block_size, spec.vec, spec.n_per_block
+    BS, VEC, N = spec.block_size, spec.resolved_vec, spec.n_per_block
 
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = BS

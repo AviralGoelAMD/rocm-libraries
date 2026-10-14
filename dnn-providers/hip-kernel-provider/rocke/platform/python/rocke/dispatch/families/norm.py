@@ -32,6 +32,7 @@ from dataclasses import asdict, dataclass
 from typing import Sequence, Tuple
 
 from ...core.arch import ArchTarget, known_arches
+from ...core.ir import STREAMING_ARCHS
 from ...instances.common import layernorm2d as _ln
 from ...instances.common import rmsnorm2d as _rms
 from ..core import (
@@ -120,6 +121,7 @@ def _make_spec(req: NormRequest, *, block_size: int, vec: int):
     """Build the instance spec for one (kind, block_size, vec) candidate."""
     dtype = _norm_dtype(req.dtype)
     wave = ArchTarget.from_gfx(req.arch).wave_size
+    streaming = req.arch in STREAMING_ARCHS
     if req.kind.lower() == "rmsnorm":
         return _rms.RMSNorm2DSpec(
             n_per_block=int(req.cols),
@@ -127,6 +129,7 @@ def _make_spec(req: NormRequest, *, block_size: int, vec: int):
             vec=vec,
             dtype=dtype,
             wave_size=wave,
+            streaming=streaming,
         )
     return _ln.LayerNorm2DSpec(
         n_per_block=int(req.cols),
@@ -134,6 +137,7 @@ def _make_spec(req: NormRequest, *, block_size: int, vec: int):
         vec=vec,
         dtype=dtype,
         wave_size=wave,
+        streaming=streaming,
     )
 
 

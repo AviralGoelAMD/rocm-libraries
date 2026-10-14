@@ -91,6 +91,7 @@ def verify_add_rmsnorm2d_bf16(rt) -> tuple:
         dtype="bf16",
         save_residual=True,
         wave_size=32,
+        streaming=False,
     )
     art = compile_kernel(build_add_rmsnorm2d_bf16(spec, arch=ARCH), arch=ARCH)
 
@@ -139,6 +140,7 @@ def verify_add_rmsnorm2d_rdquant(rt) -> tuple:
         save_residual=True,
         save_yscale=True,
         wave_size=32,
+        streaming=False,
     )
     art = compile_kernel(build_add_rmsnorm2d_rdquant(spec, arch=ARCH), arch=ARCH)
 
@@ -315,6 +317,7 @@ def verify_smoothquant(rt) -> tuple:
         vec=4,
         save_yscale=True,
         wave_size=32,
+        wave_reduce=False,
     )
     art = compile_kernel(build_smoothquant(spec, arch=ARCH), arch=ARCH)
 

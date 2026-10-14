@@ -24,6 +24,7 @@ def _spec(idx: int) -> AddRMSNorm2DBF16Spec:
             dtype="bf16",
             save_residual=True,
             wave_size=64,
+            streaming=False,
         )
     if idx == 1:
         return AddRMSNorm2DBF16Spec(
@@ -33,6 +34,7 @@ def _spec(idx: int) -> AddRMSNorm2DBF16Spec:
             dtype="bf16",
             save_residual=True,
             wave_size=64,
+            streaming=False,
         )
     if idx == 2:
         return AddRMSNorm2DBF16Spec(
@@ -42,6 +44,7 @@ def _spec(idx: int) -> AddRMSNorm2DBF16Spec:
             dtype="bf16",
             save_residual=True,
             wave_size=64,
+            streaming=False,
         )
     if idx == 3:
         return AddRMSNorm2DBF16Spec(
@@ -51,6 +54,7 @@ def _spec(idx: int) -> AddRMSNorm2DBF16Spec:
             dtype="bf16",
             save_residual=True,
             wave_size=64,
+            streaming=False,
         )
     if idx == 4:
         return AddRMSNorm2DBF16Spec(
@@ -60,6 +64,7 @@ def _spec(idx: int) -> AddRMSNorm2DBF16Spec:
             dtype="f16",
             save_residual=False,
             wave_size=64,
+            streaming=False,
         )
     if idx == 5:
         return AddRMSNorm2DBF16Spec(
@@ -69,6 +74,7 @@ def _spec(idx: int) -> AddRMSNorm2DBF16Spec:
             dtype="bf16",
             save_residual=True,
             wave_size=64,
+            streaming=False,
         )
     if idx == 6:
         return AddRMSNorm2DBF16Spec(
@@ -90,6 +96,9 @@ def _spec(idx: int) -> AddRMSNorm2DBF16Spec:
             wave_size=64,
             streaming=True,
         )
+    if idx == 8:
+        # All defaults: streaming on, auto vec narrows to 4 for a short row.
+        return AddRMSNorm2DBF16Spec(n_per_block=1024)
     raise SystemExit(f"unknown config index {idx}")
 
 

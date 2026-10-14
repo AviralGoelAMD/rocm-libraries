@@ -165,6 +165,14 @@ int rocke_validate_io(rocke_arena_t* arena,
                       const rocke_io_spec_rule_t* rule,
                       const char** out_reason);
 
+/* row_auto_vec(vec, n_per_block, block_size, streaming): a non-zero vec is
+ * returned as-is; vec 0 (auto) picks the widest of (8 if streaming,) 4, 2 with
+ * n_per_block % (block_size * v) == 0, else 4 (validate_io then rejects). */
+int rocke_row_auto_vec(int vec, int n_per_block, int block_size, int streaming);
+
+/* `arch in STREAMING_ARCHS` (rocke/core/ir.py): 1 for gfx942 / gfx950. */
+int rocke_is_streaming_arch(const char* arch);
+
 /* ------------------------------------------------------------------ *
  * choose_load_vec
  * ------------------------------------------------------------------ *

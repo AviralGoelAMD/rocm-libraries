@@ -32,6 +32,7 @@ static int make_spec(int idx, rocke_rmsnorm2d_spec_t* s)
         s->vec = 4;
         s->dtype = "f16";
         s->save_inv_rms = false;
+        s->streaming = false;
         break;
     case 1: /* N2048 b256 v4 bf16 */
         s->n_per_block = 2048;
@@ -39,6 +40,7 @@ static int make_spec(int idx, rocke_rmsnorm2d_spec_t* s)
         s->vec = 4;
         s->dtype = "bf16";
         s->save_inv_rms = false;
+        s->streaming = false;
         break;
     case 2: /* N4096 b256 v4 f16 */
         s->n_per_block = 4096;
@@ -46,6 +48,7 @@ static int make_spec(int idx, rocke_rmsnorm2d_spec_t* s)
         s->vec = 4;
         s->dtype = "f16";
         s->save_inv_rms = false;
+        s->streaming = false;
         break;
     case 3: /* N8192 b256 v8 bf16 */
         s->n_per_block = 8192;
@@ -53,6 +56,7 @@ static int make_spec(int idx, rocke_rmsnorm2d_spec_t* s)
         s->vec = 8;
         s->dtype = "bf16";
         s->save_inv_rms = false;
+        s->streaming = false;
         break;
     case 4: /* N16384 b256 v8 f16 save_inv_rms */
         s->n_per_block = 16384;
@@ -60,6 +64,7 @@ static int make_spec(int idx, rocke_rmsnorm2d_spec_t* s)
         s->vec = 8;
         s->dtype = "f16";
         s->save_inv_rms = true;
+        s->streaming = false;
         break;
     case 5: /* N131072 b256 v4 f16 (two-pass) */
         s->n_per_block = 131072;
@@ -67,6 +72,7 @@ static int make_spec(int idx, rocke_rmsnorm2d_spec_t* s)
         s->vec = 4;
         s->dtype = "f16";
         s->save_inv_rms = false;
+        s->streaming = false;
         break;
     case 6: /* N8192 b256 v8 bf16 streaming */
         s->n_per_block = 8192;
@@ -92,6 +98,9 @@ static int make_spec(int idx, rocke_rmsnorm2d_spec_t* s)
         s->save_inv_rms = true;
         s->streaming = true;
         break;
+    case 9: /* N1024 all defaults: streaming, auto vec narrows to 4 */
+        s->n_per_block = 1024;
+        break;
     default:
         return -1;
     }
@@ -102,7 +111,7 @@ int main(int argc, char** argv)
 {
     if(argc < 2)
     {
-        fprintf(stderr, "usage: %s <config_index 0..8> [mode]\n", argv[0]);
+        fprintf(stderr, "usage: %s <config_index 0..9> [mode]\n", argv[0]);
         return 2;
     }
     int idx = atoi(argv[1]);

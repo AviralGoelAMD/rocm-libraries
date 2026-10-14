@@ -363,7 +363,7 @@ rocke_add_rmsnorm2d_rdquant_spec_t rocke_add_rmsnorm2d_rdquant_spec_default(void
     s.wave_size = 64;
     s.name = ROCKE_ADD_RMSNORM2D_RDQUANT_DEFAULT_NAME;
     s.wave_reduce = false;
-    s.streaming = false;
+    s.streaming = true;
     return s;
 }
 
@@ -464,6 +464,12 @@ bool rocke_add_rmsnorm2d_rdquant_is_valid_spec(const rocke_add_rmsnorm2d_rdquant
                  arch ? "'" : "",
                  arch ? arch : "None",
                  arch ? "'" : "");
+        rocke_arn_set_reason(reason, reason_cap, buf);
+        return false;
+    }
+    if(spec->streaming && !rocke_is_streaming_arch(arch))
+    {
+        snprintf(buf, sizeof(buf), "streaming (nt) hint is not supported on %s", arch);
         rocke_arn_set_reason(reason, reason_cap, buf);
         return false;
     }

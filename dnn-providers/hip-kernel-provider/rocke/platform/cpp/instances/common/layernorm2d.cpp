@@ -41,12 +41,12 @@ rocke_layernorm2d_spec_t rocke_layernorm2d_spec_default(void)
     rocke_layernorm2d_spec_t s;
     s.n_per_block = 0; /* required: caller must set */
     s.block_size = 256;
-    s.vec = 4;
+    s.vec = 0; /* auto: rocke_row_auto_vec */
     s.dtype = "f16";
     s.save_mean_invstd = false;
     s.wave_size = 64;
     s.name = "rocke_layernorm2d_fwd";
-    s.streaming = false;
+    s.streaming = true;
     return s;
 }
 
@@ -79,7 +79,8 @@ rocke_status_t
 
     snprintf(part_n, sizeof part_n, "N%d", spec->n_per_block);
     snprintf(part_b, sizeof part_b, "b%d", spec->block_size);
-    snprintf(part_v, sizeof part_v, "v%d", spec->vec);
+    snprintf(part_v, sizeof part_v, "v%d",
+             rocke_row_auto_vec(spec->vec, spec->n_per_block, spec->block_size, spec->streaming));
 
     parts[0] = spec->dtype;
     parts[1] = part_n;
@@ -139,6 +140,11 @@ bool rocke_layernorm2d_is_valid_spec(const rocke_layernorm2d_spec_t* spec,
         ln_set_reason(reason, reason_cap, "unknown arch");
         return false;
     }
+    if(spec->streaming && !rocke_is_streaming_arch(arch))
+    {
+        ln_set_reason(reason, reason_cap, "streaming (nt) hint is not supported on this arch");
+        return false;
+    }
 
     elems = rocke_layernorm2d_elems_per_thread(spec);
 
@@ -147,7 +153,11 @@ bool rocke_layernorm2d_is_valid_spec(const rocke_layernorm2d_spec_t* spec,
     two_pass = rocke_row_norm_needs_two_pass(elems, ROCKE_REGISTER_TILE_MAX_ELEMS_PER_THREAD);
 
     /* validate_io(IOSpecRule(dtype, block_size, vec, n_per_block, cap)). */
-    rocke_io_spec_rule_init(&rule, spec->dtype, spec->block_size, spec->vec);
+    rocke_io_spec_rule_init(&rule,
+                            spec->dtype,
+                            spec->block_size,
+                            rocke_row_auto_vec(spec->vec, spec->n_per_block, spec->block_size,
+                                               spec->streaming));
     rule.n_per_block_set = 1;
     rule.n_per_block = spec->n_per_block;
     if(two_pass)
@@ -409,7 +419,7 @@ rocke_kernel_def_t* rocke_build_layernorm2d(rocke_ir_builder_t* b,
         return NULL;
     }
     BS = spec->block_size;
-    VEC = spec->vec;
+    VEC = rocke_row_auto_vec(spec->vec, spec->n_per_block, spec->block_size, spec->streaming);
     N = spec->n_per_block;
     elems = rocke_layernorm2d_elems_per_thread(spec);
 

@@ -35,6 +35,7 @@ def _spec(idx: int) -> AddRmsnorm2DRdquantSpec:
             save_residual=True,
             save_yscale=True,
             wave_size=64,
+            streaming=False,
         )
     if idx == 1:
         return AddRmsnorm2DRdquantSpec(
@@ -46,6 +47,7 @@ def _spec(idx: int) -> AddRmsnorm2DRdquantSpec:
             save_residual=True,
             save_yscale=True,
             wave_size=64,
+            streaming=False,
         )
     if idx == 2:
         return AddRmsnorm2DRdquantSpec(
@@ -57,6 +59,7 @@ def _spec(idx: int) -> AddRmsnorm2DRdquantSpec:
             save_residual=False,
             save_yscale=False,
             wave_size=64,
+            streaming=False,
         )
     if idx == 3:
         return AddRmsnorm2DRdquantSpec(
@@ -68,6 +71,7 @@ def _spec(idx: int) -> AddRmsnorm2DRdquantSpec:
             save_residual=True,
             save_yscale=True,
             wave_size=64,
+            streaming=False,
         )
     if idx == 4:
         return AddRmsnorm2DRdquantSpec(
@@ -79,6 +83,7 @@ def _spec(idx: int) -> AddRmsnorm2DRdquantSpec:
             save_residual=True,
             save_yscale=True,
             wave_size=64,
+            streaming=False,
         )
     if idx == 5:
         return AddRmsnorm2DRdquantSpec(
@@ -90,6 +95,7 @@ def _spec(idx: int) -> AddRmsnorm2DRdquantSpec:
             save_residual=True,
             save_yscale=False,
             wave_size=64,
+            streaming=False,
         )
     if idx == 6:
         return AddRmsnorm2DRdquantSpec(
@@ -102,6 +108,7 @@ def _spec(idx: int) -> AddRmsnorm2DRdquantSpec:
             save_yscale=True,
             wave_size=64,
             wave_reduce=True,
+            streaming=False,
         )
     if idx == 7:
         # One wave per block: the butterfly alone, no cross-warp LDS round.
@@ -115,6 +122,7 @@ def _spec(idx: int) -> AddRmsnorm2DRdquantSpec:
             save_yscale=True,
             wave_size=64,
             wave_reduce=True,
+            streaming=False,
         )
     if idx == 8:
         return AddRmsnorm2DRdquantSpec(

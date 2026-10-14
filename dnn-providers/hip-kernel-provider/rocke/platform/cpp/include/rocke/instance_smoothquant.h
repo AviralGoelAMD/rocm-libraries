@@ -55,7 +55,7 @@ extern "C" {
  *
  * Mirrors the frozen dataclass field-for-field. Defaults (Python):
  *   dtype="f16", out_dtype="i8", block_size=256, vec=4, save_yscale=True,
- *   wave_size=64, wave_reduce=False, name="rocke_smoothquant".
+ *   wave_size=64, wave_reduce=True, name="rocke_smoothquant".
  *
  * `dtype` is one of "f16"/"bf16"; `out_dtype` is one of
  * "i8"/"fp8e4m3"/"bf8e5m2". Both are referenced as-is (not copied).
@@ -73,7 +73,7 @@ typedef struct rocke_smoothquant_spec
     bool save_yscale;
     int wave_size;
     const char* name; /* kernel-name prefix                */
-    bool wave_reduce; /* default false                     */
+    bool wave_reduce; /* default true                      */
 } rocke_smoothquant_spec_t;
 
 /* Initialise `spec` with the Python dataclass defaults and the one required

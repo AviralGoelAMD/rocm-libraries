@@ -446,7 +446,7 @@ void rocke_smoothquant_spec_init(rocke_smoothquant_spec_t* spec, int n_per_block
     spec->save_yscale = true;
     spec->wave_size = 64;
     spec->name = "rocke_smoothquant";
-    spec->wave_reduce = false;
+    spec->wave_reduce = true;
 }
 
 int rocke_smoothquant_elems_per_thread(const rocke_smoothquant_spec_t* spec)

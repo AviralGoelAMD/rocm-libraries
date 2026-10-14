@@ -37,6 +37,7 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_rdquant_spec_t* spec)
         spec->save_residual = true;
         spec->save_yscale = true;
         spec->wave_size = 64;
+        spec->streaming = false;
         break;
     case 1:
         spec->n_per_block = 8192;
@@ -47,6 +48,7 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_rdquant_spec_t* spec)
         spec->save_residual = true;
         spec->save_yscale = true;
         spec->wave_size = 64;
+        spec->streaming = false;
         break;
     case 2:
         spec->n_per_block = 2048;
@@ -57,6 +59,7 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_rdquant_spec_t* spec)
         spec->save_residual = false;
         spec->save_yscale = false;
         spec->wave_size = 64;
+        spec->streaming = false;
         break;
     case 3:
         spec->n_per_block = 16384;
@@ -67,6 +70,7 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_rdquant_spec_t* spec)
         spec->save_residual = true;
         spec->save_yscale = true;
         spec->wave_size = 64;
+        spec->streaming = false;
         break;
     case 4:
         spec->n_per_block = 1024;
@@ -77,6 +81,7 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_rdquant_spec_t* spec)
         spec->save_residual = true;
         spec->save_yscale = true;
         spec->wave_size = 64;
+        spec->streaming = false;
         break;
     case 5:
         spec->n_per_block = 6144;
@@ -87,6 +92,7 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_rdquant_spec_t* spec)
         spec->save_residual = true;
         spec->save_yscale = false;
         spec->wave_size = 64;
+        spec->streaming = false;
         break;
     case 6: /* N8192 f16->i8 b512 v8 wave_reduce */
         spec->n_per_block = 8192;
@@ -98,6 +104,7 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_rdquant_spec_t* spec)
         spec->save_yscale = true;
         spec->wave_size = 64;
         spec->wave_reduce = true;
+        spec->streaming = false;
         break;
     case 7: /* N1024 bf16->i8 b64 v4 wave_reduce (one wave: no LDS round) */
         spec->n_per_block = 1024;
@@ -109,6 +116,7 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_rdquant_spec_t* spec)
         spec->save_yscale = true;
         spec->wave_size = 64;
         spec->wave_reduce = true;
+        spec->streaming = false;
         break;
     case 8: /* N4096 f16->i8 b256 v4 streaming */
         spec->n_per_block = 4096;

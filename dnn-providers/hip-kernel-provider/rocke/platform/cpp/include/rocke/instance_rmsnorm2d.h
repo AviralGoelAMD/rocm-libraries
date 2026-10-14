@@ -74,12 +74,12 @@ typedef struct rocke_rmsnorm2d_spec
 {
     int n_per_block;
     int block_size; /* default 256 */
-    int vec; /* default 4   */
+    int vec; /* default 0 = auto (rocke_row_auto_vec) */
     const char* dtype; /* default "f16" ; one of "f16" | "bf16" */
     bool save_inv_rms; /* default false */
     int wave_size; /* default 64  */
     const char* name; /* default "rocke_rmsnorm2d_fwd" */
-    bool streaming; /* default false */
+    bool streaming; /* default true (gfx942/gfx950 only) */
 } rocke_rmsnorm2d_spec_t;
 
 /* Default-constructed spec (every field == Python dataclass default;

@@ -17,27 +17,57 @@ from _emit_common import run_emit
 def _spec(idx: int) -> RMSNorm2DSpec:
     if idx == 0:
         return RMSNorm2DSpec(
-            n_per_block=1024, block_size=256, vec=4, dtype="f16", save_inv_rms=False
+            n_per_block=1024,
+            block_size=256,
+            vec=4,
+            dtype="f16",
+            save_inv_rms=False,
+            streaming=False,
         )
     if idx == 1:
         return RMSNorm2DSpec(
-            n_per_block=2048, block_size=256, vec=4, dtype="bf16", save_inv_rms=False
+            n_per_block=2048,
+            block_size=256,
+            vec=4,
+            dtype="bf16",
+            save_inv_rms=False,
+            streaming=False,
         )
     if idx == 2:
         return RMSNorm2DSpec(
-            n_per_block=4096, block_size=256, vec=4, dtype="f16", save_inv_rms=False
+            n_per_block=4096,
+            block_size=256,
+            vec=4,
+            dtype="f16",
+            save_inv_rms=False,
+            streaming=False,
         )
     if idx == 3:
         return RMSNorm2DSpec(
-            n_per_block=8192, block_size=256, vec=8, dtype="bf16", save_inv_rms=False
+            n_per_block=8192,
+            block_size=256,
+            vec=8,
+            dtype="bf16",
+            save_inv_rms=False,
+            streaming=False,
         )
     if idx == 4:
         return RMSNorm2DSpec(
-            n_per_block=16384, block_size=256, vec=8, dtype="f16", save_inv_rms=True
+            n_per_block=16384,
+            block_size=256,
+            vec=8,
+            dtype="f16",
+            save_inv_rms=True,
+            streaming=False,
         )
     if idx == 5:
         return RMSNorm2DSpec(
-            n_per_block=131072, block_size=256, vec=4, dtype="f16", save_inv_rms=False
+            n_per_block=131072,
+            block_size=256,
+            vec=4,
+            dtype="f16",
+            save_inv_rms=False,
+            streaming=False,
         )
     if idx == 6:
         return RMSNorm2DSpec(
@@ -67,6 +97,9 @@ def _spec(idx: int) -> RMSNorm2DSpec:
             save_inv_rms=True,
             streaming=True,
         )
+    if idx == 9:
+        # All defaults: streaming on, auto vec narrows to 4 for a short row.
+        return RMSNorm2DSpec(n_per_block=1024)
     raise SystemExit(f"unknown config index {idx}")
 
 
@@ -78,7 +111,7 @@ def main() -> int:
     return run_emit(
         _spec,
         _build,
-        usage="usage: rmsnorm2d_emit.py <config_index 0..8> [mode]\n",
+        usage="usage: rmsnorm2d_emit.py <config_index 0..9> [mode]\n",
     )
 
 

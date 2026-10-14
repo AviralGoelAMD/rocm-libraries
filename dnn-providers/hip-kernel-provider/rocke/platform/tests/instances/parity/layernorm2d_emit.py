@@ -71,6 +71,9 @@ CONFIGS = [
     (8192, 256, 8, "f16", False, True),  # 35
     (4096, 512, 8, "bf16", True, True),  # 36
     (33280, 256, 2, "f16", False, True),  # 37  two-pass: pass-1 loads stay default
+    # --- auto vec (vec=0) with streaming: widest that divides the row ---
+    (4096, 256, 0, "f16", False, True),  # 38  auto -> 8
+    (1024, 256, 0, "bf16", True, True),  # 39  auto narrows to 4
 ]
 
 

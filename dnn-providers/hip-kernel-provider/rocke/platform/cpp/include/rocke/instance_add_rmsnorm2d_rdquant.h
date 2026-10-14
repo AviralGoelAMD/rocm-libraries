@@ -90,7 +90,7 @@ typedef struct rocke_add_rmsnorm2d_rdquant_spec
     int wave_size; /* default 64     */
     const char* name; /* default "rocke_add_rmsnorm2d_rdquant" */
     bool wave_reduce; /* default false  */
-    bool streaming; /* default false  */
+    bool streaming; /* default true   */
 } rocke_add_rmsnorm2d_rdquant_spec_t;
 
 /* Default-constructed spec (every field == Python dataclass default). The

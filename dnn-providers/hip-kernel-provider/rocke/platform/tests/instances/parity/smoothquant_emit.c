@@ -32,6 +32,7 @@ static int make_spec(int idx, rocke_smoothquant_spec_t* s)
         s->out_dtype = "i8";
         s->block_size = 256;
         s->vec = 4;
+        s->wave_reduce = false;
         break;
     case 1: /* N2048 bf16->i8 b256 v8 */
         s->n_per_block = 2048;
@@ -39,6 +40,7 @@ static int make_spec(int idx, rocke_smoothquant_spec_t* s)
         s->out_dtype = "i8";
         s->block_size = 256;
         s->vec = 8;
+        s->wave_reduce = false;
         break;
     case 2: /* N512 f16->fp8e4m3 b128 v4 */
         s->n_per_block = 512;
@@ -46,6 +48,7 @@ static int make_spec(int idx, rocke_smoothquant_spec_t* s)
         s->out_dtype = "fp8e4m3";
         s->block_size = 128;
         s->vec = 4;
+        s->wave_reduce = false;
         break;
     case 3: /* N1024 bf16->bf8e5m2 b64 v2 */
         s->n_per_block = 1024;
@@ -53,6 +56,7 @@ static int make_spec(int idx, rocke_smoothquant_spec_t* s)
         s->out_dtype = "bf8e5m2";
         s->block_size = 64;
         s->vec = 2;
+        s->wave_reduce = false;
         break;
     case 4: /* N2048 f16->i8 b512 v4 */
         s->n_per_block = 2048;
@@ -60,6 +64,7 @@ static int make_spec(int idx, rocke_smoothquant_spec_t* s)
         s->out_dtype = "i8";
         s->block_size = 512;
         s->vec = 4;
+        s->wave_reduce = false;
         break;
     case 5: /* N256 bf16->fp8e4m3 b256 v2 */
         s->n_per_block = 256;
@@ -67,6 +72,7 @@ static int make_spec(int idx, rocke_smoothquant_spec_t* s)
         s->out_dtype = "fp8e4m3";
         s->block_size = 256;
         s->vec = 2;
+        s->wave_reduce = false;
         break;
     case 6: /* N8192 f16->i8 b256 v8 wave_reduce */
         s->n_per_block = 8192;

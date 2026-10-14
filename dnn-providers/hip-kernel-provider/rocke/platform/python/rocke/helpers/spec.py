@@ -37,6 +37,7 @@ __all__ = [
     "ptr_type_str",
     "sig_param",
     "sig_scalar",
+    "row_auto_vec",
     "validate_io",
 ]
 
@@ -97,6 +98,23 @@ def validate_io(rule: IOSpecRule) -> Tuple[bool, str]:
                     "pick a larger block_size or a multi-pass kernel"
                 )
     return True, "ok"
+
+
+def row_auto_vec(vec: int, n_per_block: int, block_size: int, streaming: bool) -> int:
+    """Resolve a row-norm ``vec`` knob; ``vec=0`` means auto.
+
+    A non-zero ``vec`` is returned as-is. Auto picks the widest width that
+    divides the row (``n_per_block % (block_size * v) == 0``), trying 8 only
+    when ``streaming`` is on (the 16-byte width pays off together with the
+    non-temporal hint), then 4, then 2. When nothing divides it returns 4 so
+    :func:`validate_io` rejects the spec with the usual reason.
+    """
+    if vec:
+        return vec
+    for v in (8, 4, 2) if streaming else (4, 2):
+        if block_size and n_per_block % (block_size * v) == 0:
+            return v
+    return 4
 
 
 # ---------------------------------------------------------------------

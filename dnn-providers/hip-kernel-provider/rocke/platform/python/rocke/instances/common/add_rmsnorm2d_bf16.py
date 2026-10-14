@@ -45,6 +45,7 @@ from ...helpers.spec import (
     SignatureBuilder,
     ceil_div_grid,
     kernel_name_join,
+    row_auto_vec,
     validate_io,
 )
 from ...helpers.tensor_view import (
@@ -64,18 +65,25 @@ class AddRMSNorm2DBF16Spec:
 
     n_per_block: int
     block_size: int = 256
-    vec: int = 4
+    # 0 = auto (``row_auto_vec``): 8 with ``streaming``, else 4, narrowed to
+    # the widest width that divides the row.
+    vec: int = 0
     dtype: DType = "bf16"
     save_residual: bool = True  # write x = a + b to ``X``
     wave_size: int = 64
     # Streaming (``nt``) cache hint on the read-once A/B loads and the
-    # write-once X/Y stores; gamma keeps the default policy.
-    streaming: bool = False
+    # write-once X/Y stores; gamma keeps the default policy. Only
+    # gfx942/gfx950 lower it; other targets must pass ``streaming=False``.
+    streaming: bool = True
     name: str = "rocke_add_rmsnorm2d_bf16"
 
     @property
     def elems_per_thread(self) -> int:
         return self.n_per_block // self.block_size
+
+    @property
+    def resolved_vec(self) -> int:
+        return row_auto_vec(self.vec, self.n_per_block, self.block_size, self.streaming)
 
     def kernel_name(self) -> str:
         return kernel_name_join(
@@ -83,7 +91,7 @@ class AddRMSNorm2DBF16Spec:
             self.dtype,
             f"N{self.n_per_block}",
             f"b{self.block_size}",
-            f"v{self.vec}",
+            f"v{self.resolved_vec}",
             flags={"sr": self.save_residual, "nt": self.streaming},
         )
 
@@ -100,17 +108,20 @@ def is_valid_spec(spec: AddRMSNorm2DBF16Spec, arch: str = "gfx950") -> Tuple[boo
     behavior is unchanged.
     """
     from ...core.arch import ArchTarget
+    from ...core.ir import STREAMING_ARCHS
 
     try:
         target = ArchTarget.from_gfx(arch)
     except KeyError as e:
         return False, str(e)
+    if spec.streaming and arch not in STREAMING_ARCHS:
+        return False, f"streaming (nt) hint is not supported on {arch}"
 
     ok, why = validate_io(
         IOSpecRule(
             dtype=spec.dtype,
             block_size=spec.block_size,
-            vec=spec.vec,
+            vec=spec.resolved_vec,
             n_per_block=spec.n_per_block,
             max_elems_per_thread=64,
         )
@@ -165,7 +176,7 @@ def build_add_rmsnorm2d_bf16(
         raise ValueError(f"invalid add_rmsnorm2d_bf16 spec: {why}")
 
     io_ty = io_ir_type(spec.dtype)
-    BS, VEC, N = spec.block_size, spec.vec, spec.n_per_block
+    BS, VEC, N = spec.block_size, spec.resolved_vec, spec.n_per_block
 
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = BS

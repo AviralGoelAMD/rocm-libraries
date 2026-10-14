@@ -131,6 +131,31 @@ static const char* rocke_format_int_set(rocke_arena_t* arena, const int* vals, s
     return buf;
 }
 
+int rocke_row_auto_vec(int vec, int n_per_block, int block_size, int streaming)
+{
+    static const int k_stream[] = {8, 4, 2};
+    static const int k_plain[]  = {4, 2};
+    const int* cand;
+    size_t n;
+    size_t i;
+    if(vec != 0)
+        return vec;
+    cand = streaming ? k_stream : k_plain;
+    n    = streaming ? 3u : 2u;
+    for(i = 0; i < n; ++i)
+    {
+        long long chunk = (long long)block_size * cand[i];
+        if(chunk != 0 && (long long)n_per_block % chunk == 0)
+            return cand[i];
+    }
+    return 4;
+}
+
+int rocke_is_streaming_arch(const char* arch)
+{
+    return arch && (strcmp(arch, "gfx942") == 0 || strcmp(arch, "gfx950") == 0);
+}
+
 int rocke_validate_io(rocke_arena_t* arena,
                       const rocke_io_spec_rule_t* rule,
                       const char** out_reason)

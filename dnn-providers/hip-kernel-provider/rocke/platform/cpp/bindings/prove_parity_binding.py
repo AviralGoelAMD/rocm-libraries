@@ -138,6 +138,8 @@ def cfgs_layernorm2d():
         (8192, 256, 8, "f16", False, True),
         (4096, 512, 8, "bf16", True, True),
         (33280, 256, 2, "f16", False, True),
+        (4096, 256, 0, "f16", False, True),
+        (1024, 256, 0, "bf16", True, True),
     ]
     return [
         dict(
@@ -163,6 +165,7 @@ def cfgs_rmsnorm2d():
         (8192, 256, 8, "bf16", False, True),
         (131072, 256, 4, "f16", False, True),
         (4096, 512, 8, "f16", True, True),
+        (1024, 256, 0, "f16", False, True),
     ]
     return [
         dict(n_per_block=n, block_size=b, vec=v, dtype=d, save_inv_rms=s, streaming=nt)
@@ -180,6 +183,7 @@ def cfgs_add_rmsnorm2d_bf16():
         (2048, 128, 4, "bf16", True, 64, False),
         (8192, 256, 8, "bf16", True, 64, True),
         (4096, 512, 8, "f16", False, 64, True),
+        (1024, 256, 0, "bf16", True, 64, True),
     ]
     return [
         dict(
@@ -196,16 +200,17 @@ def cfgs_add_rmsnorm2d_bf16():
 
 
 def cfgs_add_rmsnorm2d_rdquant():
-    # Trailing dict: opt-in knobs on top of the spec defaults.
+    # Trailing dict: knobs on top of the spec defaults (streaming defaults on).
+    off = {"streaming": False}
     rows = [
-        (4096, "f16", "i8", 256, 4, True, True, 64, {}),
-        (8192, "f16", "fp8e4m3", 256, 8, True, True, 64, {}),
-        (2048, "bf16", "bf8e5m2", 128, 4, False, False, 64, {}),
-        (16384, "f16", "i8", 256, 4, True, True, 64, {}),
-        (1024, "bf16", "i8", 64, 4, True, True, 64, {}),
-        (6144, "f16", "fp8e4m3", 256, 2, True, False, 64, {}),
-        (8192, "f16", "i8", 512, 8, True, True, 64, {"wave_reduce": True}),
-        (1024, "bf16", "i8", 64, 4, True, True, 64, {"wave_reduce": True}),
+        (4096, "f16", "i8", 256, 4, True, True, 64, off),
+        (8192, "f16", "fp8e4m3", 256, 8, True, True, 64, off),
+        (2048, "bf16", "bf8e5m2", 128, 4, False, False, 64, off),
+        (16384, "f16", "i8", 256, 4, True, True, 64, off),
+        (1024, "bf16", "i8", 64, 4, True, True, 64, off),
+        (6144, "f16", "fp8e4m3", 256, 2, True, False, 64, off),
+        (8192, "f16", "i8", 512, 8, True, True, 64, {"wave_reduce": True, **off}),
+        (1024, "bf16", "i8", 64, 4, True, True, 64, {"wave_reduce": True, **off}),
         (4096, "f16", "i8", 256, 4, True, True, 64, {"streaming": True}),
         (
             8192,

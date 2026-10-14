@@ -535,6 +535,7 @@ def add_rmsnorm_rdquant_specs(
             block_size=NORM_BLOCK_SIZE,
             vec=NORM_VEC,
             wave_size=WAVE_SIZE,
+            streaming=False,
         )
         for out_dtype in RDQUANT_OUT_DTYPES
     )

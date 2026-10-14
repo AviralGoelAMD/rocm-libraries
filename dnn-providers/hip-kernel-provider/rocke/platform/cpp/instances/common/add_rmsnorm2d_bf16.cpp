@@ -33,12 +33,12 @@ rocke_add_rmsnorm2d_bf16_spec_t rocke_add_rmsnorm2d_bf16_spec_default(void)
     rocke_add_rmsnorm2d_bf16_spec_t s;
     s.n_per_block = 0; /* mandatory; no Python default */
     s.block_size = 256;
-    s.vec = 4;
+    s.vec = 0; /* auto: rocke_row_auto_vec */
     s.dtype = "bf16";
     s.save_residual = true;
     s.wave_size = 64;
     s.name = "rocke_add_rmsnorm2d_bf16";
-    s.streaming = false;
+    s.streaming = true;
     return s;
 }
 
@@ -70,7 +70,8 @@ rocke_status_t rocke_add_rmsnorm2d_bf16_kernel_name(const rocke_add_rmsnorm2d_bf
     }
     snprintf(part_n, sizeof(part_n), "N%d", spec->n_per_block);
     snprintf(part_b, sizeof(part_b), "b%d", spec->block_size);
-    snprintf(part_v, sizeof(part_v), "v%d", spec->vec);
+    snprintf(part_v, sizeof(part_v), "v%d",
+             rocke_row_auto_vec(spec->vec, spec->n_per_block, spec->block_size, spec->streaming));
     parts[0] = spec->dtype;
     parts[1] = part_n;
     parts[2] = part_b;
@@ -122,6 +123,14 @@ bool rocke_is_valid_spec_add_rmsnorm2d_bf16(const rocke_add_rmsnorm2d_bf16_spec_
         }
         return false;
     }
+    if(spec->streaming && !rocke_is_streaming_arch(arch))
+    {
+        if(reason != NULL && reason_cap > 0)
+        {
+            snprintf(reason, reason_cap, "streaming (nt) hint is not supported on %s", arch);
+        }
+        return false;
+    }
 
     /* validate_io(IOSpecRule(dtype, block_size, vec, n_per_block,
      *                        max_elems_per_thread=64)) */
@@ -129,7 +138,11 @@ bool rocke_is_valid_spec_add_rmsnorm2d_bf16(const rocke_add_rmsnorm2d_bf16_spec_
     {
         return false;
     }
-    rocke_io_spec_rule_init(&rule, spec->dtype, spec->block_size, spec->vec);
+    rocke_io_spec_rule_init(&rule,
+                            spec->dtype,
+                            spec->block_size,
+                            rocke_row_auto_vec(spec->vec, spec->n_per_block, spec->block_size,
+                                               spec->streaming));
     rule.n_per_block_set = 1;
     rule.n_per_block = spec->n_per_block;
     rule.max_elems_per_thread_set = 1;
@@ -318,7 +331,7 @@ rocke_kernel_def_t* rocke_build_add_rmsnorm2d_bf16(rocke_ir_builder_t* b,
         return NULL;
     }
     BS = spec->block_size;
-    VEC = spec->vec;
+    VEC = rocke_row_auto_vec(spec->vec, spec->n_per_block, spec->block_size, spec->streaming);
     N = spec->n_per_block;
 
     /* b.kernel.attrs["max_workgroup_size"] = BS */

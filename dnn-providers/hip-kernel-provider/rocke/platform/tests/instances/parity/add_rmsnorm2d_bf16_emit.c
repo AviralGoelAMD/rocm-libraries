@@ -32,6 +32,7 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_bf16_spec_t* spec)
         spec->dtype = "bf16";
         spec->save_residual = true;
         spec->wave_size = 64;
+        spec->streaming = false;
         break;
     case 1:
         spec->n_per_block = 2048;
@@ -40,6 +41,7 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_bf16_spec_t* spec)
         spec->dtype = "bf16";
         spec->save_residual = true;
         spec->wave_size = 64;
+        spec->streaming = false;
         break;
     case 2:
         spec->n_per_block = 4096;
@@ -48,6 +50,7 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_bf16_spec_t* spec)
         spec->dtype = "bf16";
         spec->save_residual = true;
         spec->wave_size = 64;
+        spec->streaming = false;
         break;
     case 3:
         spec->n_per_block = 8192;
@@ -56,6 +59,7 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_bf16_spec_t* spec)
         spec->dtype = "bf16";
         spec->save_residual = true;
         spec->wave_size = 64;
+        spec->streaming = false;
         break;
     case 4:
         spec->n_per_block = 1024;
@@ -64,6 +68,7 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_bf16_spec_t* spec)
         spec->dtype = "f16";
         spec->save_residual = false;
         spec->wave_size = 64;
+        spec->streaming = false;
         break;
     case 5:
         spec->n_per_block = 2048;
@@ -72,6 +77,7 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_bf16_spec_t* spec)
         spec->dtype = "bf16";
         spec->save_residual = true;
         spec->wave_size = 64;
+        spec->streaming = false;
         break;
     case 6: /* N8192 b256 v8 bf16 sr streaming */
         spec->n_per_block = 8192;
@@ -90,6 +96,9 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_bf16_spec_t* spec)
         spec->save_residual = false;
         spec->wave_size = 64;
         spec->streaming = true;
+        break;
+    case 8: /* N1024 all defaults: streaming, auto vec narrows to 4 */
+        spec->n_per_block = 1024;
         break;
     default:
         return -1;

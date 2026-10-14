@@ -84,6 +84,9 @@ static const ln_cfg_t CONFIGS[] = {
     {8192, 256, 8, "f16", false, true},
     {4096, 512, 8, "bf16", true, true},
     {33280, 256, 2, "f16", false, true},
+    /* 38..39 auto vec (vec=0) with streaming */
+    {4096, 256, 0, "f16", false, true},
+    {1024, 256, 0, "bf16", true, true},
 };
 
 #define NCFG ((int)(sizeof(CONFIGS) / sizeof(CONFIGS[0])))

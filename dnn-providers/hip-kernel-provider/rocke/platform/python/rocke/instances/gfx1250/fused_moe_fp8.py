@@ -184,6 +184,7 @@ class Gfx1250Fp8Moe:
             vec=aq_vec,
             save_yscale=True,
             wave_size=32,
+            wave_reduce=False,
             name=f"{spec.name}_actq",
         )
         self._hq_spec = SmoothQuantSpec(
@@ -194,6 +195,7 @@ class Gfx1250Fp8Moe:
             vec=hq_vec,
             save_yscale=True,
             wave_size=32,
+            wave_reduce=False,
             name=f"{spec.name}_hidq",
         )
         self._actq = self._compile(build_smoothquant(self._aq_spec, arch=arch))

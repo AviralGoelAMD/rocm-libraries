@@ -50,12 +50,12 @@ rocke_rmsnorm2d_spec_t rocke_rmsnorm2d_spec_default(void)
     rocke_rmsnorm2d_spec_t s;
     s.n_per_block = 0;
     s.block_size = 256;
-    s.vec = 4;
+    s.vec = 0; /* auto: rocke_row_auto_vec */
     s.dtype = "f16";
     s.save_inv_rms = false;
     s.wave_size = 64;
     s.name = "rocke_rmsnorm2d_fwd";
-    s.streaming = false;
+    s.streaming = true;
     return s;
 }
 
@@ -88,7 +88,8 @@ rocke_status_t
 
     snprintf(part_n, sizeof(part_n), "N%d", spec->n_per_block);
     snprintf(part_b, sizeof(part_b), "b%d", spec->block_size);
-    snprintf(part_v, sizeof(part_v), "v%d", spec->vec);
+    snprintf(part_v, sizeof(part_v), "v%d",
+             rocke_row_auto_vec(spec->vec, spec->n_per_block, spec->block_size, spec->streaming));
 
     parts[0] = spec->dtype;
     parts[1] = part_n;
@@ -145,6 +146,14 @@ bool rocke_rmsnorm2d_is_valid_spec(const rocke_rmsnorm2d_spec_t* spec,
         }
         return false;
     }
+    if(spec->streaming && !rocke_is_streaming_arch(arch))
+    {
+        if(reason != NULL && reason_cap > 0)
+        {
+            snprintf(reason, reason_cap, "streaming (nt) hint is not supported on %s", arch);
+        }
+        return false;
+    }
 
     elems_per_thread = rocke_rmsnorm2d_elems_per_thread(spec);
 
@@ -161,7 +170,11 @@ bool rocke_rmsnorm2d_is_valid_spec(const rocke_rmsnorm2d_spec_t* spec,
     {
         return false;
     }
-    rocke_io_spec_rule_init(&rule, spec->dtype, spec->block_size, spec->vec);
+    rocke_io_spec_rule_init(&rule,
+                            spec->dtype,
+                            spec->block_size,
+                            rocke_row_auto_vec(spec->vec, spec->n_per_block, spec->block_size,
+                                               spec->streaming));
     rule.n_per_block_set = 1;
     rule.n_per_block = spec->n_per_block;
     if(two_pass)
@@ -400,7 +413,7 @@ rocke_kernel_def_t* rocke_build_rmsnorm2d(rocke_ir_builder_t* b,
             return NULL;
         }
         BS = spec->block_size;
-        VEC = spec->vec;
+        VEC = rocke_row_auto_vec(spec->vec, spec->n_per_block, spec->block_size, spec->streaming);
         N = spec->n_per_block;
 
         /* b.kernel.attrs["max_workgroup_size"] = BS */

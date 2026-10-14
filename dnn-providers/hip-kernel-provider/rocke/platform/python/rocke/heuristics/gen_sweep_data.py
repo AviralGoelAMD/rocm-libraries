@@ -365,6 +365,7 @@ _NORM_ROWS = 4096
 def _norm_enumerate(arch: str, max_shapes: Optional[int]) -> List[object]:
     import itertools
 
+    from ..core.ir import STREAMING_ARCHS
     from ..instances import RMSNorm2DSpec
     from ..instances.common.rmsnorm2d import is_valid_spec
 
@@ -383,6 +384,7 @@ def _norm_enumerate(arch: str, max_shapes: Optional[int]) -> List[object]:
             block_size=bs,
             vec=vec,
             dtype=dtype,
+            streaming=arch in STREAMING_ARCHS,
         )
         ok, _ = is_valid_spec(spec, arch)
         if ok:

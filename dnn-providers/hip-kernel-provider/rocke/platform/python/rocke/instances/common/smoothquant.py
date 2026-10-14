@@ -200,7 +200,7 @@ class SmoothQuantSpec:
     wave_size: int = 64
     # Fold the row amax with the wave XOR butterfly plus one cross-warp LDS
     # round instead of the full block-wide LDS tree.
-    wave_reduce: bool = False
+    wave_reduce: bool = True
     name: str = "rocke_smoothquant"
 
     @property
