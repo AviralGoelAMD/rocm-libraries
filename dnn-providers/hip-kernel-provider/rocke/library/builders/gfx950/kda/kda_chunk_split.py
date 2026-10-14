@@ -38,12 +38,17 @@ except ImportError:  # running as a bare script outside the editable install
 import torch  # noqa: E402
 
 from kernels.gfx950.kda_chunkwise import (  # noqa: E402
+    KdaChunkPairSpec,
     KdaChunkPrepSpec,
     KdaChunkScanSpec,
     KdaTileSpec,
+    build_kda_chunk_pair,
     build_kda_chunk_scan,
+    is_valid_pair_spec,
     is_valid_scan_spec,
     is_valid_spec,
+    kda_chunk_pair_grid,
+    kda_chunk_pair_signature,
     kda_chunk_scan_grid,
     kda_chunk_scan_signature,
 )
@@ -79,6 +84,47 @@ def make_launcher(spec: KdaChunkScanSpec) -> KernelLauncher:
             signature=kda_chunk_scan_signature(spec),
         )
     return _LAUNCHER_CACHE[key]
+
+
+def make_pair_launcher(spec: KdaChunkPairSpec) -> KernelLauncher:
+    key = spec.kernel_name()
+    if key not in _LAUNCHER_CACHE:
+        ok, why = is_valid_pair_spec(spec)
+        if not ok:
+            raise ValueError(f"unsupported spec: {why}")
+        art = compile_kernel(
+            build_kda_chunk_pair(spec),
+            arch="gfx950",
+            backend="python",
+            capture_ir_text=False,
+        )
+        _LAUNCHER_CACHE[key] = KernelLauncher(
+            hsaco=art.hsaco,
+            kernel_name=art.kernel_name,
+            signature=kda_chunk_pair_signature(spec),
+        )
+    return _LAUNCHER_CACHE[key]
+
+
+def run_pair(spec: KdaChunkPairSpec, ws, ws2, num_tiles: int, stream=None) -> None:
+    """Combine ``num_tiles`` C-chunk tiles in ``ws`` into ``num_tiles / 2``
+    2C-chunk tiles in ``ws2`` (see :class:`KdaChunkPairSpec`).
+
+    Pairs are consecutive tile indices, so every head's chunk count must be
+    even for no pair to straddle two heads.
+    """
+    assert num_tiles % 2 == 0, "chunk pairing needs an even chunk count"
+    launcher = make_pair_launcher(spec)
+    if stream is None:
+        stream = torch.cuda.current_stream().cuda_stream
+    cfg = LaunchConfig(
+        grid=kda_chunk_pair_grid(spec, num_tiles // 2),
+        block=(spec.block_size, 1, 1),
+        stream=stream,
+    )
+    args = {f"{n}_ptr": ws[n] for n in ("a", "gk", "gq", "aqk", "kt", "dec")}
+    args.update({f"{n}2_ptr": ws2[n] for n in ("a", "gk", "gq", "aqk", "kt", "dec")})
+    launcher(args, config=cfg)
 
 
 def prep_spec_of(spec: KdaChunkScanSpec, *, raw: bool = False) -> KdaChunkPrepSpec:
