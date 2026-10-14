@@ -276,6 +276,12 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # wave raises its priority for its MFMA windows; 2 = for its operand
     # windows; 3 = no s_setprio.
     window_priority: int = field(default=0, kw_only=True)
+    # mfma_windows only: P packs (of block_n // 16, the last ones in PV order)
+    # whose exp2 runs in the PV MFMA window instead of the QK window. The QK
+    # window otherwise carries the whole tile's exp2 work and outlasts the
+    # other group's operand window; this moves part of it next to the PV
+    # MFMAs that do not consume those packs. Needs pv_loop_order k_major.
+    pv_window_exp: int = field(default=0, kw_only=True)
 
     def resolved_exp_per_pv_step(self) -> int:
         if self.exp_per_pv_step is not None:
@@ -540,6 +546,15 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
                 "lds_dma_manual_wait, and excludes bulk_operand_reads and "
                 "operand_read_ahead"
             )
+        if self.pv_window_exp and (
+            not self.mfma_windows
+            or not 0 < self.pv_window_exp < self.block_n // 16
+            or self.resolved_pv_loop_order() != "k_major"
+        ):
+            raise ValueError(
+                "pv_window_exp needs mfma_windows and k_major PV order, and must "
+                f"be below block_n // 16; got {self.pv_window_exp}"
+            )
 
     @property
     def resolved_persist_decode(self) -> str:
@@ -690,6 +705,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "operand_read_ahead",
             "mfma_windows",
             "window_priority",
+            "pv_window_exp",
         )
     }
 )
@@ -828,6 +844,7 @@ def build_attention_dense(
     READ_AHEAD = int(spec.operand_read_ahead)
     WINDOWS = int(spec.mfma_windows)
     WIN_PRIO = int(spec.window_priority)
+    PV_EXP = int(spec.pv_window_exp)
     IGLP = spec.resolved_iglp_mode()
     gqa = Hq // Hkv
     stride_q_tok = Hq * D
@@ -1866,7 +1883,10 @@ def build_attention_dense(
             + [(f"o{dt}", o0[dt]) for dt in range(D_TILES)]
             + [(f"s{n}", s0v[n]) for n in range(N_SUB)]
         )
-        exp_per_qk = -(-(N_SUB * 16) // (N_SUB * K_STEPS))
+        exp_per_qk = -(-((KK_STEPS - PV_EXP) * 8) // (N_SUB * K_STEPS))
+        # pv_window_exp: deferred exps spread over the PV MFMAs that do not
+        # consume a deferred pack (k_major: the first D_TILES * kept packs).
+        exp_per_pv = -(-(PV_EXP * 8) // (D_TILES * (KK_STEPS - PV_EXP)))
         max_per_pv = -(-(N_SUB * 16) // len(PV_STEPS))
         la_rs_ctr = [0]
         # (nsub, reg) feeding each PV B-operand pack, in relayout_p's order.
@@ -1917,9 +1937,12 @@ def build_attention_dense(
             # row sums, are emitted as soon as their inputs exist instead of as
             # a serial tail after the last MFMA.
             neg_m = b.fneg(m_j)
-            slots = iter(
-                [(kk, e, n, i) for kk, row in enumerate(_P_ORDER) for e, (n, i) in enumerate(row)]
-            )
+            all_slots = [
+                (kk, e, n, i) for kk, row in enumerate(_P_ORDER) for e, (n, i) in enumerate(row)
+            ]
+            n_qk_slots = (KK_STEPS - PV_EXP) * 8
+            slots = iter(all_slots[:n_qk_slots])
+            pv_slots = iter(all_slots[n_qk_slots:])
             pk_elems = [[None] * 8 for _ in range(KK_STEPS)]
             p_packs = [None] * KK_STEPS
             lsum = [None, None]
@@ -1949,10 +1972,15 @@ def build_attention_dense(
                 s_next = do_qk(buf_j1, after_mfma=exp_hook, tail_read=pv_read)
             for slot in slots:
                 emit_exp(*slot)
-            l_local = b.fadd(lsum[0], lsum[1])
-            if not spec.defer_row_sum:
-                l_local = half_combine(l_local, b.fadd)
-            l_acc = b.fadd(l_i, l_local)
+
+            def finish_row_sum():
+                l_local = b.fadd(lsum[0], lsum[1])
+                if not spec.defer_row_sum:
+                    l_local = half_combine(l_local, b.fadd)
+                return b.fadd(l_i, l_local)
+
+            if not PV_EXP:
+                l_acc = finish_row_sum()
 
             # Phase B: PV(j) with the mask + row max of tile j+1 in its shadow.
             vops = None
@@ -1990,7 +2018,23 @@ def build_attention_dense(
                 # Window 4 (MFMA): PV(j). Its closing boundary opens the next
                 # tile's window 1, which also carries the softmax finish and
                 # the O rescale below.
-                o_acc = pv_mfma_run(o_acc, p_packs, vops, after_mfma=max_hook)
+                if PV_EXP:
+                    o_acc = list(o_acc)
+                    for idx, (dt, kk_step) in enumerate(PV_STEPS):
+                        if p_packs[kk_step] is None:
+                            for slot in pv_slots:
+                                emit_exp(*slot)
+                        o_acc[dt] = mfma_32x32x16_for_dtype(
+                            b, dtype, vops[idx], p_packs[kk_step], o_acc[dt]
+                        )
+                        for _ in range(exp_per_pv):
+                            slot = next(pv_slots, None)
+                            if slot is not None:
+                                emit_exp(*slot)
+                        max_hook()
+                    l_acc = finish_row_sum()
+                else:
+                    o_acc = pv_mfma_run(o_acc, p_packs, vops, after_mfma=max_hook)
                 window_barrier(opens="read")
             else:
                 o_acc = do_pv(
