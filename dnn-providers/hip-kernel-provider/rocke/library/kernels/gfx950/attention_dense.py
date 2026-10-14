@@ -289,8 +289,6 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
                     "causal_bottom_right is not supported with varlen=True"
                 )
         if self.wide_lds_dma:
-            if not self.persistent:
-                raise ValueError("wide_lds_dma requires persistent=True")
             if self.head_size != 128 or self.block_n != 64:
                 raise ValueError("wide_lds_dma requires head_size=128 and block_n=64")
             if self.ragged or self.varlen or self.paged:
@@ -845,8 +843,27 @@ def build_attention_dense(
         K_ROWS_LDS = BN // K_GROUP
         LDROW = K_GROUP * D + spec.lds_k_group_pad
     VROW = D + spec.lds_v_row_pad if ROWS_PER_INSTR == 1 else D
-    K_lds = b.smem_alloc(dtype, [NBUF, K_ROWS_LDS, LDROW], name_hint="Klds")
-    V_lds = b.smem_alloc(dtype, [NBUF, BN, VROW], name_hint="Vlds")
+    WIDE_DMA = spec.wide_lds_dma
+    if WIDE_DMA:
+        # Same slab layout as the persistent wide path: 8 rows x 64 columns per
+        # padded line, two dwordx4 DMA instructions per operand per line pass.
+        K_D_RPT = D // 64
+        K_N_RPT = BN // 8
+        K_LINE_STRIDE = 64 * 8 + PAD
+        V_D_RPT = D // 64
+        V_N_RPT = BN // 8
+        V_LINE_STRIDE = 64 * 8 + spec.lds_v_row_pad
+        WIDE_LINE_PASSES = 8 // WAVES
+        assert 8 % WAVES == 0
+        K_lds = b.smem_alloc(
+            dtype, [NBUF, K_D_RPT, K_N_RPT, K_LINE_STRIDE], name_hint="Klds"
+        )
+        V_lds = b.smem_alloc(
+            dtype, [NBUF, V_D_RPT, V_N_RPT, V_LINE_STRIDE], name_hint="Vlds"
+        )
+    else:
+        K_lds = b.smem_alloc(dtype, [NBUF, K_ROWS_LDS, LDROW], name_hint="Klds")
+        V_lds = b.smem_alloc(dtype, [NBUF, BN, VROW], name_hint="Vlds")
     # Packed-K read decode, hoisted out of the KV loop: krow = nsub*32 + lane_m
     # with nsub*32 even, so the group/sub-row split is a shift+and on lane_m
     # plus a compile-time nsub scale.
@@ -888,6 +905,9 @@ def build_attention_dense(
     # the row pitch and the D=128 emission is unchanged.
     K_GROUP_BYTES = LDROW * 2
     V_BYTES_PER_BUF = BN * VROW * 2
+    if WIDE_DMA:
+        K_BYTES_PER_BUF = K_D_RPT * K_N_RPT * K_LINE_STRIDE * 2
+        V_BYTES_PER_BUF = V_D_RPT * V_N_RPT * V_LINE_STRIDE * 2
     # NOT a padded pitch: the DMA writes ROWS_PER_INSTR*D CONTIGUOUS elements, so
     # a padded V would need its second row at +D, not +D+pad. Padding V requires
     # a pad-aware transposed read, not a wider stride here.
@@ -1030,12 +1050,47 @@ def build_attention_dense(
                     rsrc, row_base, b.mul(voff, b.const_i32(2)), zero_soff, 1
                 )
 
+    def _async_load_wide(rsrc, lds_base, buf_val, tile_key0, bytes_per_buf, line_stride):
+        """Two 128-bit-per-lane DMAs fill one slab-padded K or V tile per line pass
+        (the persistent wide path's layout)."""
+        buf_off = b.mul(b.zext(buf_val, I64), b.const_i64(bytes_per_buf))
+        n_in_wave = b.div(lane, b.const_i32(8))
+        d_bucket = b.mod(lane, b.const_i32(8))
+        n_rpt = BN // 8
+        for n_pass in range(WIDE_LINE_PASSES):
+            line_id = b.add(wave, b.const_i32(n_pass * WAVES))
+            row = b.add(tile_key0, b.add(b.mul(n_in_wave, b.const_i32(8)), line_id))
+            src_base = b.add(
+                b.add(k_base, b.mul(row, b.const_i32(stride_k_tok))),
+                b.mul(d_bucket, b.const_i32(8)),
+            )
+            for d_rpt in range(D // 64):
+                line = b.add(
+                    b.mul(line_id, b.const_i32(line_stride * 2)),
+                    b.const_i32(d_rpt * n_rpt * line_stride * 2),
+                )
+                row_base = b.smem_ptr_add(lds_base, b.add(buf_off, b.zext(line, I64)))
+                voff = b.add(src_base, b.const_i32(d_rpt * 64))
+                b.async_buffer_load_lds_addr(
+                    rsrc, row_base, b.mul(voff, b.const_i32(2)), zero_soff, 4
+                )
+
     def async_load_k(lds_base, buf_val, tile_key0):
+        if WIDE_DMA:
+            _async_load_wide(
+                k_rsrc, lds_base, buf_val, tile_key0, K_BYTES_PER_BUF, K_LINE_STRIDE
+            )
+            return
         _async_load(
             k_rsrc, lds_base, buf_val, tile_key0, K_BYTES_PER_BUF, K_GROUP_BYTES
         )
 
     def async_load_v(lds_base, buf_val, tile_key0):
+        if WIDE_DMA:
+            _async_load_wide(
+                v_rsrc, lds_base, buf_val, tile_key0, V_BYTES_PER_BUF, V_LINE_STRIDE
+            )
+            return
         _async_load(
             v_rsrc, lds_base, buf_val, tile_key0, V_BYTES_PER_BUF, V_GROUP_BYTES
         )
@@ -1055,11 +1110,27 @@ def build_attention_dense(
         s_reg = []
         for nsub in range(N_SUB):
             acc = b.zero_vec_f32(16)
-            if K_GROUP == 1:
+            if WIDE_DMA:
+                kline = b.mod(lane_m, b.const_i32(8))
+                kelem_base = b.add(
+                    b.add(
+                        b.mul(b.div(lane_m, b.const_i32(8)), b.const_i32(64)),
+                        b.mul(lane_h, b.const_i32(8)),
+                    ),
+                    b.const_i32(nsub * 256),
+                )
+            elif K_GROUP == 1:
                 krow = b.add(b.const_i32(nsub * 32), lane_m)
             else:
                 krow = b.add(b.const_i32(nsub * (32 // K_GROUP)), k_lane_grp)
             for ks in range(K_STEPS):
+                if WIDE_DMA:
+                    kelem = b.add(kelem_base, b.const_i32((ks % 4) * 16))
+                    k_pack = b.smem_load_vN(
+                        K_lds, kbuf, b.const_i32(ks // 4), kline, kelem, dtype=dtype, n=8
+                    )
+                    acc = mfma_32x32x16_for_dtype(b, dtype, k_pack, q_packs[ks], acc)
+                    continue
                 col = b.add(b.const_i32(ks * 16), d_base)
                 if K_GROUP > 1:
                     col = b.add(k_sub_col, col)
@@ -1154,8 +1225,35 @@ def build_attention_dense(
             packs.append(b.vec_pack(elems, dtype))
         return packs
 
+    if WIDE_DMA:
+        vline = b.add(
+            b.mul(lane_h, b.const_i32(4)),
+            b.div(b.mod(lane, b.const_i32(16)), b.const_i32(4)),
+        )
+        velem_lane = b.add(
+            b.mul(
+                b.mod(b.div(lane, b.const_i32(16)), b.const_i32(2)),
+                b.const_i32(16),
+            ),
+            b.mul(b.mod(lane, b.const_i32(4)), b.const_i32(4)),
+        )
+
     def read_v(dt, kk_step, vbuf):
         """CK-1 half-local transposed V A-operand (matches ``relayout_p``)."""
+        if WIDE_DMA:
+            velem = b.add(velem_lane, b.const_i32((dt % 2) * 32 + kk_step * 128))
+            a0 = b.ds_read_tr16_b64(
+                V_lds, vbuf, b.const_i32(dt // 2), vline, velem, dtype=dtype
+            )
+            a1 = b.ds_read_tr16_b64(
+                V_lds,
+                vbuf,
+                b.const_i32(dt // 2),
+                vline,
+                b.add(velem, b.const_i32(64)),
+                dtype=dtype,
+            )
+            return b.vec_concat(a0, a1)
         return pv32_v_load_paired(
             b,
             V_lds=V_lds,
