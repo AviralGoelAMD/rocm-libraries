@@ -145,6 +145,13 @@ __all__ = [
 ]
 
 
+# Largest ``tokens * topk`` for which the dynamic grouped forward sorts with
+# the single-CTA padded kernel (no memsets, one launch) instead of the
+# histogram -> padded scan -> scatter chain. Above it the one CTA walking
+# every pair loses to the multi-CTA chain.
+_SINGLE_CTA_SORT_MAX_PAIRS = 1024
+
+
 def _default_gemm_tile() -> TileSpec:
     """Tuned MFMA tile for the fused-MoE batched GEMMs.
 
@@ -1537,7 +1544,10 @@ class FusedMoeForward:
         (:func:`~.moe_sorting.build_moe_sort_scan_padded`) turns the
         histogram into tile-aligned offsets plus ``BlockExpertIds`` and
         marks every unused row with token id ``-1``; the scatter then
-        writes each pair into its packed row. The gather and the
+        writes each pair into its packed row. Up to
+        ``_SINGLE_CTA_SORT_MAX_PAIRS`` routed pairs the whole sort is the
+        single-CTA :func:`~.moe_sorting.build_moe_sort_persistent_padded`
+        instead (same outputs, no memsets). The gather and the
         ``grouped=True`` gate+up+silu and down-reduce GEMMs run over the
         routing-independent bound :func:`~.moe_sorting.moe_sort_padded_bound_blocks`
         of M-blocks; blocks past the used ones carry expert ``-1`` and
@@ -1586,9 +1596,7 @@ class FusedMoeForward:
         hidden = ws["HiddenPacked"]
         y_f32 = ws["Y_f32"]
 
-        # Atomic-add targets: histogram, scatter counter, f32 output.
-        ws["Hist"].zero_()
-        ws["Counter"].zero_()
+        # f32 output accumulator (atomic-add target of the down-reduce).
         y_f32.zero_()
 
         router_callable = make_kernel(
@@ -1603,37 +1611,61 @@ class FusedMoeForward:
             topk_softmax_grid(s.tokens, s.to_topk_softmax_spec()),
             (s.router_block_size, 1, 1),
         )
-        sort_callables = self._sort_launcher.make_padded_callables(
-            {
-                "histogram": {
-                    "TopkIds": topk_ids,
-                    "Hist": ws["Hist"],
-                    "num_pairs": s.total_pairs,
-                    "num_experts": s.experts,
+        if s.total_pairs <= _SINGLE_CTA_SORT_MAX_PAIRS:
+            # One launch, histogram + counters in LDS: no memsets.
+            sort_callables = [
+                self._sort_launcher.make_persistent_padded_callable(
+                    {
+                        "TopkIds": topk_ids,
+                        "TopkWeights": topk_weights,
+                        "Offsets": ws["Offsets"],
+                        "Counts": ws["Counts"],
+                        "BlockExpertIds": block_expert_ids,
+                        "SortedTokenIds": sorted_token_ids,
+                        "SortedTopkIds": ws["SortedTopkIdsPacked"],
+                        "SortedWeights": sorted_weights,
+                        "tokens": s.tokens,
+                        "topk": s.topk,
+                        "num_experts": s.experts,
+                    },
+                    tile_m,
+                )
+            ]
+        else:
+            # Histogram and scatter counter are global atomic-add targets.
+            ws["Hist"].zero_()
+            ws["Counter"].zero_()
+            sort_callables = self._sort_launcher.make_padded_callables(
+                {
+                    "histogram": {
+                        "TopkIds": topk_ids,
+                        "Hist": ws["Hist"],
+                        "num_pairs": s.total_pairs,
+                        "num_experts": s.experts,
+                    },
+                    "scan": {
+                        "Hist": ws["Hist"],
+                        "Offsets": ws["Offsets"],
+                        "Counts": ws["Counts"],
+                        "BlockExpertIds": block_expert_ids,
+                        "SortedTokenIds": sorted_token_ids,
+                        "num_experts": s.experts,
+                    },
+                    "scatter": {
+                        "TopkIds": topk_ids,
+                        "TopkWeights": topk_weights,
+                        "Offsets": ws["Offsets"],
+                        "Counter": ws["Counter"],
+                        "SortedTokenIds": sorted_token_ids,
+                        "SortedTopkIds": ws["SortedTopkIdsPacked"],
+                        "SortedWeights": sorted_weights,
+                        "tokens": s.tokens,
+                        "topk": s.topk,
+                        "num_experts": s.experts,
+                    },
                 },
-                "scan": {
-                    "Hist": ws["Hist"],
-                    "Offsets": ws["Offsets"],
-                    "Counts": ws["Counts"],
-                    "BlockExpertIds": block_expert_ids,
-                    "SortedTokenIds": sorted_token_ids,
-                    "num_experts": s.experts,
-                },
-                "scatter": {
-                    "TopkIds": topk_ids,
-                    "TopkWeights": topk_weights,
-                    "Offsets": ws["Offsets"],
-                    "Counter": ws["Counter"],
-                    "SortedTokenIds": sorted_token_ids,
-                    "SortedTopkIds": ws["SortedTopkIdsPacked"],
-                    "SortedWeights": sorted_weights,
-                    "tokens": s.tokens,
-                    "topk": s.topk,
-                    "num_experts": s.experts,
-                },
-            },
-            tile_m,
-        )
+                tile_m,
+            )
         gather_callable = make_kernel(
             self._fused_moe_launcher._ensure_launchers()["gather"],
             {

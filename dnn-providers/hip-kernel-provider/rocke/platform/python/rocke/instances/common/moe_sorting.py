@@ -438,6 +438,7 @@ def build_moe_sort_scan(spec: MoeSortingSpec, arch: str = "gfx950") -> KernelDef
 
     return b.kernel
 
+
 def moe_sort_padded_bound_blocks(spec: MoeSortingSpec, tile_m: int) -> int:
     """Upper bound on ``sum_e ceil(count[e] / tile_m)`` for any routing.
 
@@ -477,12 +478,10 @@ def build_moe_sort_scan_padded(
     if tile_m <= 0:
         raise ValueError(f"tile_m must be > 0 (got {tile_m})")
 
-    BS = spec.block_size
     E = spec.experts
-    NB = moe_sort_padded_bound_blocks(spec, tile_m)
 
     b = IRBuilder(spec.kernel_name(f"scan_pad{tile_m}"))
-    b.kernel.attrs["max_workgroup_size"] = BS
+    b.kernel.attrs["max_workgroup_size"] = spec.block_size
 
     Hist = b.param("Hist", PtrType(I32, "global"), noalias=True, readonly=True, align=4)
     Offsets = b.param("Offsets", PtrType(I32, "global"), writeonly=True, align=4)
@@ -496,6 +495,48 @@ def build_moe_sort_scan_padded(
     _ = b.param("num_experts", I32)  # noqa: F841 - ABI symmetry with scan
 
     tid = b.thread_id_x()
+    in_bounds = b.cmp_lt(tid, b.const_i32(E))
+    safe_e = b.select(in_bounds, tid, b.const_i32(0))
+    lds = b.smem_alloc(I32, [E + 1], name_hint="lds_scan_pad")
+    v = b.select(in_bounds, b.global_load_i32(Hist, safe_e), b.const_i32(0))
+    _emit_padded_layout(
+        b,
+        counts=v,
+        lds=lds,
+        tid=tid,
+        spec=spec,
+        tile_m=tile_m,
+        Offsets=Offsets,
+        Counts=Counts,
+        BlockExpertIds=BlockExpertIds,
+        SortedTokenIds=SortedTokenIds,
+    )
+    return b.kernel
+
+
+def _emit_padded_layout(
+    b: IRBuilder,
+    *,
+    counts: Value,
+    lds: Value,
+    tid: Value,
+    spec: MoeSortingSpec,
+    tile_m: int,
+    Offsets: Value,
+    Counts: Value,
+    BlockExpertIds: Value,
+    SortedTokenIds: Value,
+) -> None:
+    """Shared body of the padded scan: per-lane expert ``counts`` (0 for
+    lanes ``>= experts``) -> ``Counts``, tile-aligned ``Offsets``,
+    ``BlockExpertIds`` (``-1`` tail up to the bound) and ``-1`` pad rows in
+    ``SortedTokenIds``. ``lds`` is an ``experts + 1`` i32 buffer; on return
+    ``lds[e]`` holds expert ``e``'s first block (exclusive block scan) and
+    ``lds[experts]`` the number of used blocks, both visible to every lane.
+    """
+    BS = spec.block_size
+    E = spec.experts
+    NB = moe_sort_padded_bound_blocks(spec, tile_m)
     c0 = b.const_i32(0)
     c1 = b.const_i32(1)
     c_neg1 = b.const_i32(-1)
@@ -504,12 +545,9 @@ def build_moe_sort_scan_padded(
     in_bounds = b.cmp_lt(tid, b.const_i32(E))
     safe_e = b.select(in_bounds, tid, c0)
 
-    # Slot E holds the total number of used blocks after the scan.
-    lds = b.smem_alloc(I32, [E + 1], name_hint="lds_scan_pad")
-    v = b.select(in_bounds, b.global_load_i32(Hist, safe_e), c0)
-    nblk = b.div(b.add(v, b.const_i32(tile_m - 1)), c_tm)
+    nblk = b.div(b.add(counts, b.const_i32(tile_m - 1)), c_tm)
     with b.scf_if(in_bounds):
-        b.global_store(Counts, tid, v, align=4)
+        b.global_store(Counts, tid, counts, align=4)
         b.smem_store_vN(lds, [tid], nblk, 1)
     b.sync()
 
@@ -527,7 +565,7 @@ def build_moe_sort_scan_padded(
         with b.scf_for(c0, nblk, c1, iv_name="blk") as j:
             b.global_store(BlockExpertIds, b.add(boff, j), tid, align=4)
         pad_end = b.add(row0, b.mul(nblk, c_tm))
-        with b.scf_for(b.add(row0, v), pad_end, c1, iv_name="prow") as r:
+        with b.scf_for(b.add(row0, counts), pad_end, c1, iv_name="prow") as r:
             b.global_store(SortedTokenIds, r, c_neg1, align=4)
 
     # Tail past the last used block, up to the launch bound.
@@ -536,9 +574,6 @@ def build_moe_sort_scan_padded(
     tail_row0 = b.add(b.mul(used, c_tm), tid)
     with b.scf_for(tail_row0, b.const_i32(NB * tile_m), c_bs, iv_name="trow") as r:
         b.global_store(SortedTokenIds, r, c_neg1, align=4)
-
-    return b.kernel
-
 
 
 # ---------------------------------------------------------------------
@@ -856,6 +891,136 @@ def build_moe_sort_persistent(spec: MoeSortingSpec, arch: str = "gfx950") -> Ker
     return b.kernel
 
 
+def build_moe_sort_persistent_padded(
+    spec: MoeSortingSpec, tile_m: int, arch: str = "gfx950"
+) -> KernelDef:
+    """Single-CTA sort straight into the ``tile_m``-aligned packed layout.
+
+    One launch replaces histogram -> :func:`build_moe_sort_scan_padded` ->
+    scatter and the two ``Hist`` / ``Counter`` memsets in front of them:
+    the histogram and the per-expert next-free counters live in LDS. The
+    outputs are exactly those of the three-kernel padded chain
+    (``Counts``, tile-aligned ``Offsets``, ``BlockExpertIds`` with a ``-1``
+    tail, packed ``SortedTokenIds`` / ``SortedTopkIds`` /
+    ``SortedWeights`` with ``-1`` pad token ids).
+
+    Every lane walks ``ceil(tokens * topk / block_size)`` pairs (unrolled),
+    keeping each pair's expert id in a register between the histogram and
+    the scatter, so it is meant for decode-sized ``tokens * topk``.
+    """
+    ok, why = is_valid_spec(spec, arch)
+    if not ok:
+        raise ValueError(f"invalid moe_sorting spec: {why}")
+    if tile_m <= 0:
+        raise ValueError(f"tile_m must be > 0 (got {tile_m})")
+
+    BS = spec.block_size
+    E = spec.experts
+    NP = spec.total_pairs
+
+    b = IRBuilder(spec.kernel_name(f"persistent_pad{tile_m}"))
+    b.kernel.attrs["max_workgroup_size"] = BS
+
+    TopkIds = b.param(
+        "TopkIds", PtrType(I32, "global"), noalias=True, readonly=True, align=4
+    )
+    TopkWeights = b.param(
+        "TopkWeights", PtrType(F32, "global"), noalias=True, readonly=True, align=4
+    )
+    Offsets = b.param("Offsets", PtrType(I32, "global"), writeonly=True, align=4)
+    Counts = b.param("Counts", PtrType(I32, "global"), writeonly=True, align=4)
+    BlockExpertIds = b.param(
+        "BlockExpertIds", PtrType(I32, "global"), writeonly=True, align=4
+    )
+    SortedTokenIds = b.param("SortedTokenIds", PtrType(I32, "global"), align=4)
+    SortedTopkIds = b.param(
+        "SortedTopkIds", PtrType(I32, "global"), writeonly=True, align=4
+    )
+    SortedWeights = b.param(
+        "SortedWeights", PtrType(F32, "global"), writeonly=True, align=4
+    )
+    _tokens = b.param("tokens", I32)  # noqa: F841 - ABI
+    _topk = b.param("topk", I32)  # noqa: F841 - ABI; uses spec.topk
+    num_experts = b.param("num_experts", I32)
+
+    tid = b.thread_id_x()
+    c0 = b.const_i32(0)
+    c1 = b.const_i32(1)
+    c_BS = b.const_i32(BS)
+    c_NP = b.const_i32(NP)
+    c_tm = b.const_i32(tile_m)
+
+    # Phase 1: LDS histogram; each lane keeps its pairs' expert ids.
+    lds_hist = b.smem_alloc(I32, [E], name_hint="lds_hist")
+    lds_zero_i32(b, lds_hist, tid=tid, block_size=BS, length=E)
+    pairs_per_thread = (NP + BS - 1) // BS
+    pairs = []
+    for i in range(pairs_per_thread):
+        pair_idx = b.add(b.const_i32(i * BS), tid)
+        in_bounds = b.cmp_lt(pair_idx, c_NP)
+        eid = b.global_load_i32(TopkIds, b.select(in_bounds, pair_idx, c0))
+        valid = b.land(
+            in_bounds, b.land(b.cmp_ge(eid, c0), b.cmp_lt(eid, num_experts))
+        )
+        with b.scf_if(valid):
+            b.lds_atomic_add(lds_hist, [eid], c1)
+        pairs.append((pair_idx, eid, valid))
+    b.sync()
+
+    # Phase 2: padded layout (block scan, Offsets, BlockExpertIds, -1 rows).
+    in_e = b.cmp_lt(tid, b.const_i32(E))
+    safe_e = b.select(in_e, tid, c0)
+    cnt = b.vec_extract(b.smem_load_vN(lds_hist, safe_e, dtype=I32, n=1), 0)
+    lds_blk = b.smem_alloc(I32, [E + 1], name_hint="lds_scan_pad")
+    _emit_padded_layout(
+        b,
+        counts=b.select(in_e, cnt, c0),
+        lds=lds_blk,
+        tid=tid,
+        spec=spec,
+        tile_m=tile_m,
+        Offsets=Offsets,
+        Counts=Counts,
+        BlockExpertIds=BlockExpertIds,
+        SortedTokenIds=SortedTokenIds,
+    )
+
+    # Phase 3: LDS scatter into the packed rows.
+    lds_counter = b.smem_alloc(I32, [E], name_hint="lds_counter")
+    lds_zero_i32(b, lds_counter, tid=tid, block_size=BS, length=E)
+    for pair_idx, eid, valid in pairs:
+        with b.scf_if(valid):
+            local_off = b.lds_atomic_add(lds_counter, [eid], c1)
+            blk = b.vec_extract(b.smem_load_vN(lds_blk, eid, dtype=I32, n=1), 0)
+            row = b.add(b.mul(blk, c_tm), local_off)
+            t_idx, k_idx = _decode_pair_token_topk(b, pair_idx, spec.topk)
+            w = b.global_load_f32(TopkWeights, pair_idx)
+            b.global_store(SortedTokenIds, row, t_idx, align=4)
+            b.global_store(SortedTopkIds, row, k_idx, align=4)
+            b.global_store(SortedWeights, row, w, align=4)
+
+    return b.kernel
+
+
+def moe_sort_persistent_padded_signature(spec: MoeSortingSpec):
+    return (
+        SignatureBuilder()
+        .ptr("TopkIds", "i32")
+        .ptr("TopkWeights", "f32")
+        .ptr("Offsets", "i32")
+        .ptr("Counts", "i32")
+        .ptr("BlockExpertIds", "i32")
+        .ptr("SortedTokenIds", "i32")
+        .ptr("SortedTopkIds", "i32")
+        .ptr("SortedWeights", "f32")
+        .scalar("tokens", "i32")
+        .scalar("topk", "i32")
+        .scalar("num_experts", "i32")
+        .build()
+    )
+
+
+
 def moe_sort_persistent_grid(spec: MoeSortingSpec) -> Tuple[int, int, int]:
     """Grid for the single-kernel path: one CTA handles everything."""
     return (1, 1, 1)
@@ -953,7 +1118,7 @@ class MoeSortingLauncher:
     def __post_init__(self) -> None:
         object.__setattr__(self, "_launchers", None)
         object.__setattr__(self, "_persistent", None)
-        object.__setattr__(self, "_scan_padded", {})
+        object.__setattr__(self, "_padded", {})
 
     def _stages(
         self,
@@ -1050,8 +1215,12 @@ class MoeSortingLauncher:
             ),
         ]
 
-    def _ensure_scan_padded(self, tile_m: int) -> Any:
-        cached = self._scan_padded.get(tile_m)  # type: ignore[attr-defined]
+    def _ensure_padded(self, kind: str, tile_m: int) -> Any:
+        """Compile + cache a padded-layout kernel: ``kind`` is ``"scan_pad"``
+        (:func:`build_moe_sort_scan_padded`) or ``"persistent_pad"``
+        (:func:`build_moe_sort_persistent_padded`)."""
+        phase = f"{kind}{tile_m}"
+        cached = self._padded.get(phase)  # type: ignore[attr-defined]
         if cached is not None:
             return cached
         from ...helpers.compile import compile_kernel
@@ -1059,18 +1228,41 @@ class MoeSortingLauncher:
 
         arch = _resolve_launch_arch(self.arch)
         s = self.spec
-        phase = f"scan_pad{tile_m}"
-        artifact = compile_kernel(
-            build_moe_sort_scan_padded(s, tile_m, arch), arch=arch, capture_ir_text=False
-        )
+        if kind == "scan_pad":
+            kernel_def = build_moe_sort_scan_padded(s, tile_m, arch)
+            signature = moe_sort_scan_padded_signature(s)
+        elif kind == "persistent_pad":
+            kernel_def = build_moe_sort_persistent_padded(s, tile_m, arch)
+            signature = moe_sort_persistent_padded_signature(s)
+        else:
+            raise ValueError(f"unknown padded sort kernel {kind!r}")
+        artifact = compile_kernel(kernel_def, arch=arch, capture_ir_text=False)
         launcher = KernelLauncher(
             hsaco=artifact.hsaco,
             kernel_name=artifact.kernel_name,
-            signature=moe_sort_scan_padded_signature(s),
+            signature=signature,
             cache_key=("moe_sorting", phase, s.kernel_name(phase)),
         )
-        self._scan_padded[tile_m] = launcher  # type: ignore[attr-defined]
+        self._padded[phase] = launcher  # type: ignore[attr-defined]
         return launcher
+
+    def make_persistent_padded_callable(
+        self,
+        values: Mapping[str, Any],
+        tile_m: int,
+    ) -> Callable[[Any], None]:
+        """Single-launch closure of :func:`build_moe_sort_persistent_padded`
+        (``values`` = its full ABI, see
+        :func:`moe_sort_persistent_padded_signature`). Needs no pre-zeroed
+        workspace."""
+        from ...runtime.launcher import make_kernel
+
+        return make_kernel(
+            self._ensure_padded("persistent_pad", tile_m),
+            values,
+            moe_sort_persistent_grid(self.spec),
+            (self.spec.block_size, 1, 1),
+        )
 
     def make_padded_callables(
         self,
@@ -1099,7 +1291,7 @@ class MoeSortingLauncher:
                 block,
             ),
             make_kernel(
-                self._ensure_scan_padded(tile_m),
+                self._ensure_padded("scan_pad", tile_m),
                 values["scan"],
                 moe_sort_scan_grid(s),
                 block,
@@ -1206,6 +1398,7 @@ __all__ = [
     "MoeSortingSpec",
     "build_moe_sort_histogram",
     "build_moe_sort_persistent",
+    "build_moe_sort_persistent_padded",
     "build_moe_sort_scan",
     "build_moe_sort_scan_padded",
     "build_moe_sort_scatter",
@@ -1221,5 +1414,6 @@ __all__ = [
     "moe_sort_scatter_signature",
     "moe_sort_persistent_grid",
     "moe_sort_persistent_signature",
+    "moe_sort_persistent_padded_signature",
     "moe_sorting_workspace_bytes",
 ]
