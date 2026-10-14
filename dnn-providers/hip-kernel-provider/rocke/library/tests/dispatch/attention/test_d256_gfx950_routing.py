@@ -1,6 +1,6 @@
 # Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-"""Routing tests for the gfx950 bf16 D256 prefill dispatch candidate.
+"""Routing tests for the gfx950 bf16/fp16 D256 prefill dispatch candidate.
 
 CPU-only: exercises the ``attention_gfx950_d256`` candidate's selection through
 ``dispatch_attention`` (filter -> priority -> pick). No GPU required.
@@ -61,8 +61,14 @@ class TestD256Gfx950Routing(unittest.TestCase):
     def test_rejects_non_gfx950(self):
         self.assertNotEqual(_routed_spec_id(_d256(arch="gfx942")), "gfx950_d256")
 
-    def test_rejects_non_bf16(self):
-        self.assertNotEqual(_routed_spec_id(_d256(dtype="fp16")), "gfx950_d256")
+    def test_selects_fp16(self):
+        # fp16 shares the bf16 32x32 body (the cohort is bf16/fp16).
+        r = dispatch_attention(_d256(dtype="fp16"))
+        self.assertEqual(r.candidate.spec_id, "gfx950_d256")
+        self.assertEqual(r.spec.path, "2d")
+
+    def test_rejects_fp8(self):
+        self.assertNotEqual(_routed_spec_id(_d256(use_fp8=True)), "gfx950_d256")
 
     def test_rejects_non_d256(self):
         self.assertNotEqual(
