@@ -756,6 +756,13 @@ class UnifiedAttention2DTiledSpec:
             raise ValueError("use_fp8_mfma_qk requires kv_storage_dtype='fp8e4m3'")
         if self.use_fp8_mfma_pv and self.kv_storage_dtype != "fp8e4m3":
             raise ValueError("use_fp8_mfma_pv requires kv_storage_dtype='fp8e4m3'")
+        if self.use_fp8_mfma_pv and self.use_i64_kv_addr:
+            # The native-fp8 V loads index the cache with the 32-bit voffset
+            # and do not honour the 64-bit per-block base.
+            raise ValueError(
+                "use_fp8_mfma_pv does not support use_i64_kv_addr "
+                "(paged KV cache > 2 GiB)"
+            )
         if self.use_register_pv:
             if self.use_mfma_32x32:
                 raise ValueError(

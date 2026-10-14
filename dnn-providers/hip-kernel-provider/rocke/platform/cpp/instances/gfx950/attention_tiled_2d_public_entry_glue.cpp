@@ -449,6 +449,16 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
         rocke_g950_fail(b, ROCKE_ERR_VALUE, "use_fast_paged_kv_desc is restricted to dtype='bf16'");
     }
 
+    /* ---- native-fp8 PV V loads use the 32-bit voffset and ignore the 64-bit
+     * per-block base (Python __post_init__ rejects the combination). */
+    if(spec->use_fp8_mfma_pv && spec->use_i64_kv_addr)
+    {
+        rocke_g950_fail(b,
+                        ROCKE_ERR_VALUE,
+                        "use_fp8_mfma_pv does not support use_i64_kv_addr "
+                        "(paged KV cache > 2 GiB)");
+    }
+
     /* ---- V-double-buffer / deep-ring / staggered-wait / q-reread.
      * Python __post_init__ accepts these flags (and the emitter wires the
      * depth-2 V-double-buffer + staggered iter-start schedule). The gfx950 C
