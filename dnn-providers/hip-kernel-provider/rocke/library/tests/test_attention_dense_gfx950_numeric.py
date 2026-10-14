@@ -1015,6 +1015,28 @@ _LOOKAHEAD_ARMS = {
             window_priority=1,
         ),
     ),
+    "windows4_fence_pvexp2": (
+        256,
+        dict(
+            _LOOKAHEAD_BASE,
+            lds_read_base=True,
+            scalar_uniforms=True,
+            wave_group_pingpong=True,
+            mfma_windows=4,
+            window_fence=True,
+            pv_window_exp=2,
+        ),
+    ),
+    "windows4_pvexp1": (
+        256,
+        dict(
+            _LOOKAHEAD_BASE,
+            lds_read_base=True,
+            wave_group_pingpong=True,
+            mfma_windows=4,
+            pv_window_exp=1,
+        ),
+    ),
 }
 
 
