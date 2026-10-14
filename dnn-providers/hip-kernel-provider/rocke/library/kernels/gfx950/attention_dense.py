@@ -247,6 +247,11 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # behind a scheduling fence, so the MFMA run carries no LDS waits. Costs
     # the operand registers of a whole tile.
     bulk_operand_reads: int = field(default=0, kw_only=True)
+    # wide_lds_dma only: address every K/V operand read of a tile as one
+    # per-lane base (lane offset + buffer offset, formed once per tile) plus a
+    # compile-time immediate, so the ds_read offset field absorbs the constant
+    # part instead of the backend keeping one address register per read.
+    lds_read_base: bool = field(default=False, kw_only=True)
 
     def resolved_exp_per_pv_step(self) -> int:
         if self.exp_per_pv_step is not None:
@@ -469,6 +474,8 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
             raise ValueError(
                 "bulk_operand_reads requires qk_lookahead (D128 or wide_lds_dma)"
             )
+        if self.lds_read_base and (not self.wide_lds_dma or self.persistent):
+            raise ValueError("lds_read_base requires wide_lds_dma on the grid body")
 
     @property
     def resolved_persist_decode(self) -> str:
@@ -614,6 +621,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "wave_group_pingpong",
             "qk_lookahead_unroll",
             "bulk_operand_reads",
+            "lds_read_base",
         )
     }
 )
@@ -748,6 +756,7 @@ def build_attention_dense(
     UNROLL = int(spec.qk_lookahead_unroll)
     BULK_K = bool(spec.bulk_operand_reads & 1)
     BULK_V = bool(spec.bulk_operand_reads & 2)
+    LDS_READ_BASE = spec.lds_read_base
     IGLP = spec.resolved_iglp_mode()
     gqa = Hq // Hkv
     stride_q_tok = Hq * D
@@ -1178,6 +1187,28 @@ def build_attention_dense(
 
     # ---- per-tile compute closures ----
 
+    if LDS_READ_BASE:
+        # lds_read_base: the per-lane element offset inside one K buffer. Each
+        # tile adds its buffer offset once; every read then adds only a
+        # compile-time constant, which lands in the ds_read offset field.
+        _z = b.const_i32(0)
+        k_lane_elem = b.add(
+            b.mul(b.mod(lane_m, b.const_i32(8)), b.const_i32(K_LINE_STRIDE)),
+            b.add(
+                b.mul(b.div(lane_m, b.const_i32(8)), b.const_i32(64)),
+                b.mul(lane_h, b.const_i32(8)),
+            ),
+        )
+
+    def k_tile_base(kbuf):
+        return b.add(k_lane_elem, b.mul(kbuf, b.const_i32(K_BYTES_PER_BUF // 2)))
+
+    def read_k_at(kt, nsub, ks):
+        off = (ks // 4) * K_N_RPT * K_LINE_STRIDE + nsub * 256 + (ks % 4) * 16
+        return b.smem_load_vN(
+            K_lds, _z, _z, _z, b.add(kt, b.const_i32(off)), dtype=dtype, n=8
+        )
+
     def do_qk(kbuf, after_mfma=None, accs=None):
         """QK MFMA: S^T = K@Q^T. mfma(a=K, bv=Q) => key on the 16 per-lane accumulator
         regs (+lane^32), query on lane%32 -- the layout that keeps softmax a cheap
@@ -1190,9 +1221,12 @@ def build_attention_dense(
         if BULK_K:
             return _do_qk_bulk(kbuf, after_mfma, accs)
         s_reg = []
+        kt = k_tile_base(kbuf) if LDS_READ_BASE else None
         for nsub in range(N_SUB):
             acc = b.zero_vec_f32(16)
-            if WIDE_DMA:
+            if LDS_READ_BASE:
+                pass
+            elif WIDE_DMA:
                 kline = b.mod(lane_m, b.const_i32(8))
                 kelem_base = b.add(
                     b.add(
@@ -1206,6 +1240,12 @@ def build_attention_dense(
             else:
                 krow = b.add(b.const_i32(nsub * (32 // K_GROUP)), k_lane_grp)
             for ks in range(K_STEPS):
+                if LDS_READ_BASE:
+                    k_pack = read_k_at(kt, nsub, ks)
+                    acc = mfma_32x32x16_for_dtype(b, dtype, k_pack, q_packs[ks], acc)
+                    if after_mfma is not None:
+                        after_mfma()
+                    continue
                 if WIDE_DMA:
                     kelem = b.add(kelem_base, b.const_i32((ks % 4) * 16))
                     k_pack = b.smem_load_vN(
@@ -1236,8 +1276,11 @@ def build_attention_dense(
         """``bulk_operand_reads``: issue every K operand read of the tile before
         the first QK MFMA (one LDS wait), so the MFMA run has no LDS waits."""
         packs = []
+        kt = k_tile_base(kbuf) if LDS_READ_BASE else None
         for nsub in range(N_SUB):
-            if WIDE_DMA:
+            if LDS_READ_BASE:
+                pass
+            elif WIDE_DMA:
                 kline = b.mod(lane_m, b.const_i32(8))
                 kelem_base = b.add(
                     b.add(
@@ -1249,7 +1292,9 @@ def build_attention_dense(
             else:
                 krow = b.add(b.const_i32(nsub * 32), lane_m)
             for ks in range(K_STEPS):
-                if WIDE_DMA:
+                if LDS_READ_BASE:
+                    packs.append(read_k_at(kt, nsub, ks))
+                elif WIDE_DMA:
                     kelem = b.add(kelem_base, b.const_i32((ks % 4) * 16))
                     packs.append(
                         b.smem_load_vN(
@@ -1384,9 +1429,28 @@ def build_attention_dense(
             ),
             b.mul(b.mod(lane, b.const_i32(4)), b.const_i32(4)),
         )
+        if LDS_READ_BASE:
+            v_lane_elem = b.add(b.mul(vline, b.const_i32(V_LINE_STRIDE)), velem_lane)
+
+    def v_operand_base(vbuf):
+        """lds_read_base: the tile's per-lane V element base (lane offset plus
+        buffer offset), formed once per PV run; otherwise ``vbuf`` itself."""
+        if not LDS_READ_BASE:
+            return vbuf
+        return b.add(v_lane_elem, b.mul(vbuf, b.const_i32(V_BYTES_PER_BUF // 2)))
 
     def read_v(dt, kk_step, vbuf):
-        """CK-1 half-local transposed V A-operand (matches ``relayout_p``)."""
+        """CK-1 half-local transposed V A-operand (matches ``relayout_p``).
+        Under lds_read_base ``vbuf`` is the tile base from ``v_operand_base``."""
+        if LDS_READ_BASE:
+            off = (dt // 2) * V_N_RPT * V_LINE_STRIDE + (dt % 2) * 32 + kk_step * 128
+            a0 = b.ds_read_tr16_b64(
+                V_lds, _z, _z, _z, b.add(vbuf, b.const_i32(off)), dtype=dtype
+            )
+            a1 = b.ds_read_tr16_b64(
+                V_lds, _z, _z, _z, b.add(vbuf, b.const_i32(off + 64)), dtype=dtype
+            )
+            return b.vec_concat(a0, a1)
         if WIDE_DMA:
             velem = b.add(velem_lane, b.const_i32((dt % 2) * 32 + kk_step * 128))
             a0 = b.ds_read_tr16_b64(
@@ -1414,6 +1478,7 @@ def build_attention_dense(
 
     def do_pv(o_acc_in, p_packs, vbuf, after_mfma=None, bulk=False):
         out = list(o_acc_in)
+        vbuf = v_operand_base(vbuf)
         if bulk:
             # bulk_operand_reads: all V operand reads ahead of the PV MFMA run.
             vops = [read_v(dt, kk_step, vbuf) for dt, kk_step in PV_STEPS]
@@ -1451,6 +1516,7 @@ def build_attention_dense(
         p_vals = [[None] * 16 for _ in range(N_SUB)]
         it = iter(slots)
         out = list(o_acc_in)
+        vbuf = v_operand_base(vbuf)
         for dt, kk_step in PV_STEPS:
             out[dt] = mfma_32x32x16_for_dtype(
                 b, dtype, read_v(dt, kk_step, vbuf), p_packs[kk_step], out[dt]
@@ -1506,6 +1572,7 @@ def build_attention_dense(
             lsum[0] = pv if lsum[0] is None else b.vector_fma(pv, one2, lsum[0])
 
         out = list(o_acc_in)
+        vbuf = v_operand_base(vbuf)
         for dt, kk_step in PV_STEPS:
             out[dt] = mfma_32x32x16_for_dtype(
                 b, dtype, read_v(dt, kk_step, vbuf), p_packs[kk_step], out[dt]
