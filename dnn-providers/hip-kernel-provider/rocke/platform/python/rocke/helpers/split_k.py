@@ -311,9 +311,9 @@ def select_split_k_decode(
 
 # Compute-bound skinny GEMMs (M ~ one or two tiles, deep K): the atomic
 # partial traffic grows with the split degree, so the degree is sized to fill
-# the device about once (one CTA per CU) rather than to a fixed slice depth,
-# and each slice keeps at least FILL_MIN_SLICE_K of K so the DTL pipeline
-# prologue/epilogue stays amortised.
+# the device about once (``ctas_per_cu`` CTAs per CU) rather than to a fixed
+# slice depth, and each slice keeps at least FILL_MIN_SLICE_K of K so the DTL
+# pipeline prologue/epilogue stays amortised.
 FILL_MIN_SLICE_K = 1024
 
 
@@ -325,21 +325,23 @@ def select_split_k_fill(
     tile_m: int,
     tile_n: int,
     tile_k: int,
-    target_ctas: int = GFX950_TARGET_CTAS,
+    num_cus: int = GFX950_TARGET_CTAS,
+    ctas_per_cu: int = 1,
     min_slice_k: int = FILL_MIN_SLICE_K,
     env: dict | None = None,
 ) -> SplitKDecision:
     """Split-K degree that fills the device once.
 
-    ``split_k = largest valid factor <= min(target_ctas // base_grid,
-    K // min_slice_k)``, engaged only when ``base_grid < target_ctas / 2``
-    (the :func:`select_split_k` gate). ``ROCKE_GEMM_SPLIT_K`` overrides it
-    exactly as for :func:`select_split_k`.
+    ``split_k = largest valid factor <= min(ctas_per_cu * num_cus // base_grid,
+    K // min_slice_k)``, engaged only when ``base_grid <= num_cus / 2`` (at
+    least half the CUs would otherwise idle). ``ROCKE_GEMM_SPLIT_K`` overrides
+    it exactly as for :func:`select_split_k`.
     """
     env = os.environ if env is None else env
     mode, forced = _parse_env_override(env)
     base_grid = _ceil_div(M, tile_m) * _ceil_div(N, tile_n)
     max_split = max(1, K // tile_k)
+    target_ctas = ctas_per_cu * num_cus
     if mode == "off":
         return SplitKDecision(1, base_grid, target_ctas, "env override: off")
     if mode == "force":
@@ -348,7 +350,7 @@ def select_split_k_fill(
         return SplitKDecision(
             chosen, base_grid, target_ctas, f"env override: forced {forced} -> valid {chosen}"
         )
-    if base_grid >= target_ctas // 2:
+    if 2 * base_grid > num_cus:
         return SplitKDecision(
             1, base_grid, target_ctas, f"grid {base_grid} already fills device"
         )

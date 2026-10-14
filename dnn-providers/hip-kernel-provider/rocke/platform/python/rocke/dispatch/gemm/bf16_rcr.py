@@ -334,6 +334,27 @@ def _split_dtl128(req: GemmRequest, spec: UniversalGemmSpec) -> UniversalGemmSpe
     return split if split.trait.split_k > 1 else spec
 
 
+# M=64 (one 64-row block) is bandwidth-bound on B. The 64x128 DTL tile (2x2
+# warps, depth-2 ring) is small enough for two resident CTAs per CU, so its
+# split-K fills the device twice over.
+_DTL64_M_MAX = 64
+_DTL64_CTAS_PER_CU = 2
+
+
+def _spec_cdna4_dtl64x128(req: GemmRequest, name: str) -> UniversalGemmSpec:
+    tiles = (req.M // 64) * (req.N // 128)
+    return _make_spec(
+        name=name,
+        arch=req.arch,
+        tile=TileSpec(64, 128, 64, 2, 2, 1, 16, 16, 32),
+        trait=_dtl_trait(tiles, depth=2),
+    )
+
+
+def _split_dtl64x128(req: GemmRequest, spec: UniversalGemmSpec) -> UniversalGemmSpec:
+    return apply_split_k_fill(req, spec, ctas_per_cu=_DTL64_CTAS_PER_CU)
+
+
 def _make_candidate(
     *,
     name: str,
@@ -448,6 +469,15 @@ GEMM_BF16_REGISTRY.extend(
             spec_fn=_spec_cdna4_dtl128,
             arches=_CDNA4_DTL_BF16,
             split=_split_dtl128,
+        ),
+        _make_candidate(
+            name="universal_gemm_bf16_cdna4_dtl64x128",
+            spec_id="cdna4_dtl_64x128",
+            priority=7,
+            spec_fn=_spec_cdna4_dtl64x128,
+            arches=_CDNA4_DTL_BF16,
+            shapes=(ShapeRange("M", max=_DTL64_M_MAX),),
+            split=_split_dtl64x128,
         ),
         _make_candidate(
             name="universal_gemm_bf16_cdna_cshuffle",
