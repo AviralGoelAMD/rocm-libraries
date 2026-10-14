@@ -271,6 +271,39 @@ static int make_cfg_raw(int idx, rocke_implicit_gemm_conv_spec_t* spec, const ch
         *arch = "gfx950";
         return 0;
     }
+    case 29:
+    case 30:
+    case 31:
+    case 32:
+    {
+        /* bf16 operands and output: the LDS tiles, the operand loads, the
+         * fragment reads and the MFMA atom all take the operand dtype. 29 is a
+         * plain 3x3, 30 the C=8 7x7 stride-2 stem, 31 merged depthwise (its B
+         * tile loads one element per lane, the scalar typed buffer load), 32
+         * the 3x3 on the direct epilogue. Keep in lockstep with
+         * conv_implicit_gemm_emit.py. */
+        spec->dtype_a = "bf16";
+        spec->dtype_b = "bf16";
+        spec->dtype_d = "bf16";
+        if(idx == 29 || idx == 32)
+        {
+            spec->problem = rocke_conv_problem_make(2, 32, 32, 64, 64, 3, 3, 1, 1, 1, 1, 1, 1);
+        }
+        else if(idx == 30)
+        {
+            spec->problem = rocke_conv_problem_make(2, 56, 56, 8, 64, 7, 7, 2, 2, 3, 3, 1, 1);
+        }
+        else
+        {
+            spec->problem = rocke_conv_problem_make(2, 14, 14, 64, 64, 3, 3, 1, 1, 1, 1, 1, 1);
+            spec->problem.groups = 64;
+            spec->group_merge = 8;
+        }
+        if(idx != 32)
+            spec->epilogue = "cshuffle";
+        *arch = "gfx950";
+        return 0;
+    }
     default:
         return -1;
     }

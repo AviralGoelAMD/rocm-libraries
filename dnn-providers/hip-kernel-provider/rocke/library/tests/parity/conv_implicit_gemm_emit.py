@@ -13,6 +13,7 @@ from kernels.common.conv_implicit_gemm import (
     ImplicitGemmConvSpec,
     build_implicit_gemm_conv,
 )
+from kernels.common._conv_implicit_gemm_common import ConvDataSpec
 from _emit_common import run_emit
 
 import inspect as _inspect
@@ -494,6 +495,39 @@ def _spec_raw(idx: int):
                 warp_tile_k=16,
                 pipeline="mem",
                 epilogue="cshuffle",
+                **kw,
+            ),
+            "gfx950",
+        )
+    if idx in (29, 30, 31, 32):
+        # bf16 operands and output: the LDS tiles, the operand loads, the
+        # fragment reads and the MFMA atom all take the operand dtype. 29 is a
+        # plain 3x3, 30 the C=8 7x7 stride-2 stem, 31 merged depthwise (its B
+        # tile loads one element per lane, the scalar typed buffer load), 32
+        # the 3x3 on the direct epilogue.
+        bf16 = ConvDataSpec(dtype_a="bf16", dtype_b="bf16", dtype_d="bf16")
+        kw = {}
+        if idx in (29, 32):
+            p = _cp(N=2, Hi=32, Wi=32, C=64, K=64, fy=3, fx=3, pH=1, pW=1)
+        elif idx == 30:
+            p = _cp(N=2, Hi=56, Wi=56, C=8, K=64, fy=7, fx=7, sH=2, sW=2, pH=3, pW=3)
+        else:
+            p = _cp(N=2, Hi=14, Wi=14, C=64, K=64, fy=3, fx=3, pH=1, pW=1, groups=64)
+            kw["group_merge"] = 8
+        return (
+            ImplicitGemmConvSpec(
+                problem=p,
+                data=bf16,
+                tile_m=64,
+                tile_n=64,
+                tile_k=64,
+                warp_m=2,
+                warp_n=2,
+                warp_tile_m=32,
+                warp_tile_n=32,
+                warp_tile_k=16,
+                pipeline="mem",
+                epilogue="default" if idx == 32 else "cshuffle",
                 **kw,
             ),
             "gfx950",

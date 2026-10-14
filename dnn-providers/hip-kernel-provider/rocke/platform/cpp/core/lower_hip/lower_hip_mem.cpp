@@ -1223,6 +1223,53 @@ static rocke_status_t _op_tile_buffer_load_vN(rocke_h_lowerer_t* lw, const rocke
     return lw->status;
 }
 
+/* Python _op_tile_buffer_load (dtype-generic scalar): 2-byte types via
+ * raw_buffer_load_b16, 4-byte types via raw_buffer_load_b32, then memcpy into
+ * the scalar result. */
+static rocke_status_t _op_tile_buffer_load(rocke_h_lowerer_t* lw, const rocke_op_t* op)
+{
+    rocke_value_t *rsrc, *voffset, *soffset;
+    const char *res, *tmp, *elem, *hip_t;
+    if(!rocke_h_live(lw))
+    {
+        return lw->status;
+    }
+    if(op->num_operands < 3 || op->num_results < 1)
+    {
+        return rocke_h_fail(lw, ROCKE_ERR_VALUE, "tile.buffer_load: bad operand/result count");
+    }
+    rsrc = op->operands[0];
+    voffset = op->operands[1];
+    soffset = op->operands[2];
+    elem = mem_attr_str(op, "elem_type", "f16");
+    hip_t = rocke_h_type_to_hip(lw, op->results[0]->type);
+    res = rocke_h_name(lw, op->results[0]);
+    tmp = rocke_arena_printf(&lw->b->arena, "_bl_%s", res);
+    if(strcmp(elem, "f16") == 0 || strcmp(elem, "bf16") == 0)
+    {
+        rocke_h_emitf(lw,
+                      "unsigned short %s = (unsigned short)"
+                      "__builtin_amdgcn_raw_buffer_load_b16(%s, %s, %s, 0);",
+                      tmp,
+                      rocke_h_name(lw, rsrc),
+                      rocke_h_name(lw, voffset),
+                      rocke_h_name(lw, soffset));
+        rocke_h_emitf(lw, "%s %s; __builtin_memcpy(&%s, &%s, 2);", hip_t, res, res, tmp);
+    }
+    else
+    {
+        rocke_h_emitf(lw,
+                      "unsigned int %s = (unsigned int)"
+                      "__builtin_amdgcn_raw_buffer_load_b32(%s, %s, %s, 0);",
+                      tmp,
+                      rocke_h_name(lw, rsrc),
+                      rocke_h_name(lw, voffset),
+                      rocke_h_name(lw, soffset));
+        rocke_h_emitf(lw, "%s %s; __builtin_memcpy(&%s, &%s, 4);", hip_t, res, res, tmp);
+    }
+    return lw->status;
+}
+
 /* ============================== buffer store ============================ */
 
 /* Python _op_tile_buffer_store_f16 */
@@ -1716,6 +1763,7 @@ const rocke_h_handler_entry_t* rocke_h_handlers_mem(void)
            {ROCKE_OP_TILE_BUFFER_LOAD_F16, _op_tile_buffer_load_f16},
            {ROCKE_OP_TILE_BUFFER_LOAD_VN_F16, _op_tile_buffer_load_vN_f16},
            {ROCKE_OP_TILE_BUFFER_LOAD_VN, _op_tile_buffer_load_vN},
+           {ROCKE_OP_TILE_BUFFER_LOAD, _op_tile_buffer_load},
            {ROCKE_OP_TILE_BUFFER_STORE_F16, _op_tile_buffer_store_f16},
            {ROCKE_OP_TILE_BUFFER_STORE_VN_F16, _op_tile_buffer_store_vN_f16},
            {ROCKE_OP_TILE_BUFFER_LOAD_BF16, _op_tile_buffer_load_bf16},

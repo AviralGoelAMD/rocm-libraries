@@ -484,12 +484,13 @@ typedef struct rocke_conv_build_ctx
     /* Atom edge + fragment length used by the K-outer transpose-read feed. */
     rocke_value_t* tr_lane_mod4;
     rocke_value_t* tr_grp16;
-    /* Element type handed to the transpose read, mirroring Python's
-     * _smem_dtype. Must not be left NULL: rocke_b_ds_read_tr16_b128 defaults a
-     * NULL dtype to f16, and on gfx1250 that opcode is element-typed, so a bf16
-     * kernel would select .v8f16 and feed half fragments to a bf16 WMMA. The
-     * wave64 ds_read_b64_tr_b16 is type-agnostic, which is why gfx950 parity
-     * never caught it. */
+    /* LDS operand element type, mirroring Python's _smem_dtype (F16 where
+     * Python has None). It types both the row-major fragment reads
+     * (rocke_conv_emit_smem_load) and the transpose read. Must not be left NULL:
+     * rocke_b_ds_read_tr16_b128 defaults a NULL dtype to f16, and on gfx1250
+     * that opcode is element-typed, so a bf16 kernel would select .v8f16 and
+     * feed half fragments to a bf16 WMMA. The wave64 ds_read_b64_tr_b16 is
+     * type-agnostic, which is why gfx950 parity never caught it. */
     const rocke_type_t* tr_dtype;
     rocke_async_tile_loader_t a_loader; /* async A loader (valid iff async)*/
     rocke_async_tile_loader_t b_loader; /* async B loader                  */
@@ -608,9 +609,15 @@ rocke_value_t* rocke_conv_emit_mfma(rocke_ir_builder_t* b,
                                     rocke_value_t* bv,
                                     rocke_value_t* c);
 
-/* _emit_smem_load(b, smem, row, col, n): f16/n==4 fast path else vN. */
-rocke_value_t* rocke_conv_emit_smem_load(
-    rocke_ir_builder_t* b, rocke_value_t* smem, rocke_value_t* row, rocke_value_t* col, int n);
+/* _emit_smem_load(b, smem, row, col, n, smem_dtype=): typed smem_load_vN when
+ * smem_dtype is set and not f16 (NULL == Python None), else the f16 n==4 fast
+ * path / smem_load_vN_f16. */
+rocke_value_t* rocke_conv_emit_smem_load(rocke_ir_builder_t* b,
+                                         rocke_value_t* smem,
+                                         rocke_value_t* row,
+                                         rocke_value_t* col,
+                                         int n,
+                                         const rocke_type_t* smem_dtype);
 
 /* _emit_frag_smem_load(b, src, mn_in_atom, k_in_atom, atom_mn_base, k_tile_base,
  * frag_len): one frag_len-wide operand fragment from a row-major LDS tile
@@ -641,7 +648,8 @@ rocke_value_t* rocke_conv_emit_frag_smem_load(rocke_ir_builder_t* b,
                                               rocke_value_t* k_in_atom,
                                               rocke_value_t* atom_mn_base,
                                               rocke_value_t* k_tile_base,
-                                              int frag_len);
+                                              int frag_len,
+                                              const rocke_type_t* smem_dtype);
 
 /* _apply_accumulator_epilogue(b, epilogue, accs[n], out_accs[n]): apply the
  * static fp32 ConvAccumulatorEpilogue per-lane then re-pack. Identity copies
