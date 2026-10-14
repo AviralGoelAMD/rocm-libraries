@@ -498,6 +498,17 @@ class UnifiedAttention2DTiledSpec:
     # addresses: numerics are bit-identical.
     use_k_lds_xor_swizzle: bool = False
     use_v_lds_xor_swizzle: bool = False
+    # Keep the next-tile K/V async DMA in flight across the barriers that only
+    # publish the current tile. ``b.sync()`` always drains ``vmcnt(0)``, which
+    # cancels the explicit partial ``vmcnt`` wait placed before PV (and before
+    # QK on the staggered / ring schedules), so the prefetch never overlapped
+    # softmax and PV. With this flag those barriers become ``lgkmcnt(0)`` +
+    # ``s_barrier`` behind the explicit counted ``vmcnt`` wait, and the K/V
+    # DMA writes and the K/V operand reads carry disjoint scoped-noalias
+    # metadata (``lds_alias``) so the backend waitcnt pass stops inserting its
+    # own ``vmcnt(0)`` in front of the operand reads. Ordering between a tile's
+    # DMA and its reads is carried entirely by the explicit waits + barriers.
+    use_lds_dma_overlap: bool = False
 
     def __post_init__(self):
         if self.num_warps not in (1, 2, 4, 8):
@@ -819,6 +830,21 @@ class UnifiedAttention2DTiledSpec:
             raise ValueError("use_k_lds_xor_swizzle replaces use_kq_lds_pad")
         if self.use_v_lds_xor_swizzle and not self.use_transposed_half_local_pv:
             raise ValueError("use_v_lds_xor_swizzle requires use_transposed_half_local_pv")
+        if self.use_lds_dma_overlap:
+            if not (self.use_mfma_32x32 and self.use_transposed_qk_32x32):
+                raise ValueError("use_lds_dma_overlap requires the transposed 32x32 path")
+            if self.kv_storage_dtype is not None:
+                raise ValueError("use_lds_dma_overlap does not support FP8 KV")
+            if self.use_grouped_kv2_softmax:
+                raise ValueError("use_lds_dma_overlap does not support grouped_kv2")
+            if self.use_staggered_iter_wait and self.use_early_v_schedule:
+                # early-V issues V[i+1] before K[i+1]; the staggered counted
+                # wait assumes K is the older op and would publish a V tile
+                # that is still in flight once the barrier stops draining.
+                raise ValueError(
+                    "use_lds_dma_overlap does not support staggered_iter_wait "
+                    "with early_v_schedule"
+                )
 
     @property
     def num_queries_per_kv(self) -> int:
@@ -933,6 +959,7 @@ class UnifiedAttention2DTiledSpec:
             "rqb" if self.use_reverse_q_block_order else "",
             "kswz" if self.use_k_lds_xor_swizzle else "",
             "vswz" if self.use_v_lds_xor_swizzle else "",
+            "dmaov" if self.use_lds_dma_overlap else "",
         )
 
 
@@ -1950,6 +1977,23 @@ def build_unified_attention_2d_tiled(
     SWZ_CPR = HD // 8
     SWZ_RPP_SHIFT = max(0, (128 // HD).bit_length() - 1)
     SWZ_HD_SHIFT = HD.bit_length() - 1
+    # ``use_lds_dma_overlap``: scoped-noalias tags for the K/V DMA writes and
+    # the K/V operand reads (``None`` = untagged, the default emission).
+    LDS_DMA_OVERLAP = bool(spec.use_lds_dma_overlap)
+    LDS_DMA_TAG = "dma" if LDS_DMA_OVERLAP else None
+    LDS_READ_TAG = "read" if LDS_DMA_OVERLAP else None
+
+    def _kv_publish_sync() -> None:
+        """Barrier that follows an explicit ``s_waitcnt`` in the KV loop.
+
+        ``b.sync()`` adds ``vmcnt(0)``, draining every in-flight prefetch;
+        under ``use_lds_dma_overlap`` the caller's counted ``vmcnt`` is the
+        only VMEM wait, so the barrier drains LDS ops only.
+        """
+        if LDS_DMA_OVERLAP:
+            b.sync_lds_only()
+        else:
+            b.sync()
 
     def _k_swz_halves(row: Value) -> Value:
         chunk = b.land(
@@ -2223,7 +2267,8 @@ def build_unified_attention_2d_tiled(
             # ``dsl_docs/primitives/intrinsics_and_primitives.md`` as the
             # right hint for K-loop streaming tile loads.
             b.async_buffer_load_lds_addr(
-                k_rsrc, k_dst, voff, zero_soff, 4, coherency=CACHE_STREAM
+                k_rsrc, k_dst, voff, zero_soff, 4, coherency=CACHE_STREAM,
+                lds_alias=LDS_DMA_TAG,
             )
 
     def _issue_v_load_runtime(kv_tile_idx: Value, buf_idx: Value) -> None:
@@ -2282,7 +2327,8 @@ def build_unified_attention_2d_tiled(
             # re-read within this kernel; see _issue_k_load_runtime for
             # the rationale.
             b.async_buffer_load_lds_addr(
-                v_rsrc, v_dst, voff, zero_soff, 4, coherency=CACHE_STREAM
+                v_rsrc, v_dst, voff, zero_soff, 4, coherency=CACHE_STREAM,
+                lds_alias=LDS_DMA_TAG,
             )
 
     # ---------------- FP8 K/V cache: async DMA loader (round 2) ----------------
@@ -2806,9 +2852,14 @@ def build_unified_attention_2d_tiled(
                 b.mul(b.mod(k_row, b.const_i32(KQ_SLAB_ROWS)), b.const_i32(HD)),
                 k_off,
             )
-            return b.smem_load_vN(K_lds, buf_idx, slab, col_in_slab, dtype=dtype, n=8)
+            return b.smem_load_vN(
+                K_lds, buf_idx, slab, col_in_slab, dtype=dtype, n=8,
+                lds_alias=LDS_READ_TAG,
+            )
         if not K_FP8_MFMA:
-            return b.smem_load_vN(K_lds, buf_idx, k_row, k_off, dtype=dtype, n=8)
+            return b.smem_load_vN(
+                K_lds, buf_idx, k_row, k_off, dtype=dtype, n=8, lds_alias=LDS_READ_TAG
+            )
         if FP8_NATIVE_QK:
             # Native fp8 QK: hand the raw fp8 K straight to the fp8 MFMA --
             # no dequant. (k_scale is folded into qk_scale post-MFMA.)
@@ -3266,7 +3317,7 @@ def build_unified_attention_2d_tiled(
             b.s_waitcnt(vmcnt=kv_calls_per_tile, lgkmcnt=kv_calls_per_tile)
         else:
             b.s_waitcnt(vmcnt=0, lgkmcnt=0)
-        b.sync()
+        _kv_publish_sync()
         # STEP 2 lever (modes 0/1): canned iglp interleave for the whole loop
         # body. Placed once at the top of the main loop body (after the iter-start
         # K drain) per the iglp_opt contract; it owns the schedule, so the manual
@@ -3963,7 +4014,7 @@ def build_unified_attention_2d_tiled(
             # LDS-visible) while leaving the newest K[i+2] prefetch streaming into
             # its ring slot. The s_barrier then publishes V[i] to all PV reads.
             b.s_waitcnt(vmcnt=kv_calls_per_tile, lgkmcnt=kv_calls_per_tile)
-            b.sync()
+            _kv_publish_sync()
         elif GROUPED_KV2:
             # Simplicity-first prototype: wait for V0 and the next group's K
             # prefetch together. This proves the grouped softmax/PV dataflow;
@@ -3983,7 +4034,7 @@ def build_unified_attention_2d_tiled(
             # V[i+1] (K-first, 2x). PV reads V[i] from cur_buf, so drain V[i]
             # while leaving the two next-tile prefetches (2x) pending.
             b.s_waitcnt(vmcnt=2 * kv_calls_per_tile, lgkmcnt=2 * kv_calls_per_tile)
-            b.sync()
+            _kv_publish_sync()
         elif V_DOUBLE_BUF:
             # Double-buffered V: current V[i] (cur_buf) was prefetched last iter
             # and is already drained-ready by the iter-start wait. The only
@@ -3991,8 +4042,13 @@ def build_unified_attention_2d_tiled(
             # V[i+1] (before QK) and K[i+1] (after QK), kv_calls_per_tile each --
             # so leave BOTH pending (2x) and do NOT stall PV on them. PV reads
             # V[i] from cur_buf, already visible from the iter-start sync.
-            b.s_waitcnt(vmcnt=2 * kv_calls_per_tile, lgkmcnt=2 * kv_calls_per_tile)
-            b.sync()
+            # Under ``use_lds_dma_overlap`` the barrier is dropped: it
+            # published nothing (V[i] is already visible), and the next-tile
+            # writes target the other slot, whose last readers (PV[i-1])
+            # retired before the iter-start ``lgkmcnt(0)`` + barrier.
+            if not LDS_DMA_OVERLAP:
+                b.s_waitcnt(vmcnt=2 * kv_calls_per_tile, lgkmcnt=2 * kv_calls_per_tile)
+                _kv_publish_sync()
         elif K_SINGLE_BUFFER:
             # single K slot. The only in-flight async op here is V[i] (issued
             # before QK; the next-K prefetch was DEFERRED). Fully drain it so PV's
@@ -4000,7 +4056,7 @@ def build_unified_attention_2d_tiled(
             # QK[i]'s K_lds ds_reads are retired, so the single K slot is free --
             # K[i+1] is re-issued immediately below (overlaps the PV MFMA).
             b.s_waitcnt(vmcnt=0, lgkmcnt=0)
-            b.sync()
+            _kv_publish_sync()
             # Re-issue the next-K prefetch into the single slot. The above
             # s_barrier guarantees no QK[i] read can still touch K_lds, so this
             # write cannot WAR-race. K[i+1]'s DMA streams during PV[i]; the next
@@ -4012,7 +4068,7 @@ def build_unified_attention_2d_tiled(
             # exactly the next-K stream. Apply the same idea to lgkmcnt so we do
             # not wait for the next-K LDS writes before PV.
             b.s_waitcnt(vmcnt=kv_calls_per_tile, lgkmcnt=kv_calls_per_tile)
-            b.sync()
+            _kv_publish_sync()
 
         # ---- acc *= alpha, acc += P @ V ----
         # For ``M_ATOMS_PER_WARP=2`` we stack two MFMAs in M per (n, k) atom:
@@ -4067,6 +4123,7 @@ def build_unified_attention_2d_tiled(
                                 lane_col32=lane_col32,
                                 dtype=dtype,
                                 col_xor_of_row=_v_swz_halves if V_LDS_SWZ else None,
+                                lds_alias=LDS_READ_TAG,
                             )
                             b_p_elems = []
                             for kk in range(8):
@@ -4093,7 +4150,8 @@ def build_unified_attention_2d_tiled(
                                     b.mul(lane_half32, b.const_i32(8)),
                                 )
                                 v1 = b.smem_load_vN(
-                                    V_lds, v_buf, v_row, v_dim32, dtype=dtype, n=1
+                                    V_lds, v_buf, v_row, v_dim32, dtype=dtype, n=1,
+                                    lds_alias=LDS_READ_TAG,
                                 )
                                 a_v_elems.append(b.vec_extract(v1, 0))
                             # Then assemble the P operand. Each kk picks (k0,

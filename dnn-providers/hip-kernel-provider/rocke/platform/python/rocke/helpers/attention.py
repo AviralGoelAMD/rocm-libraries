@@ -802,6 +802,7 @@ def pv32_v_load_paired(
     lane_col32: Value,
     dtype: Type,
     col_xor_of_row=None,
+    lds_alias=None,
 ) -> Value:
     """Promoted 32x32x16 PV V-load (P50): two paired ``ds_read_tr16_b64``
     + concat → ``<8 x dtype>`` per lane.
@@ -830,6 +831,7 @@ def pv32_v_load_paired(
     ``col_xor_of_row`` (optional) maps an LDS row to the half-index XOR of a
     swizzled V layout (logical column ``c`` of row ``r`` stored at
     ``c ^ col_xor_of_row(r)``); ``None`` reads the natural row-major tile.
+    ``lds_alias`` tags both reads (see :meth:`IRBuilder.ds_read_tr16_b64`).
     """
     col_group16 = b.mul(b.div(lane_col32, b.const_i32(16)), b.const_i32(16))
     tr_col32 = b.add(
@@ -847,6 +849,10 @@ def pv32_v_load_paired(
     col = b.add(b.const_i32(n * 32), tr_col32)
     col_r0 = col if col_xor_of_row is None else b.xor(col, col_xor_of_row(tr_row_base32))
     col_r1 = col if col_xor_of_row is None else b.xor(col, col_xor_of_row(tr_row_hi))
-    A_r0 = b.ds_read_tr16_b64(V_lds, v_buf, tr_row_base32, col_r0, dtype=dtype)
-    A_r1 = b.ds_read_tr16_b64(V_lds, v_buf, tr_row_hi, col_r1, dtype=dtype)
+    A_r0 = b.ds_read_tr16_b64(
+        V_lds, v_buf, tr_row_base32, col_r0, dtype=dtype, lds_alias=lds_alias
+    )
+    A_r1 = b.ds_read_tr16_b64(
+        V_lds, v_buf, tr_row_hi, col_r1, dtype=dtype, lds_alias=lds_alias
+    )
     return b.vec_concat(A_r0, A_r1)
