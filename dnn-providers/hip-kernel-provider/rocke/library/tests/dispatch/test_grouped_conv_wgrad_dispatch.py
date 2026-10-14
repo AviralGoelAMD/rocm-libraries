@@ -306,7 +306,14 @@ class TestGroupedDgradDispatch(unittest.TestCase):
     """
 
     def _select(self, req):
-        cands = [c for c in conv_grouped_candidates("dgrad") if c.admits(req)[0]]
+        # The implicit-GEMM candidate only: grouped stride-1 cpg 4..16 requests
+        # are also admitted by the direct grouped_dgrad candidate, which
+        # test_grouped_conv_prepass_dispatch covers.
+        cands = [
+            c
+            for c in conv_grouped_candidates("dgrad")
+            if c.admits(req)[0] and not c.name.startswith("direct_")
+        ]
         self.assertEqual(len(cands), 1, f"expected exactly one candidate: {cands}")
         return cands[0], cands[0].select_spec(req)
 
@@ -589,13 +596,6 @@ class TestWgradMergeDegree(unittest.TestCase):
             self.assertEqual(spec.group_merge, want, f"{Y}x{X}")
             self.assertEqual(spec.tile_n, tile_n, f"{Y}x{X}")
 
-    def test_degree_is_ladder_capped_not_only_tile_capped(self):
-        # A 1x1 filter would fit 64 groups in the 64-wide tile and still have
-        # room; the degree stops at 64 because that is the last rung the kernel
-        # offers. (Checked on the selector directly: grouped pointwise wgrad is
-        # refused upstream, so this shape never reaches dispatch.)
-        from dispatch.grouped_convolution import _wgrad_merge_degree
-
     def test_short_reduction_keeps_the_shipped_tile(self):
         # Batch 1, 14x14: N*Ho*Wo = 196. A 3x3 filter already merges 4 groups
         # at the 64-wide tile, so the tile is not widened; a 7x7 one cannot
@@ -610,6 +610,13 @@ class TestWgradMergeDegree(unittest.TestCase):
         # 5x5 stride 2 at batch 1 (EfficientNet 28->14): merges 2 at 64, keeps it.
         req = self._dw(240, 5, 5, N=1, Hi=28, Wi=28, stride_h=2, stride_w=2)
         self.assertEqual(dispatch_conv_grouped(req).spec.tile_n, 64)
+
+    def test_degree_is_ladder_capped_not_only_tile_capped(self):
+        # A 1x1 filter would fit 64 groups in the 64-wide tile and still have
+        # room; the degree stops at 64 because that is the last rung the kernel
+        # offers. (Checked on the selector directly: grouped pointwise wgrad is
+        # refused upstream, so this shape never reaches dispatch.)
+        from dispatch.grouped_convolution import _wgrad_merge_degree
 
         self.assertEqual(_wgrad_merge_degree(self._dw(2048, 1, 1)), 64)
 
