@@ -44,6 +44,15 @@
  * the driver part-file via an extern prototype of its own. */
 void rocke_gemm_build_populate_ctx(rocke_gemm_build_ctx_t* ctx);
 
+/* Python _a_src_row / _b_src_row: the pad_m / pad_n clamped global load row
+ * (row itself when the axis is unpadded, so unpadded specs emit no op). */
+static rocke_value_t* gemm_src_row(rocke_ir_builder_t* b, rocke_value_t* row, rocke_value_t* lim)
+{
+    return lim == NULL ? row : rocke_b_smin(b, row, lim);
+}
+#define A_SRC_ROW(rvar) gemm_src_row(b, (rvar), ctx->a_row_lim)
+#define B_SRC_ROW(rvar) gemm_src_row(b, (rvar), ctx->b_row_lim)
+
 /* ===================================================================== *
  *  build prologue -- POPULATE rocke_gemm_build_ctx_t
  *
@@ -466,7 +475,7 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
              * its second (the k_off add). C arg eval order is unspecified -- pin
              * with temporaries so the SSA order matches. */
             rocke_value_t* a_row_term
-                = rocke_b_mul(b, rocke_b_add(b, ctx->block_m_off, row), ctx->K);
+                = rocke_b_mul(b, rocke_b_add(b, ctx->block_m_off, A_SRC_ROW(row)), ctx->K);
             rocke_value_t* a_k_term = rocke_b_add(b, k_off, rocke_gemm_swz_col(ctx, col, row));
             rocke_value_t* off_elems
                 = rocke_b_add(b, ctx->batch_off_a, rocke_b_add(b, a_row_term, a_k_term));
@@ -496,7 +505,7 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
             rocke_value_t* col = rocke_b_mul(b, col_v, ctx->dtl_c_halves_per_chunk);
             /* Same operand-order pinning as the A path above. */
             rocke_value_t* b_row_term
-                = rocke_b_mul(b, rocke_b_add(b, ctx->block_n_off, row), ctx->K);
+                = rocke_b_mul(b, rocke_b_add(b, ctx->block_n_off, B_SRC_ROW(row)), ctx->K);
             rocke_value_t* b_k_term = rocke_b_add(b, k_off, rocke_gemm_swz_col(ctx, col, row));
             rocke_value_t* off_elems
                 = rocke_b_add(b, ctx->batch_off_b, rocke_b_add(b, b_row_term, b_k_term));
@@ -570,7 +579,7 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
                 rocke_value_t* valid = PADK_VALID(elem_col);
                 rocke_value_t* safe_col
                     = rocke_b_select(b, valid, elem_col, rocke_b_const_i32(b, 0));
-                rocke_value_t* gidx[3] = {rocke_b_const_i32(b, 0), row, safe_col};
+                rocke_value_t* gidx[3] = {rocke_b_const_i32(b, 0), A_SRC_ROW(row), safe_col};
                 rocke_value_t* raw = rocke_tile_window_load_scalar(b, &a_global_tile, gidx, 3);
                 comps[i] = MASK_STORAGE(raw, valid);
             }
@@ -584,14 +593,14 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
         }
         else if(load_vec == 1)
         {
-            rocke_value_t* gidx[3] = {rocke_b_const_i32(b, 0), row, col};
+            rocke_value_t* gidx[3] = {rocke_b_const_i32(b, 0), A_SRC_ROW(row), col};
             rocke_value_t* a_val = rocke_tile_window_load_scalar(b, &a_global_tile, gidx, 3);
             rocke_value_t* lidx[2] = {LD_ROW(row, ctx->block_m), rocke_gemm_swz_col(ctx, col, row)};
             rocke_tile_window_store_scalar(b, &a_lds_tile, lidx, 2, a_val, 0);
         }
         else
         {
-            rocke_value_t* gidx[3] = {rocke_b_const_i32(b, 0), row, col};
+            rocke_value_t* gidx[3] = {rocke_b_const_i32(b, 0), A_SRC_ROW(row), col};
             rocke_value_t* a_val = rocke_tile_window_load_vec(b, &a_global_tile, gidx, 3, load_vec);
             rocke_value_t* lidx[2] = {LD_ROW(row, ctx->block_m), rocke_gemm_swz_col(ctx, col, row)};
             rocke_tile_window_store_vec(b, &a_lds_tile, lidx, 2, a_val, load_vec);
@@ -687,7 +696,7 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
                     rocke_value_t* valid = PADK_VALID(elem_col);
                     rocke_value_t* safe_col
                         = rocke_b_select(b, valid, elem_col, rocke_b_const_i32(b, 0));
-                    rocke_value_t* gidx[3] = {rocke_b_const_i32(b, 0), row, safe_col};
+                    rocke_value_t* gidx[3] = {rocke_b_const_i32(b, 0), B_SRC_ROW(row), safe_col};
                     rocke_value_t* raw = rocke_tile_window_load_scalar(b, &b_global_tile, gidx, 3);
                     comps[i] = MASK_STORAGE(raw, valid);
                 }
@@ -702,7 +711,7 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
             }
             else if(load_vec == 1)
             {
-                rocke_value_t* gidx[3] = {rocke_b_const_i32(b, 0), row, col};
+                rocke_value_t* gidx[3] = {rocke_b_const_i32(b, 0), B_SRC_ROW(row), col};
                 rocke_value_t* b_val = rocke_tile_window_load_scalar(b, &b_global_tile, gidx, 3);
                 rocke_value_t* lidx[2]
                     = {LD_ROW(row, ctx->block_n), rocke_gemm_swz_col(ctx, col, row)};
@@ -710,7 +719,7 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
             }
             else
             {
-                rocke_value_t* gidx[3] = {rocke_b_const_i32(b, 0), row, col};
+                rocke_value_t* gidx[3] = {rocke_b_const_i32(b, 0), B_SRC_ROW(row), col};
                 rocke_value_t* b_val
                     = rocke_tile_window_load_vec(b, &b_global_tile, gidx, 3, load_vec);
                 rocke_value_t* lidx[2]

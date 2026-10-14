@@ -162,6 +162,8 @@ typedef struct rocke_gemm_build_ctx
     /* ---- per-CTA tile origins (SGPR-pinned SSA) -- */
     rocke_value_t* block_m_off; /* row tile base (chiplet-swizzle aware)     */
     rocke_value_t* block_n_off; /* col tile base                             */
+    rocke_value_t* a_row_lim; /* pad_m: M-1-block_m_off, else NULL        */
+    rocke_value_t* b_row_lim; /* pad_n: N-1-block_n_off, else NULL        */
 
     /* ---- AB LDS double-buffer plan (_ab_lds_plan) -- */
     bool prefetch; /* _prefetch = trait.dtl_prefetch            */

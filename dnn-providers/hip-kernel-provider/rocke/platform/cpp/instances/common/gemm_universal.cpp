@@ -1205,6 +1205,23 @@ rocke_kernel_def_t* rocke_build_universal_gemm(rocke_ir_builder_t* b,
             = rocke_b_to_sgpr_u32(b, rocke_b_mul(b, rocke_b_block_id_x(b), ctx.c_block_n));
     }
 
+    /* pad_m / pad_n: the last M / N tile overhangs the operand. Clamp the
+     * overhanging rows' global *load* row to the last valid row so no A/B
+     * access leaves the allocation. Those rows' results are never stored (the
+     * epilogue masks them). LDS placement keeps the unclamped row. Unpadded
+     * specs emit nothing here (ctx is zeroed, so the limits stay NULL).
+     * Python: _a_row_lim / _b_row_lim. */
+    if(spec->trait.pad_m)
+    {
+        rocke_value_t* m_last = rocke_b_sub(b, ctx.M, rocke_b_const_i32(b, 1));
+        ctx.a_row_lim = rocke_b_sub(b, m_last, ctx.block_m_off);
+    }
+    if(spec->trait.pad_n)
+    {
+        rocke_value_t* n_last = rocke_b_sub(b, ctx.N, rocke_b_const_i32(b, 1));
+        ctx.b_row_lim = rocke_b_sub(b, n_last, ctx.block_n_off);
+    }
+
     /* ---- AB LDS double-buffer plan (_ab_lds_plan) -- */
     ctx.prefetch = spec->trait.dtl_prefetch;
     if(ctx.prefetch && !spec->trait.direct_to_lds)
