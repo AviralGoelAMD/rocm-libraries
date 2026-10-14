@@ -713,15 +713,20 @@ def _enable_k_single_buffer(problem: UnifiedAttentionProblem) -> bool:
 
 
 def _d256_gfx950_cohort(problem: "UnifiedAttentionProblem") -> bool:
-    """Arch-agnostic cohort for the gfx950 bf16 D256 prefill fast path.
+    """Arch-agnostic cohort for the gfx950 bf16/fp16 D256 prefill fast path.
 
     The arch gate is applied by callers (``_d256_gfx950_fast`` uses the resolved
     device arch; the ``dispatch.attention`` candidate uses the request arch), so
     this stays CPU-pure and is the single source of truth for the cohort shape.
+
+    fp16 shares the bf16 body (the 32x32 atom, transpose reads and softmax are
+    dtype-generic). Without it fp16 D256 falls to the narrow single-warp
+    geometry, whose double-buffered T=4*block_size K/V tile exceeds the gfx950
+    LDS cap at block_size=64 and fails to compile.
     """
     return (
         problem.head_size == 256
-        and problem.dtype == "bf16"
+        and problem.dtype in ("bf16", "fp16")
         and not problem.use_fp8
         and problem.sliding_window == 0
         and problem.softcap == 0
@@ -4597,7 +4602,14 @@ def _select_2d_compile_backend(problem: UnifiedAttentionProblem) -> str:
     # backend until the system hipcc is upgraded / the path is moved onto
     # register-P for hd256. The perf delta is the ~5% hipcc-scheduler edge,
     # which correctness strictly outranks.
-    if not _enable_register_pv(problem) and not _enable_mfma_32x32(problem):
+    # The D256 fast path is the transposed 32x32 body (P^T stays in registers),
+    # not the P_LDS transposed-read path the pin guards, so it keeps hipcc
+    # eligibility for fp16 as well as bf16.
+    if (
+        not _d256_gfx950_fast(problem)
+        and not _enable_register_pv(problem)
+        and not _enable_mfma_32x32(problem)
+    ):
         return "llvm"
     total_work = problem.num_seqs * max(problem.max_seqlen_q, 1)
     if problem.max_seqlen_q > 512 and total_work > 1024:

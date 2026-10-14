@@ -88,7 +88,7 @@ GFX950_TUNING_VARIANTS = tuple(_variants())
 
 
 def _make_gfx950_d256_candidate() -> KernelCandidate:
-    """Fast gfx950 bf16 head_size-256 prefill kernel — 32x32 transposed stack
+    """Fast gfx950 bf16/fp16 head_size-256 prefill kernel — 32x32 transposed stack
     with FA3-style softmax<->MFMA interleave (mode2/g4) + slab-padded K_lds.
 
     Registered at priority 5 so it outranks the generic unified_2d candidate
@@ -123,7 +123,7 @@ def _make_gfx950_d256_candidate() -> KernelCandidate:
         from kernels.common.attention_unified import _d256_gfx950_cohort
 
         if not _d256_gfx950_cohort(problem):
-            return False, "not the gfx950 bf16 D256 prefill fast-path cohort"
+            return False, "not the gfx950 bf16/fp16 D256 prefill fast-path cohort"
         return True, "ok"
 
     def select(req: OperatorRequest) -> AttentionSpec:
@@ -154,7 +154,7 @@ def _make_gfx950_d256_candidate() -> KernelCandidate:
         priority=5,
         capability=Capability(
             arches=("gfx950",),
-            dtypes=("bf16",),
+            dtypes=("bf16", "fp16"),
             shapes=(
                 ShapeRange("hdim_q", allowed=(256,)),
                 ShapeRange("kv_block_size", allowed=UNIFIED_BLOCK_SIZES),
