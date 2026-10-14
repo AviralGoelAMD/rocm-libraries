@@ -385,7 +385,8 @@ class TestDenseGeometrySpec(unittest.TestCase):
                 dtype="fp16",
             )
         )
-        defaults = DENSE_TILE_GEOMETRIES["default"]
+        # The grid candidate starts at the 128-row tile.
+        defaults = DENSE_TILE_GEOMETRIES["bm128"]
         layout = GFX950_DENSE_LAYOUTS["default"]
         self.assertEqual(spec.block_m, defaults["block_m"])
         self.assertEqual(spec.block_n, defaults["block_n"])
@@ -924,10 +925,10 @@ class TestGfx950DenseCandidates(unittest.TestCase):
         self.assertEqual((spec.block_m, spec.block_n), (128, 64))
         self.assertTrue(spec.persistent)
         self.assertTrue(spec.wide_lds_dma)
-        for spec_id in (_GRID, _PERSIST):
+        for spec_id, block_m in ((_GRID, 128), (_PERSIST, 256)):
             with self.subTest(spec_id=spec_id):
                 spec = _spec(req, spec_id, block_n=128)
-                self.assertEqual((spec.block_m, spec.block_n), (256, 128))
+                self.assertEqual((spec.block_m, spec.block_n), (block_m, 128))
         with self.assertRaises(ValueError):
             _spec(req, _WIDE, block_n=128)
 
@@ -935,8 +936,8 @@ class TestGfx950DenseCandidates(unittest.TestCase):
         req = _gfx950_dense_req(
             hdim_q=128, hdim_v=128, nhead_q=32, nhead_k=8, seqlen_q=384, seqlen_k=384
         )
-        self.assertTrue(_spec(req, _GRID).ragged)
-        self.assertFalse(_spec(req, _GRID, block_m=128).ragged)
+        self.assertFalse(_spec(req, _GRID).ragged)
+        self.assertTrue(_spec(req, _GRID, block_m=256).ragged)
 
     def test_wide_dma_starts_at_a_non_ragged_tile(self):
         """Wide DMA has no ragged path: where 256x64 is ragged its default is

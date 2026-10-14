@@ -51,6 +51,10 @@ def _gfx950_dense_inert_knobs(spec) -> dict:
         and spec.pv_sched_group_ds_read != defaults["pv_sched_group_ds_read"]
     ):
         inert["pv_sched_group_ds_read"] = "read only while the template is on"
+    if spec.grid_order != defaults["grid_order"] and spec.resolved_grid_order() != (
+        spec.grid_order
+    ):
+        inert["grid_order"] = "read only by the dense-batch grid body"
     return inert
 
 
@@ -94,6 +98,7 @@ _DENSE_ARCH: Mapping[str, _DenseTuningArch] = {
             "num_persistent": lambda s: bool(s.persistent),
             "persist_decode": lambda s: bool(s.persistent),
             "interleave": lambda s: bool(s.persistent) and bool(s.causal),
+            "grid_order": lambda s: not s.persistent and not s.varlen and not s.paged,
             # Wide DMA locks the K/V slab pads.
             "lds_k_row_pad": lambda s: int(s.head_size) == 128 and not s.wide_lds_dma,
             "lds_v_row_pad": lambda s: int(s.head_size) == 128 and not s.wide_lds_dma,

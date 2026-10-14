@@ -2864,7 +2864,10 @@ class TestAttentionDenseGfx950CodegenKnobs(unittest.TestCase):
         self.assertEqual(persistent.resolved_exp_per_pv_step(), 1)
         for spec in (grid, persistent):
             self.assertTrue(spec.resolved_pv_sched_fence())
-            self.assertTrue(spec.resolved_pv_sched_group_template())
+        # The PV sched_group template is on only for the persistent body.
+        self.assertFalse(grid.resolved_pv_sched_group_template())
+        self.assertTrue(persistent.resolved_pv_sched_group_template())
+        for spec in (grid, persistent):
             self.assertEqual(spec.resolved_iglp_mode(), -1)
             self.assertEqual(spec.resolved_pv_loop_order(), "d_major")
         self.assertFalse(wide.resolved_pv_sched_fence())

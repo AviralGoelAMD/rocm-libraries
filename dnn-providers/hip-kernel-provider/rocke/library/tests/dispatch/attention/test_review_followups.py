@@ -136,7 +136,7 @@ class TestReviewFollowups(unittest.TestCase):
             hdim_v=64,
         )
         spec = attention_tuning_spec(req, "gfx950_dense_grid").kernel_spec
-        self.assertEqual((spec.block_m, spec.block_n), (256, 64))
+        self.assertEqual((spec.block_m, spec.block_n), (128, 64))
         self.assertFalse(spec.persistent)
 
     def test_gfx942_dense_binding_rejects_paged_block_tables(self):

@@ -2990,6 +2990,16 @@ def cases():
         ("fp16_h64_sq512", {"dtype": "fp16", "head_size": 64}),
         ("bn128_sq512", {"block_n": 128}),
         ("noncausal_sq512", {"causal": False}),
+        # Grid body with the previous policy: block-id order, per-tile row-sum
+        # exchange, PV sched_group template on.
+        (
+            "grid_legacy_order_sq512",
+            {
+                "grid_order": "default",
+                "defer_row_sum": False,
+                "pv_sched_group_template": True,
+            },
+        ),
         # --- bottom-right diagonal. Four cases pin the aligned and arbitrary
         # shifted-diagonal routes, the sink composition, and the BM128 geometry.
         (
@@ -3023,6 +3033,10 @@ def cases():
         ),
         # --- persistent (grid-stride) grid + decode variants ---
         ("persistent_causal_sq512", {"persistent": True, "num_persistent": 256}),
+        (
+            "persist_rowsum_per_tile_sq512",
+            {"persistent": True, "num_persistent": 256, "defer_row_sum": False},
+        ),
         (
             "persist_qbmaj_sq512",
             {"persistent": True, "num_persistent": 256, "persist_decode": "qb_major"},

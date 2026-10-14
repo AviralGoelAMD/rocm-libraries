@@ -187,7 +187,8 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # Depth-1 sched_barrier before PV. None: on unless wide_lds_dma (IGLP owns it).
     pv_sched_fence: Optional[bool] = field(default=None, kw_only=True)
     pv_sched_fence_mask: int = field(default=0, kw_only=True)
-    # Per-PV-step sched_group_barrier template. None: on unless wide_lds_dma.
+    # Per-PV-step sched_group_barrier template. None: on for the persistent
+    # body without wide_lds_dma, off for the grid body and wide_lds_dma.
     # MFMA/VALU/TRANS populations follow what each step emits.
     pv_sched_group_template: Optional[bool] = field(default=None, kw_only=True)
     pv_sched_group_ds_read: int = field(default=2, kw_only=True)
@@ -205,16 +206,17 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # below 4: narrower fp16 stores change which f32->f16 conversion the backend
     # selects for some elements, moving them by one ulp, so fp16 is fixed at 4.
     o_store_width: int = field(default=4, kw_only=True)
-    # Grid body only: map the launch grid's linear workgroup id to work items.
+    # Grid body only (not read by the persistent body, varlen, or paged): map
+    # the launch grid's linear workgroup id to work items.
     # "default": block (x, y, z) = (query block, query head, batch).
     # "lpt": query heads fastest, then batch, then query block; causal visits
     # the query blocks from the last (most KV tiles) to the first, so the
     # longest work items are dispatched first. The grid shape is unchanged.
-    grid_order: str = field(default="default", kw_only=True)
+    grid_order: str = field(default="lpt", kw_only=True)
     # Keep the softmax row sum as a per-half-wave partial across the KV loop
     # and combine the two halves once before the epilogue, instead of a
     # cross-half exchange per KV tile.
-    defer_row_sum: bool = field(default=False, kw_only=True)
+    defer_row_sum: bool = field(default=True, kw_only=True)
 
     def resolved_exp_per_pv_step(self) -> int:
         if self.exp_per_pv_step is not None:
@@ -232,8 +234,14 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
 
     def resolved_pv_sched_group_template(self) -> bool:
         if self.pv_sched_group_template is None:
-            return not self.wide_lds_dma
+            return self.persistent and not self.wide_lds_dma
         return bool(self.pv_sched_group_template)
+
+    def resolved_grid_order(self) -> str:
+        """The order the grid body emits: varlen and paged keep the block-id map."""
+        if self.persistent or self.varlen or self.paged:
+            return "default"
+        return self.grid_order
 
     def resolved_iglp_mode(self) -> int:
         if self.iglp_mode is None:
@@ -399,10 +407,6 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
         if self.grid_order not in ("default", "lpt"):
             raise ValueError(
                 f"grid_order must be 'default' or 'lpt', got {self.grid_order!r}"
-            )
-        if self.grid_order != "default" and (self.varlen or self.paged):
-            raise ValueError(
-                "grid_order='lpt' is implemented for dense batch layouts only"
             )
 
     @property
@@ -772,7 +776,7 @@ def build_attention_dense(
         rcp_ln2 = b.const_f32(LOG2E)
         one_f = b.const_f32(1.0)
 
-    if spec.grid_order == "lpt":
+    if spec.resolved_grid_order() == "lpt":
         # Same grid (nqb, Hq, B); re-rank the linear workgroup id so query
         # heads vary fastest and, under causal, the longest query blocks go
         # first (the hardware dispatches workgroups in linear-id order).

@@ -37,6 +37,9 @@ from .common import (
 
 _DENSE_LAYOUT = "default"
 _DENSE_TILE = "default"
+# The grid body starts at the 128-row query tile; the persistent bodies keep
+# the default tile.
+_GRID_TILE = "bm128"
 # Base-spec values the knob space starts from (and sweeps away from): the
 # gfx950 CU count and the shipped occupancy hint.
 _DEFAULT_NUM_PERSISTENT = 256
@@ -139,7 +142,7 @@ def _base_spec(req: AttentionRequest, variant: Gfx950DenseVariant):
             f"gfx950 dense spec factory requires arch='gfx950', got {req.arch!r}"
         )
     sq, sk = int(req.seqlen_q), int(req.seqlen_k)
-    geometry = DENSE_TILE_GEOMETRIES[_DENSE_TILE]
+    geometry = DENSE_TILE_GEOMETRIES[_DENSE_TILE if variant.persistent else _GRID_TILE]
     layout = GFX950_DENSE_LAYOUTS[_DENSE_LAYOUT]
     bm = int(geometry["block_m"])
     bn = int(geometry["block_n"])
