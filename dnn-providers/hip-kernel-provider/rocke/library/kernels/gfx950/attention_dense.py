@@ -249,6 +249,10 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # compile-time immediate, so the ds_read offset field absorbs the constant
     # part instead of the backend keeping one address register per read.
     lds_read_base: bool = field(default=False, kw_only=True)
+    # Grid body only: lift the wave index and qk_scale into SGPRs with
+    # readfirstlane, so wave-uniform LDS-DMA destinations and the exp2 scale
+    # do not each hold a vector register across the KV loop.
+    scalar_uniforms: bool = field(default=False, kw_only=True)
 
     def resolved_exp_per_pv_step(self) -> int:
         if self.exp_per_pv_step is not None:
@@ -470,6 +474,8 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
             )
         if self.lds_read_base and (not self.wide_lds_dma or self.persistent):
             raise ValueError("lds_read_base requires wide_lds_dma on the grid body")
+        if self.scalar_uniforms and self.persistent:
+            raise ValueError("scalar_uniforms is implemented on the grid body only")
 
     @property
     def resolved_persist_decode(self) -> str:
@@ -615,6 +621,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "qk_lookahead_unroll",
             "bulk_operand_reads",
             "lds_read_base",
+            "scalar_uniforms",
         )
     }
 )
@@ -828,12 +835,19 @@ def build_attention_dense(
             align=4,
         )
     qk_scale = b.fmul(scale, b.const_f32(LOG2E))
+    if spec.scalar_uniforms:
+        # The product of two uniforms is computed on the VALU (no scalar float
+        # ALU), so lift it back to an SGPR instead of holding a VGPR.
+        qk_scale = b.bitcast(b.readfirstlane(b.bitcast(qk_scale, I32)), F32)
 
     # native v_exp_f32 (softmax arg bounded; see _MAX_SCALE) or the guarded exp2
     _exp2 = b.exp2_fast if spec.use_exp2_fast else b.exp2
 
     tid = b.thread_id_x()
     wave = b.div(tid, b.const_i32(64))
+    if spec.scalar_uniforms:
+        # Wave-uniform: every per-wave LDS-DMA destination then stays scalar.
+        wave = b.readfirstlane(wave)
     lane = b.mod(tid, b.const_i32(64))
     lane_m = b.mod(lane, b.const_i32(32))
     lane_h = b.div(lane, b.const_i32(32))
