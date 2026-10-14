@@ -54,10 +54,18 @@ class FmhaFwdPagedPrefillSpec:
     # without a body change. ~10-30× speedup on production paged-
     # prefill workloads (long-context, batched).
     use_mfma_body: bool = False
+    # Opt-in MFMA body levers (require ``use_mfma_body``), forwarded to
+    # ``mfma_attention_fwd_inner_body``.
+    reg_p: bool = False
+    qk_k32: bool = False
+    pv_k32: bool = False
+    v_lds_tr: bool = False
+    lazy_l: bool = False
+    causal_trim: bool = False
 
     def kernel_name(self) -> str:
         s = self.common.shape
-        return kernel_name_join(
+        parts = [
             self.name,
             f"H{s.head_size}",
             f"HQ{s.num_query_heads}",
@@ -66,7 +74,18 @@ class FmhaFwdPagedPrefillSpec:
             f"PG{self.page_block_size}",
             f"B{self.batch}",
             self.common.mask_mode,
-        )
+        ]
+        if self.use_mfma_body:
+            parts.append(
+                "mfma"
+                + ("_rp" if self.reg_p else "")
+                + ("_qk32" if self.qk_k32 else "")
+                + ("_pv32" if self.pv_k32 else "")
+                + ("_vtr" if self.v_lds_tr else "")
+                + ("_ll" if self.lazy_l else "")
+                + ("_ct" if self.causal_trim else "")
+            )
+        return kernel_name_join(*parts)
 
 
 def is_valid_spec(
@@ -149,7 +168,14 @@ def build_fmha_fwd_paged_prefill(
     cu_seqlens_q = kb.ptr("cu_seqlens_q")
     seqlens_k_ptr = kb.ptr("seqlens_k")
     scale_log2 = kb.scalar("scale_log2")
-    q_token = kb.q_token
+    if spec.use_mfma_body:
+        # MFMA mode: block_id_x is a BLOCK_M=16 query *tile*; the sequence
+        # search, local query position and Q/O addressing all need the
+        # tile's first *token* (each sequence's query span must be a
+        # multiple of 16 so a tile never straddles two sequences).
+        q_token = b.mul(kb.q_token, b.const_i32(16))
+    else:
+        q_token = kb.q_token
     head_idx = kb.head_idx
     kv_head_idx = kb.kv_head_idx
     block_table_stride = kb.scalar("block_table_stride")
@@ -249,7 +275,7 @@ def build_fmha_fwd_paged_prefill(
             mfma_attention_fwd_inner_body,
         )
 
-        q_tile_base = b.mul(q_token, b.const_i32(MFMA_ATTN_BLOCK_M))
+        q_tile_base = q_token  # already the tile's first token (see above)
         mfma_attention_fwd_inner_body(
             b,
             Q=Q,
@@ -274,9 +300,17 @@ def build_fmha_fwd_paged_prefill(
             dtype=s.dtype,
             mask_mode=s.mask_mode,
             sliding_window=s.sliding_window,
-            causal_ctx_offset=causal_ctx,
+            # q_pos_base already carries the within-sequence row, so the
+            # top-left-aligned causal boundary is ``k <= local_q + row``.
+            causal_ctx_offset=b.const_i32(0) if causal_ctx is not None else None,
             k_row_base_fn=_paged_row(stride_block, stride_page, stride_kv_head),
             v_row_base_fn=_paged_row(stride_v_block, stride_v_page, stride_v_kv_head),
+            reg_p=spec.reg_p,
+            qk_k32=spec.qk_k32,
+            pv_k32=spec.pv_k32,
+            v_lds_tr=spec.v_lds_tr,
+            lazy_l=spec.lazy_l,
+            causal_trim=spec.causal_trim,
             arch=arch,
         )
     else:
@@ -316,6 +350,8 @@ def build_fmha_fwd_paged_prefill(
 def fmha_fwd_paged_prefill_grid(
     spec: FmhaFwdPagedPrefillSpec, *, total_q: int
 ) -> Tuple[int, int, int]:
+    if spec.use_mfma_body:
+        return ((total_q + 15) // 16, spec.common.shape.num_query_heads, 1)
     return (total_q, spec.common.shape.num_query_heads, 1)
 
 

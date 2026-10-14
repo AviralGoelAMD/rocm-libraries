@@ -68,10 +68,17 @@ class FmhaFwdFp8Spec:
     # median of 5). ``None`` keeps the LLVM heuristic.
     waves_per_eu: Optional[int] = 4
     name: str = "rocke_fmha_fwd_fp8"
+    # Opt-in body levers, forwarded to ``mfma_attention_fwd_inner_body``
+    # (see :class:`kernels.common.fmha_mfma.FmhaMfmaSpec`).
+    reg_p: bool = False
+    qk_k32: bool = False
+    pv_k32: bool = False
+    v_lds_tr: bool = False
+    lazy_l: bool = False
 
     def kernel_name(self) -> str:
         s = self.common.shape
-        return kernel_name_join(
+        parts = [
             self.name,
             f"H{s.head_size}",
             f"HQ{s.num_query_heads}",
@@ -80,7 +87,17 @@ class FmhaFwdFp8Spec:
             self.kv_dtype,
             f"Q{self.seqlen_q}",
             self.common.mask_mode,
-        )
+        ]
+        if self.reg_p:
+            parts.append(
+                "rp"
+                + ("_qk32" if self.qk_k32 else "")
+                + ("_pv32" if self.pv_k32 else "")
+                + ("_vtr" if self.v_lds_tr else "")
+                + ("_ll" if self.lazy_l else "")
+                + f"_w{self.waves_per_eu}"
+            )
+        return kernel_name_join(*parts)
 
 
 # CDNA generations whose ``cvt.f32.fp8`` / ``cvt.f32.bf8`` intrinsics
@@ -288,6 +305,11 @@ def build_fmha_fwd_fp8(spec: FmhaFwdFp8Spec, arch: str = "gfx950") -> KernelDef:
         # fp8 / bf8 K/V dequant on load.
         kv_dtype=spec.kv_dtype,
         v_scale=v_scale,
+        reg_p=spec.reg_p,
+        qk_k32=spec.qk_k32,
+        pv_k32=spec.pv_k32,
+        v_lds_tr=spec.v_lds_tr,
+        lazy_l=spec.lazy_l,
         arch=arch,
     )
     b.ret()

@@ -135,10 +135,17 @@ class SageAttentionSpec:
     # loaded once per outer iteration instead of every K-tile.
     # Saves a per-iter f32 scale load when scale_block is large.
     use_outer_scale_loop: bool = False
+    # Opt-in MFMA-path body levers, forwarded to
+    # ``mfma_attention_fwd_inner_body`` (no effect on the warp fallback).
+    reg_p: bool = False
+    qk_k32: bool = False
+    pv_k32: bool = False
+    v_lds_tr: bool = False
+    lazy_l: bool = False
 
     def kernel_name(self) -> str:
         s = self.common.shape
-        return kernel_name_join(
+        parts = [
             self.name,
             self.quant_mode,
             f"H{s.head_size}",
@@ -147,7 +154,16 @@ class SageAttentionSpec:
             self.common.dtype,
             f"Q{self.seqlen_q}",
             f"K{self.seqlen_k}",
-        )
+        ]
+        if self.reg_p:
+            parts.append(
+                "rp"
+                + ("_qk32" if self.qk_k32 else "")
+                + ("_pv32" if self.pv_k32 else "")
+                + ("_vtr" if self.v_lds_tr else "")
+                + ("_ll" if self.lazy_l else "")
+            )
+        return kernel_name_join(*parts)
 
 
 def _mfma_dimensions_ok(spec: SageAttentionSpec) -> bool:
@@ -585,6 +601,11 @@ def _build_sage_mfma(spec: SageAttentionSpec, arch: str = "gfx950") -> KernelDef
         causal_ctx_offset=causal_ctx,
         kv_dtype=kv_dtype,
         extra_score_transform=extra_score_transform,
+        reg_p=spec.reg_p,
+        qk_k32=spec.qk_k32,
+        pv_k32=spec.pv_k32,
+        v_lds_tr=spec.v_lds_tr,
+        lazy_l=spec.lazy_l,
         arch=arch,
     )
     b.ret()
