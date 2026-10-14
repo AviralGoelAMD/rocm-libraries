@@ -197,12 +197,18 @@ class TestUniversalGemmPadNoOobRead(unittest.TestCase):
             raise unittest.SkipTest(why)
 
     def _check(self, name):
-        p = subprocess.run(
-            [sys.executable, os.path.abspath(__file__), "--child", name],
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
+        # An out-of-bounds read of the unmapped page either aborts the child
+        # (memory access fault) or, with retry-on-fault enabled, hangs it;
+        # both are failures.
+        try:
+            p = subprocess.run(
+                [sys.executable, os.path.abspath(__file__), "--child", name],
+                capture_output=True,
+                text=True,
+                timeout=240,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail(f"{name}: kernel hung (unmapped-page read past the operand)")
         tail = (p.stdout + p.stderr)[-2000:]
         self.assertEqual(p.returncode, 0, f"{name} child failed (rc={p.returncode}):\n{tail}")
         self.assertIn("OK", p.stdout, tail)
