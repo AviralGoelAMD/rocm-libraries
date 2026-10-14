@@ -594,6 +594,17 @@ class ConvGroupedSpec:
             # the i32 ws_bytes ABI using this same constant, and a cap computed
             # over a different R than the spec carries bounds nothing.
             ws_replicas=_WGRAD_WS_REPLICAS,
+            # The sweep and the AOT cache build with this policy; without it
+            # here the shipped kernel re-derives every chunk's address on the
+            # path to its loads each K step.
+            prefetch_addr=WgradConvSpec.default_prefetch_addr(
+                arch=self.arch,
+                tile_m=self.tile_m,
+                tile_n=self.tile_n,
+                tile_k=self.tile_k,
+                lds_k_outer=self.lds_k_outer,
+                wave_size=target.wave_size,
+            ),
         )
 
     def to_dgrad_spec(self, problem: "ConvProblem") -> "DgradConvSpec":
@@ -1453,6 +1464,14 @@ def _make_gfx950_wgrad_candidate() -> KernelCandidate:
             pipeline=_pipeline(req),
             epilogue=_ep,
             split_k=_sk,
+            prefetch_addr=WgradConvSpec.default_prefetch_addr(
+                arch=req.arch,
+                tile_m=tm,
+                tile_n=tn,
+                tile_k=tk,
+                lds_k_outer=_wgrad_lds_k_outer(req, wtmn),
+                wave_size=ArchTarget.from_gfx(req.arch).wave_size,
+            ),
         )
 
     def support(req: OperatorRequest) -> Tuple[bool, str]:
