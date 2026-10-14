@@ -53,6 +53,7 @@ from __future__ import annotations
 # ---- core ----
 from .core.codegen_policy import (
     CodegenPolicy,
+    F32DenormalMode,
     SchedulerStrategy,
     apply_codegen_policy,
     codegen_policy_for_kernel,
@@ -162,6 +163,7 @@ from .helpers.transforms import (
 __all__ = [
     # core
     "CodegenPolicy",
+    "F32DenormalMode",
     "SchedulerStrategy",
     "apply_codegen_policy",
     "codegen_policy_for_kernel",

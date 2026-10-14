@@ -43,6 +43,7 @@ from __future__ import annotations
 
 from .codegen_policy import (
     CodegenPolicy,
+    F32DenormalMode,
     SchedulerStrategy,
     apply_codegen_policy,
     codegen_policy_for_kernel,
@@ -116,6 +117,7 @@ __all__ = [
     "E8M0",
     "E5M3",
     "CodegenPolicy",
+    "F32DenormalMode",
     "SchedulerStrategy",
     "apply_codegen_policy",
     "codegen_policy_for_kernel",
