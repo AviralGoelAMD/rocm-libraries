@@ -187,6 +187,9 @@ class UnifiedAttention3DTiledSpec:
     # raw fp8 chunks ride in registers for one iteration and are dequantized
     # into LDS at the top of the next.
     kv_prefetch: bool = False
+    # Correctness fix (prototype flag): keep the online-softmax running max
+    # monotone, m_new = max(m_old, tile_max). Should become the default.
+    stable_running_max: bool = False
 
     def __post_init__(self):
         if type(self.use_f32_denormal_flush) is not bool:
@@ -719,13 +722,33 @@ def build_unified_attention_3d_tiled(
 
     TILE_MULT = spec.kv_tile_mult if spec.kv_layout == "paged" else 1
     PAGE_HALVES = BS * HD
-    if TILE_MULT > 1:
+    # The prefetch pipeline reads block-table entries ahead of the DMA that
+    # consumes them, so it addresses pages by physical block id directly.
+    PREFETCH_IDS = spec.kv_prefetch and spec.kv_layout == "paged"
+    if TILE_MULT > 1 or PREFETCH_IDS:
         # Clamp page lookups of the (masked) tail tile to the sequence's last
         # valid page so the block-table read never leaves the sequence's row.
         last_page = b.sub(
             b.div(b.add(seq_len, b.const_i32(BS - 1)), b.const_i32(BS)),
             b.const_i32(1),
         )
+    if PREFETCH_IDS:
+        phys_kv_desc = TensorDescriptor.naive(
+            "paged_kv_bytes",
+            lengths=[1 << 24, BS, NUM_KV, HD],
+            strides=[kv_stride_blk_b, kv_stride_tok_b, kv_stride_h_b, KV_BYTES],
+            coord_names=("physical_block", "token", "kv_head", "dim"),
+        ).transform(unmerge("linear_half", into=("token", "dim"), dims=(BS, HD)))
+
+    def _tile_block_ids(kv_tile_idx: Value):
+        """Physical block ids of a tile's pages (clamped to the last valid page,
+        so any tile index -- even past the segment -- reads a valid entry)."""
+        ids = []
+        for p in range(TILE_MULT):
+            page = b.add(b.mul(kv_tile_idx, b.const_i32(TILE_MULT)), b.const_i32(p))
+            page = b.select(b.cmp_lt(page, last_page), page, last_page)
+            ids.append(b.global_load_i32(block_tables, b.add(seq_base, page)))
+        return ids
 
     def _paged_coords(kv_tile_idx: Value, first_half: int, lane_half: Value):
         """(block-table index, within-page half offset) of one DMA call.
@@ -742,73 +765,55 @@ def build_unified_attention_3d_tiled(
         page = b.select(b.cmp_lt(page, last_page), page, last_page)
         return page, b.add(b.const_i32(first_half % PAGE_HALVES), lane_half)
 
-    def _issue_k_load(kv_tile_idx: Value, buf_idx: Value) -> None:
-        buf_off_i32 = b.mul(buf_idx, b.const_i32(bytes_per_buf))
-        buf_off_i64 = b.zext(buf_off_i32, I64)
-        K_buf_base = b.smem_ptr_add(K_lds_addr, buf_off_i64)
-        for call in range(kv_calls_per_tile):
-            page_idx, linear_half = _paged_coords(
-                kv_tile_idx, call * KV_HALVES_PER_CALL, lane_half_base
-            )
-            call_rsrc = key_rsrc
-            if spec.kv_layout == "strided":
-                voff = strided_kv_offset(
-                    b, k_strides, kv_tile_idx, linear_half, seq_len, HD, T
-                )
-            elif I64_KV_ADDR:
-                base_i64, voff, _ = paged_kv_desc.offset_i64_split(
-                    b,
-                    "physical_block",
-                    tile_idx=page_idx,
-                    linear_half=linear_half,
-                    kv_head=kv_head_idx,
-                )
-                call_rsrc = b.buffer_rsrc(
-                    b.global_ptr_add(key, base_i64), kv_block_bytes_c
-                )
-            else:
-                voff, _ = paged_kv_desc.offset(
-                    b,
-                    tile_idx=page_idx,
-                    linear_half=linear_half,
-                    kv_head=kv_head_idx,
-                )
-            k_dst = b.smem_ptr_add(K_buf_base, b.const_i64(call * bytes_per_call))
-            b.async_buffer_load_lds_addr(call_rsrc, k_dst, voff, zero_soff, 4)
+    def _kv_offset(src, page_idx, linear_half, block_ids, first_half):
+        """(buffer resource or None, voffset) of one paged K/V access.
 
-    def _issue_v_load(kv_tile_idx: Value, buf_idx: Value) -> None:
+        ``linear_half`` is page-relative (``_paged_coords``); with prefetched
+        ``block_ids`` the call's page is ``block_ids[first_half // PAGE_HALVES]``.
+        """
+        if block_ids is not None:
+            desc = phys_kv_desc
+            coords = dict(
+                physical_block=block_ids[first_half // PAGE_HALVES],
+                linear_half=linear_half,
+                kv_head=kv_head_idx,
+            )
+        else:
+            desc = paged_kv_desc
+            coords = dict(tile_idx=page_idx, linear_half=linear_half, kv_head=kv_head_idx)
+        if I64_KV_ADDR:
+            base_i64, voff, _ = desc.offset_i64_split(b, "physical_block", **coords)
+            return b.buffer_rsrc(b.global_ptr_add(src, base_i64), kv_block_bytes_c), voff
+        voff, _ = desc.offset(b, **coords)
+        return None, voff
+
+    def _issue_kv_async(kv_tile_idx: Value, buf_idx: Value, tok: str, block_ids=None):
+        src, rsrc, lds_addr, strides = (
+            (key, key_rsrc, K_lds_addr, k_strides if spec.kv_layout == "strided" else None)
+            if tok == "K"
+            else (value, value_rsrc, V_lds_addr, v_strides if spec.kv_layout == "strided" else None)
+        )
         buf_off_i32 = b.mul(buf_idx, b.const_i32(bytes_per_buf))
         buf_off_i64 = b.zext(buf_off_i32, I64)
-        V_buf_base = b.smem_ptr_add(V_lds_addr, buf_off_i64)
+        buf_base = b.smem_ptr_add(lds_addr, buf_off_i64)
         for call in range(kv_calls_per_tile):
-            page_idx, linear_half = _paged_coords(
-                kv_tile_idx, call * KV_HALVES_PER_CALL, lane_half_base
-            )
-            call_rsrc = value_rsrc
+            first_half = call * KV_HALVES_PER_CALL
+            page_idx, linear_half = _paged_coords(kv_tile_idx, first_half, lane_half_base)
+            call_rsrc = rsrc
             if spec.kv_layout == "strided":
-                voff = strided_kv_offset(
-                    b, v_strides, kv_tile_idx, linear_half, seq_len, HD, T
-                )
-            elif I64_KV_ADDR:
-                base_i64, voff, _ = paged_kv_desc.offset_i64_split(
-                    b,
-                    "physical_block",
-                    tile_idx=page_idx,
-                    linear_half=linear_half,
-                    kv_head=kv_head_idx,
-                )
-                call_rsrc = b.buffer_rsrc(
-                    b.global_ptr_add(value, base_i64), kv_block_bytes_c
-                )
+                voff = strided_kv_offset(b, strides, kv_tile_idx, linear_half, seq_len, HD, T)
             else:
-                voff, _ = paged_kv_desc.offset(
-                    b,
-                    tile_idx=page_idx,
-                    linear_half=linear_half,
-                    kv_head=kv_head_idx,
-                )
-            v_dst = b.smem_ptr_add(V_buf_base, b.const_i64(call * bytes_per_call))
-            b.async_buffer_load_lds_addr(call_rsrc, v_dst, voff, zero_soff, 4)
+                own_rsrc, voff = _kv_offset(src, page_idx, linear_half, block_ids, first_half)
+                if own_rsrc is not None:
+                    call_rsrc = own_rsrc
+            dst = b.smem_ptr_add(buf_base, b.const_i64(call * bytes_per_call))
+            b.async_buffer_load_lds_addr(call_rsrc, dst, voff, zero_soff, 4)
+
+    def _issue_k_load(kv_tile_idx: Value, buf_idx: Value, block_ids=None) -> None:
+        _issue_kv_async(kv_tile_idx, buf_idx, "K", block_ids)
+
+    def _issue_v_load(kv_tile_idx: Value, buf_idx: Value, block_ids=None) -> None:
+        _issue_kv_async(kv_tile_idx, buf_idx, "V", block_ids)
 
     # FP8 K/V cache: sync dequant loader. See attention_tiled_2d.py for the
     # rationale. The FP8 path stores the working dtype (bf16/fp16) into LDS,
@@ -866,35 +871,37 @@ def build_unified_attention_3d_tiled(
         )
         return row, col
 
-    def _fp8_chunk_load(kv_tile_idx: Value, call: int, lds_token: str):
+    def _fp8_chunk_load(kv_tile_idx: Value, call: int, lds_token: str, block_ids=None):
         """Raw ``<8 x fp8>`` global load of one chunk; returns (vec, row, col)."""
         src = key if lds_token == "K" else value
         row, col = _fp8_chunk_coords(call)
         linear_half_first = b.add(b.mul(row, b.const_i32(HD)), col)
         page_idx = kv_tile_idx
+        first_half = call * THREADS * fp8_elems_per_chunk
         if TILE_MULT > 1:
             # chunk_id * 8 == call * 512 + tid * 8: one page per call.
             page_idx, linear_half_first = _paged_coords(
-                kv_tile_idx, call * THREADS * fp8_elems_per_chunk, lane_half_base
+                kv_tile_idx, first_half, lane_half_base
+            )
+        if block_ids is not None:
+            desc = phys_kv_desc
+            coords = dict(
+                physical_block=block_ids[first_half // PAGE_HALVES],
+                linear_half=linear_half_first,
+                kv_head=kv_head_idx,
+            )
+        else:
+            desc = paged_kv_desc
+            coords = dict(
+                tile_idx=page_idx, linear_half=linear_half_first, kv_head=kv_head_idx
             )
         if I64_KV_ADDR:
             # Flat per-lane global load: full i64 byte/element offset so
             # the per-thread physical_block * stride cannot overflow the
             # cache addressing for paged caches > 2 GiB.
-            voff, _ = paged_kv_desc.offset_i64(
-                b,
-                "physical_block",
-                tile_idx=page_idx,
-                linear_half=linear_half_first,
-                kv_head=kv_head_idx,
-            )
+            voff, _ = desc.offset_i64(b, "physical_block", **coords)
         else:
-            voff, _ = paged_kv_desc.offset(
-                b,
-                tile_idx=page_idx,
-                linear_half=linear_half_first,
-                kv_head=kv_head_idx,
-            )
+            voff, _ = desc.offset(b, **coords)
         fp8_vec = b.global_load_vN(
             src, voff, FP8E4M3, n=fp8_elems_per_chunk, align=fp8_elems_per_chunk
         )
@@ -925,12 +932,14 @@ def build_unified_attention_3d_tiled(
 
     PREFETCH = spec.kv_prefetch
     FP8_REG_PREFETCH = PREFETCH and KV_FP8
-    last_tile = b.sub(tile_end, b.const_i32(1)) if FP8_REG_PREFETCH else None
 
-    def _fp8_raw_tile(kv_tile_idx: Value):
+    def _ids(kv_tile_idx: Value):
+        return _tile_block_ids(kv_tile_idx) if PREFETCH_IDS else None
+
+    def _fp8_raw_tile(kv_tile_idx: Value, block_ids):
         """Raw fp8 K then V chunks of one tile (registers, not yet in LDS)."""
         return [
-            _fp8_chunk_load(kv_tile_idx, call, tok)[0]
+            _fp8_chunk_load(kv_tile_idx, call, tok, block_ids)[0]
             for tok in ("K", "V")
             for call in range(fp8_chunks_per_thread)
         ]
@@ -944,17 +953,28 @@ def build_unified_attention_3d_tiled(
                 _fp8_chunk_store(raw[i], buf_idx, row, col, tok)
                 i += 1
 
-    _issue_k(tile_start, b.const_i32(0))
-    if PREFETCH:
-        _issue_v(tile_start, b.const_i32(0))
+    if FP8_REG_PREFETCH:
+        # tile_start straight into LDS buffer 0; tile_start+1 rides in
+        # registers; block ids run one tile further ahead.
+        _fp8_stage_tile(_fp8_raw_tile(tile_start, _ids(tile_start)), b.const_i32(0))
+        nxt0 = b.add(tile_start, b.const_i32(1))
+        prefetch_carry = _fp8_raw_tile(nxt0, _ids(nxt0)) + list(
+            _ids(b.add(tile_start, b.const_i32(2)))
+        )
+    elif PREFETCH:
+        ids0 = _ids(tile_start)
+        _issue_k_load(tile_start, b.const_i32(0), ids0)
+        _issue_v_load(tile_start, b.const_i32(0), ids0)
+        ids1 = _ids(b.add(tile_start, b.const_i32(1)))
+        prefetch_carry = list(ids1) if ids1 is not None else []
+    else:
+        _issue_k(tile_start, b.const_i32(0))
+        prefetch_carry = []
 
     cur_buf_init = b.const_i32(0)
     iter_args.append(("cur_buf", cur_buf_init))
-    if FP8_REG_PREFETCH:
-        nxt0 = b.add(tile_start, b.const_i32(1))
-        raw0 = _fp8_raw_tile(b.select(b.cmp_lt(nxt0, tile_end), nxt0, last_tile))
-        for i, v in enumerate(raw0):
-            iter_args.append((f"kvraw{i}", v))
+    for i, v in enumerate(prefetch_carry):
+        iter_args.append((f"kvpf{i}", v))
 
     # LICM hoist: per-reg invariants that are constant across all KV tiles.
     # qp_r, qh_r, row_ok, and causal_lim depend only on CTA-level constants
@@ -1007,22 +1027,32 @@ def build_unified_attention_3d_tiled(
         in_range_next = b.cmp_lt(next_tile_iv_raw, tile_end)
         safe_next_tile = b.select(in_range_next, next_tile_iv_raw, kv_tile_iv)
 
-        new_raw = None
+        pf_base = 9 + PV_N_TILES
+        new_pf = []
         if FP8_REG_PREFETCH:
             # LDS[cur] was staged last iteration; only LDS needs draining, the
-            # raw fp8 registers for tile+1 (and tile+2 below) stay in flight.
+            # raw fp8 registers for tile+1 stay in flight until staged here.
+            n_raw = 2 * fp8_chunks_per_thread
+            raw = carry[pf_base : pf_base + n_raw]
+            ids_n2 = carry[pf_base + n_raw : pf_base + n_raw + TILE_MULT]
             b.sync_lds_only()
-            raw = carry[9 + PV_N_TILES : 9 + PV_N_TILES + 2 * fp8_chunks_per_thread]
             _fp8_stage_tile(raw, nxt_buf)
             nxt2 = b.add(kv_tile_iv, b.const_i32(2))
-            new_raw = _fp8_raw_tile(b.select(b.cmp_lt(nxt2, tile_end), nxt2, last_tile))
+            new_pf = _fp8_raw_tile(nxt2, ids_n2) + list(
+                _ids(b.add(kv_tile_iv, b.const_i32(3)))
+            )
         else:
             b.s_waitcnt(vmcnt=0, lgkmcnt=0)
             b.sync()
             if PREFETCH:
+                ids_n1 = (
+                    carry[pf_base : pf_base + TILE_MULT] if PREFETCH_IDS else None
+                )
                 with b.scf_if(in_range_next):
-                    _issue_k(next_tile_iv_raw, nxt_buf)
-                    _issue_v(next_tile_iv_raw, nxt_buf)
+                    _issue_k_load(next_tile_iv_raw, nxt_buf, ids_n1)
+                    _issue_v_load(next_tile_iv_raw, nxt_buf, ids_n1)
+                if PREFETCH_IDS:
+                    new_pf = list(_ids(b.add(kv_tile_iv, b.const_i32(2))))
 
         # QK
         A_kits = []
@@ -1101,6 +1131,11 @@ def build_unified_attention_3d_tiled(
                 s_local[(reg, n)] = v
                 local_max = b.fmax(local_max, v)
             full_max_raw = _warp_xor_reduce_max(b, local_max)
+            if spec.stable_running_max:
+                # Online-softmax running max: max(m_old, tile_max). Without it
+                # alpha = exp2(m_old - tile_max) exceeds 1 and overflows f32
+                # once logits spread more than 128 (log2 units) across tiles.
+                full_max_raw = b.fmax(m_vals[reg], full_max_raw)
             ok = b.fcmp("ogt", full_max_raw, neg_inf)
             m_new.append(b.select(ok, full_max_raw, zero_f))
 
@@ -1172,8 +1207,7 @@ def build_unified_attention_3d_tiled(
         for n in range(PV_N_TILES):
             yields.append(new_acc[n])
         yields.append(nxt_buf)
-        if FP8_REG_PREFETCH:
-            yields.extend(new_raw)
+        yields.extend(new_pf)
         b.scf_yield(*yields)
 
     # ---------------- write segment workspace ----------------
