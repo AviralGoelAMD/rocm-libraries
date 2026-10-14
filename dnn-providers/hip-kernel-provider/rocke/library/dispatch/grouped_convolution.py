@@ -162,6 +162,16 @@ from kernels.common.conv_implicit_gemm_dgrad import (
     DgradConvSpec,
     is_valid_dgrad_spec as _dgrad_is_valid_spec,
 )
+from kernels.common.conv_direct_grouped import (
+    DirectConvProblem,
+    DirectConvSpec,
+    DirectDepthwiseDgradStreamSpec,
+    DirectDepthwiseTiledSpec,
+    direct_launch_geometry,
+    is_valid_depthwise_dgrad_stream_spec,
+    is_valid_depthwise_tiled_spec,
+    is_valid_spec as _direct_is_valid_spec,
+)
 from rocke.dispatch.core import (
     Capability,
     CandidateRegistry,
@@ -355,6 +365,35 @@ def _problem(req: ConvGroupedRequest) -> ConvProblem:
     )
 
 
+def _direct_problem(req: ConvGroupedRequest) -> Optional[DirectConvProblem]:
+    """The request as a direct-conv problem, or None when the direct kernels
+    cannot express it: they are 2-D with one stride, one padding and no
+    dilation for both spatial axes."""
+    if (
+        req.Di is not None
+        or req.stride_h != req.stride_w
+        or req.pad_h != req.pad_w
+        or req.dilation_h != 1
+        or req.dilation_w != 1
+        or req.C % req.G
+        or req.K % req.G
+    ):
+        return None
+    return DirectConvProblem(
+        N=int(req.N),
+        H=int(req.Hi),
+        W=int(req.Wi),
+        groups=int(req.G),
+        cpg=int(req.C) // int(req.G),
+        kpg=int(req.K) // int(req.G),
+        KH=int(req.Y),
+        KW=int(req.X),
+        PAD=int(req.pad_h),
+        stride=int(req.stride_h),
+        dtype=req.dtype.lower(),
+    )
+
+
 def _request_errors(req: OperatorRequest) -> list[str]:
     if not isinstance(req, ConvGroupedRequest):
         return [f"expected ConvGroupedRequest, got {type(req).__name__}"]
@@ -500,10 +539,24 @@ class ConvGroupedSpec:
     lds_k_outer: bool = False  # wgrad only
     group_merge: int = 1  # fwd and wgrad, depthwise only
     name: str = "rocke_conv_grouped"
+    # Direct (non-GEMM) kernel families: "" selects the implicit-GEMM kernels
+    # the tile/warp/atom fields above describe. Otherwise one of
+    # _DIRECT_KINDS, with ``direct_tile`` holding that family's tile knobs
+    # (see :meth:`to_direct_spec`); the GEMM fields are then unused.
+    direct_kind: str = ""
+    direct_tile: Tuple[int, ...] = ()
 
     def kernel_name(self) -> str:
         from rocke.helpers.spec import kernel_name_join
 
+        if self.direct_kind:
+            return kernel_name_join(
+                self.name,
+                self.direction,
+                self.dtype,
+                self.direct_kind,
+                "t" + "x".join(str(v) for v in self.direct_tile),
+            )
         parts = [
             self.direction,
             self.dtype,
@@ -629,6 +682,35 @@ class ConvGroupedSpec:
             epilogue=self.epilogue,
             split_k=self.split_k,
         )
+
+    def to_direct_spec(self, req: "ConvGroupedRequest"):
+        """The direct-conv kernel spec for a ``direct_kind`` dispatcher spec."""
+        if not self.direct_kind:
+            raise ValueError("to_direct_spec is only valid for direct specs")
+        p = _direct_problem(req)
+        t = self.direct_tile
+        if self.direct_kind == "dw_tiled":
+            return DirectDepthwiseTiledSpec(
+                problem=p,
+                name=self.name,
+                block_w=t[0],
+                block_h=t[1],
+                block_waves=t[2],
+                unroll_rows=True,
+            )
+        if self.direct_kind == "dw_dgrad_stream":
+            return DirectDepthwiseDgradStreamSpec(
+                problem=p, name=self.name, block_w=t[0], block_waves=t[1]
+            )
+        if self.direct_kind == "grouped":
+            return DirectConvSpec(
+                problem=p,
+                name=self.name,
+                block_q=t[0],
+                block_groups=t[1],
+                double_buffer=bool(t[2]),
+            )
+        raise ValueError(f"unknown direct_kind {self.direct_kind!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -1814,6 +1896,149 @@ def _make_gfx1250_wgrad_candidate() -> KernelCandidate:
 
 
 # ---------------------------------------------------------------------------
+# gfx950 direct (non-GEMM) candidates
+# ---------------------------------------------------------------------------
+#
+# Depthwise and small-cpg grouped convolutions are a poor fit for the
+# implicit GEMM: their per-group GEMM is a handful of columns wide, so a 64x64
+# MFMA tile is mostly padding and the grid is one thin CTA column per group.
+# The direct kernels in kernels/common/conv_direct_grouped.py stream NHWC rows
+# with no GEMM padding at all. They take precedence (lower priority value) over
+# the implicit-GEMM candidate wherever they admit the request; everything else
+# still reaches the implicit GEMM.
+
+_DIRECT_PRIORITY = 5
+_DIRECT_KINDS = ("dw_tiled", "dw_dgrad_stream", "grouped")
+
+
+def _direct_block(spec: ConvGroupedSpec) -> Tuple[int, int, int]:
+    """Threads per CTA of a direct spec: the last ``direct_tile`` knob is the
+    wave count (depthwise) or the groups-per-block wave count (grouped)."""
+    return (spec.direct_tile[-1 if spec.direct_kind != "grouped" else 1] * 64, 1, 1)
+
+
+def _direct_grid(spec: ConvGroupedSpec, req: OperatorRequest) -> Tuple[int, int, int]:
+    assert isinstance(req, ConvGroupedRequest)
+    return direct_launch_geometry(spec.to_direct_spec(req))[0]
+
+
+def _dw_tiled_tile(p: DirectConvProblem) -> Tuple[int, int, int]:
+    """(block_w, block_h, block_waves) for the output-stationary depthwise
+    forward kernel. One wave per CTA; a 7-wide output strip when the width
+    tiles by 7 (the 56/28/14/7 maps of the common backbones); a 7-row tile for
+    the larger filters and the large stride-1 maps, where amortising the input
+    halo over more rows pays, else 4 rows."""
+    block_w = 7 if p.Wo % 7 == 0 else 8
+    block_h = 7 if (p.KH >= 5 or (p.stride == 1 and p.Ho >= 56)) else 4
+    return (block_w, block_h, 1)
+
+
+def _grouped_direct_tile(p: DirectConvProblem) -> Tuple[int, int, int]:
+    """(block_q, block_groups, double_buffer) for the generic grouped kernel."""
+    return (16, 4 if p.cpg <= 8 else 2, 1)
+
+
+def _make_gfx950_direct_candidate(kind: str) -> KernelCandidate:
+    """A direct-conv candidate for gfx950: ``kind`` is one of _DIRECT_KINDS.
+
+    * ``dw_tiled`` -- depthwise forward, :class:`DirectDepthwiseTiledSpec`.
+    * ``dw_dgrad_stream`` -- depthwise backward-data,
+      :class:`DirectDepthwiseDgradStreamSpec` (the implicit-GEMM dgrad
+      candidate rejects depthwise outright).
+    * ``grouped`` -- grouped forward with ``cpg == kpg`` in 4..16,
+      :class:`DirectConvSpec`. Wider groups stay on the implicit GEMM, whose
+      tile is dense enough there.
+    """
+    direction = "dgrad" if kind == "dw_dgrad_stream" else "fwd"
+    name = f"direct_conv_{kind}"
+    spec_id = f"direct_{kind}"
+    algorithm = f"direct_{kind}"
+
+    def _tile(p: DirectConvProblem) -> Tuple[int, ...]:
+        if kind == "dw_tiled":
+            return _dw_tiled_tile(p)
+        if kind == "dw_dgrad_stream":
+            return (4, 1)
+        return _grouped_direct_tile(p)
+
+    def _spec(req: ConvGroupedRequest, p: DirectConvProblem) -> ConvGroupedSpec:
+        return ConvGroupedSpec(
+            direction=direction,
+            tile_m=0,
+            tile_n=0,
+            tile_k=0,
+            warp_m=0,
+            warp_n=0,
+            warp_tile_mn=0,
+            warp_tile_k=0,
+            pipeline="direct",
+            epilogue="direct",
+            dtype=req.dtype.lower(),
+            arch=req.arch,
+            name=name,
+            direct_kind=kind,
+            direct_tile=_tile(p),
+        )
+
+    def support(req: OperatorRequest) -> Tuple[bool, str]:
+        errors = _request_errors(req)
+        if errors:
+            return False, "; ".join(errors)
+        assert isinstance(req, ConvGroupedRequest)
+        if not _is_gfx950(req):
+            return False, f"gfx950 candidate requires arch=gfx950 (got {req.arch!r})"
+        if req.direction != direction:
+            return False, f"candidate handles {direction!r}, got {req.direction!r}"
+        ok, why = selector_matches(req, candidate)
+        if not ok:
+            return False, why
+        p = _direct_problem(req)
+        if p is None:
+            return False, "direct kernels need 2-D, square stride/pad, no dilation"
+        if p.groups <= 1:
+            return False, "direct grouped kernels need groups > 1"
+        if kind in ("dw_tiled", "dw_dgrad_stream"):
+            if p.cpg != 1 or p.kpg != 1:
+                return False, f"{kind} is depthwise only (cpg=kpg=1)"
+        elif p.cpg != p.kpg or p.cpg % 4 or not 4 <= p.cpg <= 16:
+            return False, "grouped direct needs cpg == kpg in 4..16 (multiple of 4)"
+        inst = _spec(req, p).to_direct_spec(req)
+        if kind == "dw_tiled":
+            return is_valid_depthwise_tiled_spec(inst, arch=req.arch)
+        if kind == "dw_dgrad_stream":
+            return is_valid_depthwise_dgrad_stream_spec(inst, arch=req.arch)
+        return _direct_is_valid_spec(inst, arch=req.arch)
+
+    def select(req: OperatorRequest) -> ConvGroupedSpec:
+        ok, why = candidate.admits(req)
+        if not ok:
+            raise ValueError(f"{name} does not support request: {why}")
+        assert isinstance(req, ConvGroupedRequest)
+        return _spec(req, _direct_problem(req))
+
+    candidate = KernelCandidate(
+        name=name,
+        family=_FAMILY_DGRAD if direction == "dgrad" else _FAMILY_FWD,
+        algorithm=algorithm,
+        spec_id=spec_id,
+        abi_version=CONV_GROUPED_ABI_VERSION,
+        priority=_DIRECT_PRIORITY,
+        capability=Capability(
+            arches=("gfx950",),
+            dtypes=("fp16", "bf16"),
+            layouts=("NHWC",),
+        ),
+        _supports=support,
+        select_spec=select,
+        signature=lambda _spec: (),
+        grid=_direct_grid,
+        block=_direct_block,
+        sweep_space=lambda req: (select(req),) if candidate.admits(req)[0] else (),
+    )
+    return candidate
+
+
+# ---------------------------------------------------------------------------
 # Registries — one per direction (different family strings)
 # ---------------------------------------------------------------------------
 
@@ -1851,6 +2076,7 @@ CONV_DGRAD_REGISTRY.register(_make_gfx950_dgrad_candidate())
 CONV_FWD_REGISTRY = CandidateRegistry(_FAMILY_FWD, dim_vocabulary=_CONV_DIM_VOCABULARY)
 CONV_FWD_REGISTRY.register(_make_gfx942_fwd_candidate())
 CONV_FWD_REGISTRY.register(_make_gfx950_fwd_candidate())
+CONV_FWD_REGISTRY.register(_make_gfx950_direct_candidate("dw_tiled"))
 CONV_FWD_REGISTRY.register(_make_gfx1250_fwd_candidate())
 
 CONV_WGRAD_REGISTRY = CandidateRegistry(
@@ -1943,7 +2169,12 @@ def _signature_for(req: ConvGroupedRequest, spec: ConvGroupedSpec) -> tuple:
     also carries the workspace pair. Kernargs pack positionally, so omitting
     one shifts every argument after it.
     """
-    from kernels.common.conv_abi import conv_args_signature
+    from kernels.common.conv_abi import conv_args_signature, conv_direct_args_signature
+
+    if spec.direct_kind:
+        if req.direction == "fwd":
+            return tuple(conv_direct_args_signature(req.dtype))
+        return tuple(conv_direct_args_signature(req.dtype, direction=req.direction))
 
     p = _problem(req)
     dtype = req.dtype
@@ -1992,6 +2223,16 @@ def launch_values_for(
     """
     from kernels.common.conv_args import ConvArgs
 
+    if spec.direct_kind:
+        # The direct kernels take the conv_direct kernarg block: the problem
+        # extents and strides, with no tile counts.
+        dp = _direct_problem(req)
+        args = (
+            ConvArgs.from_problem(dp)
+            if req.direction == "fwd"
+            else ConvArgs.from_problem(dp, direction=req.direction)
+        )
+        return args.to_launch_values(A_ptr, B_ptr, D_ptr, A_bytes, B_bytes, D_bytes)
     p = _problem(req)
     tile_m, tile_n = spec.tile_m, spec.tile_n
     if req.direction == "wgrad":
