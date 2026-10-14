@@ -554,7 +554,27 @@ def _reference_generic_3d(problem):
             if au._enable_f32_denormal_flush(problem)
             else {}
         ),
+        **_reference_gfx950_decode_knobs(problem),
     )
+
+
+def _reference_gfx950_decode_knobs(problem):
+    """The gfx950 paged decode config, spelled out (bf16 vs fp8 KV)."""
+    if not au._gfx950_decode_3d_cohort(problem):
+        return {}
+    knobs = dict(
+        decode_fast_path=True,
+        seg_major_order=True,
+        kv_tile_mult=2,
+        kv_prefetch=True,
+        scalar_block_ids=True,
+        transposed_softmax=True,
+    )
+    if problem.use_fp8:
+        knobs.update(fold_kv_scale=True)
+    else:
+        knobs.update(kv_split_wait=True, kv_load_aux=3)
+    return knobs
 
 
 class TestGeneric3dSpecFn(unittest.TestCase):
@@ -584,6 +604,10 @@ class TestGeneric3dSpecFn(unittest.TestCase):
         {},
         {"head_size": 256},
         {"num_query_heads": 32, "num_kv_heads": 8, "dtype": "fp16"},
+        # gfx950 paged decode cohort: bf16 / fp8 KV, GQA 4 and 8.
+        {"num_query_heads": 32, "num_kv_heads": 8, "num_seqs": 4, "total_q": 4},
+        {"num_query_heads": 32, "num_kv_heads": 8, "use_fp8": True},
+        {"num_query_heads": 8, "num_kv_heads": 1, "num_seqs": 64, "total_q": 64},
     ]
 
     def _run(self, arch):

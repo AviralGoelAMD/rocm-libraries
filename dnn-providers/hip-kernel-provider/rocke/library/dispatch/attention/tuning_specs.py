@@ -31,7 +31,7 @@ TILE_POLICIES: Tuple[str, ...] = (
 NUM_WARPS: Tuple[int, ...] = (1, 2, 4, 8)
 BLOCK_M_PER_WARP: Tuple[int, ...] = (16, 32)
 WAVES_PER_EU: Tuple[Optional[int], ...] = (None, 1, 2, 3, 4)
-NUM_SEGMENTS: Tuple[int, ...] = (8, 16, 32, 64, 128)
+NUM_SEGMENTS: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
 
 
 def validate_explicit_fp8_encoding(*, arch: str, use_fp8: bool, fp8_fnuz: bool) -> None:
@@ -258,13 +258,22 @@ def make_explicit_attention_3d_specs(
         raise ValueError(f"waves_per_eu must be one of {WAVES_PER_EU}")
 
     tile = resolve_tile_policy(problem.block_size, config.tile_policy)
-    if arch == "gfx950" and tile != int(problem.block_size):
-        raise ValueError("gfx950 3D implements only tile_size == block_size")
-    if arch == "gfx942" and tile not in (
+    tile_fields: dict[str, object] = {}
+    if arch == "gfx950":
+        # The gfx950 segment kernel tiles whole pages: T = block_size * kv_tile_mult.
+        if tile % int(problem.block_size):
+            raise ValueError("gfx950 3D tiles must be a whole number of pages")
+        if tile != int(problem.block_size):
+            tile_fields["kv_tile_mult"] = tile // int(problem.block_size)
+    elif tile not in (
         int(problem.block_size),
         max(1, int(problem.block_size) // 2),
     ):
         raise ValueError("gfx942 3D implements only full- or half-block tiles")
+    else:
+        tile_fields["tile_size_override"] = (
+            None if tile == int(problem.block_size) else int(tile)
+        )
 
     spec_type, reduce_type, _, _, supports = _tiled_3d_impl(arch)
     knobs = _checked_knobs(config.knob_dict())
@@ -273,11 +282,15 @@ def make_explicit_attention_3d_specs(
         for name in ("use_invariant_hoist", "use_wide_kv_load")
     ):
         raise ValueError("gfx950 3D does not implement hoist/wide-KV tuning knobs")
+    if knobs.get("decode_fast_path", False) and int(problem.max_seqlen_q) != 1:
+        # The all-decode kernel maps CTA x to sequence x and serves one query
+        # token per sequence; a longer query would be silently dropped.
+        raise ValueError("decode_fast_path requires max_seqlen_q == 1")
     segment = spec_type(
         **_semantic_fields(problem),
         num_segments=int(config.num_segments),
         waves_per_eu=config.waves_per_eu,
-        tile_size_override=(None if tile == int(problem.block_size) else int(tile)),
+        **tile_fields,
         **knobs,
     )
     ok, why = supports(

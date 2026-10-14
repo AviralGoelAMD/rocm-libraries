@@ -2617,6 +2617,82 @@ def _enable_fp_contract(problem: UnifiedAttentionProblem) -> bool:
     return _resolve_attention_arch() == "gfx950"
 
 
+def _gfx950_decode_3d_cohort(problem: UnifiedAttentionProblem) -> bool:
+    """Paged gfx950 split-KV decode shapes that take the decode kernel config.
+
+    Every sequence has at most one query token (``max_seqlen_q == 1``), the
+    query dtype is bf16 (KV bf16 or OCP fp8), head_size 128 with 16-token
+    pages, GQA groups of 4 or 8 query heads per KV head, and no sliding
+    window, sinks, softcap, ALiBi or QQ bias. These are the shapes the config
+    below and :func:`_gfx950_decode_3d_segments` were validated on; every
+    other shape keeps the generic segment kernel. The spec class comes from
+    the running box and the segment count from ``clamp_arch``, so both must
+    name gfx950.
+    """
+    if problem.clamp_arch not in (None, "gfx950"):
+        return False
+    shape_ok = (
+        problem.max_seqlen_q == 1
+        and problem.dtype == "bf16"
+        and problem.q_dtype in (None, "bf16")
+        and not problem.fp8_fnuz
+        and problem.head_size == 128
+        and problem.block_size == 16
+        and problem.num_kv_heads > 0
+        and problem.num_query_heads % problem.num_kv_heads == 0
+        and problem.num_queries_per_kv in (4, 8)
+        and problem.sliding_window == 0
+        and not problem.use_sinks
+        and problem.softcap == 0
+        and not problem.use_alibi
+        and not problem.use_qq_bias
+    )
+    return shape_ok and _resolve_attention_arch() == "gfx950"
+
+
+def _gfx950_decode_3d_segments(problem: UnifiedAttentionProblem) -> int:
+    """Segment count for the gfx950 decode kernel config.
+
+    Fill the device with ``_effective_target_ctas`` CTAs (4 per CU by default)
+    across the ``num_seqs * num_kv_heads`` (sequence, KV head) pairs, rounded
+    up to a power of two; keep every segment at least 4 tiles of 32 keys
+    (``max_seqlen_k // 128``, rounded down to a power of two); cap at 128.
+    Uses only host-known request values.
+    """
+    pairs = max(1, problem.num_seqs * problem.num_kv_heads)
+    fill = _next_power_of_2(-(-problem._effective_target_ctas // pairs))
+    span = max(1, problem.max_seqlen_k // 128)
+    span_pow2 = 1 << (span.bit_length() - 1)
+    return max(1, min(128, span_pow2, fill))
+
+
+def _gfx950_decode_3d_knobs(problem: UnifiedAttentionProblem) -> dict:
+    """Segment-kernel fields of the gfx950 decode config (empty off-cohort).
+
+    All-decode launch with an exact grid and segment-fastest CTA order, a
+    two-page KV tile, one-tile-ahead K/V prefetch with prefetched block ids
+    read as scalar invariant loads, and the transposed softmax. bf16 KV adds
+    split K/V waits and streaming (GLC|SLC) K/V DMAs; fp8 KV folds the K/V
+    scales out of the dequant.
+    """
+    if not _gfx950_decode_3d_cohort(problem):
+        return {}
+    knobs = {
+        "decode_fast_path": True,
+        "seg_major_order": True,
+        "kv_tile_mult": 2,
+        "kv_prefetch": True,
+        "scalar_block_ids": True,
+        "transposed_softmax": True,
+    }
+    if problem.use_fp8:
+        knobs["fold_kv_scale"] = True
+    else:
+        knobs["kv_split_wait"] = True
+        knobs["kv_load_aux"] = 3
+    return knobs
+
+
 # --- LDS-budget resolver ----------------------------------------------------
 # The 2D-tiled register-PV path stages the K/V tiles plus a small epilogue Acc_lds
 # buffer in LDS (Q, P^T and the running O accumulator are register-resident, so
@@ -2949,8 +3025,16 @@ def _pre_bump_segments(problem: UnifiedAttentionProblem) -> int:
     )
 
 
-def _num_segments(problem: UnifiedAttentionProblem) -> int:
-    """Mirror AITER ``select_3d_config`` num_segments derivation exactly."""
+def _num_segments(problem: UnifiedAttentionProblem, *, paged_kv: bool = True) -> int:
+    """Mirror AITER ``select_3d_config`` num_segments derivation exactly.
+
+    Paged gfx950 decode shapes in :func:`_gfx950_decode_3d_cohort` instead use
+    :func:`_gfx950_decode_3d_segments`, the rule measured for the decode kernel
+    config; ``paged_kv=False`` (the strided decode kernel, which does not take
+    that config) keeps the generic derivation.
+    """
+    if paged_kv and _gfx950_decode_3d_cohort(problem):
+        return _gfx950_decode_3d_segments(problem)
     attn_cfg, _ = problem.select_3d()
     segments = attn_cfg.NUM_SEGMENTS_PER_SEQ
     # Key the clamp on the arch this problem targets when the dispatcher threaded
@@ -3274,7 +3358,7 @@ def _strided_3d_specs_from_problem(problem: UnifiedAttentionProblem, *, arch: st
         has_softcap=problem.softcap > 0,
         use_alibi=problem.use_alibi,
         use_qq_bias=problem.use_qq_bias,
-        num_segments=_num_segments(problem),
+        num_segments=_num_segments(problem, paged_kv=False),
         num_seqs=problem.num_seqs,
         waves_per_eu=waves,
         tile_size_override=_gfx942_3d_tile_size_override(problem, arch=arch),
@@ -3352,6 +3436,7 @@ def _tiled_3d_cache_key(problem: UnifiedAttentionProblem) -> Tuple:
         _kv_storage_dtype(problem),
         _enable_i64_kv_addr(problem),
         _enable_f32_denormal_flush(problem),
+        tuple(sorted(_gfx950_decode_3d_knobs(problem).items())),
     )
     if _resolve_attention_arch() == "gfx1250":
         sp = _tiled_3d_spec_from_problem(problem)
@@ -3696,7 +3781,7 @@ def _run_3d_tiled_on_stream(
         num_segments = int(tuning_spec.kernel_spec.num_segments)
         cache_key = tuning_spec.cache_key()
     else:
-        num_segments = _num_segments(problem)
+        num_segments = _num_segments(problem, paged_kv=kv_cache_layout is None)
         cache_key = _tiled_3d_cache_key(problem)
     if kv_cache_layout is not None:
         cache_key = cache_key + ("strided_kv",)
@@ -4485,10 +4570,24 @@ def _get_3d_pipeline(
         cache_key=("3d_red",) + cache_key,
     )
     pipeline = PipelineLauncher([seg_launcher, red_launcher])
-    block_q = (
-        16 // problem.num_queries_per_kv if problem.num_queries_per_kv <= 16 else 1
-    )
-    total_num_q_blocks = problem.total_q // block_q + problem.num_seqs
+    if tuning_spec is not None:
+        decode_fast_path = bool(
+            getattr(tuning_spec.kernel_spec, "decode_fast_path", False)
+        )
+    else:
+        decode_fast_path = not strided_kv and bool(
+            _gfx950_decode_3d_knobs(problem).get("decode_fast_path", False)
+        )
+    if decode_fast_path:
+        # All-decode kernel contract: CTA x owns sequence x.
+        total_num_q_blocks = problem.num_seqs
+    else:
+        block_q = (
+            16 // problem.num_queries_per_kv
+            if problem.num_queries_per_kv <= 16
+            else 1
+        )
+        total_num_q_blocks = problem.total_q // block_q + problem.num_seqs
     # gfx1250 (gfx1250) runs the split-KV segment + reduce as one wave32 CTA; the
     # CDNA wave64 archs (gfx950/gfx942) use a wave64 CTA.
     wave_size = 32 if _resolve_attention_arch() == "gfx1250" else 64

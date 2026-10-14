@@ -128,7 +128,23 @@ _GFX950_FP_POLICY_AXES: Tuple[KnobAxis, ...] = (
     _flag("use_f32_denormal_flush"),
     _flag("use_fp_contract"),
 )
-_GFX950_3D_AXES: Tuple[KnobAxis, ...] = _3D_AXES + (_flag("use_f32_denormal_flush"),)
+# gfx950 split-KV decode-kernel knobs. The all-decode launch, the prefetch the
+# split waits and scalar block ids build on, and the transposed softmax lead as
+# enablers; the explicit spec builder rejects decode_fast_path for a problem
+# with max_seqlen_q > 1, and the spec validator prunes the dtype-specific ones
+# (split waits: bf16/fp16 KV; scale folding: fp8 KV).
+_GFX950_3D_AXES: Tuple[KnobAxis, ...] = (
+    _flag("decode_fast_path", enabler=True),
+    _flag("kv_prefetch", enabler=True),
+    _flag("transposed_softmax", enabler=True),
+    *_3D_AXES,
+    _flag("use_f32_denormal_flush"),
+    _flag("seg_major_order"),
+    _flag("scalar_block_ids"),
+    _flag("kv_split_wait"),
+    _flag("fold_kv_scale"),
+    _values("kv_load_aux", 0, (0, 1, 2, 3)),
+)
 
 # Dense-kernel spec fields the tuning space never varies. Problem fields come
 # from the request; variant fields are fixed by the registered dense candidate
@@ -333,6 +349,16 @@ _R4_HLPV = {
 _VDBUF = {"use_v_double_buffer": True}
 _VDBUF_STGW = {**_VDBUF, "use_staggered_iter_wait": True}
 _PROD_SCHED_BARRIER_MASKS = (0x0, 0x008, 0x108)
+# The gfx950 paged decode config (kernels.common.attention_unified.
+# _gfx950_decode_3d_knobs) with the f32 flush the dispatcher also sets.
+_GFX950_DECODE_3D = {
+    "decode_fast_path": True,
+    "seg_major_order": True,
+    "kv_prefetch": True,
+    "scalar_block_ids": True,
+    "transposed_softmax": True,
+    "use_f32_denormal_flush": True,
+}
 
 _PRODUCTION_STACKS: Mapping[Tuple[str, str], Tuple[Tuple[str, Mapping], ...]] = {
     ("gfx950", "narrow"): (
@@ -437,7 +463,13 @@ _PRODUCTION_STACKS: Mapping[Tuple[str, str], Tuple[Tuple[str, Mapping], ...]] = 
         ("widekv", {"use_wide_kv_load": True}),
         ("hoist_widekv", {"use_invariant_hoist": True, "use_wide_kv_load": True}),
     ),
-    ("gfx950", "splitkv"): (("baseline", {}),),
+    ("gfx950", "splitkv"): (
+        ("baseline", {}),
+        # The paged decode config the dispatcher selects (_gfx950_decode_3d_knobs).
+        ("decode", _GFX950_DECODE_3D),
+        ("decode_bf16kv", {**_GFX950_DECODE_3D, "kv_split_wait": True, "kv_load_aux": 3}),
+        ("decode_fp8kv", {**_GFX950_DECODE_3D, "fold_kv_scale": True}),
+    ),
 }
 # Production micro-axes layered on some stacks: padded K for the single-K
 # unaliased-Q stack, the sched_group_barrier interleave on three transposed
