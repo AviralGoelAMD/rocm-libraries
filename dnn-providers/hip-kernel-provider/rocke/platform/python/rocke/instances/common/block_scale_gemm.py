@@ -55,7 +55,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Tuple
 
-from ...core.ir import F32, I32, IRBuilder, KernelDef, PtrType
+from ...core.ir import BF16, F32, I32, IRBuilder, KernelDef, PtrType
 from ...helpers.atoms import MfmaAtom
 from ...helpers.io import io_ir_type
 from ...helpers.mfma_gemm_inner import (
@@ -122,6 +122,9 @@ class BlockScaleGemmSpec:
     prefetch: bool = False
     k_unroll: int = 1
     lds: bool = False
+    # Tiled body only: "bf16" rounds the f32 accumulators in the epilogue
+    # and C becomes a bf16 (M, N) tensor (needs split_k == 1).
+    out_dtype: str = "f32"
 
     @property
     def tiled(self) -> bool:
@@ -134,6 +137,7 @@ class BlockScaleGemmSpec:
             or self.prefetch
             or self.k_unroll != 1
             or self.lds
+            or self.out_dtype != "f32"
         )
 
     def tiled_config(self) -> TiledScaledGemmConfig:
@@ -153,6 +157,7 @@ class BlockScaleGemmSpec:
             prefetch=self.prefetch,
             k_unroll=self.k_unroll,
             lds=self.lds,
+            out_dtype=self.out_dtype,
         )
 
     @property
@@ -200,7 +205,7 @@ class BlockScaleGemmSpec:
             parts.append(
                 f"tl{self.b_layout}m{self.mfma_m}n{self.mfma_n}w{self.warp_m}x{self.warp_n}"
                 f"k{self.k_atom}s{self.split_k}{'pf' if self.prefetch else ''}u{self.k_unroll}"
-                f"{'lds' if self.lds else ''}"
+                f"{'lds' if self.lds else ''}{'' if self.out_dtype == 'f32' else self.out_dtype}"
             )
         return kernel_name_join(self.name, *parts, flags={"psb": self.preshuffle_b})
 
@@ -353,10 +358,11 @@ def build_block_scale_gemm(spec: BlockScaleGemmSpec, arch: str = "gfx950") -> Ke
         AScale = b.param("AScale", PtrType(F32, "global"), readonly=True, align=4)
     if spec.quant_mode in ("bquant", "abquant"):
         BScale = b.param("BScale", PtrType(F32, "global"), readonly=True, align=4)
+    c_ty = BF16 if spec.out_dtype == "bf16" else F32
     if spec.split_k > 1:
-        C = b.param("C", PtrType(F32, "global"), align=4)
+        C = b.param("C", PtrType(c_ty, "global"), align=4)
     else:
-        C = b.param("C", PtrType(F32, "global"), writeonly=True, align=4)
+        C = b.param("C", PtrType(c_ty, "global"), writeonly=True, align=4)
     M = b.param("M", I32)  # noqa: F841 -- ABI; equals spec.M
     N = b.param("N", I32)  # noqa: F841 -- ABI; equals spec.N
     Kp = b.param("K", I32)  # noqa: F841 -- ABI
@@ -552,7 +558,7 @@ def block_scale_gemm_signature(spec: BlockScaleGemmSpec):
         sb.ptr("AScale", "f32")
     if spec.quant_mode in ("bquant", "abquant"):
         sb.ptr("BScale", "f32")
-    sb.ptr("C", "f32").scalar("M", "i32").scalar("N", "i32").scalar("K", "i32")
+    sb.ptr("C", spec.out_dtype).scalar("M", "i32").scalar("N", "i32").scalar("K", "i32")
     return sb.build()
 
 

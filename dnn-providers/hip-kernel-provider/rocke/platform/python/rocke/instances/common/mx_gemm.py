@@ -55,7 +55,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Tuple
 
-from ...core.ir import F32, I8, I32, IRBuilder, KernelDef, PtrType
+from ...core.ir import BF16, F32, I8, I32, IRBuilder, KernelDef, PtrType
 from ...helpers.atoms import MfmaAtom
 from ...helpers.mfma_gemm_inner import (
     decode_mfma_lanes,
@@ -122,6 +122,9 @@ class MxGemmSpec:
     prefetch: bool = False
     k_unroll: int = 1
     lds: bool = False
+    # Tiled body only: "bf16" rounds the f32 accumulators in the epilogue
+    # and C becomes a bf16 (M, N) tensor (needs split_k == 1).
+    out_dtype: str = "f32"
 
     @property
     def tiled(self) -> bool:
@@ -135,6 +138,7 @@ class MxGemmSpec:
             or self.prefetch
             or self.k_unroll != 1
             or self.lds
+            or self.out_dtype != "f32"
         )
 
     def tiled_config(self) -> TiledScaledGemmConfig:
@@ -155,6 +159,7 @@ class MxGemmSpec:
             prefetch=self.prefetch,
             k_unroll=self.k_unroll,
             lds=self.lds,
+            out_dtype=self.out_dtype,
         )
 
     @property
@@ -189,7 +194,7 @@ class MxGemmSpec:
             parts.append(
                 f"tl{self.b_layout}m{self.mfma_m}n{self.mfma_n}w{self.warp_m}x{self.warp_n}"
                 f"k{self.k_atom}{'sc' if self.scaled_mfma else ''}s{self.split_k}{'pf' if self.prefetch else ''}u{self.k_unroll}"
-                f"{'lds' if self.lds else ''}"
+                f"{'lds' if self.lds else ''}{'' if self.out_dtype == 'f32' else self.out_dtype}"
             )
         return kernel_name_join(self.name, *parts)
 
@@ -275,10 +280,11 @@ def build_mx_gemm(spec: MxGemmSpec, arch: str = "gfx950") -> KernelDef:
     AScale = b.param("AScale", PtrType(I8, "global"), readonly=True, align=1)
     Bp = b.param("B", PtrType(mantissa_ty, "global"), readonly=True, align=16)
     BScale = b.param("BScale", PtrType(I8, "global"), readonly=True, align=1)
+    c_ty = BF16 if spec.out_dtype == "bf16" else F32
     if spec.split_k > 1:
-        C = b.param("C", PtrType(F32, "global"), align=4)
+        C = b.param("C", PtrType(c_ty, "global"), align=4)
     else:
-        C = b.param("C", PtrType(F32, "global"), writeonly=True, align=4)
+        C = b.param("C", PtrType(c_ty, "global"), writeonly=True, align=4)
     _M = b.param("M", I32)  # noqa: F841 -- ABI
     _N = b.param("N", I32)  # noqa: F841 -- ABI
     _K = b.param("K", I32)  # noqa: F841 -- ABI
@@ -450,7 +456,7 @@ def mx_gemm_signature(spec: MxGemmSpec):
         .ptr("AScale", "i8")
         .ptr("B", spec.mantissa_dtype)
         .ptr("BScale", "i8")
-        .ptr("C", "f32")
+        .ptr("C", spec.out_dtype)
         .scalar("M", "i32")
         .scalar("N", "i32")
         .scalar("K", "i32")

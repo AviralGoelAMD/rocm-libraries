@@ -53,6 +53,8 @@ class TiledScaledGemmConfig:
     prefetch: bool = False
     k_unroll: int = 1
     lds: bool = False
+    # "f32" or "bf16" (rounded in the epilogue; needs split_k == 1).
+    out_dtype: str = "f32"
 
     @property
     def tile_m(self) -> int:
@@ -117,6 +119,10 @@ def validate_tiled(cfg: TiledScaledGemmConfig) -> Tuple[bool, str]:
         return False, "the 16x16x128 atom needs b_layout='nk' (K-contiguous B)"
     if cfg.scale_mode == "block" and gn % 16 and gn != 1:
         return False, "group_n must be 1 or a multiple of 16"
+    if cfg.out_dtype not in ("f32", "bf16"):
+        return False, f"out_dtype must be 'f32' or 'bf16' (got {cfg.out_dtype!r})"
+    if cfg.out_dtype != "f32" and cfg.split_k > 1:
+        return False, "split_k accumulates f32 atomically; out_dtype must be 'f32'"
     return True, "ok"
 
 
@@ -312,6 +318,8 @@ def emit_tiled_scaled_gemm(
                 v = b.vec_extract(acc, i)
                 if cfg.split_k > 1:
                     b.global_atomic_add(C, addr, v)
+                elif cfg.out_dtype == "bf16":
+                    b.global_store(C, addr, b.trunc_f32_to_bf16(v), align=2)
                 else:
                     b.global_store(C, addr, v, align=4)
 
