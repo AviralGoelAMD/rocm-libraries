@@ -107,6 +107,16 @@ void rocke_dconv_emit_params(rocke_ir_builder_t* b,
                              const char* direction,
                              const rocke_type_t* io_type);
 
+/* Python dilation_reason(p): true (and the reason in `why`) when a direct-conv
+ * kernel without dilation support cannot compute p. Defined in
+ * conv_direct_grouped_spec_and_validate.cpp. */
+bool rocke_direct_dilation_reason(const rocke_direct_conv_problem_t* p, char* why, size_t why_cap);
+
+/* Copy `msg` into (err, err_cap), NUL-terminated and truncated to fit. No-op
+ * if err is NULL or err_cap is 0. Defined in
+ * conv_direct_grouped_public_entry_glue.cpp. */
+void rocke_dconv_set_err(char* err, size_t err_cap, const char* msg);
+
 /* A[N,H,W,total_c] with runtime extents + the two conv-spatial embeds.
  * w_upper_0 / w_upper_1 name the column pair ("q_pos"/"W_lds_pos" for the
  * LDS-staged variants, "wo"/"s" for the DRAM-direct 4c one). */

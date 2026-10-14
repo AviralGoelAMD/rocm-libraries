@@ -40,43 +40,6 @@
 
 #include "rocke/error_boundary.hpp"
 
-namespace
-{
-
-/* Python dilation_reason(p) (file-local twin of the static helper in
- * conv_direct_grouped_spec_and_validate.cpp; same text). */
-bool dgs_dilation_reason(const rocke_direct_conv_problem_t* p, char* why, size_t why_cap)
-{
-    if(p->dil_h != 1 || p->dil_w != 1)
-    {
-        snprintf(why,
-                 why_cap,
-                 "this direct conv kernel has no dilation (got %dx%d); only the non-grouped "
-                 "forward kernel computes a dilated convolution",
-                 p->dil_h,
-                 p->dil_w);
-        return true;
-    }
-    return false;
-}
-
-/* Copy `msg` into (err, err_cap), NUL-terminated and truncated. */
-void dgs_set_err(char* err, size_t err_cap, const char* msg)
-{
-    size_t n;
-    if(err == NULL || err_cap == 0)
-        return;
-    if(msg == NULL)
-        msg = "";
-    n = strlen(msg);
-    if(n >= err_cap)
-        n = err_cap - 1;
-    memcpy(err, msg, n);
-    err[n] = '\0';
-}
-
-} // namespace
-
 /* ===================================================================== *
  *  Spec helpers
  * ===================================================================== */
@@ -190,7 +153,7 @@ bool rocke_direct_depthwise_dgrad_stream_is_valid_spec(
     p = &spec->problem;
     {
         char dil_why[256];
-        if(dgs_dilation_reason(p, dil_why, sizeof dil_why))
+        if(rocke_direct_dilation_reason(p, dil_why, sizeof dil_why))
         {
             if(reason != NULL && reason_cap > 0)
                 snprintf(reason, reason_cap, "%s", dil_why);
@@ -659,7 +622,7 @@ rocke_status_t rocke_direct_depthwise_dgrad_stream_lower_to_llvm(
         *out_ll = NULL;
     if(spec == NULL || out_ll == NULL)
     {
-        dgs_set_err(err, err_cap, "lower_to_llvm: null spec/out");
+        rocke_dconv_set_err(err, err_cap, "lower_to_llvm: null spec/out");
         return ROCKE_ERR_VALUE;
     }
     if(arch == NULL)
@@ -669,10 +632,11 @@ rocke_status_t rocke_direct_depthwise_dgrad_stream_lower_to_llvm(
     {
         const char* m = rocke_ir_builder_error(&b);
         st = rocke_ir_builder_status(&b);
-        dgs_set_err(err,
-                    err_cap,
-                    (m != NULL && m[0] != '\0') ? m
-                                                : "build_direct_depthwise_dgrad_streaming failed");
+        rocke_dconv_set_err(err,
+                            err_cap,
+                            (m != NULL && m[0] != '\0')
+                                ? m
+                                : "build_direct_depthwise_dgrad_streaming failed");
         rocke_ir_builder_free(&b);
         return (st == ROCKE_OK) ? ROCKE_ERR_VALUE : st;
     }
