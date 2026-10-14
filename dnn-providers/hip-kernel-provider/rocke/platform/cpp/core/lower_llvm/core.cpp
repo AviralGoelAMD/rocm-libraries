@@ -1984,6 +1984,22 @@ void rocke_ll_finalize(rocke_lower_t* L, rocke_strbuf_t* out)
             rocke_strbuf_appendf(
                 out, " \"amdgpu-cluster-dims\"=\"%s\"", rocke_ll_format_cluster_dims(L, cluster));
         }
+        /* Per-kernel subtarget feature overrides, emitted verbatim as the
+         * LLVM "target-features" function attribute; an empty string emits
+         * nothing (mirrors the Python lowerer). */
+        const rocke_attr_value_t* features
+            = rocke_attr_get(&L->kernel->attrs, "target_features");
+        if(features)
+        {
+            if(features->kind != ROCKE_ATTR_STR || !features->u.s)
+            {
+                rocke_ll_fail(L, ROCKE_ERR_VALUE, "target_features must be a string");
+            }
+            if(features->u.s[0] != '\0')
+            {
+                rocke_strbuf_appendf(out, " \"target-features\"=\"%s\"", features->u.s);
+            }
+        }
     }
     rocke_strbuf_append(out, " norecurse nounwind }\n");
 

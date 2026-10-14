@@ -6581,6 +6581,15 @@ class _Lowerer:
             self._require_gfx1250_llvm23("cluster_dims")
             cx, cy, cz = check_cluster_dims(cluster_dims)
             attr_parts.append(f'"amdgpu-cluster-dims"="{cx},{cy},{cz}"')
+        # Optional per-kernel subtarget feature overrides, lowered verbatim to
+        # the LLVM "target-features" function attribute (for example
+        # "-packed-fp32-ops"). An empty string emits nothing.
+        target_features = self.kernel.attrs.get("target_features")
+        if target_features is not None:
+            if not isinstance(target_features, str):
+                raise ValueError("target_features must be a string")
+            if target_features:
+                attr_parts.append(f'"target-features"="{target_features}"')
         out.append(
             "attributes #0 = { " + " ".join(attr_parts) + " norecurse nounwind }"
         )
