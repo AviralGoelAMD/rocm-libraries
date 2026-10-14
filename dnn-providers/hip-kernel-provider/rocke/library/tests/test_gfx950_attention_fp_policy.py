@@ -70,7 +70,7 @@ def test_gfx950_2d_spec_turns_both_flags_on(arch):
     with arch("gfx950"):
         spec = sb._tiled_spec_from_problem(_problem())
     assert spec.use_f32_denormal_flush and spec.use_fp_contract
-    assert spec.kernel_name().endswith("_ftz_fpc")
+    assert "_ftz_fpc" in spec.kernel_name()
 
 
 def test_gfx950_3d_spec_turns_flush_on_only(arch):

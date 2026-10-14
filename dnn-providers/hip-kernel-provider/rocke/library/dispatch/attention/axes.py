@@ -60,6 +60,12 @@ _GFX950_2D_AXES: Tuple[KnobAxis, ...] = (
     _flag("use_staggered_iter_wait"),
     _values("kv_ring_depth", 2, (2, 3)),
     _flag("use_q_reread"),
+    _flag("use_reverse_q_block_order"),
+    _flag("use_k_lds_xor_swizzle"),
+    _flag("use_v_lds_xor_swizzle"),
+    _flag("use_lds_dma_overlap"),
+    _flag("use_kv_block_id_prefetch"),
+    _flag("use_softmax_scale_fold"),
     _gated("use_kq_lds_pad", {"kq_lds_pad_halves": _KQ_LDS_PAD_HALVES}),
     _gated("use_sched_barrier", {"sched_barrier_mask": _SCHED_BARRIER_MASKS}),
     KnobAxis(
@@ -332,6 +338,18 @@ _R4_HLPV = {
 }
 _VDBUF = {"use_v_double_buffer": True}
 _VDBUF_STGW = {**_VDBUF, "use_staggered_iter_wait": True}
+# The gfx950 pipelined single-seq prefill stack (mirrors
+# ``_gfx950_prefill_pipeline_overrides``; the tile comes from the geometry).
+_PIPELINE = {
+    **_VDBUF,
+    "use_k_lds_xor_swizzle": True,
+    "use_v_lds_xor_swizzle": True,
+    "use_reverse_q_block_order": True,
+    "use_lds_dma_overlap": True,
+    "use_mask_phase_split": True,
+    "use_kv_block_id_prefetch": True,
+    "use_softmax_scale_fold": True,
+}
 _PROD_SCHED_BARRIER_MASKS = (0x0, 0x008, 0x108)
 
 _PRODUCTION_STACKS: Mapping[Tuple[str, str], Tuple[Tuple[str, Mapping], ...]] = {
@@ -377,6 +395,7 @@ _PRODUCTION_STACKS: Mapping[Tuple[str, str], Tuple[Tuple[str, Mapping], ...]] = 
         ("r4_mlim_vdbuf", {**_R4_MLIM, **_VDBUF}),
         ("r4_mlim_phase", {**_R4_MLIM, "use_mask_phase_split": True}),
         ("r4_hlpv_agpr0", {**_R4_HLPV, "use_agpr_alloc_zero": True}),
+        ("pipeline", {**_R4_HLPV, **_PIPELINE}),
     ),
     ("gfx942", "narrow"): (
         ("baseline", {}),

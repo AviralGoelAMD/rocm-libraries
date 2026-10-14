@@ -400,6 +400,38 @@ static bool enable_transposed_subflags(const rocke_unified_attn_problem_t* p)
     return enable_transposed_qk_32x32(p);
 }
 
+/* Python: _gfx950_prefill_pipeline_cohort(problem). Shape cohort of the
+ * gfx950 pipelined prefill stack. Single-seq: the single-batch combo cohort.
+ * Multi-seq: the transposed-32x32 half-local-PV body
+ * (_enable_transposed_half_local_pv == _enable_transposed_qk_32x32) with the
+ * no-SW softmax sub-flags, outside the combo_2d family. Both without SW /
+ * ALiBi / QQ-bias / sinks / softcap / FP8, paged block_size 16, head 128. */
+static bool gfx950_prefill_pipeline_cohort(const rocke_unified_attn_problem_t* p)
+{
+    bool body;
+    if(p->num_seqs == 1)
+    {
+        body = enable_single_batch_combo(p);
+    }
+    else
+    {
+        body = enable_transposed_qk_32x32(p) && enable_transposed_subflags(p)
+               && !enable_combo_2d(p);
+    }
+    return body && p->sliding_window == 0 && !p->use_alibi && !p->use_qq_bias && !p->use_sinks
+           && p->softcap == 0 && !p->use_fp8 && p->block_size == 16 && p->head_size == 128;
+}
+
+/* Python: _gfx950_prefill_pipeline(problem) = the cohort AND
+ * _select_2d_compile_backend(problem) == "llvm". The C problem carries no
+ * compile_backend (it is the auto selection), and auto pins the cohort to
+ * LLVM-direct, so the predicate reduces to the cohort. An explicit
+ * compile_backend="hipcc" override exists only on the Python problem. */
+static bool gfx950_prefill_pipeline(const rocke_unified_attn_problem_t* p)
+{
+    return gfx950_prefill_pipeline_cohort(p);
+}
+
 /* Python: _enable_gfx942_small_q_narrow(problem). */
 static bool enable_gfx942_small_q_narrow(const rocke_unified_attn_problem_t* p)
 {
@@ -516,6 +548,12 @@ static int select_2d_tile_size(const rocke_unified_attn_problem_t* p)
     {
         return p->block_size;
     }
+    /* gfx950 pipelined prefill stack (single- and multi-seq): tuned at a
+     * 64-token tile. */
+    if(gfx950_prefill_pipeline(p))
+    {
+        return 64;
+    }
     /* Single-batch d128/d64 prefill full-combo cohort: d128 -> 2*BS, d64 -> 128. */
     if(enable_single_batch_combo(p))
     {
@@ -610,6 +648,13 @@ int rocke_unified_attn_select_2d_num_warps(const rocke_unified_attn_problem_t* p
             break;
         }
         return (t2 > 1) ? t2 : 1;
+    }
+    /* Multi-seq pipelined prefill: the measured geometry is nw=4 at T=64. The
+       generic LDS step-down below budgets P/Acc tiles this register-resident
+       transposed body never allocates, and would halve it to nw=2. */
+    if(p->num_seqs >= 2 && gfx950_prefill_pipeline_cohort(p))
+    {
+        return 4;
     }
     /* Single-batch d128/d64 prefill full-combo cohort (re-tuned by the
        joint num_warps x schedule sweep): d64 -> nw=4 (T=128); d128 -> nw=2
@@ -927,6 +972,16 @@ bool rocke_unified_attn_enable_early_v_schedule(const rocke_unified_attn_problem
     return enable_early_v_schedule(p);
 }
 
+bool rocke_unified_attn_gfx950_prefill_pipeline_cohort(const rocke_unified_attn_problem_t* p)
+{
+    return gfx950_prefill_pipeline_cohort(p);
+}
+
+bool rocke_unified_attn_gfx950_prefill_pipeline(const rocke_unified_attn_problem_t* p)
+{
+    return gfx950_prefill_pipeline(p);
+}
+
 /* ----------------------------------------- tiled_spec_from_problem */
 
 /* Python: attention_spec_builder._tiled_spec_from_problem(problem).
@@ -1052,6 +1107,26 @@ rocke_attention_tiled_2d_spec_t
      * from the comparison until the predicate is fully ported.
      * NOTE: this is the only field not fully implemented; all non-fp8 problems in the
      * problem matrix will have correct selector parity. */
+
+    /* gfx950 pipelined prefill stack: mirrors Python
+     * _gfx950_prefill_pipeline_overrides() applied by _spec_gfx950_generic.
+     * use_kq_lds_pad=False is the C struct's implicit default (the field is
+     * not carried). */
+    if(gfx950_prefill_pipeline(p))
+    {
+        s.use_k_lds_xor_swizzle = true;
+        s.use_v_lds_xor_swizzle = true;
+        s.use_reverse_q_block_order = true;
+        s.use_v_double_buffer = true;
+        s.use_staggered_iter_wait = false;
+        s.use_early_v_schedule = false;
+        s.use_k_single_buffer = false;
+        s.use_fast_paged_kv_desc = false;
+        s.use_lds_dma_overlap = true;
+        s.use_mask_phase_split = true;
+        s.use_kv_block_id_prefetch = true;
+        s.use_softmax_scale_fold = true;
+    }
     return s;
 }
 

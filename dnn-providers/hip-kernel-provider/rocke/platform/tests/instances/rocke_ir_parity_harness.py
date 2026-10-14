@@ -2926,6 +2926,53 @@ def cases():
             use_fp_contract=True,
         ),
     )
+    # The dispatcher's gfx950 D128 bs16 GQA-4 paged prefill pipeline stack:
+    # single-seq bf16 / fp16 (softmax interleave) and multi-seq bf16.
+    _pipe = dict(
+        head_size=128,
+        block_size=16,
+        num_query_heads=32,
+        num_kv_heads=8,
+        num_warps=4,
+        waves_per_eu=2,
+        tile_size=64,
+        block_m_per_warp=32,
+        use_mfma_32x32=True,
+        use_transposed_qk_32x32=True,
+        use_transposed_scalar_state=True,
+        use_transposed_mask_once=True,
+        use_transposed_half_local_pv=True,
+        use_mfma32_skip_legacy_qreg=True,
+        use_transposed_mask_limit=True,
+        use_v_double_buffer=True,
+        use_mask_phase_split=True,
+        use_f32_denormal_flush=True,
+        use_fp_contract=True,
+        use_reverse_q_block_order=True,
+        use_k_lds_xor_swizzle=True,
+        use_v_lds_xor_swizzle=True,
+        use_lds_dma_overlap=True,
+        use_kv_block_id_prefetch=True,
+        use_softmax_scale_fold=True,
+    )
+    for _tag, _dt, _seqs, _smxil in (
+        ("bf16", "bf16", 1, True),
+        ("fp16", "fp16", 1, True),
+        ("bf16_multiseq", "bf16", 4, False),
+    ):
+        add(
+            "attention",
+            f"attention/gfx950/2d_{_tag}_d128_b16_gqa4_pipeline",
+            "gfx950",
+            build_attention_2d(
+                f"irhash_attn_950_2d_{_tag}_pipeline",
+                "gfx950",
+                dtype=_dt,
+                num_seqs=_seqs,
+                use_softmax_mfma_interleave=_smxil,
+                **_pipe,
+            ),
+        )
     add(
         "attention",
         "attention/gfx950/3d_bf16_d128_b16_gqa4_ftz",

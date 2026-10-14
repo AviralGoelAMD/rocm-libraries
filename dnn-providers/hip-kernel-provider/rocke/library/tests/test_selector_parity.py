@@ -25,7 +25,7 @@ written for the CORRECT behavior (bias should block combo_2d) and are being skip
 from __future__ import annotations
 
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from unittest import mock
 
 import builders.common.attention_spec_builder as _asb
@@ -424,6 +424,129 @@ class TestTransposedSubflags(unittest.TestCase):
         s = _spec(_combo_prob(use_qq_bias=True))
         self.assertFalse(s["use_transposed_mask_once"])
         self.assertFalse(s["use_transposed_mask_limit"])
+
+
+# ---------------------------------------------------------------------------
+# gfx950 pipelined prefill stack (_gfx950_prefill_pipeline); C++ twin:
+# gfx950_prefill_pipeline in attention_unified_selectors.cpp.
+# ---------------------------------------------------------------------------
+
+_PIPELINE_FLAGS = (
+    "use_k_lds_xor_swizzle",
+    "use_v_lds_xor_swizzle",
+    "use_reverse_q_block_order",
+    "use_v_double_buffer",
+    "use_lds_dma_overlap",
+    "use_mask_phase_split",
+    "use_kv_block_id_prefetch",
+    "use_softmax_scale_fold",
+)
+
+
+def _pipe_prob(**overrides) -> UnifiedAttentionProblem:
+    """d128 bs16 GQA-4 causal prefill (the pipeline cohort's SSOT shape)."""
+    defaults = dict(
+        head_size=128,
+        block_size=16,
+        num_query_heads=32,
+        num_kv_heads=8,
+        max_seqlen_q=8192,
+        max_seqlen_k=8192,
+        num_seqs=1,
+        total_q=8192,
+    )
+    defaults.update(overrides)
+    return _prob(**defaults)
+
+
+class TestGfx950PrefillPipeline(unittest.TestCase):
+    def _routed(self, problem: UnifiedAttentionProblem, arch: str = "gfx950") -> bool:
+        with _patch_arch(arch):
+            return _au._gfx950_prefill_pipeline(problem)
+
+    def _assert_pipeline_spec(self, s: dict, num_warps: int) -> None:
+        for flag in _PIPELINE_FLAGS:
+            self.assertTrue(s[flag], flag)
+        for flag in (
+            "use_kq_lds_pad",
+            "use_staggered_iter_wait",
+            "use_early_v_schedule",
+            "use_k_single_buffer",
+            "use_fast_paged_kv_desc",
+            "use_sched_barrier",
+        ):
+            self.assertFalse(s[flag], flag)
+        self.assertEqual(s["tile_size"], 64)
+        self.assertEqual(s["num_warps"], num_warps)
+        self.assertTrue(s["use_transposed_half_local_pv"])
+
+    def test_single_seq_bf16_and_fp16(self):
+        for dtype in ("bf16", "fp16"):
+            p = _pipe_prob(dtype=dtype)
+            self.assertTrue(self._routed(p), dtype)
+            s = _spec(p)
+            self._assert_pipeline_spec(s, num_warps=4)
+            # single-seq keeps the softmax<->MFMA interleave (iglp mode 1)
+            self.assertTrue(s["use_softmax_mfma_interleave"])
+
+    def test_single_seq_gqa8(self):
+        p = _pipe_prob(num_query_heads=8, num_kv_heads=1, max_seqlen_q=2048,
+                       max_seqlen_k=2048, total_q=2048)
+        self.assertTrue(self._routed(p))
+        self._assert_pipeline_spec(_spec(p), num_warps=4)
+
+    def test_multi_seq_and_ragged(self):
+        for num_seqs, total_q, max_q in ((4, 8192, 2048), (7, 8204, 3000)):
+            p = _pipe_prob(num_seqs=num_seqs, total_q=total_q, max_seqlen_q=max_q,
+                           max_seqlen_k=max_q)
+            self.assertTrue(self._routed(p), num_seqs)
+            s = _spec(p)
+            # nw=4 pinned (the generic LDS step-down would pick 2)
+            self._assert_pipeline_spec(s, num_warps=4)
+            self.assertFalse(s["use_softmax_mfma_interleave"])
+
+    def test_llvm_backend_pinned(self):
+        with _patch_arch("gfx950"):
+            for num_seqs in (1, 4):
+                p = _pipe_prob(num_seqs=num_seqs, max_seqlen_q=2048, max_seqlen_k=2048)
+                self.assertEqual(_au._select_2d_compile_backend(p), "llvm")
+
+    def test_explicit_hipcc_keeps_plain_body(self):
+        p = replace(_pipe_prob(), compile_backend="hipcc")
+        with _patch_arch("gfx950"):
+            self.assertTrue(_au._gfx950_prefill_pipeline_cohort(p))
+        self.assertFalse(self._routed(p))
+        s = _spec(p)
+        for flag in _PIPELINE_FLAGS:
+            if flag != "use_mask_phase_split":
+                self.assertFalse(s[flag], flag)
+
+    def test_cache_key_separates_pipeline(self):
+        p = _pipe_prob()
+        with _patch_arch("gfx950"):
+            k_pipe = _au._tiled_cache_key(p)
+            k_hip = _au._tiled_cache_key(replace(p, compile_backend="hipcc"))
+        self.assertNotEqual(k_pipe, k_hip)
+
+    def test_exclusions(self):
+        excluded = {
+            "block_size_32": _pipe_prob(block_size=32),
+            "head_size_64": _pipe_prob(head_size=64),
+            "sliding_window": _pipe_prob(sliding_window=256),
+            "sinks": _pipe_prob(use_sinks=True),
+            "alibi": _pipe_prob(use_alibi=True),
+            "qq_bias": _pipe_prob(use_qq_bias=True),
+            "softcap": _pipe_prob(softcap=30.0),
+            "fp8": _pipe_prob(use_fp8=True),
+            "short_q": _pipe_prob(max_seqlen_q=256, total_q=256),
+        }
+        for name, p in excluded.items():
+            self.assertFalse(self._routed(p), name)
+            self.assertNotEqual(_spec(p).get("use_lds_dma_overlap"), True, name)
+
+    def test_other_arches_never_route(self):
+        for arch in ("gfx942", "gfx1250"):
+            self.assertFalse(self._routed(_pipe_prob(), arch=arch), arch)
 
 
 if __name__ == "__main__":
