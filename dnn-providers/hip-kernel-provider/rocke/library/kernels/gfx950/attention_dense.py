@@ -261,6 +261,12 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # scheduler). Holds that many operands in registers; a fence per MFMA
     # keeps the distance.
     operand_read_ahead: int = field(default=0, kw_only=True)
+    # wave_group_pingpong + lds_read_base only: four barrier windows per KV tile
+    # that alternate operand reads (all K, then all V operands of a tile) with
+    # MFMA runs (QK, then PV). The lagging wave group runs one window behind,
+    # so on each SIMD one wave reads operands while the other issues MFMAs.
+    # K is prefetched two tiles ahead.
+    mfma_windows: bool = field(default=False, kw_only=True)
 
     def resolved_exp_per_pv_step(self) -> int:
         if self.exp_per_pv_step is not None:
@@ -496,6 +502,20 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
                 "lds_read_base, and excludes bulk_operand_reads; got "
                 f"{self.operand_read_ahead}"
             )
+        if self.mfma_windows and (
+            not (
+                self.wave_group_pingpong
+                and self.lds_read_base
+                and self.lds_dma_manual_wait
+            )
+            or self.bulk_operand_reads
+            or self.operand_read_ahead
+        ):
+            raise ValueError(
+                "mfma_windows needs wave_group_pingpong, lds_read_base and "
+                "lds_dma_manual_wait, and excludes bulk_operand_reads and "
+                "operand_read_ahead"
+            )
 
     @property
     def resolved_persist_decode(self) -> str:
@@ -643,6 +663,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "lds_read_base",
             "scalar_uniforms",
             "operand_read_ahead",
+            "mfma_windows",
         )
     }
 )
@@ -779,6 +800,7 @@ def build_attention_dense(
     BULK_V = bool(spec.bulk_operand_reads & 2)
     LDS_READ_BASE = spec.lds_read_base
     READ_AHEAD = int(spec.operand_read_ahead)
+    WINDOWS = spec.mfma_windows
     IGLP = spec.resolved_iglp_mode()
     gqa = Hq // Hkv
     stride_q_tok = Hq * D
@@ -967,6 +989,9 @@ def build_attention_dense(
         V_LINE_STRIDE = 64 * 8 + spec.lds_v_row_pad
         WIDE_LINE_PASSES = 8 // WAVES
         assert 8 % WAVES == 0
+        # mfma_windows: one K or V tile is this many DMA instructions per wave;
+        # each window wait leaves the two newest tiles in flight.
+        WIN_VMCNT = 2 * WIDE_LINE_PASSES * (D // 64)
         K_lds = b.smem_alloc(
             dtype, [NBUF, K_D_RPT, K_N_RPT, K_LINE_STRIDE], name_hint="Klds"
         )
@@ -1379,6 +1404,11 @@ def build_attention_dense(
                         b.smem_load_vN(K_lds, kbuf, krow, col, dtype=dtype, n=8)
                     )
         b.sched_barrier(0)
+        return _qk_mfma_run(packs, after_mfma, accs)
+
+    def _qk_mfma_run(packs, after_mfma, accs):
+        """The QK MFMA run over K operands already in registers (tile order:
+        nsub-major, then k-step)."""
         s_reg = []
         for nsub in range(N_SUB):
             acc = b.zero_vec_f32(16)
@@ -1392,6 +1422,11 @@ def build_attention_dense(
                 accs.append(acc)
             s_reg.append([b.vec_extract(acc, i) for i in range(16)])
         return s_reg
+
+    def read_k_tile(kbuf):
+        """Every K operand of one tile (lds_read_base addressing)."""
+        kt = k_tile_base(kbuf)
+        return [read_k_at(kt, n, ks) for n in range(N_SUB) for ks in range(K_STEPS)]
 
     def do_mask(s_reg, tile_idx, lower=False, upper=True):
         """Apply causal (upper: ktok<=q) and/or sliding-window (lower:
@@ -1591,6 +1626,22 @@ def build_attention_dense(
                 after_mfma()
         return out
 
+    def read_v_tile(vbuf):
+        """Every V operand of one tile, in PV_STEPS order."""
+        base = v_operand_base(vbuf)
+        return [read_v(dt, kk_step, base) for dt, kk_step in PV_STEPS]
+
+    def pv_mfma_run(o_acc_in, p_packs, vops, after_mfma=None):
+        """The PV MFMA run over V operands already in registers."""
+        out = list(o_acc_in)
+        for idx, (dt, kk_step) in enumerate(PV_STEPS):
+            out[dt] = mfma_32x32x16_for_dtype(
+                b, dtype, vops[idx], p_packs[kk_step], out[dt]
+            )
+            if after_mfma is not None:
+                after_mfma()
+        return out
+
     def rescale_o(o_acc, alpha):
         return [
             b.vec_pack(
@@ -1677,6 +1728,15 @@ def build_attention_dense(
     start_buf = b.mod(start_tile, b.const_i32(NBUF))
     start_buf1 = b.mod(b.add(start_tile, b.const_i32(1)), b.const_i32(NBUF))
 
+    def window_barrier(lgkmcnt=-1, vmcnt=-1):
+        """mfma_windows: one window boundary. The fences keep every MFMA and
+        LDS access of a window on its side of the barrier."""
+        b.sched_barrier(0)
+        if lgkmcnt >= 0 or vmcnt >= 0:
+            b.s_waitcnt(vmcnt=vmcnt, lgkmcnt=lgkmcnt)
+        b.s_barrier_bare()
+        b.sched_barrier(0)
+
     def _emit_lookahead_main():
         """QK-lookahead KV loop (``qk_lookahead``): one tile of software skew
         inside the wave so every MFMA run has independent softmax VALU work.
@@ -1704,6 +1764,15 @@ def build_attention_dense(
         acc0 = []
         s0 = do_qk(sb, accs=acc0)
         do_mask(s0, start_tile)
+        if WINDOWS:
+            # mfma_windows prefetches K two tiles ahead: once every wave is
+            # done reading K(start) it refills that buffer with K(start + 2).
+            window_barrier(lgkmcnt=0)
+            async_load_k(
+                K_lds_addr,
+                sb,
+                b.mul(b.add(start_tile, b.const_i32(2)), b.const_i32(BN)),
+            )
         if use_sinks:
             sink_h = b.global_load(sinks, hq, dtype, align=2)
             m_init = b.fmul(b.cast_to_f32(sink_h), rcp_ln2)
@@ -1753,11 +1822,23 @@ def build_attention_dense(
             j1 = b.add(j, b.const_i32(1))
             buf_j = b.mod(j, b.const_i32(NBUF))
             buf_j1 = b.mod(j1, b.const_i32(NBUF))
-            b.s_waitcnt(vmcnt=0)
-            b.s_barrier_bare()
-            async_load_k(
-                K_lds_addr, buf_j, b.mul(b.add(j, b.const_i32(2)), b.const_i32(BN))
-            )
+            if WINDOWS:
+                # Window 1 (operands; opened by the previous tile's last
+                # boundary, or the prologue): refill V buffer (j+1) % 2, whose
+                # V(j-1) both groups read before that boundary, and read every
+                # K(j+1) operand. The previous tile's softmax finish and O
+                # rescale also run here. The closing wait makes V(j) land one
+                # boundary ahead of its reads in window 3.
+                async_load_v(V_lds_addr, buf_j1, b.mul(j1, b.const_i32(BN)))
+                kops = read_k_tile(buf_j1)
+                window_barrier(lgkmcnt=0, vmcnt=WIN_VMCNT)
+            else:
+                kops = None
+                b.s_waitcnt(vmcnt=0)
+                b.s_barrier_bare()
+                async_load_k(
+                    K_lds_addr, buf_j, b.mul(b.add(j, b.const_i32(2)), b.const_i32(BN))
+                )
             if not PINGPONG:
                 async_load_v(V_lds_addr, buf_j1, b.mul(j1, b.const_i32(BN)))
 
@@ -1795,7 +1876,11 @@ def build_attention_dense(
             # V(j) landed before this iteration's top barrier, so the first PV
             # operand reads may already run in the QK MFMA shadow.
             pv_read, pv_pre = v_prefetch(buf_j) if READ_AHEAD else (None, None)
-            s_next = do_qk(buf_j1, after_mfma=exp_hook, tail_read=pv_read)
+            if WINDOWS:
+                # Window 2 (MFMA): QK(j+1) from the K operands of window 1.
+                s_next = _qk_mfma_run(kops, exp_hook, None)
+            else:
+                s_next = do_qk(buf_j1, after_mfma=exp_hook, tail_read=pv_read)
             for slot in slots:
                 emit_exp(*slot)
             l_local = b.fadd(lsum[0], lsum[1])
@@ -1804,7 +1889,18 @@ def build_attention_dense(
             l_acc = b.fadd(l_i, l_local)
 
             # Phase B: PV(j) with the mask + row max of tile j+1 in its shadow.
-            if PINGPONG:
+            vops = None
+            if WINDOWS:
+                # Window 3 (operands): K(j+3) refills K buffer (j+1) % 2, which
+                # both groups finished reading in window 1, then every V(j)
+                # operand is read; K(j+2) must land one boundary early.
+                window_barrier()
+                async_load_k(
+                    K_lds_addr, buf_j1, b.mul(b.add(j, b.const_i32(3)), b.const_i32(BN))
+                )
+                vops = read_v_tile(buf_j)
+                window_barrier(lgkmcnt=0, vmcnt=WIN_VMCNT)
+            elif PINGPONG:
                 # Second barrier: the lagging group runs phase A of this tile
                 # while the leading group runs phase B. V(j+1) refills V buffer
                 # (j+1) % 2 only after both groups are past PV(j-1).
@@ -1826,9 +1922,16 @@ def build_attention_dense(
 
             if PV_PRIORITY and not PINGPONG:
                 b.s_setprio(PV_PRIORITY)
-            o_acc = do_pv(
-                o_acc, p_packs, buf_j, after_mfma=max_hook, bulk=BULK_V, pre=pv_pre
-            )
+            if WINDOWS:
+                # Window 4 (MFMA): PV(j). Its closing boundary opens the next
+                # tile's window 1, which also carries the softmax finish and
+                # the O rescale below.
+                o_acc = pv_mfma_run(o_acc, p_packs, vops, after_mfma=max_hook)
+                window_barrier()
+            else:
+                o_acc = do_pv(
+                    o_acc, p_packs, buf_j, after_mfma=max_hook, bulk=BULK_V, pre=pv_pre
+                )
             if PV_PRIORITY and not PINGPONG:
                 b.s_setprio(0)
             for n, i in mslots:
