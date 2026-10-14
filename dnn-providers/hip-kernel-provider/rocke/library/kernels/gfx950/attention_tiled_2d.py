@@ -529,6 +529,11 @@ class UnifiedAttention2DTiledSpec:
     # single serial chain (see the softmax body). Inactive with softcap /
     # ALiBi / QQ-bias, which are defined on the scaled score.
     use_softmax_scale_fold: bool = False
+    # Transposed 32x32 softmax: combine the two 32-lane halves of the row max
+    # and row sum with one ``v_permlane32_swap_b32`` (VALU) instead of a
+    # ``ds_bpermute`` round trip. The bpermute is an LDS-queue op, so its
+    # ``lgkmcnt(0)`` wait also drained every K/V operand read in flight.
+    use_permlane32_row_reduce: bool = False
 
     def __post_init__(self):
         if self.num_warps not in (1, 2, 4, 8):
@@ -882,6 +887,10 @@ class UnifiedAttention2DTiledSpec:
             self.use_mfma_32x32 and self.use_transposed_qk_32x32
         ):
             raise ValueError("use_softmax_scale_fold requires the transposed 32x32 path")
+        if self.use_permlane32_row_reduce and not (
+            self.use_mfma_32x32 and self.use_transposed_qk_32x32
+        ):
+            raise ValueError("use_permlane32_row_reduce requires the transposed 32x32 path")
 
     @property
     def num_queries_per_kv(self) -> int:
@@ -997,6 +1006,7 @@ class UnifiedAttention2DTiledSpec:
             "kswz" if self.use_k_lds_xor_swizzle else "",
             "vswz" if self.use_v_lds_xor_swizzle else "",
             "smfold" if self.use_softmax_scale_fold else "",
+            "plred" if self.use_permlane32_row_reduce else "",
             "dmaov" if self.use_lds_dma_overlap else "",
             "bidpf" if self.use_kv_block_id_prefetch else "",
         )
@@ -1198,6 +1208,17 @@ def build_unified_attention_2d_tiled(
     SOFTMAX_SCALE_FOLD = bool(spec.use_softmax_scale_fold) and not (
         USE_SOFTCAP or USE_ALIBI or USE_QQ_BIAS
     )
+    PERMLANE32_ROW_REDUCE = bool(spec.use_permlane32_row_reduce)
+
+    def _halves_pair(x: Value):
+        """``(x[L], x[L ^ 32])`` in some order, per lane, via one
+        ``v_permlane32_swap_b32``; feeds a commutative half-combine. The
+        optimization barrier stops the SLP vectorizer from treating the
+        swap's (x, x) operand pair as a splat and duplicating x's whole
+        producer chain into packed f32 ops."""
+        xi = b.bitcast(b.optimization_barrier(x), I32)
+        r0, r1 = b.permlane32_swap(xi, xi)
+        return b.bitcast(r0, F32), b.bitcast(r1, F32)
     TRANSPOSED_SCALAR_STATE = spec.use_transposed_scalar_state
     TRANSPOSED_INVARIANT_HOIST = spec.use_transposed_invariant_hoist
     TRANSPOSED_MASK_ONCE = spec.use_transposed_mask_once
@@ -3783,8 +3804,11 @@ def build_unified_attention_2d_tiled(
                                 score = b.fadd(score, b.fmul(qq_v, rcp_ln2))
                             st_scores[(group_idx, n, reg)] = score
                             st_local_max = b.fmax(st_local_max, score)
-                st_remote_max = b.warp_shuffle_xor(st_local_max, 32)
-                st_tile_max = b.fmax(st_local_max, st_remote_max)
+                if PERMLANE32_ROW_REDUCE:
+                    st_tile_max = b.fmax(*_halves_pair(st_local_max))
+                else:
+                    st_remote_max = b.warp_shuffle_xor(st_local_max, 32)
+                    st_tile_max = b.fmax(st_local_max, st_remote_max)
                 if SOFTMAX_SCALE_FOLD:
                     # Scores are still raw: the scale is positive, so scaling
                     # the reduced max equals reducing the scaled tile.
@@ -3824,8 +3848,11 @@ def build_unified_attention_2d_tiled(
                 PT32_n = PT32_groups[0]
                 if GROUPED_KV2:
                     PT32_n_g1 = PT32_groups[1]
-                st_l_remote = b.warp_shuffle_xor(st_l_local, 32)
-                st_l_sum = b.fadd(st_l_local, st_l_remote)
+                if PERMLANE32_ROW_REDUCE:
+                    st_l_sum = b.fadd(*_halves_pair(st_l_local))
+                else:
+                    st_l_remote = b.warp_shuffle_xor(st_l_local, 32)
+                    st_l_sum = b.fadd(st_l_local, st_l_remote)
                 # The transposed orientation has one softmax state per query
                 # column/lane, shared across all 16 output-dimension regs.
                 # ``m_new`` / ``l_local`` are intentionally broadcast across
