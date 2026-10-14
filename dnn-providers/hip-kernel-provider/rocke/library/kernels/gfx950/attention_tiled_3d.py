@@ -1212,6 +1212,11 @@ class UnifiedAttentionReduceTiledSpec:
     # AMDGPU occupancy hint (``"amdgpu-waves-per-eu"``). ``None`` keeps
     # the LLVM backend's heuristic.
     waves_per_eu: Optional[int] = None
+    # Fully unroll the per-dim segment accumulation so every segment's
+    # partial-acc load is issued back to back (one memory latency per CTA
+    # instead of one per segment). The per-segment factors are read from LDS
+    # once, before the loads.
+    unroll_segments: bool = False
 
     @property
     def dtype_ir(self) -> Type:
@@ -1226,6 +1231,7 @@ class UnifiedAttentionReduceTiledSpec:
             f"h{self.num_query_heads}",
             f"seg{self.num_segments}",
             self.dtype,
+            "unroll" if self.unroll_segments else "",
         )
 
 
@@ -1382,6 +1388,28 @@ def build_unified_attention_reduce_tiled(
     # Each thread handles HALFS_PER_THREAD output dims. The per-segment
     # factor is read from LDS (computed once above) rather than
     # reloading seg_max + recomputing exp2 per dim.
+    if spec.unroll_segments:
+        dims = [
+            b.add(b.mul(b.const_i32(li), b.const_i32(THREADS)), tid)
+            for li in range(HALFS_PER_THREAD)
+        ]
+        accs = [zero_f] * HALFS_PER_THREAD
+        for s in range(NUM_SEG):
+            factor_s = b.vec_extract(
+                b.smem_load_vN_f32(factor_lds, b.const_i32(s), n=1), 0
+            )
+            for li, d in enumerate(dims):
+                idx_acc, _ = seg_acc_desc_red.offset(
+                    b, token=q_token, head=q_head, seg=b.const_i32(s), dim=d
+                )
+                ov = b.global_load_f32(seg_out, idx_acc)
+                accs[li] = b.fadd(accs[li], b.fmul(ov, factor_s))
+        for li, d in enumerate(dims):
+            scalar_out = b.cast_f32_to(b.fmul(accs[li], inv_l), dtype)
+            out_idx, _ = out_desc_red.offset(b, token=q_token, head=q_head, dim=d)
+            b.global_store(out, out_idx, scalar_out, align=2)
+        return b.kernel
+
     for li in range(HALFS_PER_THREAD):
         d = b.add(b.mul(b.const_i32(li), b.const_i32(THREADS)), tid)
         acc_loop = b.scf_for_iter(
