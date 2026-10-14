@@ -691,6 +691,8 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
         }
         /* Python: attrs[F32_DENORMAL_MODE_ATTR] = "preserve-sign". */
         rocke_attr_set_str(b, &b->kernel->attrs, "f32_denormal_mode", "preserve-sign");
+        /* Python: attrs[FP_CONTRACT_ATTR] = True. */
+        rocke_attr_set_bool(b, &b->kernel->attrs, "fp_contract", true);
     }
 
     /* ---- parameter declarations (Py850-889) ---- */

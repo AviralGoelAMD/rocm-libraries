@@ -43,7 +43,11 @@ from dataclasses import dataclass
 import math
 from typing import Optional, Tuple
 
-from rocke.core.codegen_policy import F32_DENORMAL_MODE_ATTR, F32DenormalMode
+from rocke.core.codegen_policy import (
+    F32_DENORMAL_MODE_ATTR,
+    FP_CONTRACT_ATTR,
+    F32DenormalMode,
+)
 from rocke.core.ir import (
     BF16,
     CACHE_STREAM,
@@ -1193,6 +1197,8 @@ def build_unified_attention_2d_tiled(
     # softmax input is <= 0, and results below 2^-126 are invisible in the
     # bf16/fp16 P operand.
     b.kernel.attrs[F32_DENORMAL_MODE_ATTR] = F32DenormalMode.PRESERVE_SIGN.value
+    # Let the backend fuse the softmax scale/rescale fmul+fadd chains into FMA.
+    b.kernel.attrs[FP_CONTRACT_ATTR] = True
 
     # ---------------- parameter declarations ----------------
     output = b.param(
