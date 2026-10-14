@@ -220,6 +220,11 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # Grid body only: compute the exp2 arguments and the per-tile row sum on
     # two-element vectors (packed f32 FMA).
     packed_softmax: bool = field(default=False, kw_only=True)
+    # Grid body only: tag LDS-DMA writes and LDS reads with disjoint alias
+    # scopes so the backend's waitcnt pass no longer drains every in-flight
+    # K/V DMA (vmcnt(0)) before the first LDS read after it. The body's own
+    # s_waitcnt + s_barrier already order each DMA before its reads.
+    lds_dma_manual_wait: bool = field(default=False, kw_only=True)
 
     def resolved_exp_per_pv_step(self) -> int:
         if self.exp_per_pv_step is not None:
@@ -548,6 +553,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "grid_order",
             "defer_row_sum",
             "packed_softmax",
+            "lds_dma_manual_wait",
         )
     }
 )
@@ -692,6 +698,8 @@ def build_attention_dense(
     b = IRBuilder(spec.kernel_name())
     b.kernel.attrs["max_workgroup_size"] = WAVES * 64
     b.kernel.attrs["waves_per_eu"] = int(spec.waves_per_eu)
+    if spec.lds_dma_manual_wait:
+        b.kernel.attrs["lds_dma_alias_scopes"] = True
 
     q = b.param(
         "q_ptr", PtrType(dtype, "global"), noalias=True, readonly=True, align=16
