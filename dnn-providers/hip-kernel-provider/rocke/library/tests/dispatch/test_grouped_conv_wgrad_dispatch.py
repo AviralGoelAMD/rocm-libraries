@@ -19,6 +19,7 @@ a match here proves the dispatch path launches a correct grid.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import unittest
 
@@ -175,12 +176,25 @@ class TestTwoStageSelection(unittest.TestCase):
 
     def test_even_wg_N_stays_on_the_packed_atomic(self):
         # wg_N even => the packed atomic can address dW directly and no
-        # scratch/second launch is needed.
+        # scratch/second launch is needed -- unless the degree is deep enough
+        # (gfx950, split_k >= _WGRAD_TWO_STAGE_MIN_SPLIT_K) that per-slice
+        # rounding through the 16-bit atomic costs accuracy.
+        from dispatch.grouped_convolution import _WGRAD_TWO_STAGE_MIN_SPLIT_K
+
         r = dispatch_conv_grouped(_wgrad("gfx950", C=64, K=64, Y=3, X=3, dtype="bf16"))
         ws = r.spec.to_wgrad_spec(_problem(r.request))
-        self.assertFalse(
-            ws.two_stage, "an even wg_N should reach split-K via packed atomics"
+        self.assertEqual(
+            ws.two_stage,
+            ws.split_k >= _WGRAD_TWO_STAGE_MIN_SPLIT_K,
+            "an even wg_N should reach shallow split-K via packed atomics and "
+            "deep split-K via the f32 scratch",
         )
+        for split_k in (2, _WGRAD_TWO_STAGE_MIN_SPLIT_K):
+            ws = dataclasses.replace(r.spec, split_k=split_k).to_wgrad_spec(
+                _problem(r.request)
+            )
+            self.assertEqual(ws.split_k, split_k)
+            self.assertEqual(ws.two_stage, split_k >= _WGRAD_TWO_STAGE_MIN_SPLIT_K)
 
     def test_split_k_1_needs_no_two_stage(self):
         r = dispatch_conv_grouped(_wgrad("gfx1250"))
