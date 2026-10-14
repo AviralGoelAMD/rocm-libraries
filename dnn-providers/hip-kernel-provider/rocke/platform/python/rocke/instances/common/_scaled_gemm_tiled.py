@@ -29,7 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
 
-from ...core.ir import F32, I32, IRBuilder, Value
+from ...core.ir import F32, I32, I64, IRBuilder, Value
 from ...helpers.atoms import MfmaAtom
 
 
@@ -61,6 +61,11 @@ class TiledScaledGemmConfig:
     # LDS staging only: unpadded 128-byte rows with XOR-permuted 16-byte chunks
     # instead of 144-byte padded rows (see _lds_mainloop.lds_col).
     lds_swizzle: bool = False
+    # LDS staging only: double-buffered direct global->LDS copies
+    # (global_load_lds_dwordx4) into the swizzled layout, one barrier per step.
+    lds_dma: bool = False
+    # lds_dma only: LDS buffers in the ring (stages - 1 K steps in flight).
+    lds_stages: int = 2
 
     @property
     def tile_m(self) -> int:
@@ -133,6 +138,14 @@ def validate_tiled(cfg: TiledScaledGemmConfig) -> Tuple[bool, str]:
         return False, f"tile_swizzle ({cfg.tile_swizzle}) must divide the M tile count ({cfg.M // cfg.tile_m})"
     if cfg.lds_swizzle and (not cfg.lds or _loop_k(cfg) % 128):
         return False, "lds_swizzle needs lds=True and a K step that is a multiple of 128"
+    if cfg.lds_dma and (not cfg.lds or _loop_k(cfg) != 128 or cfg.prefetch):
+        return False, "lds_dma needs lds=True, a 128 K step, and prefetch=False (it double-buffers in LDS)"
+    if cfg.lds_dma:
+        fold = cfg.scale_mode == "block" and cfg.K // cfg.group_mnk[2] > 1
+        if cfg.lds_stages < 2 or (fold and cfg.lds_stages != 2):
+            return False, "lds_stages must be >= 2 (exactly 2 with per-K-group block scales)"
+        if cfg.lds_stages * (cfg.tile_m + cfg.tile_n) * 128 > 160 * 1024:
+            return False, f"lds_stages={cfg.lds_stages} panels exceed the 160 KiB LDS"
     return True, "ok"
 
 
@@ -254,11 +267,20 @@ def emit_tiled_scaled_gemm(
             flat += load_iter(b.add(base, b.const_i32(u)) if u else base)
         return flat
 
-    def compute_step(frags, kg, accs):
-        """MFMAs (+ per-group scale fold) of one K step on its fragments."""
+    fold_scales = not cfg.scaled_mfma and not scale_in_epilogue
+
+    def step_scales(kg):
+        """Flattened per-(mi, ni) <4 x f32> scales of K group ``kg`` (fold path)."""
+        s = _group_scales(b, cfg, AScale, BScale, kg, out_row0, b_cols, decode_mx)
+        return [v for row in s for v in row]
+
+    def compute_step(frags, kg, accs, scales=None):
+        """MFMAs (+ per-group scale fold) of one K step on its fragments.
+        ``scales``: the step's step_scales(kg) if already loaded."""
         ab_scale = None
-        if not cfg.scaled_mfma and not scale_in_epilogue:
-            ab_scale = _group_scales(b, cfg, AScale, BScale, kg, out_row0, b_cols, decode_mx)
+        if fold_scales:
+            flat_sc = scales if scales is not None else step_scales(kg)
+            ab_scale = [flat_sc[mi * cfg.mfma_n : (mi + 1) * cfg.mfma_n] for mi in range(cfg.mfma_m)]
         work = list(accs) if (cfg.scaled_mfma or scale_in_epilogue) else zero_accs()
         for t in range(atoms_per_iter):
             f = frags[t * per_atom : (t + 1) * per_atom]
@@ -290,7 +312,7 @@ def emit_tiled_scaled_gemm(
             atoms_per_iter=atoms_per_iter, init=init, tr_lo=tr_lo, tr_hi=tr_hi, tid=tid,
             wm=wm, wn=wn, lane16=lane16, k_blk=k_blk, a_rows=a_rows, b_cols=b_cols,
             m_cta=m_cta, n_cta=n_cta,
-            compute_step=compute_step,
+            compute_step=compute_step, step_scales=step_scales if fold_scales else None,
         )
     else:
         if cfg.prefetch:
@@ -364,7 +386,7 @@ def _cta_coords(b, cfg):
 
 def _lds_mainloop(
     b, cfg, *, A, Bp, AScale, BScale, dtype, loop_k, atoms_per_iter, init, tr_lo, tr_hi,
-    tid, wm, wn, lane16, k_blk, a_rows, b_cols, m_cta, n_cta, compute_step,
+    tid, wm, wn, lane16, k_blk, a_rows, b_cols, m_cta, n_cta, compute_step, step_scales,
 ):
     """CTA-shared operand staging: every K step the whole CTA copies its
     ``tile_m x loop_k`` A panel and ``tile_n x loop_k`` B panel into LDS with
@@ -372,15 +394,21 @@ def _lds_mainloop(
     its MFMA fragments from LDS. Warps that share rows (columns) of the CTA
     tile thereby share one global read instead of each issuing its own.
     With ``prefetch`` the next step's global loads are issued right after the
-    LDS store so they overlap the current step's MFMAs."""
+    LDS store so they overlap the current step's MFMAs.
+
+    ``lds_dma``: the panels go global -> LDS directly (global_load_lds_dwordx4,
+    no VGPR round trip) into a ring of ``lds_stages`` LDS buffers; see
+    ``_lds_dma_loop``."""
     atom = cfg.atom
     K = cfg.K
     TM, TN, BS = cfg.tile_m, cfg.tile_n, cfg.block_size
-    swz = cfg.lds_swizzle
+    dma = cfg.lds_dma
+    swz = cfg.lds_swizzle or dma
     row_bytes = loop_k if swz else loop_k + _LDS_PAD
     chunks = loop_k // 16
-    A_s = b.smem_alloc(dtype, [TM, row_bytes], name_hint="A_s")
-    B_s = b.smem_alloc(dtype, [TN, row_bytes], name_hint="B_s")
+    nbuf = cfg.lds_stages if dma else 1
+    A_s = b.smem_alloc(dtype, [nbuf * TM, row_bytes], name_hint="A_s")
+    B_s = b.smem_alloc(dtype, [nbuf * TN, row_bytes], name_hint="B_s")
 
     def lds_col(row, byte):
         """LDS byte column of logical (row, byte). Swizzled layout: unpadded
@@ -458,17 +486,26 @@ def _lds_mainloop(
         c0 = b.add(b.const_i32(t * atom.k), b.mul(k_blk, b.const_i32(atom.a_per_lane)))
         return b.smem_load_vN(smem, row, lds_col(row, c0), dtype=dtype, n=atom.a_per_lane)
 
-    def frags_from_lds(scales):
+    def frags_from_lds(scales, a_row0=None, b_row0=None):
         flat = []
         n_sc = cfg.mfma_m + cfg.mfma_n
+        a_rows_l = a_lrow if a_row0 is None else [b.add(a_row0, r) for r in a_lrow]
+        b_rows_l = b_lrow if b_row0 is None else [b.add(b_row0, r) for r in b_lrow]
         for t in range(atoms_per_iter):
-            flat += [read_frag(A_s, r, t) for r in a_lrow]
-            flat += [read_frag(B_s, r, t) for r in b_lrow]
+            flat += [read_frag(A_s, r, t) for r in a_rows_l]
+            flat += [read_frag(B_s, r, t) for r in b_rows_l]
             flat += scales[t * n_sc : (t + 1) * n_sc]
         return flat
 
     n_acc = cfg.mfma_m * cfg.mfma_n
     init = list(init)
+    if dma:
+        return _lds_dma_loop(
+            b, cfg, A=A, Bp=Bp, A_s=A_s, B_s=B_s, row_bytes=row_bytes, loop_k=loop_k, tid=tid,
+            m_cta=m_cta, n_cta=n_cta, init=init, tr_lo=tr_lo, tr_hi=tr_hi, n_acc=n_acc,
+            frags_from_lds=frags_from_lds, scale_bytes=scale_bytes, step_scales=step_scales,
+            compute_step=compute_step,
+        )
     if cfg.prefetch:
         init += [(f"st_{j}", v) for j, v in enumerate(gload(tr_lo))]
     loop = b.scf_for_iter(
@@ -487,6 +524,100 @@ def _lds_mainloop(
             nxt = gload(b.select(b.cmp_lt(tn, tr_hi), tn, tr))
         accs = compute_step(frags_from_lds(regs[n_panel:]), tr, accs)
         b.scf_yield(*accs, *nxt)
+    return list(loop.results)[:n_acc]
+
+
+def _lds_dma_loop(
+    b, cfg, *, A, Bp, A_s, B_s, row_bytes, loop_k, tid, m_cta, n_cta, init, tr_lo, tr_hi, n_acc,
+    frags_from_lds, scale_bytes, step_scales, compute_step,
+):
+    """Multi-buffered direct-to-LDS main loop (see ``_lds_mainloop``).
+
+    ``S = cfg.lds_stages`` LDS buffers; S - 1 steps are in flight. Iteration t
+    waits for step t's copy, reads its fragments from buffer t % S, issues
+    step t + S - 1 into the buffer step t - 1 used, then runs its MFMAs while
+    the copies are in flight. One barrier per step.
+
+    ``global_load_lds_dwordx4`` writes each wave's 64 x 16 bytes contiguously
+    at a wave-uniform LDS address, so the XOR chunk permutation of the
+    swizzled layout is applied on the *source* side: the lane that lands on
+    LDS chunk slot ``p`` of row ``r`` fetches logical chunk ``p ^ f(r)``."""
+    K = cfg.K
+    TM, TN, BS = cfg.tile_m, cfg.tile_n, cfg.block_size
+    S = cfg.lds_stages
+    chunks = loop_k // 16
+    warp_bytes = b.mul(b.div(tid, b.const_i32(64)), b.const_i32(64 * 16))
+
+    def dma_slots(rows, base_row):
+        out = []
+        for i in range(rows * chunks // BS):
+            c = b.add(tid, b.const_i32(i * BS)) if i else tid
+            r = b.div(c, b.const_i32(chunks))
+            f = b.xor(b.mod(r, b.const_i32(8)), b.mod(b.div(r, b.const_i32(8)), b.const_i32(2)))
+            lc = b.xor(b.mod(c, b.const_i32(chunks)), f)
+            src = b.add(b.mul(b.add(base_row, r), b.const_i32(K)), b.mul(lc, b.const_i32(16)))
+            out.append((src, b.add(warp_bytes, b.const_i32(i * BS * 16))))
+        return out
+
+    a_dma = dma_slots(TM, m_cta)
+    b_dma = dma_slots(TN, n_cta)
+    a_base = b.smem_addr_of(A_s)
+    b_base = b.smem_addr_of(B_s)
+    # VMEM instructions one step issues per wave (copies + MX scale bytes);
+    # S - 2 younger steps may stay in flight when step t must have landed.
+    per_step = len(a_dma) + len(b_dma)
+    if cfg.scaled_mfma:
+        per_step += (loop_k // cfg.atom.k) * (cfg.mfma_m + cfg.mfma_n)
+
+    def issue(tr, buf):
+        k0 = b.mul(tr, b.const_i32(loop_k))
+        for slots, base, ptr, rows in ((a_dma, a_base, A, TM), (b_dma, b_base, Bp, TN)):
+            buf_off = b.mul(buf, b.const_i32(rows * row_bytes))
+            for src, off in slots:
+                dst = b.smem_ptr_add(base, b.sext(b.add(buf_off, off), I64))
+                b.global_load_lds(ptr, b.add(src, k0), dst, 16)
+
+    def next_scales(tr):
+        if cfg.scaled_mfma:
+            return scale_bytes(tr)
+        if step_scales is not None:
+            return step_scales(tr)
+        return []
+
+    last = b.sub(tr_hi, b.const_i32(1))
+    pending = []
+    for s in range(S - 1):
+        ts = b.smin(b.add(tr_lo, b.const_i32(s)), last) if s else tr_lo
+        sc = next_scales(ts)
+        issue(ts, b.const_i32(s))
+        pending.append(sc)
+    n_sc = len(pending[0])
+    init = list(init) + [(f"sc_{j}", v) for j, v in enumerate(x for p in pending for x in p)]
+    loop = b.scf_for_iter(
+        tr_lo, tr_hi, b.const_i32(1), init, iv_name="kt", elide_trailing_barrier=False
+    )
+    with loop as (tr, carried):
+        carried = list(carried)
+        accs, scales = carried[:n_acc], carried[n_acc:]
+        b.s_waitcnt(vmcnt=(S - 2) * per_step)  # step tr's copy has landed
+        b.sync()  # ... in every wave; and every wave is done with step tr - 1
+        cur = b.mod(b.sub(tr, tr_lo), b.const_i32(S))
+        now = scales[:n_sc]
+        frags = frags_from_lds(
+            now if cfg.scaled_mfma else [],
+            a_row0=b.mul(cur, b.const_i32(TM)),
+            b_row0=b.mul(cur, b.const_i32(TN)),
+        )
+        tn = b.smin(b.add(tr, b.const_i32(S - 1)), last)
+        # Keep every fragment read ahead of the next copy and every MFMA behind
+        # it, so the copy is in flight for the whole MFMA block (the scheduler
+        # otherwise defers fragment reads, which the copy must then follow).
+        b.sched_barrier(0)
+        nsc = next_scales(tn)
+        issue(tn, b.mod(b.add(cur, b.const_i32(S - 1)), b.const_i32(S)))
+        b.sched_barrier(0)
+        accs = compute_step(frags, tr, accs, scales=now if (step_scales is not None and not cfg.scaled_mfma) else None)
+        b.scf_yield(*accs, *scales[n_sc:], *nsc)
     return list(loop.results)[:n_acc]
 
 

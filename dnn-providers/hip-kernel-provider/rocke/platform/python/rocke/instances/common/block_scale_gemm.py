@@ -129,6 +129,9 @@ class BlockScaleGemmSpec:
     tile_swizzle: int = 0
     # Tiled LDS body only: XOR-swizzled unpadded LDS rows.
     lds_swizzle: bool = False
+    # Tiled LDS body only: double-buffered direct global->LDS panel copies.
+    lds_dma: bool = False
+    lds_stages: int = 2
 
     @property
     def tiled(self) -> bool:
@@ -144,6 +147,7 @@ class BlockScaleGemmSpec:
             or self.out_dtype != "f32"
             or self.tile_swizzle != 0
             or self.lds_swizzle
+            or self.lds_dma
         )
 
     def tiled_config(self) -> TiledScaledGemmConfig:
@@ -166,6 +170,8 @@ class BlockScaleGemmSpec:
             out_dtype=self.out_dtype,
             tile_swizzle=self.tile_swizzle,
             lds_swizzle=self.lds_swizzle,
+            lds_dma=self.lds_dma,
+            lds_stages=self.lds_stages,
         )
 
     @property
@@ -215,6 +221,7 @@ class BlockScaleGemmSpec:
                 f"k{self.k_atom}s{self.split_k}{'pf' if self.prefetch else ''}u{self.k_unroll}"
                 f"{'lds' if self.lds else ''}{'' if self.out_dtype == 'f32' else self.out_dtype}"
                 f"{f'sw{self.tile_swizzle}' if self.tile_swizzle else ''}{'lx' if self.lds_swizzle else ''}"
+                f"{f'dma{self.lds_stages}' if self.lds_dma else ''}"
             )
         return kernel_name_join(self.name, *parts, flags={"psb": self.preshuffle_b})
 
