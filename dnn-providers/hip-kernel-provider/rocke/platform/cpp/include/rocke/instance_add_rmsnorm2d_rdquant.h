@@ -67,12 +67,16 @@ extern "C" {
  *     save_yscale: bool = True
  *     wave_size: int = 64
  *     wave_reduce: bool = False
+ *     streaming: bool = False
  *     name: str = "rocke_add_rmsnorm2d_rdquant"
  *
  * `wave_reduce` folds the sum-of-squares / amax pair with the wave XOR
  * butterfly plus one cross-warp LDS round
  * (rocke_block_lds_reduce_pair_with_wave_prologue) instead of the block-wide
- * LDS tree. Fields past `name` are appended so existing offsets hold.
+ * LDS tree. `streaming` puts the TemporalHint.STREAMING (``nt``) hint on the
+ * read-once A/B loads and the write-once residual X stores (gamma and QY keep
+ * the default policy). Fields past `name` are appended so existing offsets
+ * hold.
  */
 typedef struct rocke_add_rmsnorm2d_rdquant_spec
 {
@@ -86,6 +90,7 @@ typedef struct rocke_add_rmsnorm2d_rdquant_spec
     int wave_size; /* default 64     */
     const char* name; /* default "rocke_add_rmsnorm2d_rdquant" */
     bool wave_reduce; /* default false  */
+    bool streaming; /* default false  */
 } rocke_add_rmsnorm2d_rdquant_spec_t;
 
 /* Default-constructed spec (every field == Python dataclass default). The
@@ -100,7 +105,7 @@ int rocke_add_rmsnorm2d_rdquant_elems_per_thread(const rocke_add_rmsnorm2d_rdqua
  *     kernel_name_join(self.name, self.dtype, self.out_dtype,
  *                      f"N{n_per_block}", f"b{block_size}", f"v{vec}",
  *                      flags={"sr": save_residual, "ys": save_yscale,
- *                             "wr": wave_reduce})
+ *                             "wr": wave_reduce, "nt": streaming})
  *
  * Returns ROCKE_OK, or ROCKE_ERR_VALUE (buffer too small / null args). */
 rocke_status_t rocke_add_rmsnorm2d_rdquant_kernel_name(

@@ -110,6 +110,40 @@ static int make_spec(int idx, rocke_add_rmsnorm2d_rdquant_spec_t* spec)
         spec->wave_size = 64;
         spec->wave_reduce = true;
         break;
+    case 8: /* N4096 f16->i8 b256 v4 streaming */
+        spec->n_per_block = 4096;
+        spec->dtype = "f16";
+        spec->out_dtype = "i8";
+        spec->block_size = 256;
+        spec->vec = 4;
+        spec->save_residual = true;
+        spec->save_yscale = true;
+        spec->wave_size = 64;
+        spec->streaming = true;
+        break;
+    case 9: /* N8192 f16->i8 b512 v8 wave_reduce + streaming */
+        spec->n_per_block = 8192;
+        spec->dtype = "f16";
+        spec->out_dtype = "i8";
+        spec->block_size = 512;
+        spec->vec = 8;
+        spec->save_residual = true;
+        spec->save_yscale = true;
+        spec->wave_size = 64;
+        spec->wave_reduce = true;
+        spec->streaming = true;
+        break;
+    case 10: /* N2048 bf16->bf8e5m2 b128 v4 streaming, no residual store */
+        spec->n_per_block = 2048;
+        spec->dtype = "bf16";
+        spec->out_dtype = "bf8e5m2";
+        spec->block_size = 128;
+        spec->vec = 4;
+        spec->save_residual = false;
+        spec->save_yscale = false;
+        spec->wave_size = 64;
+        spec->streaming = true;
+        break;
     default:
         return -1;
     }
@@ -120,7 +154,7 @@ int main(int argc, char** argv)
 {
     if(argc < 2)
     {
-        fprintf(stderr, "usage: %s <config_index 0..7> [ll|ir|verify]\n", argv[0]);
+        fprintf(stderr, "usage: %s <config_index 0..10> [ll|ir|verify]\n", argv[0]);
         return 2;
     }
     int idx = atoi(argv[1]);

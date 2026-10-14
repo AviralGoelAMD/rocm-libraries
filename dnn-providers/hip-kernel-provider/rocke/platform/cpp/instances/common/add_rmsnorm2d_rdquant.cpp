@@ -363,6 +363,7 @@ rocke_add_rmsnorm2d_rdquant_spec_t rocke_add_rmsnorm2d_rdquant_spec_default(void
     s.wave_size = 64;
     s.name = ROCKE_ADD_RMSNORM2D_RDQUANT_DEFAULT_NAME;
     s.wave_reduce = false;
+    s.streaming = false;
     return s;
 }
 
@@ -380,7 +381,7 @@ int rocke_add_rmsnorm2d_rdquant_elems_per_thread(const rocke_add_rmsnorm2d_rdqua
  *   kernel_name_join(self.name, self.dtype, self.out_dtype,
  *                    f"N{n_per_block}", f"b{block_size}", f"v{vec}",
  *                    flags={"sr": save_residual, "ys": save_yscale,
- *                           "wr": wave_reduce}). */
+ *                           "wr": wave_reduce, "nt": streaming}). */
 rocke_status_t rocke_add_rmsnorm2d_rdquant_kernel_name(
     const rocke_add_rmsnorm2d_rdquant_spec_t* spec, char* out, size_t out_cap)
 {
@@ -388,8 +389,8 @@ rocke_status_t rocke_add_rmsnorm2d_rdquant_kernel_name(
     char bbuf[32];
     char vbuf[32];
     const char* parts[5];
-    const char* flag_names[3];
-    int flag_on[3];
+    const char* flag_names[4];
+    int flag_on[4];
 
     if(spec == NULL || out == NULL)
     {
@@ -419,8 +420,10 @@ rocke_status_t rocke_add_rmsnorm2d_rdquant_kernel_name(
     flag_on[1] = spec->save_yscale ? 1 : 0;
     flag_names[2] = "wr";
     flag_on[2] = spec->wave_reduce ? 1 : 0;
+    flag_names[3] = "nt";
+    flag_on[3] = spec->streaming ? 1 : 0;
 
-    return rocke_kernel_name_join(spec->name, parts, 5, flag_names, flag_on, 3, out, out_cap, NULL);
+    return rocke_kernel_name_join(spec->name, parts, 5, flag_names, flag_on, 4, out, out_cap, NULL);
 }
 
 /* ===================================================================== *
@@ -570,6 +573,8 @@ typedef struct rocke_arn_pass1_ctx
     rocke_value_t** cached_xg;
     int num_cached_xg;
     int cap_cached_xg;
+    /* spec.streaming temporal hint (read-once B loads, write-once X stores) */
+    const rocke_mem_opts_t* stream;
 } rocke_arn_pass1_ctx_t;
 
 /* tree_reduce combiners (rocke_combine_fn): forward to fadd / fmax. */
@@ -608,7 +613,8 @@ static void rocke_arn_pass1_body(rocke_ir_builder_t* b,
 
     (void)vec;
 
-    /* b_scalars = bt_tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=VEC)
+    /* b_scalars = bt_tile.load_vec_as_f32(b, b.const_i32(0), n_off, n=VEC,
+     *                                     temporal_hint=stream)
      * Python spells a FRESH b.const_i32(0) at every call site (no const
      * caching in the builder), so each load/store gets its own const op and
      * the SSA-id counter advances exactly as in Python. */
@@ -616,7 +622,7 @@ static void rocke_arn_pass1_body(rocke_ir_builder_t* b,
         rocke_value_t* idx[2];
         idx[0] = rocke_b_const_i32(b, 0);
         idx[1] = n_off;
-        rocke_tile_window_load_vec_as_f32(b, c->bt_tile, idx, 2, VEC, b_scalars);
+        rocke_tile_window_load_vec_as_f32_ex(b, c->bt_tile, idx, 2, VEC, b_scalars, c->stream);
     }
     /* g_scalars = g_view.load_vec_as_f32(b, [n_off], n=VEC) */
     gidx[0] = n_off;
@@ -645,13 +651,14 @@ static void rocke_arn_pass1_body(rocke_ir_builder_t* b,
         c->cached_xg[c->num_cached_xg++] = chunk_xg[i];
     }
 
-    /* if spec.save_residual: x_tile.store_vec_from_f32(b, b.const_i32(0), n_off, chunk_x) */
+    /* if spec.save_residual: x_tile.store_vec_from_f32(b, b.const_i32(0), n_off,
+     *                                                  chunk_x, temporal_hint=stream) */
     if(c->spec->save_residual)
     {
         rocke_value_t* idx[2];
         idx[0] = rocke_b_const_i32(b, 0);
         idx[1] = n_off;
-        rocke_tile_window_store_vec_from_f32(b, c->x_tile, idx, 2, chunk_x, VEC);
+        rocke_tile_window_store_vec_from_f32_ex(b, c->x_tile, idx, 2, chunk_x, VEC, c->stream);
     }
 }
 
@@ -872,6 +879,10 @@ rocke_kernel_def_t* rocke_build_add_rmsnorm2d_rdquant(
         return NULL;
     }
 
+    /* stream = TemporalHint.STREAMING if spec.streaming else DEFAULT */
+    rocke_mem_opts_t stream = ROCKE_MEM_OPTS_INIT;
+    stream.temporal_hint = spec->streaming ? ROCKE_TEMPORAL_STREAMING : ROCKE_TEMPORAL_DEFAULT;
+
     /* s_sq = b.const_f32(0.0); s_amax_g = b.const_f32(0.0) */
     p1.spec = spec;
     p1.VEC = VEC;
@@ -883,20 +894,22 @@ rocke_kernel_def_t* rocke_build_add_rmsnorm2d_rdquant(
     p1.cached_xg = cached_xg;
     p1.num_cached_xg = 0;
     p1.cap_cached_xg = elems_per_thread;
+    p1.stream = &stream;
 
     /* sweep_row_chunks(b, a_tile, tid=tid, block_size=BS, vec=VEC,
      *                  elems_per_thread=spec.elems_per_thread,
-     *                  body=pass1_body, cache=False) */
-    (void)rocke_sweep_row_chunks(b,
-                                 &a_tile,
-                                 tid,
-                                 BS,
-                                 VEC,
-                                 elems_per_thread,
-                                 NULL /* row */,
-                                 rocke_arn_pass1_body,
-                                 &p1,
-                                 false /* cache */);
+     *                  body=pass1_body, cache=False, temporal_hint=stream) */
+    (void)rocke_sweep_row_chunks_ex(b,
+                                    &a_tile,
+                                    tid,
+                                    BS,
+                                    VEC,
+                                    elems_per_thread,
+                                    NULL /* row */,
+                                    rocke_arn_pass1_body,
+                                    &p1,
+                                    false /* cache */,
+                                    &stream);
 
     /* Twin-channel cross-thread reduction: sum for the sum-of-squares, max for
      * the abs-max of x * gamma.

@@ -3997,6 +3997,26 @@ def cases():
                 **_over,
             ),
         )
+    for _case_id, _over in (
+        ("streaming_n8192", {"streaming": True}),
+        (
+            "streaming_wave_reduce_b512_v8_n8192",
+            {"block_size": 512, "vec": 8, "wave_reduce": True, "streaming": True},
+        ),
+    ):
+        add(
+            "add_rmsnorm2d_rdquant",
+            f"add_rmsnorm2d_rdquant/gfx950/{_case_id}",
+            "gfx950",
+            build_row_kernel(
+                "add_rmsnorm2d_rdquant",
+                "AddRmsnorm2DRdquantSpec",
+                "build_add_rmsnorm2d_rdquant",
+                arch="gfx950",
+                n_per_block=8192,
+                **_over,
+            ),
+        )
 
     # ResNet-style 3x3/s2 max pool, C=256: the spec default and vec=0 (the
     # widest C pack dividing C).

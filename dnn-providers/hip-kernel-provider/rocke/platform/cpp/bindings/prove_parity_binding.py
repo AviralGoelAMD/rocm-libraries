@@ -196,6 +196,19 @@ def cfgs_add_rmsnorm2d_rdquant():
         (6144, "f16", "fp8e4m3", 256, 2, True, False, 64, {}),
         (8192, "f16", "i8", 512, 8, True, True, 64, {"wave_reduce": True}),
         (1024, "bf16", "i8", 64, 4, True, True, 64, {"wave_reduce": True}),
+        (4096, "f16", "i8", 256, 4, True, True, 64, {"streaming": True}),
+        (
+            8192,
+            "f16",
+            "i8",
+            512,
+            8,
+            True,
+            True,
+            64,
+            {"wave_reduce": True, "streaming": True},
+        ),
+        (2048, "bf16", "bf8e5m2", 128, 4, False, False, 64, {"streaming": True}),
     ]
     return [
         dict(

@@ -34,6 +34,22 @@
           "sha256": "40815f055b652e79d9c4b7d65fdeb15070797c2b5e9107e637f71b2f65842665",
           "status": "ok"
         },
+        "add_rmsnorm2d_rdquant/gfx950/streaming_n8192": {
+          "arch": "gfx950",
+          "bytes": 73548,
+          "family": "add_rmsnorm2d_rdquant",
+          "kernel_name": "rocke_add_rmsnorm2d_rdquant_f16_i8_N8192_b256_v4_sr_ys_nt",
+          "sha256": "ca4dbd3985c2a728f435f26a88588a9b826cf6d60fbac14107dcedc20199c568",
+          "status": "ok"
+        },
+        "add_rmsnorm2d_rdquant/gfx950/streaming_wave_reduce_b512_v8_n8192": {
+          "arch": "gfx950",
+          "bytes": 35251,
+          "family": "add_rmsnorm2d_rdquant",
+          "kernel_name": "rocke_add_rmsnorm2d_rdquant_f16_i8_N8192_b512_v8_sr_ys_wr_nt",
+          "sha256": "3670e538e773a2de52ae827437ebbd799772fc531da99d0d2584ecc4fc047e95",
+          "status": "ok"
+        },
         "add_rmsnorm2d_rdquant/gfx950/wave_reduce_n8192": {
           "arch": "gfx950",
           "bytes": 61083,
@@ -1645,12 +1661,12 @@
           "gfx1250": 4,
           "gfx90a": 5,
           "gfx942": 40,
-          "gfx950": 135
+          "gfx950": 137
         },
         "expected_failures": 4,
         "families": {
           "add_rmsnorm2d_bf16": 3,
-          "add_rmsnorm2d_rdquant": 2,
+          "add_rmsnorm2d_rdquant": 4,
           "attention": 16,
           "attention_d128_swa": 1,
           "attention_d256": 2,
@@ -1674,7 +1690,7 @@
           "rmsnorm2d": 3,
           "smoothquant": 2
         },
-        "ok_cases": 202
+        "ok_cases": 204
       }
     },
     "llvm22": {
@@ -1709,6 +1725,22 @@
           "family": "add_rmsnorm2d_rdquant",
           "kernel_name": "rocke_add_rmsnorm2d_rdquant_f16_i8_N8192_b256_v4_sr_ys",
           "sha256": "fc62d1de9bbad77158e9771fa424d2085f24a32b7c49f07a4f53ee2ada824388",
+          "status": "ok"
+        },
+        "add_rmsnorm2d_rdquant/gfx950/streaming_n8192": {
+          "arch": "gfx950",
+          "bytes": 73555,
+          "family": "add_rmsnorm2d_rdquant",
+          "kernel_name": "rocke_add_rmsnorm2d_rdquant_f16_i8_N8192_b256_v4_sr_ys_nt",
+          "sha256": "02344bff3a915bbb0b946c948edaf83855a1c2c27fd61abeaf998bf19ff324bb",
+          "status": "ok"
+        },
+        "add_rmsnorm2d_rdquant/gfx950/streaming_wave_reduce_b512_v8_n8192": {
+          "arch": "gfx950",
+          "bytes": 35258,
+          "family": "add_rmsnorm2d_rdquant",
+          "kernel_name": "rocke_add_rmsnorm2d_rdquant_f16_i8_N8192_b512_v8_sr_ys_wr_nt",
+          "sha256": "ffa7cbbadff3b5529cb4d153b46b24cc6140c3899816110249918d3d57cdea57",
           "status": "ok"
         },
         "add_rmsnorm2d_rdquant/gfx950/wave_reduce_n8192": {
@@ -3322,12 +3354,12 @@
           "gfx1250": 4,
           "gfx90a": 5,
           "gfx942": 40,
-          "gfx950": 135
+          "gfx950": 137
         },
         "expected_failures": 4,
         "families": {
           "add_rmsnorm2d_bf16": 3,
-          "add_rmsnorm2d_rdquant": 2,
+          "add_rmsnorm2d_rdquant": 4,
           "attention": 16,
           "attention_d128_swa": 1,
           "attention_d256": 2,
@@ -3351,7 +3383,7 @@
           "rmsnorm2d": 3,
           "smoothquant": 2
         },
-        "ok_cases": 202
+        "ok_cases": 204
       }
     },
     "llvm23": {
@@ -3386,6 +3418,22 @@
           "family": "add_rmsnorm2d_rdquant",
           "kernel_name": "rocke_add_rmsnorm2d_rdquant_f16_i8_N8192_b256_v4_sr_ys",
           "sha256": "829168dec91b0b09d978e89b03c3190c8becc6d02d16cc27d259bb315ad77700",
+          "status": "ok"
+        },
+        "add_rmsnorm2d_rdquant/gfx950/streaming_n8192": {
+          "arch": "gfx950",
+          "bytes": 73619,
+          "family": "add_rmsnorm2d_rdquant",
+          "kernel_name": "rocke_add_rmsnorm2d_rdquant_f16_i8_N8192_b256_v4_sr_ys_nt",
+          "sha256": "5c6cecc02c14f6b6a7d03bff87e228a52caf1d6a0464aae6ea93d392c7f179f7",
+          "status": "ok"
+        },
+        "add_rmsnorm2d_rdquant/gfx950/streaming_wave_reduce_b512_v8_n8192": {
+          "arch": "gfx950",
+          "bytes": 35322,
+          "family": "add_rmsnorm2d_rdquant",
+          "kernel_name": "rocke_add_rmsnorm2d_rdquant_f16_i8_N8192_b512_v8_sr_ys_wr_nt",
+          "sha256": "8c530f82a0d3855ad226427fa15d66fc4c7f2c3526cb2122bcce4e036f7bc649",
           "status": "ok"
         },
         "add_rmsnorm2d_rdquant/gfx950/wave_reduce_n8192": {
@@ -5014,12 +5062,12 @@
           "gfx1250": 8,
           "gfx90a": 5,
           "gfx942": 40,
-          "gfx950": 135
+          "gfx950": 137
         },
         "expected_failures": 0,
         "families": {
           "add_rmsnorm2d_bf16": 3,
-          "add_rmsnorm2d_rdquant": 2,
+          "add_rmsnorm2d_rdquant": 4,
           "attention": 16,
           "attention_d128_swa": 1,
           "attention_d256": 2,
@@ -5043,7 +5091,7 @@
           "rmsnorm2d": 3,
           "smoothquant": 2
         },
-        "ok_cases": 206
+        "ok_cases": 208
       }
     }
   },

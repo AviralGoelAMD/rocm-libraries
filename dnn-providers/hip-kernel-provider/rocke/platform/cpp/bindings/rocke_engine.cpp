@@ -2087,6 +2087,7 @@ rocke_add_rmsnorm2d_rdquant_spec_t ard_build_spec(const py::dict& d, std::deque<
     s.save_yscale = dict_bool(d, "save_yscale", s.save_yscale);
     s.wave_size = dict_int(d, "wave_size", s.wave_size);
     s.wave_reduce = dict_bool(d, "wave_reduce", s.wave_reduce);
+    s.streaming = dict_bool(d, "streaming", s.streaming);
     {
         std::string v;
         if(dict_str(d, "dtype", v))

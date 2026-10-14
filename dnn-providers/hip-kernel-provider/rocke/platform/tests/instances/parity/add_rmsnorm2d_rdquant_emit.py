@@ -116,13 +116,50 @@ def _spec(idx: int) -> AddRmsnorm2DRdquantSpec:
             wave_size=64,
             wave_reduce=True,
         )
+    if idx == 8:
+        return AddRmsnorm2DRdquantSpec(
+            n_per_block=4096,
+            dtype="f16",
+            out_dtype="i8",
+            block_size=256,
+            vec=4,
+            save_residual=True,
+            save_yscale=True,
+            wave_size=64,
+            streaming=True,
+        )
+    if idx == 9:
+        return AddRmsnorm2DRdquantSpec(
+            n_per_block=8192,
+            dtype="f16",
+            out_dtype="i8",
+            block_size=512,
+            vec=8,
+            save_residual=True,
+            save_yscale=True,
+            wave_size=64,
+            wave_reduce=True,
+            streaming=True,
+        )
+    if idx == 10:
+        return AddRmsnorm2DRdquantSpec(
+            n_per_block=2048,
+            dtype="bf16",
+            out_dtype="bf8e5m2",
+            block_size=128,
+            vec=4,
+            save_residual=False,
+            save_yscale=False,
+            wave_size=64,
+            streaming=True,
+        )
     raise SystemExit(f"unknown config index {idx}")
 
 
 def main() -> int:
     if len(sys.argv) < 2:
         sys.stderr.write(
-            "usage: add_rmsnorm2d_rdquant_emit.py <config_index 0..7> [ll|ir|verify]\n"
+            "usage: add_rmsnorm2d_rdquant_emit.py <config_index 0..10> [ll|ir|verify]\n"
         )
         return 2
     idx = int(sys.argv[1])
