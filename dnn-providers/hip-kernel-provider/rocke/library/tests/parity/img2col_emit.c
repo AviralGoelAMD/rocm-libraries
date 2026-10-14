@@ -95,7 +95,7 @@ static int make_spec(int idx, rocke_img2col_spec_t* spec)
         p.X = 3;
         spec->block_tile_m = 8;
         spec->block_tile_k = 120;
-        spec->vec_k = 8;
+        spec->vec_k = 1;
         break;
     case 5:
         p.N = 2;

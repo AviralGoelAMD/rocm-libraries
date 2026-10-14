@@ -114,6 +114,19 @@ bool rocke_img2col_is_valid_spec(const rocke_img2col_spec_t* spec,
         return false;
     }
 
+    /* if spec.problem.K_gemm % spec.vec_k != 0: ... (a chunk would straddle
+     * two output rows and misalign every row after the first) */
+    if(rocke_img2col_conv_problem_k_gemm(&spec->problem) % spec->vec_k != 0)
+    {
+        snprintf(buf,
+                 sizeof(buf),
+                 "K_gemm %d not divisible by vec_k %d",
+                 (int)rocke_img2col_conv_problem_k_gemm(&spec->problem),
+                 spec->vec_k);
+        rocke_img2col_set_reason(reason, reason_cap, buf);
+        return false;
+    }
+
     block_size = rocke_img2col_block_size(spec);
 
     /* if spec.block_size <= 0: ... */
