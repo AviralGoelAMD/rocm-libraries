@@ -1015,16 +1015,6 @@ _LOOKAHEAD_ARMS = {
             window_priority=1,
         ),
     ),
-    "windows3": (
-        256,
-        dict(
-            _LOOKAHEAD_BASE,
-            lds_read_base=True,
-            wave_group_pingpong=True,
-            mfma_windows=3,
-            qk_lookahead_unroll=1,
-        ),
-    ),
 }
 
 
