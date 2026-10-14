@@ -73,12 +73,28 @@ class FmhaBwdSpec:
     # ``bwd_mode="mfma"`` knobs. dK/dV kernel: waves per CTA and 16-key
     # tiles per wave (the CTA owns ``16 * waves * ktiles`` keys). dQ kernel:
     # waves per CTA and 16-row Q tiles per wave. ``mfma_lds_pad`` pads each
-    # staged LDS row by that many elements.
+    # staged LDS row by that many elements. ``mfma_waves_per_eu`` (0 = unset)
+    # is the ``amdgpu-waves-per-eu`` occupancy hint of both GEMM kernels.
+    # ``mfma_exp2_fast`` uses the single-instruction ``v_exp_f32`` for P.
     mfma_dkdv_waves: int = 4
     mfma_dkdv_ktiles: int = 1
     mfma_dq_waves: int = 4
     mfma_dq_qtiles: int = 1
     mfma_lds_pad: int = 8
+    mfma_waves_per_eu: int = 0
+    mfma_exp2_fast: bool = False
+    # ``mfma_atom32``: 32x32x16 atoms, one wave per 32 keys / 32 query rows
+    # (``ktiles`` / ``qtiles`` are ignored).
+    mfma_atom32: bool = False
+    # ``mfma_natural_rows``: 16x16 path keeps Q / K tile rows in natural order
+    # (a lane group's 8 K slots are rows ``4g + 0..3`` and ``16 + 4g + 0..3``)
+    # instead of permuting them to 8 contiguous rows.
+    mfma_natural_rows: bool = False
+    # ``mfma_pipeline``: the next tile's global loads are issued one loop
+    # iteration ahead and carried in registers. ``mfma_causal_balance``:
+    # causal dQ CTAs run heaviest-first.
+    mfma_pipeline: bool = False
+    mfma_causal_balance: bool = False
 
     def kernel_name(self) -> str:
         s = self.common.shape
@@ -636,6 +652,14 @@ def _mfma_bwd_setup(spec: FmhaBwdSpec, arch: str):
     return target.mma.by_op_id(atom.name), io_ir_type(s.dtype)
 
 
+def _mfma_bwd_op32(spec: FmhaBwdSpec, arch: str):
+    from rocke.core.arch import ArchTarget
+    from rocke.helpers.atoms import MfmaAtom
+
+    atom = MfmaAtom.bf16_32x32x16() if spec.common.dtype == "bf16" else MfmaAtom.f16_32x32x16()
+    return ArchTarget.from_gfx(arch).mma.by_op_id(atom.name)
+
+
 def _mfma_bwd_lane(b, nw: int):
     """``(tid, lane, wave, m16, g)``; ``wave`` is pinned to an SGPR."""
     tid = b.thread_id_x()
@@ -644,12 +668,24 @@ def _mfma_bwd_lane(b, nw: int):
     return tid, lane, wave, b.mod(lane, b.const_i32(16)), b.div(lane, b.const_i32(16))
 
 
-def _mfma_bwd_perm_row(b, m16, t: int):
-    """A-operand row of 16-row sub-tile ``t`` so C row ``4g + r`` is ``8g + r + 4t``."""
+def _mfma_bwd_perm_row(b, m16, t: int, nat: bool):
+    """A-operand row of 16-row sub-tile ``t``.
+
+    ``nat``: rows ``16t + m16`` (C slot ``(t, r)`` of lane group ``g`` is row
+    ``16t + 4g + r``). Otherwise permuted so that C slot ``(t, r)`` is row
+    ``8g + 4t + r`` (8 contiguous rows per lane group).
+    """
+    if nat:
+        return b.add(m16, b.const_i32(16 * t))
     return b.add(
         b.add(b.mul(b.div(m16, b.const_i32(4)), b.const_i32(8)), b.mod(m16, b.const_i32(4))),
         b.const_i32(4 * t),
     )
+
+
+def _mfma_bwd_slot_rows(b, g, nat: bool):
+    """``(base, t_stride)``: C slot ``(t, r)`` of lane group ``g`` is row ``base + t_stride * t + r``."""
+    return (b.mul(g, b.const_i32(4)), 16) if nat else (b.mul(g, b.const_i32(8)), 4)
 
 
 class _MfmaBwdStager:
@@ -687,13 +723,21 @@ class _MfmaBwdStager:
             for r, v in zip(self.rows, vs):
                 self.b.smem_store_vN(lds, [buf, r, self.col], v, 8)
 
+    def flat(self, vals):
+        return [v for vs in vals for v in vs]
 
-def _mfma_bwd_tr8(b, lds, buf, g, m16, nd: int, dt):
-    """Lane ``(g, m16)`` gets ``lds[buf, 8g + j, 16 nd + m16]`` for ``j = 0..7``."""
+    def unflat(self, flat):
+        n = len(self.rows)
+        return [list(flat[i * n : (i + 1) * n]) for i in range(len(self.srcs))]
+
+
+def _mfma_bwd_tr8(b, lds, buf, g, m16, nd: int, dt, nat: bool):
+    """Lane ``(g, m16)`` gets ``lds[buf, row(g, j), 16 nd + m16]`` for slot ``j = 4t + r``."""
     col = b.add(b.const_i32(16 * nd), b.mul(b.mod(m16, b.const_i32(4)), b.const_i32(4)))
-    r0 = b.add(b.mul(g, b.const_i32(8)), b.div(m16, b.const_i32(4)))
+    base, t_stride = _mfma_bwd_slot_rows(b, g, nat)
+    r0 = b.add(base, b.div(m16, b.const_i32(4)))
     lo = b.ds_read_tr16_b64(lds, buf, r0, col, dtype=dt)
-    hi = b.ds_read_tr16_b64(lds, buf, b.add(r0, b.const_i32(4)), col, dtype=dt)
+    hi = b.ds_read_tr16_b64(lds, buf, b.add(r0, b.const_i32(t_stride)), col, dtype=dt)
     return b.vec_concat(lo, hi)
 
 
@@ -791,24 +835,49 @@ def _build_mfma_pre(spec: FmhaBwdSpec, arch: str) -> KernelDef:
     return kb.kernel
 
 
-def _mfma_bwd_tag(spec: FmhaBwdSpec, which: str) -> str:
+def _mfma_bwd_kb(spec: FmhaBwdSpec, which: str, nw: int, declare) -> FmhaKernelBuilder:
     if which == "dkdv":
-        return f"_mfma_dkdv_w{spec.mfma_dkdv_waves}k{spec.mfma_dkdv_ktiles}p{spec.mfma_lds_pad}"
-    return f"_mfma_dq_w{spec.mfma_dq_waves}q{spec.mfma_dq_qtiles}p{spec.mfma_lds_pad}"
+        tag = f"_mfma_dkdv_w{spec.mfma_dkdv_waves}k{spec.mfma_dkdv_ktiles}p{spec.mfma_lds_pad}"
+    else:
+        tag = f"_mfma_dq_w{spec.mfma_dq_waves}q{spec.mfma_dq_qtiles}p{spec.mfma_lds_pad}"
+    if spec.mfma_atom32:
+        tag = tag.replace("_mfma_", "_mfma_a32_")
+    if spec.mfma_waves_per_eu:
+        tag += f"_wpe{spec.mfma_waves_per_eu}"
+    if spec.mfma_exp2_fast:
+        tag += "_fx"
+    if spec.mfma_natural_rows and not spec.mfma_atom32:
+        tag += "_nat"
+    if spec.mfma_pipeline:
+        tag += "_pl"
+    if spec.mfma_causal_balance and which == "dq" and spec.common.mask_mode == "causal":
+        tag += "_cb"
+    if spec.mfma_atom32 and (spec.mfma_pipeline or spec.mfma_causal_balance or spec.mfma_natural_rows):
+        raise ValueError("fmha_bwd mfma_atom32 does not support pipeline / causal_balance / natural_rows")
+    kb = FmhaKernelBuilder(spec.kernel_name() + tag, spec.common)
+    kb.block_size(64 * nw)
+    if spec.mfma_waves_per_eu:
+        kb.builder.kernel.attrs["waves_per_eu"] = spec.mfma_waves_per_eu
+    declare(kb)
+    return kb
+
+
+def _mfma_bwd_exp2(b, spec: FmhaBwdSpec, x):
+    return b.exp2_fast(x) if spec.mfma_exp2_fast else b.exp2(x)
 
 
 def _build_mfma_dkdv(spec: FmhaBwdSpec, arch: str) -> KernelDef:
+    pipe = spec.mfma_pipeline
     s = spec.common
     op, dt = _mfma_bwd_setup(spec, arch)
     D = s.shape.head_size
     G = s.shape.num_queries_per_kv
     nw, kpw = spec.mfma_dkdv_waves, spec.mfma_dkdv_ktiles
     causal = s.mask_mode == "causal"
+    nat = spec.mfma_natural_rows
     BM = _MFMA_BWD_STEP
     n_a, n_d = D // 32, D // 16
-    kb = FmhaKernelBuilder(spec.kernel_name() + _mfma_bwd_tag(spec, "dkdv"), s)
-    kb.block_size(64 * nw)
-    _declare_mfma_dkdv_params(kb)
+    kb = _mfma_bwd_kb(spec, "dkdv", nw, _declare_mfma_dkdv_params)
     b = kb.builder
     Q, K, V, dO = kb.tensor("Q"), kb.tensor("K"), kb.tensor("V"), kb.tensor("dO")
     Lse2, Dsum = kb.ptr("Lse2"), kb.ptr("Dsum")
@@ -845,15 +914,37 @@ def _build_mfma_dkdv(spec: FmhaBwdSpec, arch: str) -> KernelDef:
         qt = b.add(qt_lo, b.mod(it, nq_eff)) if G > 1 else b.add(qt_lo, it)
         return h, b.mul(qt, b.const_i32(BM))
 
-    h0, q00 = _coords(b.const_i32(0))
-    stg.store(stg.load(q00, h0), b.const_i32(0))
-    b.sync()
+    row_base, t_stride = _mfma_bwd_slot_rows(b, g, nat)
 
+    def _stats(it):
+        # Per-lane log-sum-exp / Dsum of the query rows this lane's C slots cover.
+        h, q0 = _coords(it)
+        ws = b.add(b.add(b.mul(h, seqlen_q), q0), row_base)
+        return [
+            b.global_load_vN(ptr, b.add(ws, b.const_i32(t_stride * t)), F32, 4, align=16)
+            for ptr in (Lse2, Dsum)
+            for t in range(2)
+        ]
+
+    def _clamp(x):
+        return b.select(b.cmp_lt(x, total), x, last)
+
+    h0, q00 = _coords(b.const_i32(0))
+    last = b.sub(total, b.const_i32(1))
+    stg.store(stg.load(q00, h0), b.const_i32(0))
     iter_args = []
     for i in range(kpw):
         iter_args += [(f"dk{i}_{n}", b.zero_vec_f32(4)) for n in range(n_d)]
         iter_args += [(f"dv{i}_{n}", b.zero_vec_f32(4)) for n in range(n_d)]
-    last = b.sub(total, b.const_i32(1))
+    n_acc = len(iter_args)
+    if pipe:
+        # Software pipeline: tile it+1's Q / dO loads and tile it's stats are
+        # issued one iteration ahead and carried across the back-edge, so the
+        # LDS stores at the end of an iteration never wait on fresh loads.
+        h1, q01 = _coords(_clamp(b.const_i32(1)))
+        iter_args += [(f"pf{j}", v) for j, v in enumerate(stg.flat(stg.load(q01, h1)))]
+        iter_args += [(f"st{j}", v) for j, v in enumerate(_stats(b.const_i32(0)))]
+    b.sync()
     loop = b.scf_for_iter(
         b.const_i32(0), total, b.const_i32(1), iter_args=iter_args, iv_name="it",
         elide_trailing_barrier=False,
@@ -862,28 +953,30 @@ def _build_mfma_dkdv(spec: FmhaBwdSpec, arch: str) -> KernelDef:
         dk = [list(state[2 * n_d * i : 2 * n_d * i + n_d]) for i in range(kpw)]
         dv = [list(state[2 * n_d * i + n_d : 2 * n_d * (i + 1)]) for i in range(kpw)]
         buf = b.mod(it, b.const_i32(2))
-        nxt = b.add(it, b.const_i32(1))
-        nxt = b.select(b.cmp_lt(nxt, total), nxt, last)
-        hn, qn = _coords(nxt)
-        pre = stg.load(qn, hn)
+        if pipe:
+            n_pf = len(stg.rows) * 2
+            pre = stg.unflat(state[n_acc : n_acc + n_pf])
+            st = list(state[n_acc + n_pf :])
+        else:
+            hn, qn = _coords(_clamp(b.add(it, b.const_i32(1))))
+            pre = stg.load(qn, hn)
+            st = _stats(it)
+        lse, dsum = st[:2], st[2:]
         h, q0 = _coords(it)
 
         q_a = [
-            [b.smem_load_vN(q_lds, buf, _mfma_bwd_perm_row(b, m16, t),
+            [b.smem_load_vN(q_lds, buf, _mfma_bwd_perm_row(b, m16, t, nat),
                             b.add(b.const_i32(32 * a), b.mul(g, b.const_i32(8))), dtype=dt, n=8)
              for a in range(n_a)]
             for t in range(2)
         ]
         do_a = [
-            [b.smem_load_vN(do_lds, buf, _mfma_bwd_perm_row(b, m16, t),
+            [b.smem_load_vN(do_lds, buf, _mfma_bwd_perm_row(b, m16, t, nat),
                             b.add(b.const_i32(32 * a), b.mul(g, b.const_i32(8))), dtype=dt, n=8)
              for a in range(n_a)]
             for t in range(2)
         ]
-        q_lane = b.add(q0, b.mul(g, b.const_i32(8)))  # slot (t, r) -> query q_lane + 4t + r
-        ws = b.add(b.mul(h, seqlen_q), q_lane)
-        lse = [b.global_load_vN(Lse2, b.add(ws, b.const_i32(4 * t)), F32, 4, align=16) for t in range(2)]
-        dsum = [b.global_load_vN(Dsum, b.add(ws, b.const_i32(4 * t)), F32, 4, align=16) for t in range(2)]
+        q_lane = b.add(q0, row_base)  # slot (t, r) -> query q_lane + t_stride * t + r
         p_vec, ds_vec = [], []
         for i in range(kpw):
             key = b.add(n_wave, b.add(b.const_i32(16 * i), m16))
@@ -896,24 +989,30 @@ def _build_mfma_dkdv(spec: FmhaBwdSpec, arch: str) -> KernelDef:
                 for a in range(n_a):
                     dp_acc = b.mma(op, do_a[t][a], v_b[i][a], dp_acc)
                 for r in range(4):
-                    p = b.exp2(b.fsub(b.fmul(b.vec_extract(s_acc, r), scale_log2), b.vec_extract(lse[t], r)))
+                    p = _mfma_bwd_exp2(
+                        b, spec, b.fsub(b.fmul(b.vec_extract(s_acc, r), scale_log2), b.vec_extract(lse[t], r))
+                    )
                     if causal:
-                        qpos = b.add(q_lane, b.const_i32(4 * t + r))
+                        qpos = b.add(q_lane, b.const_i32(t_stride * t + r))
                         p = b.select(b.cmp_le(key, qpos), p, b.const_f32(0.0))
                     ps.append(p)
                     dss.append(b.fmul(p, b.fsub(b.vec_extract(dp_acc, r), b.vec_extract(dsum[t], r))))
             p_vec.append(_mfma_bwd_pack(b, ps, dt))
             ds_vec.append(_mfma_bwd_pack(b, dss, dt))
         for n in range(n_d):
-            do_t = _mfma_bwd_tr8(b, do_lds, buf, g, m16, n, dt)
+            do_t = _mfma_bwd_tr8(b, do_lds, buf, g, m16, n, dt, nat)
             for i in range(kpw):
                 dv[i][n] = b.mma(op, do_t, p_vec[i], dv[i][n])
-            q_t = _mfma_bwd_tr8(b, q_lds, buf, g, m16, n, dt)
+            q_t = _mfma_bwd_tr8(b, q_lds, buf, g, m16, n, dt, nat)
             for i in range(kpw):
                 dk[i][n] = b.mma(op, q_t, ds_vec[i], dk[i][n])
         stg.store(pre, b.sub(b.const_i32(1), buf))
+        carry = []
+        if pipe:
+            h2, q02 = _coords(_clamp(b.add(it, b.const_i32(2))))
+            carry = stg.flat(stg.load(q02, h2)) + _stats(_clamp(b.add(it, b.const_i32(1))))
         b.sync()
-        b.scf_yield(*[x for i in range(kpw) for x in dk[i] + dv[i]])
+        b.scf_yield(*[x for i in range(kpw) for x in dk[i] + dv[i]], *carry)
 
     # C fragment of dV^T / dK^T: lane (g, m16) slot r = [d = 16n + 4g + r, key = m16].
     scale_inv = kb.scalar("scale_inv")
@@ -941,16 +1040,19 @@ def _build_mfma_dq(spec: FmhaBwdSpec, arch: str) -> KernelDef:
     G = s.shape.num_queries_per_kv
     nw, qpw = spec.mfma_dq_waves, spec.mfma_dq_qtiles
     causal = s.mask_mode == "causal"
+    nat = spec.mfma_natural_rows
     BK = _MFMA_BWD_STEP
     BQ = 16 * qpw * nw
     n_a, n_d = D // 32, D // 16
-    kb = FmhaKernelBuilder(spec.kernel_name() + _mfma_bwd_tag(spec, "dq"), s)
-    kb.block_size(64 * nw)
-    _declare_mfma_dq_params(kb)
+    kb = _mfma_bwd_kb(spec, "dq", nw, _declare_mfma_dq_params)
     b = kb.builder
     Q, K, V, dO = kb.tensor("Q"), kb.tensor("K"), kb.tensor("V"), kb.tensor("dO")
     scale_log2, seqlen_q = kb.scalar("scale_log2"), kb.scalar("seqlen_q")
-    q_cta = b.to_sgpr_u32(b.mul(b.block_id_x(), b.const_i32(BQ)))
+    bid = b.block_id_x()
+    if causal and spec.mfma_causal_balance:
+        # Causal dQ work grows with the Q tile index: launch the heavy tiles first.
+        bid = b.sub(b.sub(b.div(seqlen_q, b.const_i32(BQ)), b.const_i32(1)), bid)
+    q_cta = b.to_sgpr_u32(b.mul(bid, b.const_i32(BQ)))
     h = b.to_sgpr_u32(b.block_id_y())
     kvh = b.to_sgpr_u32(b.div(h, b.const_i32(G))) if G > 1 else h
     tid, _, wave, m16, g = _mfma_bwd_lane(b, nw)
@@ -980,10 +1082,18 @@ def _build_mfma_dq(spec: FmhaBwdSpec, arch: str) -> KernelDef:
     if causal:
         need = b.add(b.div(b.add(q_cta, b.const_i32(BQ - 1)), b.const_i32(BK)), b.const_i32(1))
         nkt = b.select(b.cmp_lt(need, nkt), need, nkt)
-    stg.store(stg.load(b.const_i32(0)), b.const_i32(0))
-    b.sync()
     last = b.sub(nkt, b.const_i32(1))
+
+    def _clamp(x):
+        return b.select(b.cmp_lt(x, nkt), x, last)
+
+    stg.store(stg.load(b.const_i32(0)), b.const_i32(0))
     iter_args = [(f"dq{i}_{n}", b.zero_vec_f32(4)) for i in range(qpw) for n in range(n_d)]
+    n_acc = len(iter_args)
+    if spec.mfma_pipeline:
+        # Tile kt+1's K / V loads are issued one iteration ahead (see dK/dV).
+        iter_args += [(f"pf{j}", v) for j, v in enumerate(stg.flat(stg.load(b.mul(_clamp(b.const_i32(1)), b.const_i32(BK)))))]
+    b.sync()
     loop = b.scf_for_iter(
         b.const_i32(0), nkt, b.const_i32(1), iter_args=iter_args, iv_name="kt",
         elide_trailing_barrier=False,
@@ -991,23 +1101,25 @@ def _build_mfma_dq(spec: FmhaBwdSpec, arch: str) -> KernelDef:
     with loop as (kt, state):
         dq = [list(state[n_d * i : n_d * (i + 1)]) for i in range(qpw)]
         buf = b.mod(kt, b.const_i32(2))
-        nxt = b.add(kt, b.const_i32(1))
-        nxt = b.select(b.cmp_lt(nxt, nkt), nxt, last)
-        pre = stg.load(b.mul(nxt, b.const_i32(BK)))
+        if spec.mfma_pipeline:
+            pre = stg.unflat(state[n_acc:])
+        else:
+            pre = stg.load(b.mul(_clamp(b.add(kt, b.const_i32(1))), b.const_i32(BK)))
         k0 = b.mul(kt, b.const_i32(BK))
         k_a = [
-            [b.smem_load_vN(k_lds, buf, _mfma_bwd_perm_row(b, m16, t),
+            [b.smem_load_vN(k_lds, buf, _mfma_bwd_perm_row(b, m16, t, nat),
                             b.add(b.const_i32(32 * a), d_lane), dtype=dt, n=8)
              for a in range(n_a)]
             for t in range(2)
         ]
         v_a = [
-            [b.smem_load_vN(v_lds, buf, _mfma_bwd_perm_row(b, m16, t),
+            [b.smem_load_vN(v_lds, buf, _mfma_bwd_perm_row(b, m16, t, nat),
                             b.add(b.const_i32(32 * a), d_lane), dtype=dt, n=8)
              for a in range(n_a)]
             for t in range(2)
         ]
-        k_lane = b.add(k0, d_lane)  # slot (t, r) -> key k_lane + 4t + r
+        row_base, t_stride = _mfma_bwd_slot_rows(b, g, nat)
+        k_lane = b.add(k0, row_base)  # slot (t, r) -> key k_lane + t_stride * t + r
         ds_vec = []
         for i in range(qpw):
             dss = []
@@ -1019,19 +1131,22 @@ def _build_mfma_dq(spec: FmhaBwdSpec, arch: str) -> KernelDef:
                 for a in range(n_a):
                     dp_acc = b.mma(op, v_a[t][a], do_b[i][a], dp_acc)
                 for r in range(4):
-                    p = b.exp2(b.fsub(b.fmul(b.vec_extract(s_acc, r), scale_log2), lse[i]))
+                    p = _mfma_bwd_exp2(b, spec, b.fsub(b.fmul(b.vec_extract(s_acc, r), scale_log2), lse[i]))
                     if causal:
-                        key = b.add(k_lane, b.const_i32(4 * t + r))
+                        key = b.add(k_lane, b.const_i32(t_stride * t + r))
                         p = b.select(b.cmp_le(key, q_pos[i]), p, b.const_f32(0.0))
                     dss.append(b.fmul(p, b.fsub(b.vec_extract(dp_acc, r), dsum[i])))
             ds_vec.append(_mfma_bwd_pack(b, dss, dt))
         for n in range(n_d):
-            k_t = _mfma_bwd_tr8(b, k_lds, buf, g, m16, n, dt)
+            k_t = _mfma_bwd_tr8(b, k_lds, buf, g, m16, n, dt, nat)
             for i in range(qpw):
                 dq[i][n] = b.mma(op, k_t, ds_vec[i], dq[i][n])
         stg.store(pre, b.sub(b.const_i32(1), buf))
+        carry = []
+        if spec.mfma_pipeline:
+            carry = stg.flat(stg.load(b.mul(_clamp(b.add(kt, b.const_i32(2))), b.const_i32(BK))))
         b.sync()
-        b.scf_yield(*[x for i in range(qpw) for x in dq[i]])
+        b.scf_yield(*[x for i in range(qpw) for x in dq[i]], *carry)
 
     # C fragment of dQ^T: lane (g, m16) slot r = [d = 16n + 4g + r, query = m16].
     scale_inv = kb.scalar("scale_inv")
@@ -1049,6 +1164,236 @@ def _build_mfma_dq(spec: FmhaBwdSpec, arch: str) -> KernelDef:
     return kb.kernel
 
 
+# ---- 32x32x16 atom variant (``mfma_atom32``) ---------------------------
+#
+# One wave owns 32 rows. Lane ``(h, c) = (lane / 32, lane % 32)``: A / B
+# operands hold row / column ``c`` and the 8 K slots ``8h + 0..7`` of a
+# 16-wide K chunk; C slot ``r`` is row ``8 (r / 4) + 4h + r % 4``, column
+# ``c``. The second GEMM of each chain takes the first GEMM's C fragment as
+# its B operand directly: slots ``8u + 0..7`` cover the 16 contiguous-K
+# chunk ``u``, so no row permutation is needed, and the A operand (dO^T,
+# Q^T, K^T) is two ``ds_read_b64_tr_b16`` reads per chunk.
+
+
+def _a32_row(b, h, r: int):
+    return b.add(b.mul(h, b.const_i32(4)), b.const_i32(8 * (r // 4) + r % 4))
+
+
+def _a32_tr8(b, lds, buf, h, c, u: int, dtile: int, dt):
+    """Lane ``(h, c)``: ``lds[buf, 16u + 4h + {0..3, 8..11}, 32 dtile + c]``."""
+    m = b.mod(c, b.const_i32(16))
+    col = b.add(
+        b.const_i32(32 * dtile),
+        b.add(b.mul(b.div(c, b.const_i32(16)), b.const_i32(16)), b.mul(b.mod(m, b.const_i32(4)), b.const_i32(4))),
+    )
+    r0 = b.add(b.const_i32(16 * u), b.add(b.mul(h, b.const_i32(4)), b.div(m, b.const_i32(4))))
+    lo = b.ds_read_tr16_b64(lds, buf, r0, col, dtype=dt)
+    hi = b.ds_read_tr16_b64(lds, buf, b.add(r0, b.const_i32(8)), col, dtype=dt)
+    return b.vec_concat(lo, hi)
+
+
+def _a32_lane(b, nw: int):
+    tid = b.thread_id_x()
+    lane = b.mod(tid, b.const_i32(64)) if nw > 1 else tid
+    wave = b.to_sgpr_u32(b.div(tid, b.const_i32(64))) if nw > 1 else b.const_i32(0)
+    return tid, wave, b.div(lane, b.const_i32(32)), b.mod(lane, b.const_i32(32))
+
+
+def _a32_store(b, ptr, row, acc, h, dtile: int, scale=None):
+    """Store C slots of a ``[32 d, 32 rows]`` fragment as 4 contiguous-d f32x4 per lane."""
+    for grp in range(4):
+        out = b.zero_vec_f32(4)
+        for j in range(4):
+            x = b.vec_extract(acc, 4 * grp + j)
+            out = b.vec_insert(out, b.fmul(x, scale) if scale is not None else x, j)
+        d = b.add(b.const_i32(32 * dtile + 8 * grp), b.mul(h, b.const_i32(4)))
+        b.global_store_vN(ptr, b.add(row, d), out, 4, align=16)
+
+
+def _build_mfma_dkdv32(spec: FmhaBwdSpec, arch: str) -> KernelDef:
+    s = spec.common
+    _, dt = _mfma_bwd_setup(spec, arch)
+    op = _mfma_bwd_op32(spec, arch)
+    D = s.shape.head_size
+    G = s.shape.num_queries_per_kv
+    nw = spec.mfma_dkdv_waves
+    causal = s.mask_mode == "causal"
+    BM = _MFMA_BWD_STEP
+    n_a, n_dt = D // 16, D // 32
+    kb = _mfma_bwd_kb(spec, "dkdv", nw, _declare_mfma_dkdv_params)
+    b = kb.builder
+    Q, K, V, dO = kb.tensor("Q"), kb.tensor("K"), kb.tensor("V"), kb.tensor("dO")
+    Lse2, Dsum = kb.ptr("Lse2"), kb.ptr("Dsum")
+    scale_log2, seqlen_q = kb.scalar("scale_log2"), kb.scalar("seqlen_q")
+    n_cta = b.to_sgpr_u32(b.mul(b.block_id_x(), b.const_i32(32 * nw)))
+    kvh = b.to_sgpr_u32(b.block_id_y())
+    tid, wave, h8, c = _a32_lane(b, nw)
+    n_wave = b.add(n_cta, b.mul(wave, b.const_i32(32)))
+    key = b.add(n_wave, c)
+    d_lane = b.mul(h8, b.const_i32(8))
+
+    def _kv_b(src, name):
+        row = kb.row_base(name, key, kvh)
+        return [
+            b.global_load_vN(src, b.add(row, b.add(b.const_i32(16 * a), d_lane)), dt, 8, align=16)
+            for a in range(n_a)
+        ]
+
+    k_b, v_b = _kv_b(K, "k"), _kv_b(V, "v")
+    stg = _MfmaBwdStager(
+        b, tid, nw, D, dt, spec.mfma_lds_pad,
+        [(Q, lambda r, hh: kb.row_base("q", r, hh)), (dO, lambda r, hh: kb.row_base("do", r, hh))],
+    )
+    q_lds, do_lds = stg.lds
+    nqt = b.div(seqlen_q, b.const_i32(BM))
+    qt_lo = b.div(n_cta, b.const_i32(BM)) if causal else b.const_i32(0)
+    nq_eff = b.sub(nqt, qt_lo)
+    total = b.mul(nq_eff, b.const_i32(G))
+
+    def _coords(it):
+        if G == 1:
+            return kvh, b.mul(b.add(qt_lo, it), b.const_i32(BM))
+        hh = b.add(b.mul(kvh, b.const_i32(G)), b.div(it, nq_eff))
+        return hh, b.mul(b.add(qt_lo, b.mod(it, nq_eff)), b.const_i32(BM))
+
+    h0, q00 = _coords(b.const_i32(0))
+    stg.store(stg.load(q00, h0), b.const_i32(0))
+    b.sync()
+    iter_args = [(f"dk{n}", b.zero_vec_f32(16)) for n in range(n_dt)]
+    iter_args += [(f"dv{n}", b.zero_vec_f32(16)) for n in range(n_dt)]
+    last = b.sub(total, b.const_i32(1))
+    loop = b.scf_for_iter(
+        b.const_i32(0), total, b.const_i32(1), iter_args=iter_args, iv_name="it",
+        elide_trailing_barrier=False,
+    )
+    with loop as (it, state):
+        dk, dv = list(state[:n_dt]), list(state[n_dt:])
+        buf = b.mod(it, b.const_i32(2))
+        nxt = b.add(it, b.const_i32(1))
+        nxt = b.select(b.cmp_lt(nxt, total), nxt, last)
+        hn, qn = _coords(nxt)
+        pre = stg.load(qn, hn)
+        hh, q0 = _coords(it)
+        s_acc = b.zero_vec_f32(16)
+        dp_acc = b.zero_vec_f32(16)
+        for a in range(n_a):
+            qa = b.smem_load_vN(q_lds, buf, c, b.add(b.const_i32(16 * a), d_lane), dtype=dt, n=8)
+            s_acc = b.mma(op, qa, k_b[a], s_acc)
+        for a in range(n_a):
+            da = b.smem_load_vN(do_lds, buf, c, b.add(b.const_i32(16 * a), d_lane), dtype=dt, n=8)
+            dp_acc = b.mma(op, da, v_b[a], dp_acc)
+        ws = b.add(b.add(b.mul(hh, seqlen_q), q0), b.mul(h8, b.const_i32(4)))
+        lse = [b.global_load_vN(Lse2, b.add(ws, b.const_i32(8 * g)), F32, 4, align=16) for g in range(4)]
+        dsum = [b.global_load_vN(Dsum, b.add(ws, b.const_i32(8 * g)), F32, 4, align=16) for g in range(4)]
+        ps, dss = [], []
+        for r in range(16):
+            p = _mfma_bwd_exp2(
+                b, spec, b.fsub(b.fmul(b.vec_extract(s_acc, r), scale_log2), b.vec_extract(lse[r // 4], r % 4))
+            )
+            if causal:
+                p = b.select(b.cmp_le(key, b.add(q0, _a32_row(b, h8, r))), p, b.const_f32(0.0))
+            ps.append(p)
+            dss.append(b.fmul(p, b.fsub(b.vec_extract(dp_acc, r), b.vec_extract(dsum[r // 4], r % 4))))
+        p_vec = [_mfma_bwd_pack(b, ps[8 * u : 8 * u + 8], dt) for u in range(2)]
+        ds_vec = [_mfma_bwd_pack(b, dss[8 * u : 8 * u + 8], dt) for u in range(2)]
+        for n in range(n_dt):
+            for u in range(2):
+                dv[n] = b.mma(op, _a32_tr8(b, do_lds, buf, h8, c, u, n, dt), p_vec[u], dv[n])
+            for u in range(2):
+                dk[n] = b.mma(op, _a32_tr8(b, q_lds, buf, h8, c, u, n, dt), ds_vec[u], dk[n])
+        stg.store(pre, b.sub(b.const_i32(1), buf))
+        b.sync()
+        b.scf_yield(*dk, *dv)
+
+    scale_inv = kb.scalar("scale_inv")
+    dk_row = b.add(b.mul(key, kb.scalar("stride_dk_token")), b.mul(kvh, kb.stride_head("k")))
+    dv_row = b.add(b.mul(key, kb.scalar("stride_dv_token")), b.mul(kvh, kb.stride_head("v")))
+    for n in range(n_dt):
+        _a32_store(b, kb.ptr("dK"), dk_row, loop.results[n], h8, n, scale_inv)
+        _a32_store(b, kb.ptr("dV"), dv_row, loop.results[n_dt + n], h8, n)
+    b.ret()
+    return kb.kernel
+
+
+def _build_mfma_dq32(spec: FmhaBwdSpec, arch: str) -> KernelDef:
+    s = spec.common
+    _, dt = _mfma_bwd_setup(spec, arch)
+    op = _mfma_bwd_op32(spec, arch)
+    D = s.shape.head_size
+    G = s.shape.num_queries_per_kv
+    nw = spec.mfma_dq_waves
+    causal = s.mask_mode == "causal"
+    BK = _MFMA_BWD_STEP
+    BQ = 32 * nw
+    n_a, n_dt = D // 16, D // 32
+    kb = _mfma_bwd_kb(spec, "dq", nw, _declare_mfma_dq_params)
+    b = kb.builder
+    Q, K, V, dO = kb.tensor("Q"), kb.tensor("K"), kb.tensor("V"), kb.tensor("dO")
+    scale_log2, seqlen_q = kb.scalar("scale_log2"), kb.scalar("seqlen_q")
+    q_cta = b.to_sgpr_u32(b.mul(b.block_id_x(), b.const_i32(BQ)))
+    hq = b.to_sgpr_u32(b.block_id_y())
+    kvh = b.to_sgpr_u32(b.div(hq, b.const_i32(G))) if G > 1 else hq
+    tid, wave, h8, c = _a32_lane(b, nw)
+    q = b.add(b.add(q_cta, b.mul(wave, b.const_i32(32))), c)
+    d_lane = b.mul(h8, b.const_i32(8))
+    qr, dr = kb.row_base("q", q, hq), kb.row_base("do", q, hq)
+    q_b = [b.global_load_vN(Q, b.add(qr, b.add(b.const_i32(16 * a), d_lane)), dt, 8, align=16) for a in range(n_a)]
+    do_b = [b.global_load_vN(dO, b.add(dr, b.add(b.const_i32(16 * a), d_lane)), dt, 8, align=16) for a in range(n_a)]
+    ws = b.add(b.mul(hq, seqlen_q), q)
+    lse = b.global_load_f32(kb.ptr("Lse2"), ws)
+    dsum = b.global_load_f32(kb.ptr("Dsum"), ws)
+    stg = _MfmaBwdStager(
+        b, tid, nw, D, dt, spec.mfma_lds_pad,
+        [(K, lambda r: kb.row_base("k", r, kvh)), (V, lambda r: kb.row_base("v", r, kvh))],
+    )
+    k_lds, v_lds = stg.lds
+    nkt = b.div(kb.scalar("seqlen_k"), b.const_i32(BK))
+    if causal:
+        need = b.add(b.div(b.add(q_cta, b.const_i32(BQ - 1)), b.const_i32(BK)), b.const_i32(1))
+        nkt = b.select(b.cmp_lt(need, nkt), need, nkt)
+    stg.store(stg.load(b.const_i32(0)), b.const_i32(0))
+    b.sync()
+    last = b.sub(nkt, b.const_i32(1))
+    loop = b.scf_for_iter(
+        b.const_i32(0), nkt, b.const_i32(1), iter_args=[(f"dq{n}", b.zero_vec_f32(16)) for n in range(n_dt)],
+        iv_name="kt", elide_trailing_barrier=False,
+    )
+    with loop as (kt, state):
+        dq = list(state)
+        buf = b.mod(kt, b.const_i32(2))
+        nxt = b.add(kt, b.const_i32(1))
+        nxt = b.select(b.cmp_lt(nxt, nkt), nxt, last)
+        pre = stg.load(b.mul(nxt, b.const_i32(BK)))
+        k0 = b.mul(kt, b.const_i32(BK))
+        s_acc = b.zero_vec_f32(16)
+        dp_acc = b.zero_vec_f32(16)
+        for a in range(n_a):
+            ka = b.smem_load_vN(k_lds, buf, c, b.add(b.const_i32(16 * a), d_lane), dtype=dt, n=8)
+            s_acc = b.mma(op, ka, q_b[a], s_acc)
+        for a in range(n_a):
+            va = b.smem_load_vN(v_lds, buf, c, b.add(b.const_i32(16 * a), d_lane), dtype=dt, n=8)
+            dp_acc = b.mma(op, va, do_b[a], dp_acc)
+        dss = []
+        for r in range(16):
+            p = _mfma_bwd_exp2(b, spec, b.fsub(b.fmul(b.vec_extract(s_acc, r), scale_log2), lse))
+            if causal:
+                p = b.select(b.cmp_le(b.add(k0, _a32_row(b, h8, r)), q), p, b.const_f32(0.0))
+            dss.append(b.fmul(p, b.fsub(b.vec_extract(dp_acc, r), dsum)))
+        ds_vec = [_mfma_bwd_pack(b, dss[8 * u : 8 * u + 8], dt) for u in range(2)]
+        for n in range(n_dt):
+            for u in range(2):
+                dq[n] = b.mma(op, _a32_tr8(b, k_lds, buf, h8, c, u, n, dt), ds_vec[u], dq[n])
+        stg.store(pre, b.sub(b.const_i32(1), buf))
+        b.sync()
+        b.scf_yield(*dq)
+
+    row = b.add(b.mul(q, kb.scalar("stride_dq_token")), b.mul(hq, kb.stride_head("q")))
+    for n in range(n_dt):
+        _a32_store(b, kb.ptr("dQ"), row, loop.results[n], h8, n, kb.scalar("scale_inv"))
+    b.ret()
+    return kb.kernel
+
+
 def build_fmha_bwd_mfma(spec: FmhaBwdSpec, arch: str = "gfx950"):
     """MFMA backward: ``[(kernel, signature, grid, block), ...]`` in launch order.
 
@@ -1062,8 +1407,8 @@ def build_fmha_bwd_mfma(spec: FmhaBwdSpec, arch: str = "gfx950"):
     s = spec.common
     D = s.shape.head_size
     HQ, HK = s.shape.num_query_heads, s.shape.num_kv_heads
-    bn = 16 * spec.mfma_dkdv_waves * spec.mfma_dkdv_ktiles
-    bq = 16 * spec.mfma_dq_waves * spec.mfma_dq_qtiles
+    bn = 16 * spec.mfma_dkdv_waves * (2 if spec.mfma_atom32 else spec.mfma_dkdv_ktiles)
+    bq = 16 * spec.mfma_dq_waves * (2 if spec.mfma_atom32 else spec.mfma_dq_qtiles)
     rows_pre = _MFMA_PRE_THREADS // (D // 8)
     if D % 32 or spec.seqlen_k % bn or spec.seqlen_q % bq or spec.seqlen_q % _MFMA_BWD_STEP:
         raise ValueError(
@@ -1074,9 +1419,10 @@ def build_fmha_bwd_mfma(spec: FmhaBwdSpec, arch: str = "gfx950"):
     out = []
     for which, build, declare, grid, block in (
         ("pre", _build_mfma_pre, _declare_mfma_pre_params, (spec.seqlen_q // rows_pre, HQ, 1), _MFMA_PRE_THREADS),
-        ("dkdv", _build_mfma_dkdv, _declare_mfma_dkdv_params, (spec.seqlen_k // bn, HK, 1),
-         64 * spec.mfma_dkdv_waves),
-        ("dq", _build_mfma_dq, _declare_mfma_dq_params, (spec.seqlen_q // bq, HQ, 1), 64 * spec.mfma_dq_waves),
+        ("dkdv", _build_mfma_dkdv32 if spec.mfma_atom32 else _build_mfma_dkdv, _declare_mfma_dkdv_params,
+         (spec.seqlen_k // bn, HK, 1), 64 * spec.mfma_dkdv_waves),
+        ("dq", _build_mfma_dq32 if spec.mfma_atom32 else _build_mfma_dq, _declare_mfma_dq_params,
+         (spec.seqlen_q // bq, HQ, 1), 64 * spec.mfma_dq_waves),
     ):
         k = build(spec, arch)
         kb = FmhaKernelBuilder(f"rocke_fmha_bwd_mfma_{which}_sig_probe", s)
