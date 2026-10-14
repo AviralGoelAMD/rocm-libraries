@@ -1807,6 +1807,33 @@ static const char* rocke_ll_scheduler_strategy(rocke_lower_t* L, const rocke_att
     return strategy;
 }
 
+static bool rocke_ll_is_denormal_mode(const char* s, size_t n)
+{
+    static const char* const modes[] = {"ieee", "preserve-sign", "positive-zero", "dynamic"};
+    for(size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++)
+    {
+        if(strlen(modes[i]) == n && strncmp(s, modes[i], n) == 0)
+            return true;
+    }
+    return false;
+}
+
+static const char* rocke_ll_denormal_mode(rocke_lower_t* L, const rocke_attr_value_t* v)
+{
+    const char* text = (v && v->kind == ROCKE_ATTR_STR) ? v->u.s : NULL;
+    const char* comma = text ? strchr(text, ',') : NULL;
+    if(!comma || strchr(comma + 1, ',') || !rocke_ll_is_denormal_mode(text, (size_t)(comma - text))
+       || !rocke_ll_is_denormal_mode(comma + 1, strlen(comma + 1)))
+    {
+        rocke_ll_fail(L,
+                      ROCKE_ERR_VALUE,
+                      "denormal_fp_math_f32 must be '<out>,<in>' with each one of "
+                      "ieee, preserve-sign, positive-zero, dynamic (got '%s')",
+                      text ? text : "<non-string>");
+    }
+    return text;
+}
+
 /* ====================================================================== */
 /* finalize (Python finalize)                                             */
 /* ====================================================================== */
@@ -1983,6 +2010,16 @@ void rocke_ll_finalize(rocke_lower_t* L, rocke_strbuf_t* out)
         {
             rocke_strbuf_appendf(
                 out, " \"amdgpu-cluster-dims\"=\"%s\"", rocke_ll_format_cluster_dims(L, cluster));
+        }
+        /* Per-kernel fp32 denormal mode; mirrors the Python lowerer's
+         * _check_denormal_mode ("<out>,<in>", each a known LLVM mode). */
+        const rocke_attr_value_t* denorm
+            = rocke_attr_get(&L->kernel->attrs, "denormal_fp_math_f32");
+        if(denorm)
+        {
+            rocke_strbuf_appendf(out,
+                                 " \"denormal-fp-math-f32\"=\"%s\"",
+                                 rocke_ll_denormal_mode(L, denorm));
         }
     }
     rocke_strbuf_append(out, " norecurse nounwind }\n");

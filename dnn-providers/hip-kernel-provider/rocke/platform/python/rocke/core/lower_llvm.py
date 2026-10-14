@@ -6581,6 +6581,13 @@ class _Lowerer:
             self._require_gfx1250_llvm23("cluster_dims")
             cx, cy, cz = check_cluster_dims(cluster_dims)
             attr_parts.append(f'"amdgpu-cluster-dims"="{cx},{cy},{cz}"')
+        # Per-kernel fp32 denormal mode, e.g. "preserve-sign,preserve-sign" to
+        # flush subnormals. Absent = the target default (IEEE denormals).
+        denormal_f32 = self.kernel.attrs.get("denormal_fp_math_f32")
+        if denormal_f32 is not None:
+            attr_parts.append(
+                f'"denormal-fp-math-f32"="{_check_denormal_mode(denormal_f32)}"'
+            )
         out.append(
             "attributes #0 = { " + " ".join(attr_parts) + " norecurse nounwind }"
         )
@@ -6624,6 +6631,21 @@ def _format_agpr_alloc(value: object) -> str:
     if lo > hi:
         raise ValueError("agpr_alloc min must be <= max")
     return f"{lo},{hi}"
+
+
+_DENORMAL_MODES = ("ieee", "preserve-sign", "positive-zero", "dynamic")
+
+
+def _check_denormal_mode(value: object) -> str:
+    """Validate a kernel ``denormal_fp_math_f32`` attr: ``"<output>,<input>"``."""
+    parts = str(value).split(",") if isinstance(value, str) else []
+    if len(parts) != 2 or any(p not in _DENORMAL_MODES for p in parts):
+        raise ValueError(
+            f"denormal_fp_math_f32 must be '<out>,<in>' with each one of "
+            f"{_DENORMAL_MODES} (got {value!r})"
+        )
+    return value
+
 
 
 def _param_attrs(attrs: Dict[str, object], t: Type) -> str:

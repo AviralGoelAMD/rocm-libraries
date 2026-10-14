@@ -366,6 +366,13 @@ class KdaChunkPrepSpec:
     # GQA group size: value-heads per key-head. 1 = MHA (KDA). >1 gathers q/k
     # from key-head (head // kv_group); only valid with gate_kind="gdn".
     kv_group: int = 1
+    # Compile the tile builder with fp32 denormals flushed (LLVM
+    # ``"denormal-fp-math-f32"="preserve-sign,preserve-sign"``): subnormal
+    # inputs and results of fp32 ops become signed zero, so the hardware never
+    # takes its denormal-handling path. Strongly decayed rows of the factored
+    # exponentials are where subnormals arise; zeroing them leaves the
+    # fp64-oracle error unchanged on the GDN numeric gate.
+    flush_denormals: bool = False
 
     @property
     def atom(self) -> MfmaAtom:
@@ -425,6 +432,8 @@ class KdaChunkPrepSpec:
             parts.append(self.gate_kind)
         if self.kv_group != 1:
             parts.append(f"g{self.kv_group}")
+        if self.flush_denormals:
+            parts.append("ftz")
         return kernel_name_join(*parts)
 
 
@@ -1775,6 +1784,8 @@ def build_kda_chunk_prep(spec: KdaChunkPrepSpec, arch: str = "gfx950") -> Kernel
             t.waves_per_eu,
             t.waves_per_eu,
         )
+    if spec.flush_denormals:
+        b.kernel.attrs["denormal_fp_math_f32"] = "preserve-sign,preserve-sign"
 
     q_ptr = b.param("q_ptr", PtrType(ELEM, "global"), readonly=True, align=16)
     k_ptr = b.param("k_ptr", PtrType(ELEM, "global"), readonly=True, align=16)
