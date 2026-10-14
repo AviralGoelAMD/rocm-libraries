@@ -2078,6 +2078,7 @@ CONV_FWD_REGISTRY = CandidateRegistry(_FAMILY_FWD, dim_vocabulary=_CONV_DIM_VOCA
 CONV_FWD_REGISTRY.register(_make_gfx942_fwd_candidate())
 CONV_FWD_REGISTRY.register(_make_gfx950_fwd_candidate())
 CONV_FWD_REGISTRY.register(_make_gfx950_direct_candidate("dw_tiled"))
+CONV_FWD_REGISTRY.register(_make_gfx950_direct_candidate("grouped"))
 CONV_FWD_REGISTRY.register(_make_gfx1250_fwd_candidate())
 
 CONV_WGRAD_REGISTRY = CandidateRegistry(
