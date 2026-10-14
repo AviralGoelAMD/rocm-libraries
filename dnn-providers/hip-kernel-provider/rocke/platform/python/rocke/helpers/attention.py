@@ -841,6 +841,8 @@ def pv32_v_load_paired(
         b.mul(b.mod(lane_col32, b.const_i32(4)), b.const_i32(4)),
     )
     if col_xor_of_row is None:
+        # Natural layout: the historical emission order (each read builds its
+        # own column add; the +8 row is built between the reads).
         tr_row_base32 = b.add(
             b.add(
                 b.const_i32(k * 16),
@@ -848,17 +850,29 @@ def pv32_v_load_paired(
             ),
             b.mod(b.div(lane_col32, b.const_i32(4)), b.const_i32(4)),
         )
-        tr_row_hi = b.add(tr_row_base32, b.const_i32(8))
-        col_r0 = col_r1 = b.add(b.const_i32(n * 32), tr_col32)
-    else:
-        lane_row = b.add(
-            b.mul(lane_half32, b.const_i32(4)),
-            b.mod(b.div(lane_col32, b.const_i32(4)), b.const_i32(4)),
+        A_r0 = b.ds_read_tr16_b64(
+            V_lds,
+            v_buf,
+            tr_row_base32,
+            b.add(b.const_i32(n * 32), tr_col32),
+            dtype=dtype,
         )
-        tr_row_base32 = b.add(b.const_i32(k * 16), lane_row)
-        tr_row_hi = b.add(tr_row_base32, b.const_i32(8))
-        col = b.add(b.const_i32(n * 32), tr_col32)
-        col_r0 = col_r1 = b.xor(col, col_xor_of_row(lane_row))
-    A_r0 = b.ds_read_tr16_b64(V_lds, v_buf, tr_row_base32, col_r0, dtype=dtype)
-    A_r1 = b.ds_read_tr16_b64(V_lds, v_buf, tr_row_hi, col_r1, dtype=dtype)
+        A_r1 = b.ds_read_tr16_b64(
+            V_lds,
+            v_buf,
+            b.add(tr_row_base32, b.const_i32(8)),
+            b.add(b.const_i32(n * 32), tr_col32),
+            dtype=dtype,
+        )
+        return b.vec_concat(A_r0, A_r1)
+    lane_row = b.add(
+        b.mul(lane_half32, b.const_i32(4)),
+        b.mod(b.div(lane_col32, b.const_i32(4)), b.const_i32(4)),
+    )
+    tr_row_base32 = b.add(b.const_i32(k * 16), lane_row)
+    tr_row_hi = b.add(tr_row_base32, b.const_i32(8))
+    col = b.add(b.const_i32(n * 32), tr_col32)
+    col_swz = b.xor(col, col_xor_of_row(lane_row))
+    A_r0 = b.ds_read_tr16_b64(V_lds, v_buf, tr_row_base32, col_swz, dtype=dtype)
+    A_r1 = b.ds_read_tr16_b64(V_lds, v_buf, tr_row_hi, col_swz, dtype=dtype)
     return b.vec_concat(A_r0, A_r1)
