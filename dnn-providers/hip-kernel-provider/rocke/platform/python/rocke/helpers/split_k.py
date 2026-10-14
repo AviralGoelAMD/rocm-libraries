@@ -257,6 +257,59 @@ def select_split_k(
     )
 
 
+# Decode / GEMV (tiny-M) GEMMs are HBM-bound: one CTA per CU cannot keep
+# enough loads in flight, so the split degree is sized to put ~8 CTAs per CU
+# on the device rather than to fill it once. A base grid that already holds
+# ~3 CTAs per CU streams B at full rate unsplit; extra atomic partials only
+# add traffic there.
+DECODE_CTAS_PER_CU = 8
+DECODE_UNSPLIT_CTAS_PER_CU = 3
+DECODE_MAX_SPLIT = 8
+
+
+def select_split_k_decode(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    num_cus: int = GFX950_TARGET_CTAS,
+    env: dict | None = None,
+) -> SplitKDecision:
+    """Split-K degree for the tiny-M (decode/GEMV) GEMM candidate.
+
+    ``split_k = largest valid factor <= min(DECODE_MAX_SPLIT,
+    ceil(DECODE_CTAS_PER_CU * num_cus / base_grid))``, or ``1`` once the base
+    grid reaches ``DECODE_UNSPLIT_CTAS_PER_CU * num_cus``. Unlike
+    :func:`select_split_k` there is no "half the CUs" engage gate: a decode
+    grid of one CTA per CU still leaves HBM bandwidth idle. ``ROCKE_GEMM_SPLIT_K``
+    overrides it exactly as for :func:`select_split_k`.
+    """
+    env = os.environ if env is None else env
+    mode, forced = _parse_env_override(env)
+    base_grid = _ceil_div(M, tile_m) * _ceil_div(N, tile_n)
+    max_split = max(1, K // tile_k)
+    target = DECODE_CTAS_PER_CU * num_cus
+    if mode == "off":
+        return SplitKDecision(1, base_grid, target, "env override: off")
+    if mode == "force":
+        assert forced is not None
+        chosen = _largest_valid_split_k(K, tile_k, min(int(forced), max_split))
+        return SplitKDecision(
+            chosen, base_grid, target, f"env override: forced {forced} -> valid {chosen}"
+        )
+    if base_grid >= DECODE_UNSPLIT_CTAS_PER_CU * num_cus:
+        return SplitKDecision(1, base_grid, target, f"grid {base_grid} streams unsplit")
+    raw = min(DECODE_MAX_SPLIT, max_split, _ceil_div(target, base_grid))
+    chosen = _largest_valid_split_k(K, tile_k, raw)
+    return SplitKDecision(
+        chosen, base_grid, target, f"decode grid {base_grid} -> split_k {chosen}"
+    )
+
+
+
 def select_split_k_wgrad(
     *,
     wg_M: int,

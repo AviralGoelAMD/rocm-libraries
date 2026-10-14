@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 
 from ...core.arch import ArchTarget
-from ...helpers.split_k import select_split_k
+from ...helpers.split_k import select_split_k, select_split_k_decode
 from ...instances.common.gemm_universal import UniversalGemmSpec
 from ..core import OperatorRequest, normalize_selector
 
@@ -111,6 +111,29 @@ def apply_split_k(req: GemmRequest, spec: UniversalGemmSpec) -> UniversalGemmSpe
         return spec
     t = spec.tile
     decision = select_split_k(
+        M=req.M,
+        N=req.N,
+        K=req.K,
+        tile_m=t.tile_m,
+        tile_n=t.tile_n,
+        tile_k=t.tile_k,
+    )
+    if decision.split_k <= 1:
+        return spec
+    return replace(spec, trait=replace(spec.trait, split_k=decision.split_k))
+
+
+def apply_split_k_decode(req: GemmRequest, spec: UniversalGemmSpec) -> UniversalGemmSpec:
+    """:func:`apply_split_k` for the tiny-M decode candidate.
+
+    Uses :func:`select_split_k_decode` (bandwidth-sized degree, no half-device
+    engage gate). CDNA only, like :func:`apply_split_k`.
+    """
+    target = ArchTarget.from_gfx(req.arch)
+    if target.family != "cdna":
+        return spec
+    t = spec.tile
+    decision = select_split_k_decode(
         M=req.M,
         N=req.N,
         K=req.K,
