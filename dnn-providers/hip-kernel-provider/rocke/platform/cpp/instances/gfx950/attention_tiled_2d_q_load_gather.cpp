@@ -628,6 +628,9 @@ void rocke_gfx950_attn2d_emit_preloop_prefetch(rocke_gfx950_attn2d_build_ctx_t* 
 
     /* Prefetch tile_start's K into buffer 0 BEFORE the loop (2384). */
     rocke_gfx950_attn2d_issue_k(ctx, ctx->tile_start, rocke_b_const_i32(B, 0));
+    /* V double-buffer: also prefetch tile_start's V into slot 0 (3213-3214). */
+    if(ctx->V_DOUBLE_BUF)
+        rocke_gfx950_attn2d_issue_v(ctx, ctx->tile_start, rocke_b_const_i32(B, 0));
 
     /* cur_buf_init = const_i32(0); iter_args.append(("cur_buf", cur_buf_init))
      * (2399-2400). */

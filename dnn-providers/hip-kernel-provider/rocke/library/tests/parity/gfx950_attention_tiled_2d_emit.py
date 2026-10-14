@@ -49,6 +49,31 @@ _SHIP_D128_GQA = dict(
     use_softmax_mfma_interleave=True,
 )
 
+# gfx950 D128 bs16 GQA-4 transposed-32x32 hlpv prefill at T=64 (the routed
+# pipeline geometry with every pipeline lever off); base of the pipeline cases.
+_PIPE_D128_T64 = dict(
+    head_size=128,
+    block_size=16,
+    num_query_heads=32,
+    num_kv_heads=8,
+    dtype="bf16",
+    use_sinks=False,
+    sliding_window=0,
+    has_softcap=False,
+    num_seqs=1,
+    num_warps=4,
+    waves_per_eu=2,
+    tile_size=64,
+    block_m_per_warp=32,
+    use_mfma_32x32=True,
+    use_transposed_qk_32x32=True,
+    use_transposed_scalar_state=True,
+    use_transposed_mask_once=True,
+    use_transposed_half_local_pv=True,
+    use_mfma32_skip_legacy_qreg=True,
+    use_transposed_mask_limit=True,
+)
+
 _CONFIGS = {
     # --- idx0-4: minimal dims, block_size=16, head_size {64,128,256}, GQA ratios
     0: dict(
@@ -931,6 +956,10 @@ _CONFIGS = {
     56: dict(_SHIP_D128_GQA, use_f32_denormal_flush=True, use_fp_contract=True),
     57: dict(_SHIP_D128_GQA, dtype="fp16", use_f32_denormal_flush=True),
     58: dict(_SHIP_D128_GQA, use_fp_contract=True),
+    # Pipeline stack, one lever per case on _PIPE_D128_T64.
+    59: dict(_PIPE_D128_T64, use_v_double_buffer=True),
+    60: dict(_PIPE_D128_T64, use_mask_phase_split=True),
+    61: dict(_PIPE_D128_T64, use_v_double_buffer=True, use_early_v_schedule=True),
 }
 
 

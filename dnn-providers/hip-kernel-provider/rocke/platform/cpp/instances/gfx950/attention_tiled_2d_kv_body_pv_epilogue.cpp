@@ -38,6 +38,8 @@
 #include "rocke/instance_gfx950_attention_tiled_2d_internal.h"
 
 #include <assert.h>
+#include <stdio.h>
+#include <string.h>
 
 /* ============================================================ *
  *  Local dtype-dispatch wrappers mirroring the Python module aliases
@@ -277,6 +279,13 @@ void rocke_gfx950_attn2d_emit_pv_bucket(rocke_gfx950_attn2d_build_ctx_t* ctx,
         rocke_b_s_waitcnt(b, 0, 0, -1);
         rocke_b_sync(b);
     }
+    else if(ctx->V_DOUBLE_BUF)
+    {
+        /* V[i] (cur_buf) is already visible from the iter-start sync; leave the
+         * two next-tile prefetches (V[i+1], K[i+1]) pending. */
+        rocke_b_s_waitcnt(b, 2 * kv_calls_per_tile, 2 * kv_calls_per_tile, -1);
+        rocke_b_sync(b);
+    }
     else if(ctx->K_SINGLE_BUFFER)
     {
         /* single K slot. Only V[i] is in flight here (next-K was deferred).
@@ -307,7 +316,7 @@ void rocke_gfx950_attn2d_emit_pv_bucket(rocke_gfx950_attn2d_build_ctx_t* ctx,
             /* Transposed PV: O^T = V^T @ P^T via register P^T (Python 3221-3341).
              * v_buf and use_hi are emitted ONCE here (Python 3231-3232), before
              * the per-N acc-scale + apply loop, and reused by every apply call. */
-            ctx->pv_v_buf_v = rocke_b_const_i32(b, 0);
+            ctx->pv_v_buf_v = ctx->V_DOUBLE_BUF ? ctx->cur_buf : rocke_b_const_i32(b, 0);
             ctx->pv_use_hi_v = rocke_b_cmp_eq(b, ctx->lane_half32_v, rocke_b_const_i32(b, 1));
             for(n = 0; n < ctx->ACC_N_TILES; ++n)
             {
@@ -349,7 +358,7 @@ void rocke_gfx950_attn2d_emit_pv_bucket(rocke_gfx950_attn2d_build_ctx_t* ctx,
         else
         {
             /* Transitional 32x32 PV from the P_lds bridge (Python 3342-3412). */
-            rocke_value_t* v_buf = rocke_b_const_i32(b, 0);
+            rocke_value_t* v_buf = ctx->V_DOUBLE_BUF ? ctx->cur_buf : rocke_b_const_i32(b, 0);
             for(n = 0; n < ctx->ACC_N_TILES; ++n)
             {
                 rocke_value_t* scaled[ROCKE_GFX950_ATTN2D_MAX_REGS_PER_LANE];
@@ -459,7 +468,7 @@ void rocke_gfx950_attn2d_emit_pv_bucket(rocke_gfx950_attn2d_build_ctx_t* ctx,
                 rocke_value_t* ncb_16 = rocke_b_const_i32(b, 16);
                 n_col_base = rocke_b_add(b, rocke_b_mul(b, ncb_n, ncb_16), ctx->pv_tr_reader->col);
             }
-            v_buf = rocke_b_const_i32(b, 0);
+            v_buf = ctx->V_DOUBLE_BUF ? ctx->cur_buf : rocke_b_const_i32(b, 0);
 
             for(k = 0; k < ctx->PV_K_ITERS; ++k)
             {
@@ -675,34 +684,29 @@ void rocke_gfx950_attn2d_emit_pv_bucket(rocke_gfx950_attn2d_build_ctx_t* ctx,
  *  emitter, then leave. Returns the loop handle; the epilogue reads the
  *  rewritten carry from kvloop.op->results.
  * ============================================================ */
-rocke_for_t rocke_gfx950_attn2d_drive_kv_loop(rocke_gfx950_attn2d_build_ctx_t* ctx)
+/* One KV-loop phase: scf_for_iter over [lo, hi) with the given named carry,
+ * the body unpacked into ctx and emitted with ``skip_mask``. */
+static rocke_for_t rocke__attn2d_kv_phase(rocke_gfx950_attn2d_build_ctx_t* ctx,
+                                          rocke_value_t* lo,
+                                          rocke_value_t* hi,
+                                          const rocke_iter_arg_t* iter_args,
+                                          const char* iv_name,
+                                          bool skip_mask)
 {
     rocke_ir_builder_t* b = ctx->b;
-    rocke_iter_arg_t iter_args[ROCKE_GFX950_ATTN2D_MAX_ITER_ARGS];
     rocke_for_t kvloop;
     int i;
     int ml = ctx->ml_count;
     int num_accs = ctx->ACC_N_TILES * ctx->ACC_M_ATOMS;
 
-    for(i = 0; i < ctx->iter_args_count; ++i)
-    {
-        iter_args[i].name = ctx->iter_args_names[i];
-        iter_args[i].init = ctx->iter_args[i];
-    }
-
-    kvloop = rocke_b_scf_for_iter(b,
-                                  ctx->tile_start,
-                                  ctx->tile_end,
-                                  ctx->kv_step,
-                                  iter_args,
-                                  ctx->iter_args_count,
-                                  "kv_tile",
-                                  false,
-                                  true);
+    kvloop = rocke_b_scf_for_iter(
+        b, lo, hi, ctx->kv_step, iter_args, ctx->iter_args_count, iv_name, false, true);
+    if(kvloop.op == NULL)
+        return kvloop;
 
     rocke_b_region_enter(b, kvloop.body);
     ctx->kv_tile_iv = kvloop.iv;
-    /* Unpack the carry the same way the Python body does (lines 2495-2508). */
+    /* Unpack the carry the same way the Python body does. */
     for(i = 0; i < ctx->SOFTMAX_STATE_SLOTS; ++i)
     {
         ctx->m_cur[i] = kvloop.iter_vars[2 * i];
@@ -711,12 +715,67 @@ rocke_for_t rocke_gfx950_attn2d_drive_kv_loop(rocke_gfx950_attn2d_build_ctx_t* c
     for(i = 0; i < num_accs; ++i)
         ctx->acc_cur[i] = kvloop.iter_vars[ml + i];
     ctx->cur_buf = kvloop.iter_vars[ml + num_accs];
-    ctx->skip_mask = false;
+    ctx->skip_mask = skip_mask;
 
     rocke_gfx950_attn2d_emit_kv_body(ctx);
 
     rocke_b_region_leave(b);
     return kvloop;
+}
+
+rocke_for_t rocke_gfx950_attn2d_drive_kv_loop(rocke_gfx950_attn2d_build_ctx_t* ctx)
+{
+    rocke_ir_builder_t* b = ctx->b;
+    rocke_iter_arg_t iter_args[ROCKE_GFX950_ATTN2D_MAX_ITER_ARGS];
+    int i;
+
+    for(i = 0; i < ctx->iter_args_count; ++i)
+    {
+        iter_args[i].name = ctx->iter_args_names[i];
+        iter_args[i].init = ctx->iter_args[i];
+    }
+
+    /* use_mask_phase_split (Python 4660-4698): a full-tile phase with the mask
+     * elided, then the masked boundary phase, threading the carry through. */
+    const bool MASK_PHASE_SPLIT = ctx->spec->use_mask_phase_split && ctx->TRANSPOSED_MASK_LIMIT
+                                  && ctx->SLIDING_WINDOW == 0;
+    if(!MASK_PHASE_SPLIT)
+        return rocke__attn2d_kv_phase(
+            ctx, ctx->tile_start, ctx->tile_end, iter_args, "kv_tile", false);
+
+    /* First masked tile: split = min((min_causal_lim+1)//T, max_seq_prefix_len//T)
+     * clamped to [tile_start, tile_end]. */
+    rocke_value_t* min_causal_lim = rocke_b_add(b, ctx->context_len, ctx->qb_start_pos);
+    rocke_value_t* fbc_num = rocke_b_add(b, min_causal_lim, rocke_b_const_i32(b, 1));
+    rocke_value_t* full_by_causal = rocke_b_div(b, fbc_num, rocke_b_const_i32(b, ctx->T));
+    rocke_value_t* full_by_prefix
+        = rocke_b_div(b, ctx->max_seq_prefix_len_v, rocke_b_const_i32(b, ctx->T));
+    rocke_value_t* fb_lt = rocke_b_cmp_lt(b, full_by_causal, full_by_prefix);
+    rocke_value_t* split_raw = rocke_b_select(b, fb_lt, full_by_causal, full_by_prefix);
+    rocke_value_t* lo_lt = rocke_b_cmp_lt(b, split_raw, ctx->tile_start);
+    rocke_value_t* split_lo = rocke_b_select(b, lo_lt, ctx->tile_start, split_raw);
+    rocke_value_t* hi_lt = rocke_b_cmp_lt(b, split_lo, ctx->tile_end);
+    rocke_value_t* split = rocke_b_select(b, hi_lt, split_lo, ctx->tile_end);
+
+    rocke_for_t loop1
+        = rocke__attn2d_kv_phase(ctx, ctx->tile_start, split, iter_args, "kv_tile_f", true);
+    if(loop1.op == NULL)
+        return loop1;
+
+    /* Thread loop1's results into loop2. The iter_arg names seed the minted SSA
+     * value names, so loop2 uses "<name>_b" to keep them distinct. */
+    rocke_iter_arg_t iter_args2[ROCKE_GFX950_ATTN2D_MAX_ITER_ARGS];
+    for(i = 0; i < ctx->iter_args_count; ++i)
+    {
+        size_t len = strlen(ctx->iter_args_names[i]) + 3;
+        char* nm = (char*)rocke_arena_alloc(&b->arena, len);
+        if(nm == NULL)
+            return loop1;
+        snprintf(nm, len, "%s_b", ctx->iter_args_names[i]);
+        iter_args2[i].name = nm;
+        iter_args2[i].init = loop1.op->results[i];
+    }
+    return rocke__attn2d_kv_phase(ctx, split, ctx->tile_end, iter_args2, "kv_tile_b", false);
 }
 
 /* ============================================================ *

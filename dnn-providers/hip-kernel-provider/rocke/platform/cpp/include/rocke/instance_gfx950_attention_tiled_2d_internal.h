@@ -137,6 +137,9 @@ typedef struct rocke_gfx950_attn2d_build_ctx
      * modes 0/1 emit iglp_opt(mode); mutually exclusive with USE_SCHED_BARRIER. */
     bool USE_SOFTMAX_INTERLEAVE;
     int SOFTMAX_INTERLEAVE_MODE;
+    /* V double-buffer (V_lds[2]): V[i+1] is prefetched into the alternate slot
+     * during iteration i; PV reads V[i] from cur_buf. */
+    bool V_DOUBLE_BUF;
     /* fp8 K/V cache predicates */
     bool KV_FP8, FP8_MFMA_QK, FP8_MFMA_PV;
     bool REGISTER_PV, USE_MFMA_32X32, TRANSPOSED_QK_32X32;

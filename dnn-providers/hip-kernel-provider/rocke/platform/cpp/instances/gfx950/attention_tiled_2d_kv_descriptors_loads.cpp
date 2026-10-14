@@ -474,15 +474,27 @@ void rocke_gfx950_attn2d_issue_v_load_runtime(rocke_gfx950_attn2d_build_ctx_t* c
     int kv_calls_per_tile = rocke__kv_calls_per_tile(ctx);
     int kv_halves_per_call = rocke__kv_halves_per_call(ctx);
 
-    (void)buf_idx; /* V is single-buffered; always slot 0 (Python 1699). */
     rocke_value_t* V_lds_addr = rocke__V_lds_addr(ctx);
     rocke_value_t* wave_off = rocke__wave_lds_offset_i64(ctx);
     rocke_value_t* zero_soff = rocke__zero_soff(ctx);
     rocke_value_t* kv_block_bytes_c = rocke__kv_block_bytes_c(ctx);
     rocke_value_t* lane_half_base = rocke__lane_half_base(ctx);
 
-    /* V_wave_base = V_lds_addr + wave_lds_offset (1700). */
-    rocke_value_t* V_wave_base = rocke_b_smem_ptr_add(b, V_lds_addr, wave_off);
+    /* V single-buffered: always slot 0, buf_idx ignored (Python 1699). Under
+     * V_DOUBLE_BUF, buf_idx selects the slot (T*HD*2 bytes apart). */
+    rocke_value_t* V_wave_base;
+    if(ctx->V_DOUBLE_BUF)
+    {
+        rocke_value_t* v_buf_off_i32
+            = rocke_b_mul(b, buf_idx, rocke_b_const_i32(b, ctx->T * ctx->HD * 2));
+        rocke_value_t* v_buf_off_i64 = rocke_b_zext(b, v_buf_off_i32, rocke_i64());
+        V_wave_base
+            = rocke_b_smem_ptr_add(b, rocke_b_smem_ptr_add(b, V_lds_addr, v_buf_off_i64), wave_off);
+    }
+    else
+    {
+        V_wave_base = rocke_b_smem_ptr_add(b, V_lds_addr, wave_off);
+    }
 
     rocke_value_t* fast_block0 = NULL;
     rocke_value_t* fast_block1 = NULL;

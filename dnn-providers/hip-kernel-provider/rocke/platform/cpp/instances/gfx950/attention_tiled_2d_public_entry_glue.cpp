@@ -449,29 +449,24 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
         rocke_g950_fail(b, ROCKE_ERR_VALUE, "use_fast_paged_kv_desc is restricted to dtype='bf16'");
     }
 
-    /* ---- V-double-buffer / deep-ring / staggered-wait / q-reread.
-     * Python __post_init__ accepts these flags (and the emitter wires the
-     * depth-2 V-double-buffer + staggered iter-start schedule). The gfx950 C
-     * twin currently emits ONLY the depth-2 single/early-V schedule, so reject
-     * any spec that asks for the V-double-buffer family (and kv_ring_depth!=2 /
-     * q_reread) rather than silently emit the wrong schedule. This keeps the
-     * spec struct byte-identical with Python (provider passthrough) while making
-     * the C emitter's narrower coverage explicit. When these schedules are
-     * ported to C, replace these guards with the real emit + Python's exact
-     * __post_init__ messages. */
+    /* ---- V-double-buffer (Python __post_init__). The depth-2 non-staggered
+     * schedule (incl. the early-V combination) is ported. ---- */
     if(spec->use_v_double_buffer)
     {
-        rocke_g950_fail(b,
-                        ROCKE_ERR_NOTIMPL,
-                        "use_v_double_buffer: gfx950 C twin emits only the depth-2 "
-                        "single/early-V schedule (not yet ported)");
+        if(spec->use_grouped_kv2_softmax)
+            rocke_g950_fail(b, ROCKE_ERR_VALUE, "use_v_double_buffer does not support grouped_kv2");
+        if(spec->kv_storage_dtype != NULL)
+            rocke_g950_fail(b, ROCKE_ERR_VALUE, "use_v_double_buffer v1 does not support FP8 KV");
     }
+    /* ---- staggered iter-start wait / deep ring / q-reread. Python accepts
+     * these; the gfx950 C twin does not emit their schedules, so reject (do not
+     * silently ignore). */
     if(spec->use_staggered_iter_wait)
     {
         rocke_g950_fail(b,
                         ROCKE_ERR_NOTIMPL,
-                        "use_staggered_iter_wait: gfx950 C twin emits only the depth-2 "
-                        "single/early-V schedule (not yet ported)");
+                        "use_staggered_iter_wait: the gfx950 C twin does not port the "
+                        "staggered iter-start wait schedule");
     }
     if(spec->kv_ring_depth != 2)
     {
@@ -523,6 +518,21 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
                         ROCKE_ERR_VALUE,
                         "use_softmax_mfma_interleave and use_sched_barrier are mutually "
                         "exclusive (they steer the post-RA scheduler in opposite directions)");
+    }
+    /* ---- mask phase split (Python __post_init__). ---- */
+    if(spec->use_mask_phase_split)
+    {
+        if(!(spec->use_mfma_32x32 && spec->use_transposed_qk_32x32
+             && spec->use_transposed_mask_limit))
+            rocke_g950_fail(b,
+                            ROCKE_ERR_VALUE,
+                            "use_mask_phase_split requires the transposed-32x32 mask_limit "
+                            "combo path");
+        if(spec->sliding_window > 0)
+            rocke_g950_fail(b,
+                            ROCKE_ERR_VALUE,
+                            "use_mask_phase_split requires no sliding window (the peel "
+                            "assumes a monotone causal bound)");
     }
     /* K single-buffer IS ported in the gfx950 C twin (it shares the
      * depth-2 V-single `else` schedule). Mirror Python __post_init__ guards so
@@ -602,6 +612,7 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
     ctx->SCHED_BARRIER_MASK = spec->sched_barrier_mask;
     ctx->USE_SOFTMAX_INTERLEAVE = spec->use_softmax_mfma_interleave;
     ctx->SOFTMAX_INTERLEAVE_MODE = spec->softmax_interleave_mode;
+    ctx->V_DOUBLE_BUF = spec->use_v_double_buffer;
 
     /* ---- fp8 K/V cache predicates (Py783-797) ---- */
     const bool KV_FP8 = rocke_g950_streq(spec->kv_storage_dtype, "fp8e4m3");
@@ -835,7 +846,8 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
         ctx->K_lds = rocke_b_smem_alloc(b, K_LDS_DTYPE, shp, 3, "Klds");
     }
 
-    const int V_BUFS = 1; /* single-buffer V (race-free, Py1039) */
+    /* single-buffer V (race-free, Py1039); 2 slots under use_v_double_buffer. */
+    const int V_BUFS = ctx->V_DOUBLE_BUF ? 2 : 1;
     ctx->V_BUFS = V_BUFS;
 
     /* ---- V_lds smem_alloc (Py1040-1060) ---- */
@@ -1084,6 +1096,11 @@ static rocke_status_t rocke_g950_attn2d_kernel_name(const rocke_attention_tiled_
     }
     else
         smxil_buf[0] = '\0';
+    char ring_buf[32];
+    if(s->kv_ring_depth != 2)
+        snprintf(ring_buf, sizeof(ring_buf), "ring%d", s->kv_ring_depth);
+    else
+        ring_buf[0] = '\0';
 
     {
         const char* parts[] = {
@@ -1113,6 +1130,8 @@ static rocke_status_t rocke_g950_attn2d_kernel_name(const rocke_attention_tiled_
             s->use_early_v_schedule ? "earlyv" : "",
             s->use_v_double_buffer ? "vdbuf" : "",
             s->use_k_single_buffer ? "ksb" : "", /* K single-buffer */
+            s->use_mask_phase_split ? "mphsplit" : "",
+            ring_buf,
             s->use_staggered_iter_wait ? "stgw" : "",
             schedb_buf,
             smxil_buf,

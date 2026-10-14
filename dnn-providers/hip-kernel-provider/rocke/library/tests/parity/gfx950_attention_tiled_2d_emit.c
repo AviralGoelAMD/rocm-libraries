@@ -25,6 +25,34 @@
 #include "rocke/lower_llvm.h"
 #include "rocke/verify.h"
 
+/* Python _PIPE_D128_T64: D128 bs16 GQA-4 transposed-32x32 hlpv prefill at
+ * T=64 with every pipeline lever off (base of the pipeline cases). */
+static void pipe_d128_t64(rocke_attention_tiled_2d_spec_t* s)
+{
+    s->head_size = 128;
+    s->block_size = 16;
+    s->num_query_heads = 32;
+    s->num_kv_heads = 8;
+    s->dtype = "bf16";
+    s->use_sinks = false;
+    s->sliding_window = 0;
+    s->has_softcap = false;
+    s->num_seqs = 1;
+    s->num_warps = 4;
+    s->has_waves_per_eu = true;
+    s->waves_per_eu = 2;
+    s->has_tile_size = true;
+    s->tile_size = 64;
+    s->block_m_per_warp = 32;
+    s->use_mfma_32x32 = true;
+    s->use_transposed_qk_32x32 = true;
+    s->use_transposed_scalar_state = true;
+    s->use_transposed_mask_once = true;
+    s->use_transposed_half_local_pv = true;
+    s->use_mfma32_skip_legacy_qreg = true;
+    s->use_transposed_mask_limit = true;
+}
+
 /* Fill `s` for config index `idx`. Returns 0 on success, -1 on unknown idx. */
 static int make_spec(int idx, rocke_attention_tiled_2d_spec_t* s)
 {
@@ -947,6 +975,22 @@ static int make_spec(int idx, rocke_attention_tiled_2d_spec_t* s)
         s->softmax_interleave_mode = 1;
         s->use_f32_denormal_flush = (idx != 58);
         s->use_fp_contract = (idx != 57);
+        break;
+
+    /* Pipeline stack, one lever per case on pipe_d128_t64. Lockstep with the
+     * Python _CONFIGS. */
+    case 59:
+        pipe_d128_t64(s);
+        s->use_v_double_buffer = true;
+        break;
+    case 60:
+        pipe_d128_t64(s);
+        s->use_mask_phase_split = true;
+        break;
+    case 61:
+        pipe_d128_t64(s);
+        s->use_v_double_buffer = true;
+        s->use_early_v_schedule = true;
         break;
 
     default:

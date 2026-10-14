@@ -825,6 +825,7 @@ rocke_attention_tiled_2d_spec_t t2d_build(const py::dict& d, Store& st)
     s.use_grouped_kv2_softmax = a_bool(d, "use_grouped_kv2_softmax", s.use_grouped_kv2_softmax);
     s.use_early_v_schedule = a_bool(d, "use_early_v_schedule", s.use_early_v_schedule);
     s.use_fast_paged_kv_desc = a_bool(d, "use_fast_paged_kv_desc", s.use_fast_paged_kv_desc);
+    s.use_mask_phase_split = a_bool(d, "use_mask_phase_split", s.use_mask_phase_split);
     std::string v;
     if(a_str(d, "dtype", v))
         s.dtype = st.keep(v);
@@ -1367,6 +1368,7 @@ static py::dict spec_to_dict(const rocke_attention_tiled_2d_spec_t& s)
     d["use_fp8_mfma_qk"] = s.use_fp8_mfma_qk;
     d["use_f32_denormal_flush"] = s.use_f32_denormal_flush;
     d["use_fp_contract"] = s.use_fp_contract;
+    d["use_mask_phase_split"] = s.use_mask_phase_split;
     return d;
 }
 
