@@ -217,7 +217,8 @@ rocke_unified_attention_reduce_tiled_spec_t rocke_unified_attention_reduce_tiled
 
 #endif /* !ROCKE_INSTANCE_GFX942_ATTENTION_TILED_3D_H (shared spec POD defaults) */
 
-/* __post_init__: kv_storage_dtype must be None or 'fp8e4m3'. */
+/* __post_init__ (same rule order and messages as the Python dataclass; the
+ * kv_layout rules live in the strided build entry). */
 bool rocke_gfx950_unified_attention_3d_tiled_spec_validate(
     rocke_ir_builder_t* b, const rocke_unified_attention_3d_tiled_spec_t* s)
 {

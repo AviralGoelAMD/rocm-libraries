@@ -674,69 +674,42 @@ def build_unified_attention_3d_tiled(
         unmerge("linear_half", into=("token", "dim"), dims=(T, HD)),
     )
 
-    def _issue_k_load(kv_tile_idx: Value, buf_idx: Value) -> None:
+    def _kv_offset(src, kv_tile_idx, linear_half):
+        """(buffer resource or None, voffset) of one paged K/V access."""
+        desc = paged_kv_desc
+        coords = dict(tile_idx=kv_tile_idx, linear_half=linear_half, kv_head=kv_head_idx)
+        if I64_KV_ADDR:
+            base_i64, voff, _ = desc.offset_i64_split(b, "physical_block", **coords)
+            return b.buffer_rsrc(b.global_ptr_add(src, base_i64), kv_block_bytes_c), voff
+        voff, _ = desc.offset(b, **coords)
+        return None, voff
+
+    def _issue_kv_async(kv_tile_idx: Value, buf_idx: Value, tok: str):
+        src, rsrc, lds_addr, strides = (
+            (key, key_rsrc, K_lds_addr, k_strides if spec.kv_layout == "strided" else None)
+            if tok == "K"
+            else (value, value_rsrc, V_lds_addr, v_strides if spec.kv_layout == "strided" else None)
+        )
         buf_off_i32 = b.mul(buf_idx, b.const_i32(bytes_per_buf))
         buf_off_i64 = b.zext(buf_off_i32, I64)
-        K_buf_base = b.smem_ptr_add(K_lds_addr, buf_off_i64)
+        buf_base = b.smem_ptr_add(lds_addr, buf_off_i64)
         for call in range(kv_calls_per_tile):
             linear_half = b.add(b.const_i32(call * KV_HALVES_PER_CALL), lane_half_base)
-            call_rsrc = key_rsrc
+            call_rsrc = rsrc
             if spec.kv_layout == "strided":
-                voff = strided_kv_offset(
-                    b, k_strides, kv_tile_idx, linear_half, seq_len, HD, T
-                )
-            elif I64_KV_ADDR:
-                base_i64, voff, _ = paged_kv_desc.offset_i64_split(
-                    b,
-                    "physical_block",
-                    tile_idx=kv_tile_idx,
-                    linear_half=linear_half,
-                    kv_head=kv_head_idx,
-                )
-                call_rsrc = b.buffer_rsrc(
-                    b.global_ptr_add(key, base_i64), kv_block_bytes_c
-                )
+                voff = strided_kv_offset(b, strides, kv_tile_idx, linear_half, seq_len, HD, T)
             else:
-                voff, _ = paged_kv_desc.offset(
-                    b,
-                    tile_idx=kv_tile_idx,
-                    linear_half=linear_half,
-                    kv_head=kv_head_idx,
-                )
-            k_dst = b.smem_ptr_add(K_buf_base, b.const_i64(call * bytes_per_call))
-            b.async_buffer_load_lds_addr(call_rsrc, k_dst, voff, zero_soff, 4)
+                own_rsrc, voff = _kv_offset(src, kv_tile_idx, linear_half)
+                if own_rsrc is not None:
+                    call_rsrc = own_rsrc
+            dst = b.smem_ptr_add(buf_base, b.const_i64(call * bytes_per_call))
+            b.async_buffer_load_lds_addr(call_rsrc, dst, voff, zero_soff, 4)
+
+    def _issue_k_load(kv_tile_idx: Value, buf_idx: Value) -> None:
+        _issue_kv_async(kv_tile_idx, buf_idx, "K")
 
     def _issue_v_load(kv_tile_idx: Value, buf_idx: Value) -> None:
-        buf_off_i32 = b.mul(buf_idx, b.const_i32(bytes_per_buf))
-        buf_off_i64 = b.zext(buf_off_i32, I64)
-        V_buf_base = b.smem_ptr_add(V_lds_addr, buf_off_i64)
-        for call in range(kv_calls_per_tile):
-            linear_half = b.add(b.const_i32(call * KV_HALVES_PER_CALL), lane_half_base)
-            call_rsrc = value_rsrc
-            if spec.kv_layout == "strided":
-                voff = strided_kv_offset(
-                    b, v_strides, kv_tile_idx, linear_half, seq_len, HD, T
-                )
-            elif I64_KV_ADDR:
-                base_i64, voff, _ = paged_kv_desc.offset_i64_split(
-                    b,
-                    "physical_block",
-                    tile_idx=kv_tile_idx,
-                    linear_half=linear_half,
-                    kv_head=kv_head_idx,
-                )
-                call_rsrc = b.buffer_rsrc(
-                    b.global_ptr_add(value, base_i64), kv_block_bytes_c
-                )
-            else:
-                voff, _ = paged_kv_desc.offset(
-                    b,
-                    tile_idx=kv_tile_idx,
-                    linear_half=linear_half,
-                    kv_head=kv_head_idx,
-                )
-            v_dst = b.smem_ptr_add(V_buf_base, b.const_i64(call * bytes_per_call))
-            b.async_buffer_load_lds_addr(call_rsrc, v_dst, voff, zero_soff, 4)
+        _issue_kv_async(kv_tile_idx, buf_idx, "V")
 
     # FP8 K/V cache: sync dequant loader. See attention_tiled_2d.py for the
     # rationale. The FP8 path stores the working dtype (bf16/fp16) into LDS,
@@ -776,49 +749,53 @@ def build_unified_attention_3d_tiled(
         the comment block in the 2D sync loader (~lines 1600-1630) for
         the full correctness argument.
         """
-        scale = k_scale_p if lds_token == "K" else v_scale_p
-        lds = K_lds if lds_token == "K" else V_lds
-        src = key if lds_token == "K" else value
         assert fp8_elems_per_chunk == 8, (
             f"FP8 dequant loader expects 8-elem chunks (got "
             f"{fp8_elems_per_chunk}); the packed-cvt path needs the chunk "
             f"to split cleanly into 2× <4 x fp8> sub-chunks."
         )
         for call in range(fp8_chunks_per_thread):
-            chunk_id = b.add(b.mul(b.const_i32(call), b.const_i32(THREADS)), tid)
-            row = b.div(chunk_id, b.const_i32(HD // fp8_elems_per_chunk))
-            col = b.mul(
-                b.mod(chunk_id, b.const_i32(HD // fp8_elems_per_chunk)),
-                b.const_i32(fp8_elems_per_chunk),
-            )
-            linear_half_first = b.add(b.mul(row, b.const_i32(HD)), col)
-            if I64_KV_ADDR:
-                # Flat per-lane global load: full i64 byte/element offset so
-                # the per-thread physical_block * stride cannot overflow the
-                # cache addressing for paged caches > 2 GiB.
-                voff, _ = paged_kv_desc.offset_i64(
-                    b,
-                    "physical_block",
-                    tile_idx=kv_tile_idx,
-                    linear_half=linear_half_first,
-                    kv_head=kv_head_idx,
-                )
-            else:
-                voff, _ = paged_kv_desc.offset(
-                    b,
-                    tile_idx=kv_tile_idx,
-                    linear_half=linear_half_first,
-                    kv_head=kv_head_idx,
-                )
-            fp8_vec = b.global_load_vN(
-                src, voff, FP8E4M3, n=fp8_elems_per_chunk, align=fp8_elems_per_chunk
-            )
-            # Split <8 x fp8> into 2x <4 x fp8> for the packed cvt; the
-            # backend collapses the extract+pack chain back into a
-            # bitcast-equivalent shuffle once it sees the
-            # cvt.pk.f32.fp8 operand is whole-i32.
-            packed = dequant_fp8x8_to_dtype(b, fp8_vec, scale, dtype)
-            b.smem_store_vN(lds, [buf_idx, row, col], packed, fp8_elems_per_chunk)
+            fp8_vec, row, col = _fp8_chunk_load(kv_tile_idx, call, lds_token)
+            _fp8_chunk_store(fp8_vec, buf_idx, row, col, lds_token)
+
+    def _fp8_chunk_coords(call: int):
+        chunk_id = b.add(b.mul(b.const_i32(call), b.const_i32(THREADS)), tid)
+        row = b.div(chunk_id, b.const_i32(HD // fp8_elems_per_chunk))
+        col = b.mul(
+            b.mod(chunk_id, b.const_i32(HD // fp8_elems_per_chunk)),
+            b.const_i32(fp8_elems_per_chunk),
+        )
+        return row, col
+
+    def _fp8_chunk_load(kv_tile_idx: Value, call: int, lds_token: str):
+        """Raw ``<8 x fp8>`` global load of one chunk; returns (vec, row, col)."""
+        src = key if lds_token == "K" else value
+        row, col = _fp8_chunk_coords(call)
+        linear_half_first = b.add(b.mul(row, b.const_i32(HD)), col)
+        desc = paged_kv_desc
+        coords = dict(tile_idx=kv_tile_idx, linear_half=linear_half_first, kv_head=kv_head_idx)
+        if I64_KV_ADDR:
+            # Flat per-lane global load: full i64 byte/element offset so
+            # the per-thread physical_block * stride cannot overflow the
+            # cache addressing for paged caches > 2 GiB.
+            voff, _ = desc.offset_i64(b, "physical_block", **coords)
+        else:
+            voff, _ = desc.offset(b, **coords)
+        fp8_vec = b.global_load_vN(
+            src, voff, FP8E4M3, n=fp8_elems_per_chunk, align=fp8_elems_per_chunk
+        )
+        return fp8_vec, row, col
+
+    def _fp8_chunk_store(fp8_vec, buf_idx: Value, row, col, lds_token: str) -> None:
+        """Dequantize one ``<8 x fp8>`` chunk and store it to K/V LDS."""
+        scale = k_scale_p if lds_token == "K" else v_scale_p
+        lds = K_lds if lds_token == "K" else V_lds
+        # Split <8 x fp8> into 2x <4 x fp8> for the packed cvt; the
+        # backend collapses the extract+pack chain back into a
+        # bitcast-equivalent shuffle once it sees the
+        # cvt.pk.f32.fp8 operand is whole-i32.
+        packed = dequant_fp8x8_to_dtype(b, fp8_vec, scale, dtype)
+        b.smem_store_vN(lds, [buf_idx, row, col], packed, fp8_elems_per_chunk)
 
     def _issue_k(tile_idx: Value, buf_idx: Value) -> None:
         if KV_FP8:

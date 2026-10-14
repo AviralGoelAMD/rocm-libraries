@@ -1640,7 +1640,36 @@ def cfgs_gfx942_attention_tiled_3d():
 
 
 def cfgs_gfx950_attention_tiled_3d():
-    return cfgs_gfx942_attention_tiled_3d()
+    # 0..4 are shared with gfx942; 5.. mirror gfx950_attention_tiled_3d_emit.c
+    # (i64 KV and f32 flush).
+    return cfgs_gfx942_attention_tiled_3d() + [
+        dict(
+            head_size=128,
+            block_size=16,
+            num_query_heads=16,
+            num_kv_heads=16,
+            dtype="fp16",
+            num_segments=16,
+            use_sinks=False,
+            sliding_window=0,
+            has_softcap=False,
+            kv_storage_dtype=None,
+            use_i64_kv_addr=True,
+        ),
+        dict(
+            head_size=128,
+            block_size=16,
+            num_query_heads=32,
+            num_kv_heads=8,
+            dtype="bf16",
+            num_segments=16,
+            num_seqs=32,
+            use_sinks=False,
+            sliding_window=0,
+            has_softcap=False,
+            use_f32_denormal_flush=True,
+        ),
+    ]
 
 
 def cfgs_deep_fused_conv_pool():

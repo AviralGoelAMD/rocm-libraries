@@ -29,6 +29,7 @@
  * IR is byte-identical.
  */
 
+#include <stdio.h> /* snprintf */
 #include <string.h>
 
 #include "rocke/instance_gfx950_attention_tiled_3d_internal.h"
@@ -95,7 +96,8 @@ static rocke_value_t* rocke__c_row(rocke_gfx950_attention_tiled_3d_build_ctx_t* 
 }
 
 /* ============================================================ *
- * emit_loop_init (lines 536-562, 715-718)
+ * emit_loop_init: softmax/acc carry inits, async DMA infra, and the first
+ * K issue.
  * ============================================================ */
 void rocke_gfx950_attention_tiled_3d_emit_loop_init(
     rocke_gfx950_attention_tiled_3d_build_ctx_t* ctx)
@@ -105,7 +107,7 @@ void rocke_gfx950_attention_tiled_3d_emit_loop_init(
     const rocke_type_t* dtype = cfg->dtype;
     int n, r;
 
-    /* ---- m_inits (sinks-conditioned) / l_inits (lines 536-552) ---- */
+    /* ---- m_inits (sinks-conditioned) ---- */
     if(cfg->USE_SINKS)
     {
         /* Triton's 3D applies sinks only when segm_idx == 0. */
@@ -136,7 +138,7 @@ void rocke_gfx950_attention_tiled_3d_emit_loop_init(
         ctx->l_inits[r] = ctx->one_f;
     }
 
-    /* ---- acc_inits (lines 554-555) ---- */
+    /* ---- acc_inits ---- */
     {
         rocke_value_t* acc_zero = rocke_b_zero_vec_f32(b, 4);
         for(n = 0; n < cfg->PV_N_TILES; n++)
@@ -145,18 +147,18 @@ void rocke_gfx950_attention_tiled_3d_emit_loop_init(
         }
     }
 
-    /* ---- async DMA infra + paged-KV descriptor (lines 564-601) ----
+    /* ---- async DMA infra + paged-KV descriptor ----
      * Emitted here (not in emit_prologue) so the SSA op order matches Python's
      * single linear build: acc_zero precedes the buffer rsrc / seq_base / desc. */
     rocke_gfx950_attention_tiled_3d_emit_async_infra(ctx);
 
-    /* ---- first K load + cur_buf_init (lines 715-718) ---- */
+    /* ---- first K issue ---- */
     rocke_gfx950_attention_tiled_3d_issue_k(ctx, ctx->tile_start, rocke_b_const_i32(b, 0));
     ctx->cur_buf_init = rocke_b_const_i32(b, 0);
 }
 
 /* ============================================================ *
- * emit_softmax_loop (lines 720-898)
+ * emit_softmax_loop: the online-softmax scf.for over [tile_start, tile_end).
  * ============================================================ */
 void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
     rocke_gfx950_attention_tiled_3d_build_ctx_t* ctx)
@@ -167,9 +169,8 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
     const rocke_type_t* f32 = rocke_f32();
     int r, n, k, reg;
 
-    /* iter_args: m0,l0,m1,l1,m2,l2,m3,l3, acc0..accN-1, cur_buf */
-    int num_ml = 8;
-    int num_iter = num_ml + cfg->PV_N_TILES + 1;
+    /* iter_args: m0,l0..m3,l3, acc0..accN-1, cur_buf */
+    int num_iter = 8 + cfg->PV_N_TILES + 1;
     rocke_iter_arg_t* iter_args
         = (rocke_iter_arg_t*)rocke_arena_alloc(&b->arena, (size_t)num_iter * sizeof(*iter_args));
     if(iter_args == NULL)
@@ -178,32 +179,21 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
     }
     {
         int ai = 0;
-        char buf[16];
+        char buf[24];
         for(r = 0; r < 4; r++)
         {
-            buf[0] = 'm';
-            buf[1] = (char)('0' + r);
-            buf[2] = '\0';
+            snprintf(buf, sizeof(buf), "m%d", r);
             iter_args[ai].name = rocke_arena_strdup(&b->arena, buf);
             iter_args[ai].init = ctx->m_inits[r];
             ai++;
-            buf[0] = 'l';
+            snprintf(buf, sizeof(buf), "l%d", r);
             iter_args[ai].name = rocke_arena_strdup(&b->arena, buf);
             iter_args[ai].init = ctx->l_inits[r];
             ai++;
         }
         for(n = 0; n < cfg->PV_N_TILES; n++)
         {
-            int p = 0;
-            buf[p++] = 'a';
-            buf[p++] = 'c';
-            buf[p++] = 'c';
-            if(n >= 10)
-            {
-                buf[p++] = (char)('0' + (n / 10));
-            }
-            buf[p++] = (char)('0' + (n % 10));
-            buf[p] = '\0';
+            snprintf(buf, sizeof(buf), "acc%d", n);
             iter_args[ai].name = rocke_arena_strdup(&b->arena, buf);
             iter_args[ai].init = ctx->acc_inits[n];
             ai++;
@@ -213,10 +203,9 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
         ai++;
     }
 
-    /* LICM hoist: per-reg invariants constant across all KV tiles (Python lines
-     * 772-810). qp_r, qh_r, row_ok, and causal_lim depend only on CTA-level
-     * constants and the per-thread row index — none of which change inside the
-     * KV loop. ALiBi slopes are per query-head: also loop-invariant. */
+    /* LICM hoist: per-row invariants constant across all KV tiles. qp_r, qh_r,
+     * row_ok, and causal_lim depend only on CTA-level constants and the
+     * per-thread row index. ALiBi slopes are per query-head: also invariant. */
     {
         int hoist_reg;
         for(hoist_reg = 0; hoist_reg < 4; hoist_reg++)
@@ -401,18 +390,20 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
                 }
                 if(cfg->USE_QQ_BIAS)
                 {
+                    /* Sequenced so the op order matches Python's left-to-right
+                     * argument evaluation. */
                     rocke_value_t* krp = rocke_b_sub(b, col_abs, ctx->context_len);
-                    rocke_value_t* krp_ok
-                        = rocke_b_land(b,
-                                       rocke_b_cmp_ge(b, krp, rocke_b_const_i32(b, 0)),
-                                       rocke_b_cmp_lt(b, krp, ctx->qq_bias_stride0_p));
+                    rocke_value_t* krp_ge = rocke_b_cmp_ge(b, krp, rocke_b_const_i32(b, 0));
+                    rocke_value_t* krp_lt = rocke_b_cmp_lt(b, krp, ctx->qq_bias_stride0_p);
+                    rocke_value_t* krp_ok = rocke_b_land(b, krp_ge, krp_lt);
                     rocke_value_t* qq_ok = rocke_b_land(b, row_ok, krp_ok);
                     rocke_value_t* qp_safe
                         = rocke_b_select(b, row_ok, qp_r, rocke_b_const_i32(b, 0));
                     rocke_value_t* qq_idx
                         = rocke_b_add(b, rocke_b_mul(b, qp_safe, ctx->qq_bias_stride0_p), krp);
+                    rocke_value_t* qq_zero = rocke_b_const_f32(b, 0.0);
                     rocke_value_t* qq_v = rocke_b_masked_global_load(
-                        b, ctx->qq_bias_ptr, qq_idx, qq_ok, rocke_b_const_f32(b, 0.0), f32, 4);
+                        b, ctx->qq_bias_ptr, qq_idx, qq_ok, qq_zero, f32, 4);
                     s_scaled = rocke_b_fadd(b, s_scaled, rocke_b_fmul(b, qq_v, ctx->rcp_ln2));
                 }
                 masked[n * 4 + reg] = rocke_b_select(b, m_ok, s_scaled, ctx->neg_inf);
@@ -465,15 +456,16 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
                 }
                 l_local[reg] = rocke_warp_xor_reduce_sum(b, sum_p, 4);
             }
-        }
 
-        for(r = 0; r < 4; r++)
-        {
-            alpha_regs[r] = rocke_b_exp2(b, rocke_b_fsub(b, m_vals[r], m_new[r]));
-        }
-        for(r = 0; r < 4; r++)
-        {
-            new_l_vals[r] = rocke_b_fadd(b, rocke_b_fmul(b, l_vals[r], alpha_regs[r]), l_local[r]);
+            for(r = 0; r < 4; r++)
+            {
+                alpha_regs[r] = rocke_b_exp2(b, rocke_b_fsub(b, m_vals[r], m_new[r]));
+            }
+            for(r = 0; r < 4; r++)
+            {
+                new_l_vals[r]
+                    = rocke_b_fadd(b, rocke_b_fmul(b, l_vals[r], alpha_regs[r]), l_local[r]);
+            }
         }
 
         if(cfg->KV_FP8)
@@ -589,7 +581,7 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
     }
     rocke_b_region_leave(b);
 
-    /* ---------------- stash final (m,l,acc) into ctx (lines 901-904) ---------- */
+    /* ---------------- stash final (m,l,acc) into ctx ---------- */
     {
         rocke_value_t** final = kvloop.op->results;
         for(r = 0; r < 4; r++)
