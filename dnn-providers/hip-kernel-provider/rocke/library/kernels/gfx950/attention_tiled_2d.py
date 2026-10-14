@@ -473,6 +473,16 @@ class UnifiedAttention2DTiledSpec:
     # no-SW transposed-32x32 combo (TRANSPOSED_MASK_LIMIT). Default OFF
     # (golden-safe; the single-loop body is byte-identical).
     use_mask_phase_split: bool = False
+    # Causal load balance: walk the grid's Q-block axis heaviest-first. The
+    # dispatcher issues workgroups in ascending ``block_id_y`` order, so the
+    # default mapping runs the shortest causal rows first and leaves the
+    # longest rows (the full-KV-length tail) for the last wave of workgroups.
+    # Reversing the index (LPT order) starts the long rows first and fills the
+    # tail with short ones. The grid's Q-block extent is recomputed in-kernel
+    # from ``cu_q[num_seqs] // BLOCK_Q + num_seqs`` (the launch formula), so no
+    # ABI change. Pure index permutation: every output row is computed by the
+    # same code, so results are bit-identical.
+    use_reverse_q_block_order: bool = False
 
     def __post_init__(self):
         if self.num_warps not in (1, 2, 4, 8):
@@ -889,6 +899,7 @@ class UnifiedAttention2DTiledSpec:
             "fp8mfma" if self.use_fp8_mfma_qk else "",
             "fp8pv" if self.use_fp8_mfma_pv else "",
             "regpv" if self.use_register_pv else "",
+            "rqb" if self.use_reverse_q_block_order else "",
         )
 
 
@@ -1230,7 +1241,16 @@ def build_unified_attention_2d_tiled(
     qq_bias_stride0_p = b.param("qq_bias_stride_0", I32)
 
     kv_head_idx = b.block_id_x()
-    q_block_global_idx = b.block_id_y()
+    if spec.use_reverse_q_block_order:
+        # grid.y == cu_q[num_seqs] // BLOCK_Q + num_seqs (the launch formula).
+        total_q_tok = b.global_load_i32(cu_q, num_seqs_p)
+        last_q_block = b.sub(
+            b.add(b.div(total_q_tok, b.const_i32(BLOCK_Q)), num_seqs_p),
+            b.const_i32(1),
+        )
+        q_block_global_idx = b.sub(last_q_block, b.block_id_y())
+    else:
+        q_block_global_idx = b.block_id_y()
     tid = b.thread_id_x()
 
     # Wave decomposition. For NUM_WARPS=1 this collapses to `wave_id=0,
