@@ -222,8 +222,8 @@ typedef struct rocke_gemm_build_ctx
     int dtl_pass_bytes; /* block_size * dtl_bytes_per_lane           */
     int dtl_chunks_per_row; /* block_k / dtl_halves                      */
     rocke_value_t* dtl_big_bytes; /* const_i32(0x7FFF0000)        */
-    rocke_value_t* dtl_a_rsrc; /* buffer_rsrc(A, big_bytes)    */
-    rocke_value_t* dtl_b_rsrc; /* buffer_rsrc(Bp, big_bytes)   */
+    rocke_value_t* dtl_a_rsrc; /* rsrc at A batch+tile-row base */
+    rocke_value_t* dtl_b_rsrc; /* rsrc at Bp batch+tile-row base */
     rocke_value_t* dtl_a_lds_base; /* smem_addr_of(A_smem)         */
     rocke_value_t* dtl_b_lds_base; /* smem_addr_of(B_smem)         */
     rocke_value_t* dtl_zero_soff; /* const_i32(0)                 */
@@ -299,6 +299,14 @@ rocke_value_t* rocke_gemm_emit_smem_load(rocke_ir_builder_t* b,
  * unchanged when ctx->swz is false. (Python inner closure `_swz_col`.) */
 rocke_value_t*
     rocke_gemm_swz_col(rocke_gemm_build_ctx_t* ctx, rocke_value_t* col, rocke_value_t* row);
+
+/* _dtl_tile_rsrc(ptr, batch_off, row_off): DTL buffer resource whose 64-bit
+ * base is ptr + (batch_off + row_off*K)*2 bytes, so the i32 voffset only holds
+ * the in-tile offset. (Python inner closure `_dtl_tile_rsrc`.) */
+rocke_value_t* rocke_gemm_dtl_tile_rsrc(rocke_gemm_build_ctx_t* ctx,
+                                        rocke_value_t* ptr,
+                                        rocke_value_t* batch_off,
+                                        rocke_value_t* row_off);
 
 /* hotloop_* family (module-level). The well-formed guard + per-tile schedule
  * emission used by emit_mfma_phase for compv3/compv4. */

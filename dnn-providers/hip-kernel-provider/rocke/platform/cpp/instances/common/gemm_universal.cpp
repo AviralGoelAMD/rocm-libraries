@@ -1410,9 +1410,11 @@ rocke_kernel_def_t* rocke_build_universal_gemm(rocke_ir_builder_t* b,
         ctx.dtl_pass_bytes = spec->block_size * ctx.dtl_bytes_per_lane;
         ctx.dtl_chunks_per_row = ctx.block_k / ctx.dtl_halves;
 
+        /* The DTL voffset is i32 and num_records is 0x7FFF0000, so the batch and
+         * tile-row origin go into a 64-bit resource base (Python _dtl_tile_rsrc). */
         ctx.dtl_big_bytes = rocke_b_const_i32(b, 0x7FFF0000);
-        ctx.dtl_a_rsrc = rocke_b_buffer_rsrc(b, ctx.A, ctx.dtl_big_bytes);
-        ctx.dtl_b_rsrc = rocke_b_buffer_rsrc(b, ctx.Bp, ctx.dtl_big_bytes);
+        ctx.dtl_a_rsrc = rocke_gemm_dtl_tile_rsrc(&ctx, ctx.A, ctx.batch_off_a, ctx.block_m_off);
+        ctx.dtl_b_rsrc = rocke_gemm_dtl_tile_rsrc(&ctx, ctx.Bp, ctx.batch_off_b, ctx.block_n_off);
         ctx.dtl_a_lds_base = rocke_b_smem_addr_of(b, ctx.A_smem);
         ctx.dtl_b_lds_base = rocke_b_smem_addr_of(b, ctx.B_smem);
         ctx.dtl_zero_soff = rocke_b_const_i32(b, 0);
