@@ -187,6 +187,15 @@ class TraitSpec:
     # at typical tile sizes) but hides the global-load latency that
     # otherwise serialises every K-tile.
     dtl_prefetch: bool = False
+    # DTL ping-pong: tag the in-flight direct-to-LDS writes and the MFMA
+    # operand LDS reads with disjoint alias scopes. The ping-pong reads half
+    # ``p`` while the DMA fills half ``p^1``; without the scopes the backend's
+    # waitcnt pass cannot see that and drains the just-issued DMA
+    # (``s_waitcnt vmcnt(0)``) before the first operand read, serialising the
+    # prefetch behind the MFMAs it was meant to overlap. Cross-iteration
+    # ordering stays with the explicit ``s_waitcnt`` + barrier at the top of
+    # each K-tile. Requires ``dtl_prefetch``; default off (byte-identical).
+    dtl_lds_alias: bool = False
     # MoE active-tile early-exit. When True (only honored in
     # ``batched=True`` mode), the kernel takes two extra args
     # (``SortedTokenIds: ptr<i32>``, ``slot_size: i32``) and at CTA
@@ -320,6 +329,7 @@ class UniversalGemmSpec(WarpTileBlockSizeMixin):
                 "preb": tr.preshuffle_b,
                 "dtl": tr.direct_to_lds,
                 "pref": tr.dtl_prefetch,
+                "lalias": tr.dtl_lds_alias,
                 "actt": tr.active_tile_skip,
                 f"spk{tr.split_k}": tr.split_k > 1,
                 "noalc": tr.cshuffle_no_alias,
@@ -622,6 +632,8 @@ def is_valid_spec(spec: UniversalGemmSpec, arch: str = "gfx950") -> Tuple[bool, 
         return False, f"split_k must be >= 1 (got {sk})"
     if sk > 1 and family != "mma":
         return False, f"split_k > 1 is CDNA-only (got family {family!r} on {arch})"
+    if spec.trait.dtl_lds_alias and not spec.trait.dtl_prefetch:
+        return False, "dtl_lds_alias requires dtl_prefetch"
 
     return True, "ok"
 
@@ -724,11 +736,17 @@ def _choose_load_vec(spec: UniversalGemmSpec) -> int:
 
 
 def _emit_smem_load(
-    b: IRBuilder, smem: Value, row: Value, col: Value, n: int, dtype: Type
+    b: IRBuilder,
+    smem: Value,
+    row: Value,
+    col: Value,
+    n: int,
+    dtype: Type,
+    lds_alias: Optional[str] = None,
 ) -> Value:
-    if dtype == F16 and n == 4:
+    if dtype == F16 and n == 4 and lds_alias is None:
         return b.smem_load_v4_f16(smem, row, col)
-    return b.smem_load_vN(smem, row, col, dtype=dtype, n=n)
+    return b.smem_load_vN(smem, row, col, dtype=dtype, n=n, lds_alias=lds_alias)
 
 
 def _hotloop_inst_list(spec: UniversalGemmSpec, load_vec: int):
@@ -1127,6 +1145,9 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
     _prefetch = bool(spec.trait.dtl_prefetch)
     if _prefetch and not spec.trait.direct_to_lds:
         raise ValueError("dtl_prefetch requires direct_to_lds=True")
+    # Alias-scope tags for the DTL ping-pong (see TraitSpec.dtl_lds_alias).
+    _dma_alias = "dma" if (_prefetch and spec.trait.dtl_lds_alias) else None
+    _read_alias = "read" if _dma_alias else None
     # compv4 (non-DTL) double-buffers the AB LDS so the next K-tile's
     # global->LDS copy overlaps the current K-tile's MFMA/ds_read work
     # (a real software-pipelined prefetch). The validity gate already
@@ -1378,6 +1399,7 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                     _dtl_zero_soff,
                     _DTL_DWORDS,
                     coherency=spec.trait.dtl_cache_a,
+                    lds_alias=_dma_alias,
                 )
             for p in range(_dtl_b_passes):
                 pass_off_bytes = p * _dtl_pass_bytes + b_parity_bytes_static
@@ -1407,6 +1429,7 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                     _dtl_zero_soff,
                     _DTL_DWORDS,
                     coherency=spec.trait.dtl_cache_b,
+                    lds_alias=_dma_alias,
                 )
             # The following ``b.sync()`` (in the caller) lowers to
             # ``s_waitcnt vmcnt(0) lgkmcnt(0) ; s_barrier``, which drains
@@ -1806,7 +1829,13 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                 else a_row
             )
             return _emit_smem_load(
-                b, A_src, a_row, _swz_col(col_base, swz_row), a_per_lane, storage_dtype
+                b,
+                A_src,
+                a_row,
+                _swz_col(col_base, swz_row),
+                a_per_lane,
+                storage_dtype,
+                lds_alias=_read_alias,
             )
 
         def _read_b(kk: int, ni: int) -> Value:
@@ -1823,7 +1852,13 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                 else b_row
             )
             return _emit_smem_load(
-                b, B_src, b_row, _swz_col(col_base, swz_row), b_per_lane, storage_dtype
+                b,
+                B_src,
+                b_row,
+                _swz_col(col_base, swz_row),
+                b_per_lane,
+                storage_dtype,
+                lds_alias=_read_alias,
             )
 
         def _mma_cluster(a_rows, b_cols) -> None:

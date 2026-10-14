@@ -1592,6 +1592,10 @@ class _Lowerer:
         self._needs_av_scope_md: bool = False
         # ``!5 = !{i32 1}`` referenced by ``!nontemporal`` loads/stores.
         self._needs_nontemporal_md: bool = False
+        # Scoped-noalias LDS metadata (``!9000``..``!9004``) referenced by
+        # DTL ``buffer.load.lds`` writes and LDS reads that carry an
+        # ``lds_alias`` attr ("dma" / "read"); see ``_lds_alias_md``.
+        self._needs_lds_alias_md: bool = False
         # Off unless the kernel was built with source-location capture (see
         # IRBuilder's ``capture_loc`` / ROCKE_DEBUG_LOC). When off, not one byte
         # of the emitted .ll changes, so the byte-identity gate and the IR
@@ -3458,8 +3462,29 @@ class _Lowerer:
         else:
             self._current().emit(
                 f"  {op.result.name} = load {volatile}<{vec} x {elem_ty}>, ptr addrspace(3) {base}, "
-                f"align {align}"
+                f"align {align}{self._lds_alias_md(op)}"
             )
+
+    def _lds_alias_md(self, op: Op) -> str:
+        """Scoped-noalias metadata suffix for an op tagged ``lds_alias``.
+
+        Two scopes in one domain: ``dma`` (direct-to-LDS async writes) and
+        ``read`` (LDS operand reads). Each side is ``noalias`` with the other,
+        which lets the backend's waitcnt pass skip the conservative
+        ``vmcnt(0)`` it otherwise places before every LDS read that follows
+        an in-flight LDS DMA. The emitter only tags accesses that target
+        disjoint LDS halves; cross-iteration ordering is enforced by the
+        explicit ``s_waitcnt`` + barrier the caller places.
+        """
+        tag = op.attrs.get("lds_alias")
+        if tag is None:
+            return ""
+        self._needs_lds_alias_md = True
+        if tag == "dma":
+            return ", !alias.scope !9003, !noalias !9004"
+        if tag == "read":
+            return ", !alias.scope !9004, !noalias !9003"
+        raise ValueError(f"unknown lds_alias tag {tag!r}")
 
     def _op_tile_wmma_f32_16x16x16_f16(self, op: Op) -> None:
         # RDNA WMMA: emission is arch-specific, so it routes through the ISA
@@ -4787,7 +4812,7 @@ class _Lowerer:
             f"i32 {size_bytes}, "
             f"i32 {self._operand(voff)}, "
             f"i32 {self._operand(soff)}, "
-            f"i32 0, i32 {aux})"
+            f"i32 0, i32 {aux}){self._lds_alias_md(op)}"
         )
 
     def _op_tile_s_wait_asynccnt(self, op: Op) -> None:
@@ -6596,6 +6621,13 @@ class _Lowerer:
             out.append("")
         if self._needs_nontemporal_md:
             out.append("!5 = !{i32 1}")
+            out.append("")
+        if self._needs_lds_alias_md:
+            out.append('!9000 = distinct !{!9000, !"rocke.lds"}')
+            out.append('!9001 = distinct !{!9001, !9000, !"rocke.lds.dma"}')
+            out.append('!9002 = distinct !{!9002, !9000, !"rocke.lds.read"}')
+            out.append("!9003 = !{!9001}")
+            out.append("!9004 = !{!9002}")
             out.append("")
         if self._debug is not None:
             out.extend(self._debug.render())

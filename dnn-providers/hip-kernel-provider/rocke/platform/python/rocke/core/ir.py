@@ -2202,7 +2202,9 @@ class IRBuilder:
         """
         return self.smem_load_vN(smem, *indices, dtype=F16, n=n)
 
-    def smem_load_vN(self, smem: Value, *indices, dtype: Type, n: int = 0) -> Value:
+    def smem_load_vN(
+        self, smem: Value, *indices, dtype: Type, n: int = 0, lds_alias: Optional[str] = None
+    ) -> Value:
         """LDS load of ``<N x dtype>``. Supports 8-bit (fp8e4m3 / bf8e5m2 /
         i8), 16-bit (f16 / bf16), 32-bit (f32 / i32) and 64-bit (f64, ``n in
         {1, 2}``) element types; loads exactly N elements. In addition to
@@ -2240,11 +2242,15 @@ class IRBuilder:
             )
         if not indices:
             raise ValueError("smem_load_vN needs at least one index")
+        attrs = {"elem_type": dtype.name, "vec": n, "rank": len(indices)}
+        if lds_alias is not None:
+            # Scoped-noalias tag ("read"); see ``async_buffer_load_lds_addr``.
+            attrs["lds_alias"] = lds_alias
         return self._op(
             "tile.smem_load_vN",
             [smem, *indices],
             [VectorType(dtype, n)],
-            attrs={"elem_type": dtype.name, "vec": n, "rank": len(indices)},
+            attrs=attrs,
             result_name_hint=f"av{n}",
         ).result
 
@@ -3840,6 +3846,7 @@ class IRBuilder:
         soffset: Value,
         dwords: int,
         coherency: int = 0,
+        lds_alias: Optional[str] = None,
     ) -> None:
         """Variant of `async_buffer_load_lds` that takes a raw i64 LDS
         address instead of a typed `smem<...>` value. This is the form
@@ -3856,6 +3863,12 @@ class IRBuilder:
         the L1/L2 caching policy. ``CACHE_STREAM`` is the
         right hint for one-shot streaming loads in a
         ping-pong pipeline that won't reuse the data.
+        lds_alias: optional scoped-noalias tag. ``"dma"`` on the write and
+        ``"read"`` on LDS reads (``smem_load_vN``) declares the two
+        disjoint, so the backend need not drain this DMA (``vmcnt``)
+        before those reads. Only valid when the caller orders the
+        reads after the writes they consume with an explicit
+        ``s_waitcnt`` + barrier.
         """
         if dwords not in (1, 3, 4):
             raise ValueError(
@@ -3863,10 +3876,13 @@ class IRBuilder:
             )
         if coherency not in (0, 1, 2, 3):
             raise ValueError(f"coherency must be 0..3 (got {coherency})")
+        attrs = {"dwords": int(dwords), "aux": int(coherency)}
+        if lds_alias is not None:
+            attrs["lds_alias"] = lds_alias
         self._op(
             "tile.async_buffer_load_lds_addr",
             [rsrc, lds_addr, voffset, soffset],
-            attrs={"dwords": int(dwords), "aux": int(coherency)},
+            attrs=attrs,
         )
 
     # ----- scheduler / synchronisation hints -----
