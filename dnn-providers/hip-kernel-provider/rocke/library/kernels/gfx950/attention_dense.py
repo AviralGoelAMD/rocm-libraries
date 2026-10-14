@@ -211,6 +211,10 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # the query blocks from the last (most KV tiles) to the first, so the
     # longest work items are dispatched first. The grid shape is unchanged.
     grid_order: str = field(default="default", kw_only=True)
+    # Keep the softmax row sum as a per-half-wave partial across the KV loop
+    # and combine the two halves once before the epilogue, instead of a
+    # cross-half exchange per KV tile.
+    defer_row_sum: bool = field(default=False, kw_only=True)
 
     def resolved_exp_per_pv_step(self) -> int:
         if self.exp_per_pv_step is not None:
@@ -537,6 +541,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "causal_diag_split",
             "o_store_width",
             "grid_order",
+            "defer_row_sum",
         )
     }
 )
@@ -1210,7 +1215,10 @@ def build_attention_dense(
         for nsub in range(N_SUB):
             for i in range(16):
                 l_local = b.fadd(l_local, p_vals[nsub][i])
-        l_tile = b.fadd(l_local, b.warp_shuffle_xor(l_local, 32))
+        if spec.defer_row_sum:
+            l_tile = l_local
+        else:
+            l_tile = b.fadd(l_local, b.warp_shuffle_xor(l_local, 32))
         return out, p_vals, l_tile
 
     if varlen:
@@ -1282,11 +1290,20 @@ def build_attention_dense(
     for nsub in range(N_SUB):
         for i in range(16):
             l0_local = b.fadd(l0_local, p0_vals[nsub][i])
-    l0 = b.fadd(l0_local, b.warp_shuffle_xor(l0_local, 32))
+    if spec.defer_row_sum:
+        l0 = l0_local
+    else:
+        l0 = b.fadd(l0_local, b.warp_shuffle_xor(l0_local, 32))
     if use_sinks:
         # Rescale l_init by alpha0: when m0 > m_init (sink), multiply by alpha0 to change
         # the sink's contribution from exp(sink - m_init) = 1.0 to exp(sink - m0).
-        l0 = b.fadd(l0, b.fmul(l_init, alpha0))
+        sink_l = b.fmul(l_init, alpha0)
+        if spec.defer_row_sum:
+            # Per-half partials: only half 0 carries the sink term.
+            sink_l = b.select(
+                b.cmp_eq(lane_h, b.const_i32(0)), sink_l, b.const_f32(0.0)
+            )
+        l0 = b.fadd(l0, sink_l)
     o0 = [b.zero_vec_f32(16) for _ in range(D_TILES)]
     pk0 = relayout_p(p0_vals)
 
@@ -1411,6 +1428,8 @@ def build_attention_dense(
 
     res = loop.results
     l_i = res[1]
+    if spec.defer_row_sum:
+        l_i = b.fadd(l_i, b.warp_shuffle_xor(l_i, 32))
     o_acc = list(res[2 : 2 + D_TILES])
     p_prev = list(res[2 + D_TILES : 2 + D_TILES + KK_STEPS])
 
