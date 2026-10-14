@@ -36,6 +36,7 @@ from ._fmha_warp_body import WARP_SIZE
 __all__ = [
     "FmhaBwdSpec",
     "build_fmha_bwd",
+    "build_fmha_bwd_split",
     "fmha_bwd_grid",
     "fmha_bwd_signature",
     "is_valid_spec",
@@ -62,6 +63,10 @@ class FmhaBwdSpec:
     # parity; H=256 workloads that are atomic-engine-bound see the
     # biggest relative improvement.
     output_grad_dtype: str = "f32"
+    # ``"atomic"`` (default): one Q-major kernel, dK / dV via f32 atomics
+    # (:func:`build_fmha_bwd`). ``"split"``: atomic-free dQ + dK/dV kernel
+    # pair (:func:`build_fmha_bwd_split`).
+    bwd_mode: str = "atomic"
 
     def kernel_name(self) -> str:
         s = self.common.shape
@@ -353,3 +358,225 @@ def fmha_bwd_signature(spec: FmhaBwdSpec):
     kb = FmhaKernelBuilder("rocke_fmha_bwd_sig_probe", spec.common)
     _declare_params(kb)
     return kb.signature()
+
+
+# ---------------------------------------------------------------------
+# Split backward (default-off lever): no global atomics.
+#
+# The atomic body above recomputes P per (q, k) inside a Q-major CTA and
+# atomic-adds every dK / dV element: ``2 * seqlen_q * seqlen_k * head_size``
+# f32 atomics per head. The split form instead runs two warp-distributed
+# kernels that each own their output rows:
+#
+#   1. ``_dq`` (grid ``(seqlen_q, HQ)``, Q-major): the same two K-loops as
+#      the atomic body, but loop 1's ``rowsum_dp`` is also written to the
+#      ``Dsum`` workspace and loop 2 only accumulates dQ (plain store).
+#   2. ``_dkdv`` (grid ``(seqlen_k, HK)``, KV-major): loops over the query
+#      rows (and the ``HQ / HK`` query heads of the KV group), recomputes P
+#      from the saved ``(M, L)`` and reads ``Dsum``; dK / dV accumulate in
+#      registers and are stored once.
+#
+# Same ABI tensors as the atomic kernel plus the ``Dsum`` f32
+# ``[seqlen_q, HQ]`` workspace; dQ / dK / dV are written (not accumulated),
+# so callers need not zero them. Causal masks bound the loops instead of
+# masking dead iterations.
+# ---------------------------------------------------------------------
+
+
+def _declare_split_dq_params(kb: FmhaKernelBuilder) -> None:
+    kb.add_tensor("Q", readonly=True)
+    kb.add_tensor("K", readonly=True)
+    kb.add_tensor("V", readonly=True)
+    kb.add_tensor("dO", readonly=True)
+    kb.add_ptr("M_saved", dtype="f32", readonly=True)
+    kb.add_ptr("L_saved", dtype="f32", readonly=True)
+    kb.add_ptr("dQ", dtype="f32", readonly=False)
+    kb.add_ptr("Dsum", dtype="f32", readonly=False)
+    kb.add_scalar("scale_log2", "f32")
+    kb.add_scalar("scale_inv", "f32")
+    kb.add_scalar("seqlen_k", "i32")
+    kb.add_strides("q", "k", "v")
+    kb.add_strides("do")
+    kb.add_scalar("stride_dq_token", "i32")
+
+
+def _declare_split_dkdv_params(kb: FmhaKernelBuilder) -> None:
+    kb.add_tensor("Q", readonly=True)
+    kb.add_tensor("K", readonly=True)
+    kb.add_tensor("V", readonly=True)
+    kb.add_tensor("dO", readonly=True)
+    kb.add_ptr("M_saved", dtype="f32", readonly=True)
+    kb.add_ptr("L_saved", dtype="f32", readonly=True)
+    kb.add_ptr("Dsum", dtype="f32", readonly=True)
+    kb.add_ptr("dK", dtype="f32", readonly=False)
+    kb.add_ptr("dV", dtype="f32", readonly=False)
+    kb.add_scalar("scale_log2", "f32")
+    kb.add_scalar("scale_inv", "f32")
+    kb.add_scalar("seqlen_q", "i32")
+    kb.add_strides("q", "k", "v")
+    kb.add_strides("do")
+    kb.add_scalar("stride_dk_token", "i32")
+    kb.add_scalar("stride_dv_token", "i32")
+
+
+def _build_split_dq(spec: FmhaBwdSpec) -> KernelDef:
+    s = spec.common
+    dtype = s.dtype
+    ept = s.shape.head_size // WARP_SIZE
+    kb = FmhaKernelBuilder(spec.kernel_name() + "_split_dq", s)
+    kb.block_size(WARP_SIZE)
+    _declare_split_dq_params(kb)
+    kb.decode_grid()
+    b = kb.builder
+    Q, K, V, dO = kb.tensor("Q"), kb.tensor("K"), kb.tensor("V"), kb.tensor("dO")
+    scale_log2 = kb.scalar("scale_log2")
+    scale_inv = kb.scalar("scale_inv")
+    q_token, head_idx = kb.q_token, kb.head_idx
+    tid = b.thread_id_x()
+    lane_d_base = b.mul(tid, b.const_i32(ept))
+    ml_row = b.add(b.mul(q_token, b.const_i32(s.shape.num_query_heads)), head_idx)
+    m_qt = b.global_load_f32(kb.ptr("M_saved"), ml_row)
+    inv_l = b.rcp(b.global_load_f32(kb.ptr("L_saved"), ml_row))
+    q_lane = load_lane_slice_f32(b, Q, kb.q_row_base(), lane_d_base, dtype=dtype, ept=ept)
+    do_lane = load_lane_slice_f32(
+        b, dO, kb.row_base("do", q_token, head_idx), lane_d_base, dtype=dtype, ept=ept
+    )
+    zero_f = b.const_f32(0.0)
+    k_hi = (
+        b.add(q_token, b.const_i32(1)) if s.mask_mode == "causal" else kb.scalar("seqlen_k")
+    )
+
+    def _p_and_dov(k_idx):
+        k_lane = load_lane_slice_f32(b, K, kb.k_row_base(k_idx), lane_d_base, dtype=dtype, ept=ept)
+        v_lane = load_lane_slice_f32(b, V, kb.v_row_base(k_idx), lane_d_base, dtype=dtype, ept=ept)
+        pqk, pdov = zero_f, zero_f
+        for k in range(ept):
+            pqk = b.fma(q_lane[k], k_lane[k], pqk)
+            pdov = b.fma(do_lane[k], v_lane[k], pdov)
+        dot_qk = warp_xor_reduce_sum(b, pqk, stages=6)
+        dot_dov = warp_xor_reduce_sum(b, pdov, stages=6)
+        s_log2 = apply_attention_mask(
+            b,
+            b.fmul(dot_qk, scale_log2),
+            mask_mode=s.mask_mode,
+            k_idx=k_idx,
+            query_pos=q_token,
+            sliding_window=s.sliding_window,
+        )
+        return b.fmul(b.exp2(b.fsub(s_log2, m_qt)), inv_l), dot_dov, k_lane
+
+    loop1 = b.scf_for_iter(b.const_i32(0), k_hi, b.const_i32(1), iter_args=[("rs", zero_f)], iv_name="k_idx")
+    with loop1 as (k_idx, (rs,)):
+        p, dot_dov, _ = _p_and_dov(k_idx)
+        b.scf_yield(b.fma(p, dot_dov, rs))
+    rowsum_dp = loop1.results[0]
+    with b.scf_if(b.cmp_eq(tid, b.const_i32(0))):
+        b.global_store(kb.ptr("Dsum"), ml_row, rowsum_dp, align=4)
+
+    loop2 = b.scf_for_iter(
+        b.const_i32(0), k_hi, b.const_i32(1),
+        iter_args=[(f"dq{k}", zero_f) for k in range(ept)], iv_name="k_idx2",
+    )
+    with loop2 as (k_idx, dq_state):
+        p, dot_dov, k_lane = _p_and_dov(k_idx)
+        dp_scale = b.fmul(b.fmul(p, b.fsub(dot_dov, rowsum_dp)), scale_inv)
+        b.scf_yield(*[b.fma(dp_scale, k_lane[k], dq_state[k]) for k in range(ept)])
+    dq_row = b.add(
+        b.mul(q_token, kb.scalar("stride_dq_token")), b.mul(head_idx, kb.stride_head("q"))
+    )
+    for k in range(ept):
+        b.global_store(
+            kb.ptr("dQ"), b.add(dq_row, b.add(lane_d_base, b.const_i32(k))), loop2.results[k], align=4
+        )
+    b.ret()
+    return kb.kernel
+
+
+def _build_split_dkdv(spec: FmhaBwdSpec) -> KernelDef:
+    s = spec.common
+    dtype = s.dtype
+    HQ = s.shape.num_query_heads
+    G = s.shape.num_queries_per_kv
+    ept = s.shape.head_size // WARP_SIZE
+    kb = FmhaKernelBuilder(spec.kernel_name() + "_split_dkdv", s)
+    kb.block_size(WARP_SIZE)
+    _declare_split_dkdv_params(kb)
+    # Grid (seqlen_k, HK): block_x = key row, block_y = KV head.
+    kb.decode_grid(num_queries_per_kv=1)
+    b = kb.builder
+    Q, K, V, dO = kb.tensor("Q"), kb.tensor("K"), kb.tensor("V"), kb.tensor("dO")
+    M_saved, L_saved, Dsum = kb.ptr("M_saved"), kb.ptr("L_saved"), kb.ptr("Dsum")
+    scale_log2 = kb.scalar("scale_log2")
+    scale_inv = kb.scalar("scale_inv")
+    k_idx, kv_head = kb.q_token, kb.head_idx
+    tid = b.thread_id_x()
+    lane_d_base = b.mul(tid, b.const_i32(ept))
+    k_lane = load_lane_slice_f32(b, K, kb.row_base("k", k_idx, kv_head), lane_d_base, dtype=dtype, ept=ept)
+    v_lane = load_lane_slice_f32(b, V, kb.row_base("v", k_idx, kv_head), lane_d_base, dtype=dtype, ept=ept)
+    zero_f = b.const_f32(0.0)
+    q_lo = k_idx if s.mask_mode == "causal" else b.const_i32(0)
+    iter_args = [(f"dk{k}", zero_f) for k in range(ept)] + [(f"dv{k}", zero_f) for k in range(ept)]
+    loop = b.scf_for_iter(q_lo, kb.scalar("seqlen_q"), b.const_i32(1), iter_args=iter_args, iv_name="q_idx")
+    with loop as (q_idx, state):
+        dk = list(state[:ept])
+        dv = list(state[ept:])
+        for hg in range(G):
+            h = b.add(b.mul(kv_head, b.const_i32(G)), b.const_i32(hg)) if G > 1 else kv_head
+            q_lane = load_lane_slice_f32(b, Q, kb.row_base("q", q_idx, h), lane_d_base, dtype=dtype, ept=ept)
+            do_lane = load_lane_slice_f32(b, dO, kb.row_base("do", q_idx, h), lane_d_base, dtype=dtype, ept=ept)
+            ml_row = b.add(b.mul(q_idx, b.const_i32(HQ)), h)
+            m_q = b.global_load_f32(M_saved, ml_row)
+            inv_l = b.rcp(b.global_load_f32(L_saved, ml_row))
+            d_q = b.global_load_f32(Dsum, ml_row)
+            pqk, pdov = zero_f, zero_f
+            for k in range(ept):
+                pqk = b.fma(q_lane[k], k_lane[k], pqk)
+                pdov = b.fma(do_lane[k], v_lane[k], pdov)
+            dot_qk = warp_xor_reduce_sum(b, pqk, stages=6)
+            dot_dov = warp_xor_reduce_sum(b, pdov, stages=6)
+            s_log2 = apply_attention_mask(
+                b,
+                b.fmul(dot_qk, scale_log2),
+                mask_mode=s.mask_mode,
+                k_idx=k_idx,
+                query_pos=q_idx,
+                sliding_window=s.sliding_window,
+            )
+            p = b.fmul(b.exp2(b.fsub(s_log2, m_q)), inv_l)
+            dp_scale = b.fmul(b.fmul(p, b.fsub(dot_dov, d_q)), scale_inv)
+            for k in range(ept):
+                dv[k] = b.fma(p, do_lane[k], dv[k])
+                dk[k] = b.fma(dp_scale, q_lane[k], dk[k])
+        b.scf_yield(*dk, *dv)
+    dk_row = b.add(b.mul(k_idx, kb.scalar("stride_dk_token")), b.mul(kv_head, kb.stride_head("k")))
+    dv_row = b.add(b.mul(k_idx, kb.scalar("stride_dv_token")), b.mul(kv_head, kb.stride_head("v")))
+    for k in range(ept):
+        d = b.add(lane_d_base, b.const_i32(k))
+        b.global_store(kb.ptr("dK"), b.add(dk_row, d), loop.results[k], align=4)
+        b.global_store(kb.ptr("dV"), b.add(dv_row, d), loop.results[ept + k], align=4)
+    b.ret()
+    return kb.kernel
+
+
+def build_fmha_bwd_split(spec: FmhaBwdSpec, arch: str = "gfx950"):
+    """Atomic-free backward: ``[(kernel, signature, grid), ...]`` in launch order.
+
+    Both kernels must run on the same stream (``_dkdv`` reads the ``Dsum``
+    workspace written by ``_dq``).
+    """
+    ok, why = is_valid_spec(spec, arch)
+    if not ok:
+        raise ValueError(f"invalid fmha_bwd spec: {why}")
+    s = spec.common
+    kdq = _build_split_dq(spec)
+    kb = FmhaKernelBuilder("rocke_fmha_bwd_split_dq_sig_probe", s)
+    _declare_split_dq_params(kb)
+    sig_dq = kb.signature()
+    kdkdv = _build_split_dkdv(spec)
+    kb = FmhaKernelBuilder("rocke_fmha_bwd_split_dkdv_sig_probe", s)
+    _declare_split_dkdv_params(kb)
+    sig_dkdv = kb.signature()
+    return [
+        (kdq, sig_dq, (spec.seqlen_q, s.shape.num_query_heads, 1)),
+        (kdkdv, sig_dkdv, (spec.seqlen_k, s.shape.num_kv_heads, 1)),
+    ]
