@@ -52,14 +52,18 @@ _CASES = [
     ("dw dgrad 5x5 s2", 2, 72, 72, 27, 27, 5, 5, 2, 2, 72, "dgrad", "dw_dgrad_stream"),
     ("dw dgrad 7x7 bw4", 32, 96, 96, 28, 28, 7, 7, 1, 3, 96, "dgrad", "dw_dgrad_stream"),
     ("dw dgrad 3x3 s2 bw2", 32, 144, 144, 28, 28, 3, 3, 2, 1, 144, "dgrad", "dw_dgrad_stream"),
-    ("grouped fwd cpg4", 2, 128, 128, 14, 14, 3, 3, 1, 1, 32, "fwd", "grouped"),
-    ("grouped fwd cpg16", 2, 256, 256, 14, 14, 3, 3, 1, 1, 16, "fwd", "grouped"),
-    ("grouped dgrad cpg4", 2, 128, 128, 14, 14, 3, 3, 1, 1, 32, "dgrad", "grouped_dgrad"),
-    ("grouped dgrad cpg16", 2, 64, 64, 15, 15, 3, 3, 1, 1, 4, "dgrad", "grouped_dgrad"),
+    # The grouped direct routes need _GROUPED_DIRECT_MIN_IGEMM_TILES implicit-GEMM
+    # output tiles (ceil(N*Ho*Wo/64)*G), so these are sized just past it.
+    ("grouped fwd cpg4", 2, 128, 128, 47, 47, 3, 3, 1, 1, 32, "fwd", "grouped"),
+    ("grouped fwd cpg16", 2, 256, 256, 65, 65, 3, 3, 1, 1, 16, "fwd", "grouped"),
+    ("grouped dgrad cpg4", 2, 128, 128, 47, 47, 3, 3, 1, 1, 32, "dgrad", "grouped_dgrad"),
+    ("grouped dgrad cpg16", 2, 64, 64, 129, 129, 3, 3, 1, 1, 4, "dgrad", "grouped_dgrad"),
     ("dw wgrad 3x3 s2", 32, 144, 144, 28, 28, 3, 3, 2, 1, 144, "wgrad", "merged"),
     ("dw wgrad 7x7", 1, 96, 96, 28, 28, 7, 7, 1, 3, 96, "wgrad", "merged"),
     ("stem C3 7x7 s2", 2, 3, 64, 45, 45, 7, 7, 2, 3, 1, "fwd", "channel_pad"),
-    ("stem C1 3x3", 2, 1, 32, 33, 33, 3, 3, 1, 1, 1, "fwd", "channel_pad"),
+    # C=1 pads only above _GFX950_STEM_PAD_C1_MAX_UNPADDED_ROWS output pixels.
+    ("stem C1 3x3", 2, 1, 32, 157, 157, 3, 3, 1, 1, 1, "fwd", "channel_pad"),
+    ("stem C1 3x3 small", 2, 1, 32, 33, 33, 3, 3, 1, 1, 1, "fwd", ""),
 ]
 
 

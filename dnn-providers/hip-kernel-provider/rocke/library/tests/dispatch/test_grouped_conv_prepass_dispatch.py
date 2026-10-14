@@ -29,10 +29,32 @@ class TestStemChannelPad(unittest.TestCase):
         from dispatch.grouped_convolution import dispatch_conv_grouped
 
         for c in (1, 3, 5, 7):
-            spec = dispatch_conv_grouped(_req(C=c)).spec
+            spec = dispatch_conv_grouped(_req(C=c, Hi=128, Wi=128)).spec
             self.assertEqual(spec.pad_c, 8, c)
             self.assertEqual(spec.prepass, "channel_pad")
             self.assertIn("padc8", spec.kernel_name())
+
+    def test_c1_pads_only_above_the_row_threshold(self):
+        """C=1 takes the pad above _GFX950_STEM_PAD_C1_MAX_UNPADDED_ROWS output
+        pixels; odd C > 1 takes it at any size."""
+        from dispatch.grouped_convolution import (
+            _GFX950_STEM_PAD_C1_MAX_UNPADDED_ROWS,
+            dispatch_conv_grouped,
+        )
+
+        # 7x7 s2 p3: 224x224 -> 112x112, 288x288 -> 144x144 (4 x 112^2 is the
+        # first point above the threshold).
+        stem = dict(C=1, Y=7, X=7, stride_h=2, stride_w=2, pad_h=3, pad_w=3)
+        for hw, n, pad in (
+            (224, 1, 0), (224, 3, 0), (288, 2, 0), (224, 4, 8), (224, 8, 8)
+        ):
+            rows = n * (hw // 2) ** 2
+            self.assertEqual(rows > _GFX950_STEM_PAD_C1_MAX_UNPADDED_ROWS, pad == 8, (hw, n))
+            spec = dispatch_conv_grouped(_req(N=n, Hi=hw, Wi=hw, **stem)).spec
+            self.assertEqual(spec.pad_c, pad, (hw, n))
+            self.assertEqual(spec.prepass, "channel_pad" if pad else "", (hw, n))
+        spec = dispatch_conv_grouped(_req(N=1, Hi=224, Wi=224, **dict(stem, C=3))).spec
+        self.assertEqual(spec.pad_c, 8)
 
     def test_other_shapes_do_not(self):
         from dispatch.grouped_convolution import dispatch_conv_grouped

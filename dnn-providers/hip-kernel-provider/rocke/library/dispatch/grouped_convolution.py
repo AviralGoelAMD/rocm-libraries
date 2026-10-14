@@ -989,11 +989,16 @@ def _fwd_merge_degree(req: "ConvGroupedRequest", spec: ImplicitGemmConvSpec) -> 
 # 16-byte load and the conv runs the dense C=8 kernel. The pad pre-pass copies
 # X (and the tiny W) once per call into a workspace.
 _GFX950_STEM_PAD_C = 8
+# For C=1 the pad pre-pass (a second launch over an 8x longer reduction) only
+# pays once the conv has more than this many output pixels (N*Ho*Wo, i.e. 768
+# 64-row implicit-GEMM tiles); up to it the unpadded kernel runs alone.
+_GFX950_STEM_PAD_C1_MAX_UNPADDED_ROWS = 49152
 
 
 def _stem_pad_c(req: "ConvGroupedRequest") -> int:
     """``pad_c`` for a gfx950 forward request: :data:`_GFX950_STEM_PAD_C` for
-    an ungrouped 2-D conv with an odd input-channel count below it, else 0."""
+    an ungrouped 2-D conv with an odd input-channel count below it (C=1 only
+    above :data:`_GFX950_STEM_PAD_C1_MAX_UNPADDED_ROWS` output pixels), else 0."""
     if (
         req.direction != "fwd"
         or int(req.G) != 1
@@ -1002,6 +1007,10 @@ def _stem_pad_c(req: "ConvGroupedRequest") -> int:
         or int(req.C) % 2 == 0
     ):
         return 0
+    if int(req.C) == 1:
+        p = _problem(req)
+        if p.N * p.Ho * p.Wo <= _GFX950_STEM_PAD_C1_MAX_UNPADDED_ROWS:
+            return 0
     return _GFX950_STEM_PAD_C
 
 
