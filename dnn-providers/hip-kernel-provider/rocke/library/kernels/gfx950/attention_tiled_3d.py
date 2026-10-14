@@ -944,10 +944,6 @@ def build_unified_attention_3d_tiled(
                 s_local[(reg, n)] = v
                 local_max = b.fmax(local_max, v)
             full_max_raw = _warp_xor_reduce_max(b, local_max)
-            # Online-softmax running max: max(m_old, tile_max). A bare tile
-            # max lets alpha = exp2(m_old - tile_max) exceed 1 and overflow
-            # f32 once logits spread more than 128 (log2 units) across tiles.
-            full_max_raw = b.fmax(m_vals[reg], full_max_raw)
             ok = b.fcmp("ogt", full_max_raw, neg_inf)
             m_new.append(b.select(ok, full_max_raw, zero_f))
 
