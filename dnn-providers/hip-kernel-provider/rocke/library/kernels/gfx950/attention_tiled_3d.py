@@ -198,9 +198,6 @@ class UnifiedAttention3DTiledSpec:
     # V before PV (two partial vmcnt waits) instead of draining both at the
     # loop top, so the V DMA overlaps QK and softmax.
     kv_split_wait: bool = False
-    # FP8 K/V: fold k_scale into the QK scale and v_scale into the segment
-    # output, so the dequant is a bare fp8 -> f32 -> bf16/fp16 convert.
-    fold_kv_scale: bool = False
 
     def __post_init__(self):
         if type(self.use_f32_denormal_flush) is not bool:
@@ -235,8 +232,6 @@ class UnifiedAttention3DTiledSpec:
             raise ValueError("transposed_softmax does not support ALiBi or QQ bias")
         if self.kv_split_wait and (not self.kv_prefetch or self.kv_storage_dtype is not None):
             raise ValueError("kv_split_wait needs kv_prefetch with a bf16/fp16 KV cache")
-        if self.fold_kv_scale and self.kv_storage_dtype is None:
-            raise ValueError("fold_kv_scale needs an fp8 KV cache")
 
     @property
     def num_queries_per_kv(self) -> int:
@@ -295,7 +290,6 @@ class UnifiedAttention3DTiledSpec:
             "pf" if self.kv_prefetch else "",
             "tsm" if self.transposed_softmax else "",
             "kvsw" if self.kv_split_wait else "",
-            "fks" if self.fold_kv_scale else "",
         )
 
 
@@ -414,7 +408,6 @@ def build_unified_attention_3d_tiled(
     PV_N_TILES = HD // MFMA_N
     # Transposed QK/PV: one query row per lane (see spec docstring).
     TRANS = spec.transposed_softmax
-    FOLD_SCALE = spec.fold_kv_scale and KV_FP8
     # Loop-carried softmax state per lane: 4 MFMA C rows, or 1 when transposed.
     NR = 1 if TRANS else 4
 
@@ -623,9 +616,6 @@ def build_unified_attention_3d_tiled(
     one_f = b.const_f32(1.0)
     rcp_ln2 = b.const_f32(1.4426950408889634)
     qk_scale = b.fmul(scale_p, rcp_ln2)
-    if FOLD_SCALE:
-        # K is dequantized without its scale; apply it to the logits instead.
-        qk_scale = b.fmul(qk_scale, k_scale_p)
     sw_const = b.const_i32(int(SLIDING_WINDOW))
     z8 = b.zero_vec(dtype, 8)
 
@@ -976,21 +966,7 @@ def build_unified_attention_3d_tiled(
         # backend collapses the extract+pack chain back into a
         # bitcast-equivalent shuffle once it sees the
         # cvt.pk.f32.fp8 operand is whole-i32.
-        if FOLD_SCALE:
-            # Scales are applied to the logits / segment output instead.
-            lo_f32 = b.cvt_pk_f32_fp8x4(
-                b.vec_pack([b.vec_extract(fp8_vec, i) for i in range(4)], FP8E4M3)
-            )
-            hi_f32 = b.cvt_pk_f32_fp8x4(
-                b.vec_pack([b.vec_extract(fp8_vec, i) for i in range(4, 8)], FP8E4M3)
-            )
-            packed = b.vec_pack(
-                [b.cast_f32_to(b.vec_extract(lo_f32, i), dtype) for i in range(4)]
-                + [b.cast_f32_to(b.vec_extract(hi_f32, i), dtype) for i in range(4)],
-                dtype,
-            )
-        else:
-            packed = dequant_fp8x8_to_dtype(b, fp8_vec, scale, dtype)
+        packed = dequant_fp8x8_to_dtype(b, fp8_vec, scale, dtype)
         b.smem_store_vN(lds, [buf_idx, row, col], packed, fp8_elems_per_chunk)
 
     def _issue_k(tile_idx: Value, buf_idx: Value) -> None:
@@ -1451,11 +1427,6 @@ def build_unified_attention_3d_tiled(
     m_final = [final[2 * r] for r in range(NR)]
     l_final = [final[2 * r + 1] for r in range(NR)]
     acc_final = [final[2 * NR + n] for n in range(PV_N_TILES)]
-    if FOLD_SCALE:
-        acc_final = [
-            b.vec_pack([b.fmul(b.vec_extract(a, i), v_scale_p) for i in range(4)], F32)
-            for a in acc_final
-        ]
 
     if TRANS:
         # Lane holds O[row = lane % 16][d = n*16 + (lane/16)*4 + 0..3]: one

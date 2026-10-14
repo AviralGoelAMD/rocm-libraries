@@ -207,8 +207,6 @@ typedef struct rocke_unified_attention_3d_tiled_spec
     bool transposed_softmax; /* False */
     /* kv_prefetch (bf16/fp16 only): wait for K before QK and V before PV. */
     bool kv_split_wait; /* False */
-    /* fp8 KV: fold k_scale into the QK scale and v_scale into the output. */
-    bool fold_kv_scale; /* False */
 } rocke_unified_attention_3d_tiled_spec_t;
 
 rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_default(void);
