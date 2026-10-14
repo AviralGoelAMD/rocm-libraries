@@ -2122,6 +2122,8 @@ class _ScanCtx:
         # single-buffered default: every staged tile starts at row 0 and the
         # accessors below emit exactly the unbiased index expression.
         self.buf_bias = None
+        # ``KdaChunkScanSpec.uw``: the residual is V~ itself, no V~ product.
+        self.uw = False
         self.NS = head_k // atom.n
         self.KS_DK = head_k // atom.k
         self.KS_C = (chunk + atom.k - 1) // atom.k
@@ -2435,23 +2437,26 @@ def _emit_scan_body(sc: _ScanCtx, state, tile, *, prefetch: "_InputPrefetch" = N
     # ---- V~^T = R^T A^T -------------------------------------------------
     # Contracts over the full chunk extent, so every tile reads the whole
     # residual: all of them are computed before any overwrites it in place.
-    acc_v = [
-        sc.gemm(sc.vn_lds, srow, sc.ab_lds, sc.crow(jt), sc.KS_C, atom.zero_acc(b))
-        for jt in range(NC_T)
-    ]
-    b.sync_lds_only()
-    for jt in range(NC_T):
-        for i in range(CPL):
-            row, col = sc.slot(i)
-            _st(
-                b,
-                sc.vn_lds,
-                b.add(wrow, row),
-                cidx(jt, col),
-                value=b.cast_f32_to(b.vec_extract(acc_v[jt], i), ELEM),
-                n=1,
-            )
-    b.sync_lds_only()
+    # Under ``uw`` the residual already is V~ (``U - W S``, with A folded into
+    # both operands upstream), so this product and its two rendezvous go.
+    if not sc.uw:
+        acc_v = [
+            sc.gemm(sc.vn_lds, srow, sc.ab_lds, sc.crow(jt), sc.KS_C, atom.zero_acc(b))
+            for jt in range(NC_T)
+        ]
+        b.sync_lds_only()
+        for jt in range(NC_T):
+            for i in range(CPL):
+                row, col = sc.slot(i)
+                _st(
+                    b,
+                    sc.vn_lds,
+                    b.add(wrow, row),
+                    cidx(jt, col),
+                    value=b.cast_f32_to(b.vec_extract(acc_v[jt], i), ELEM),
+                    n=1,
+                )
+        b.sync_lds_only()
 
     # The next chunk's inputs land here: late enough that the loads issued at
     # the top of this body have had the Z and V~ matmul groups to retire behind,
@@ -2763,6 +2768,11 @@ class KdaChunkScanSpec:
     # waves on an output axis (chunk tiles for Z^T / V~^T / O, DK tiles for the
     # state), shortening each wave's MFMA chain without any cross-wave sum.
     wave_split: int = 1
+    # Consume the W/U operand form (``KdaChunkPairSpec.uw``): ``gk_ptr`` carries
+    # ``W = A GK`` and ``v_ptr`` carries ``U = A V`` chunk-packed
+    # ``[NT, C, EV]``, so the residual ``U - W S`` already is V~. The V~
+    # product, its two rendezvous and the A tile all leave the scan.
+    uw: bool = False
     name: str = "rocke_kda_chunk_scan"
 
     @property
@@ -2818,7 +2828,7 @@ class KdaChunkScanSpec:
         return (
             bufs * 2 * C * PDK  # gk_s   bf16 (C x DK)
             + bufs * 2 * C * PDK  # gq_s  bf16 (C x DK)
-            + bufs * 2 * C * PCB  # a_s   bf16 (C x C)
+            + (0 if self.uw else bufs * 2 * C * PCB)  # a_s   bf16 (C x C)
             + bufs * 2 * C * PCB  # aqk_s bf16 (C x C)
             + bufs * 2 * DK * PCB  # kt_s bf16 (DK x C)
             + 2 * ev * PDK  # stb_s bf16 mirror of S^T
@@ -2846,6 +2856,8 @@ class KdaChunkScanSpec:
             parts += ("vp",)
         if self.wave_split != 1:
             parts += (f"ws{self.wave_split}",)
+        if self.uw:
+            parts += ("uw",)
         return kernel_name_join(self.name, *parts)
 
 
@@ -2899,6 +2911,8 @@ def is_valid_scan_spec(
             "xcd_remap needs token_major_io: the grid size comes from its "
             "batch/heads arguments"
         )
+    if spec.uw and not spec.v_prefetch:
+        return False, "uw stages U through the v_prefetch double buffer"
 
     t = spec.tile
     ok, why = _check_scan_partition(
@@ -3058,7 +3072,7 @@ def build_kda_chunk_scan(spec: KdaChunkScanSpec, arch: str = "gfx950") -> "Kerne
     nbuf = 2 if spec.prefetch_tiles else 1
     gk_lds = b.smem_alloc(ELEM, [nbuf * C, PDK], "gk_s")
     gq_lds = b.smem_alloc(ELEM, [nbuf * C, PDK], "gq_s")
-    ab_lds = b.smem_alloc(ELEM, [nbuf * C, PCB], "a_s")
+    ab_lds = None if spec.uw else b.smem_alloc(ELEM, [nbuf * C, PCB], "a_s")
     aqb_lds = b.smem_alloc(ELEM, [nbuf * C, PCB], "aqk_s")
     kt_lds = b.smem_alloc(ELEM, [nbuf * DK, PCB], "kt_s")
     dec_lds = b.smem_alloc(F32, [nbuf * DK], "dec_s")
@@ -3116,6 +3130,7 @@ def build_kda_chunk_scan(spec: KdaChunkScanSpec, arch: str = "gfx950") -> "Kerne
         v_lds=v_lds,
         wave_split=spec.wave_split,
     )
+    sc.uw = spec.uw
 
     state_base = b.add(
         b.mul(bh, b.const_i32(EV * DK)),
@@ -3129,12 +3144,16 @@ def build_kda_chunk_scan(spec: KdaChunkScanSpec, arch: str = "gfx950") -> "Kerne
     if spec.prefetch_tiles:
         # (source, destination, rows, cols, which chunk base) for the five 2-D
         # tiles. ``dec`` is separate: it is fp32, 1-D and a quarter as wide.
-        staged = (
-            (gk_ptr, gk_lds, C, DK, C * DK),
-            (gq_ptr, gq_lds, C, DK, C * DK),
-            (kt_ptr, kt_lds, DK, C, C * DK),
-            (a_ptr, ab_lds, C, C, C * C),
-            (aqk_ptr, aqb_lds, C, C, C * C),
+        staged = tuple(
+            s
+            for s in (
+                (gk_ptr, gk_lds, C, DK, C * DK),
+                (gq_ptr, gq_lds, C, DK, C * DK),
+                (kt_ptr, kt_lds, DK, C, C * DK),
+                (a_ptr, ab_lds, C, C, C * C),
+                (aqk_ptr, aqb_lds, C, C, C * C),
+            )
+            if s[1] is not None
         )
 
         def issue(tile_idx):
@@ -3211,7 +3230,21 @@ def build_kda_chunk_scan(spec: KdaChunkScanSpec, arch: str = "gfx950") -> "Kerne
                             ev_slice,
                             off,
                             b.global_load_vN(
-                                v_ptr, sc.v_global(tile_idx, vrow, vcol), ELEM, 8
+                                v_ptr,
+                                (
+                                    # U is chunk-packed [NT, C, EV].
+                                    b.add(
+                                        b.mul(tile_idx, b.const_i32(C * EV)),
+                                        b.add(
+                                            b.mul(vrow, b.const_i32(EV)),
+                                            sc.global_ev(vcol),
+                                        ),
+                                    )
+                                    if spec.uw
+                                    else sc.v_global(tile_idx, vrow, vcol)
+                                ),
+                                ELEM,
+                                8,
                             ),
                             8,
                             valid,
@@ -3403,6 +3436,13 @@ class KdaChunkPairSpec:
     factor above is a product of decays ``<= 1``, so nothing here can overflow:
     the pair carries exactly the decay envelope of one ``C`` chunk.
 
+    ``uw`` additionally folds ``A2`` into the scan's operands, the form AITER's
+    state kernel consumes: ``V~ = A2 (V - GK2 S) = U - W S`` with
+    ``W = A2 GK2`` and ``U = A2 V``. W goes out in GK2's slot, U to its own
+    ``[NT/2, 2C, EV]`` workspace, and A2 / GK2 are not written (a ``uw`` scan
+    reads neither). That takes the ``V~`` product, and the two rendezvous
+    around it, off the serial chain.
+
     One workgroup per output chunk, grid ``(BH * NC / 2, 1, 1)``. Inputs and
     outputs use the tile builder's flat per-chunk layouts at ``C`` and ``2C``.
     """
@@ -3412,6 +3452,8 @@ class KdaChunkPairSpec:
     # The INPUT chunk; the output chunk is ``2 * chunk``.
     chunk: int = 32
     block_size: int = 256
+    head_v: int = 128
+    uw: bool = False
     name: str = "rocke_kda_chunk_pair"
 
     @property
@@ -3421,16 +3463,19 @@ class KdaChunkPairSpec:
     def lds_bytes(self) -> int:
         C, PDK, PC = self.chunk, self.head_k + 8, self.chunk + 8
         # GK1, GQ1, Kt0^T (C x DK) and A1, A0^T, M^T, A1 M (C x C), bf16.
-        return 3 * 2 * C * PDK + 4 * 2 * C * PC
+        n = 3 * 2 * C * PDK + 4 * 2 * C * PC
+        if self.uw:
+            P2 = 2 * C + 8
+            # A2 (2C x 2C), GK2^T (DK x 2C), V^T (EV x 2C), bf16.
+            n += 2 * (2 * C + self.head_k + self.head_v) * P2
+        return n
 
     def kernel_name(self) -> str:
-        return kernel_name_join(
-            self.name,
-            f"dk{self.head_k}",
-            self.dtype,
-            f"c{self.chunk}x2",
-            f"b{self.block_size}",
-        )
+        parts = [self.name, f"dk{self.head_k}", self.dtype, f"c{self.chunk}x2"]
+        parts.append(f"b{self.block_size}")
+        if self.uw:
+            parts += [f"dv{self.head_v}", "uw"]
+        return kernel_name_join(*parts)
 
 
 def is_valid_pair_spec(spec: KdaChunkPairSpec, arch: str = "gfx950") -> Tuple[bool, str]:
@@ -3457,6 +3502,13 @@ def is_valid_pair_spec(spec: KdaChunkPairSpec, arch: str = "gfx950") -> Tuple[bo
         )
     if spec.head_k > 4 * spec.block_size:
         return False, f"dec ({spec.head_k}) exceeds one 4-wide pass of the block"
+    if spec.uw and (
+        spec.head_v != spec.head_k or spec.block_size != 64 * (spec.head_k // atom.n)
+    ):
+        return False, (
+            "uw maps one 32-column tile of W and of U to each wave: needs "
+            f"head_v == head_k and block_size == 64 * head_k / {atom.n}"
+        )
     if spec.lds_bytes() > LDS_LIMIT:
         return False, f"LDS request {spec.lds_bytes()} B exceeds {LDS_LIMIT} B"
     return True, "ok"
@@ -3501,6 +3553,13 @@ def build_kda_chunk_pair(spec: KdaChunkPairSpec, arch: str = "gfx950") -> Kernel
         ptr("kt2_ptr", ELEM, 0),
         ptr("dec2_ptr", F32, 0),
     )
+    if spec.uw:
+        EV = spec.head_v
+        v_in, u_out = ptr("v_ptr", ELEM, 1), ptr("u2_ptr", ELEM, 0)
+        nc2 = b.param("nc", I32)  # 2C chunks per head
+        heads = b.param("heads", I32)
+        tseq = b.param("tseq", I32)
+        io = _RawTokenAddr(b, heads=heads, tseq=tseq, nc=nc2, chunk=C2, dk=DK)
 
     gk1_s = b.smem_alloc(ELEM, [C, PDK], "gk1_s")
     gq1_s = b.smem_alloc(ELEM, [C, PDK], "gq1_s")
@@ -3509,6 +3568,11 @@ def build_kda_chunk_pair(spec: KdaChunkPairSpec, arch: str = "gfx950") -> Kernel
     a0t_s = b.smem_alloc(ELEM, [C, PC], "a0t_s")
     mt_s = b.smem_alloc(ELEM, [C, PC], "mt_s")
     p_s = b.smem_alloc(ELEM, [C, PC], "p_s")
+    if spec.uw:
+        P2 = C2 + 8
+        a2_s = b.smem_alloc(ELEM, [C2, P2], "a2_s")
+        gkt_s = b.smem_alloc(ELEM, [DK, P2], "gkt_s")
+        vtt_s = b.smem_alloc(ELEM, [EV, P2], "vtt_s")
 
     tid = b.thread_id_x()
     lane = b.mod(tid, b.const_i32(64))
@@ -3565,12 +3629,18 @@ def build_kda_chunk_pair(spec: KdaChunkPairSpec, arch: str = "gfx950") -> Kernel
                 dec0 += [b.vec_extract(dv, j) for j in range(4)]
             for src, dst, stage in ((gk_in, gk_out, gk1_s), (gq_in, gq_out, gq1_s)):
                 v0 = b.global_load_vN(src, b.add(b.mul(t0, b.const_i32(C * DK)), off), ELEM, 8)
-                b.global_store_vN(dst, b.add(out_cd, off), v0, 8)
                 v1 = b.global_load_vN(src, b.add(b.mul(t1, b.const_i32(C * DK)), off), ELEM, 8)
                 b.smem_store_vN(stage, [row, col], v1, 8)
-                b.global_store_vN(
-                    dst, b.add(out_cd, b.add(b.const_i32(C * DK), off)), scaled8(v1, dec0), 8
-                )
+                v1s = scaled8(v1, dec0)
+                if spec.uw and src is gk_in:
+                    # GK2 is consumed here (W = A2 GK2), transposed for the B side.
+                    for jj in range(8):
+                        dd = b.add(col, b.const_i32(jj))
+                        _st(b, gkt_s, dd, row, value=b.vec_extract(v0, jj), n=1)
+                        _st(b, gkt_s, dd, b.add(row, b.const_i32(C)), value=b.vec_extract(v1s, jj), n=1)
+                    continue
+                b.global_store_vN(dst, b.add(out_cd, off), v0, 8)
+                b.global_store_vN(dst, b.add(out_cd, b.add(b.const_i32(C * DK), off)), v1s, 8)
 
     # ---- Kt2 = [Kt0 * dec1 | Kt1]; Kt0 also staged transposed -----------
     out_kt = b.mul(pair, b.const_i32(DK * C2))
@@ -3600,13 +3670,31 @@ def build_kda_chunk_pair(spec: KdaChunkPairSpec, arch: str = "gfx950") -> Kernel
             for src, dst in ((a_in, a_out), (aqk_in, aqk_out)):
                 v0 = b.global_load_vN(src, b.add(b.mul(t0, b.const_i32(C * C)), off), ELEM, 8)
                 v1 = b.global_load_vN(src, b.add(b.mul(t1, b.const_i32(C * C)), off), ELEM, 8)
-                b.global_store_vN(dst, top, v0, 8)
-                b.global_store_vN(dst, b.add(top, b.const_i32(C)), zero8, 8)
-                b.global_store_vN(dst, bottom, v1, 8)
                 if src is a_in:
                     b.smem_store_vN(a1_s, [i, j], v1, 8)
                     for jj in range(8):
                         _st(b, a0t_s, b.add(j, b.const_i32(jj)), i, value=b.vec_extract(v0, jj), n=1)
+                    if spec.uw:
+                        # A2 stays on chip: W and U are its only consumers.
+                        b.smem_store_vN(a2_s, [i, j], v0, 8)
+                        b.smem_store_vN(a2_s, [i, b.add(j, b.const_i32(C))], zero8, 8)
+                        b.smem_store_vN(
+                            a2_s, [b.add(i, b.const_i32(C)), b.add(j, b.const_i32(C))], v1, 8
+                        )
+                        continue
+                b.global_store_vN(dst, top, v0, 8)
+                b.global_store_vN(dst, b.add(top, b.const_i32(C)), zero8, 8)
+                b.global_store_vN(dst, bottom, v1, 8)
+    if spec.uw:
+        # V^T of the pair's 2C tokens, the B operand of U = A2 V.
+        for vidx, guard in slots(C2 * EV // 8):
+            with guard:
+                off = b.mul(vidx, b.const_i32(8))
+                row = b.div(off, b.const_i32(EV))
+                e = b.mod(off, b.const_i32(EV))
+                vv = b.global_load_vN(v_in, io.v_off(pair, row, e, EV), ELEM, 8)
+                for jj in range(8):
+                    _st(b, vtt_s, b.add(e, b.const_i32(jj)), row, value=b.vec_extract(vv, jj), n=1)
     b.sync_lds_only()
 
     lane_m = b.mod(lane, b.const_i32(atom.m))
@@ -3654,12 +3742,41 @@ def build_kda_chunk_pair(spec: KdaChunkPairSpec, arch: str = "gfx950") -> Kernel
         x = mm(p_s, a0t_s, C // atom.k)
         for s in range(atom.c_per_lane):
             r, c = atom.lane_to_output(b, lane, s)
-            b.global_store_vN(
-                a_out,
-                lower_left(r, c),
-                b.cast_f32_to(b.fneg(b.vec_extract(x, s)), ELEM),
-                1,
-            )
+            val = b.cast_f32_to(b.fneg(b.vec_extract(x, s)), ELEM)
+            if spec.uw:
+                _st(b, a2_s, b.add(r, b.const_i32(C)), c, value=val, n=1)
+            else:
+                b.global_store_vN(a_out, lower_left(r, c), val, 1)
+
+    if spec.uw:
+        b.sync_lds_only()
+        # ---- W = A2 GK2 (into GK2's slot) and U = A2 V ---------------------
+        # Wave w owns output columns [32w, 32w + 32) of both; row tile 0 only
+        # contracts over the first chunk (A2's upper-right block is zero).
+        ccol = b.add(b.mul(wave, b.const_i32(atom.n)), lane_m)
+        for b_s, dst, ncols in ((gkt_s, gk_out, DK), (vtt_s, u_out, EV)):
+            base = b.mul(pair, b.const_i32(C2 * ncols))
+            for rt in range(C2 // atom.m):
+                acc = atom.zero_acc(b)
+                arow = b.add(b.const_i32(rt * atom.m), lane_m)
+                for ks in range((rt + 1) * atom.m // atom.k):
+                    kb = b.add(b.const_i32(ks * atom.k), koff)
+                    acc = atom.emit(
+                        b,
+                        _ld(b, a2_s, arow, kb, dtype=ELEM, n=atom.a_per_lane),
+                        _ld(b, b_s, ccol, kb, dtype=ELEM, n=atom.b_per_lane),
+                        acc,
+                    )
+                for s in range(atom.c_per_lane):
+                    r, c = atom.lane_to_output(b, lane, s)
+                    orow = b.add(b.const_i32(rt * atom.m), r)
+                    ocol = b.add(b.mul(wave, b.const_i32(atom.n)), c)
+                    b.global_store_vN(
+                        dst,
+                        b.add(base, b.add(b.mul(orow, b.const_i32(ncols)), ocol)),
+                        b.cast_f32_to(b.vec_extract(acc, s), ELEM),
+                        1,
+                    )
 
     b.ret()
     return b.kernel
@@ -3676,6 +3793,9 @@ def kda_chunk_pair_signature(spec: KdaChunkPairSpec):
         for name in ("a", "gk", "gq", "aqk", "kt"):
             sb = sb.ptr(f"{name}{suffix}_ptr", spec.dtype)
         sb = sb.ptr(f"dec{suffix}_ptr", "f32")
+    if spec.uw:
+        sb = sb.ptr("v_ptr", spec.dtype).ptr("u2_ptr", spec.dtype)
+        sb = sb.scalar("nc", "i32").scalar("heads", "i32").scalar("tseq", "i32")
     return sb.build()
 
 

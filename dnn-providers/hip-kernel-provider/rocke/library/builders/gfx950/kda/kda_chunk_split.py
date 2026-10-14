@@ -106,12 +106,15 @@ def make_pair_launcher(spec: KdaChunkPairSpec) -> KernelLauncher:
     return _LAUNCHER_CACHE[key]
 
 
-def run_pair(spec: KdaChunkPairSpec, ws, ws2, num_tiles: int, stream=None) -> None:
+def run_pair(
+    spec: KdaChunkPairSpec, ws, ws2, num_tiles: int, stream=None, *, v=None, heads=None, tseq=None
+) -> None:
     """Combine ``num_tiles`` C-chunk tiles in ``ws`` into ``num_tiles / 2``
     2C-chunk tiles in ``ws2`` (see :class:`KdaChunkPairSpec`).
 
     Pairs are consecutive tile indices, so every head's chunk count must be
-    even for no pair to straddle two heads.
+    even for no pair to straddle two heads. ``uw`` also reads the token-major
+    ``v`` and writes ``ws2["u"]`` (``[num_tiles / 2, 2C, EV]``).
     """
     assert num_tiles % 2 == 0, "chunk pairing needs an even chunk count"
     launcher = make_pair_launcher(spec)
@@ -124,6 +127,11 @@ def run_pair(spec: KdaChunkPairSpec, ws, ws2, num_tiles: int, stream=None) -> No
     )
     args = {f"{n}_ptr": ws[n] for n in ("a", "gk", "gq", "aqk", "kt", "dec")}
     args.update({f"{n}2_ptr": ws2[n] for n in ("a", "gk", "gq", "aqk", "kt", "dec")})
+    if spec.uw:
+        nc2 = int(tseq) // (2 * spec.chunk)
+        args.update(
+            {"v_ptr": v, "u2_ptr": ws2["u"], "nc": nc2, "heads": int(heads), "tseq": int(tseq)}
+        )
     launcher(args, config=cfg)
 
 
