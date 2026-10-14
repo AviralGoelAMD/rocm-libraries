@@ -802,7 +802,7 @@ def pv32_v_load_paired(
     lane_col32: Value,
     dtype: Type,
     col_xor_of_row=None,
-    lds_alias=None,
+    lds_dma_scope=None,
 ) -> Value:
     """Promoted 32x32x16 PV V-load (P50): two paired ``ds_read_tr16_b64``
     + concat → ``<8 x dtype>`` per lane.
@@ -835,7 +835,7 @@ def pv32_v_load_paired(
     evaluated once on the lane part of the row, so the swizzled column is
     k-invariant and the ``k * 16`` / ``+ 8`` row steps stay constant address
     offsets.
-    ``lds_alias`` tags both reads (see :meth:`IRBuilder.ds_read_tr16_b64`).
+    ``lds_dma_scope`` tags both reads (see :meth:`IRBuilder.ds_read_tr16_b64`).
     """
     col_group16 = b.mul(b.div(lane_col32, b.const_i32(16)), b.const_i32(16))
     tr_col32 = b.add(
@@ -843,6 +843,8 @@ def pv32_v_load_paired(
         b.mul(b.mod(lane_col32, b.const_i32(4)), b.const_i32(4)),
     )
     if col_xor_of_row is None:
+        # Natural layout: the historical emission order (each read builds its
+        # own column add; the +8 row is built between the reads).
         tr_row_base32 = b.add(
             b.add(
                 b.const_i32(k * 16),
@@ -850,21 +852,35 @@ def pv32_v_load_paired(
             ),
             b.mod(b.div(lane_col32, b.const_i32(4)), b.const_i32(4)),
         )
-        tr_row_hi = b.add(tr_row_base32, b.const_i32(8))
-        col_r0 = col_r1 = b.add(b.const_i32(n * 32), tr_col32)
-    else:
-        lane_row = b.add(
-            b.mul(lane_half32, b.const_i32(4)),
-            b.mod(b.div(lane_col32, b.const_i32(4)), b.const_i32(4)),
+        A_r0 = b.ds_read_tr16_b64(
+            V_lds,
+            v_buf,
+            tr_row_base32,
+            b.add(b.const_i32(n * 32), tr_col32),
+            dtype=dtype,
+            lds_dma_scope=lds_dma_scope,
         )
-        tr_row_base32 = b.add(b.const_i32(k * 16), lane_row)
-        tr_row_hi = b.add(tr_row_base32, b.const_i32(8))
-        col = b.add(b.const_i32(n * 32), tr_col32)
-        col_r0 = col_r1 = b.xor(col, col_xor_of_row(lane_row))
+        A_r1 = b.ds_read_tr16_b64(
+            V_lds,
+            v_buf,
+            b.add(tr_row_base32, b.const_i32(8)),
+            b.add(b.const_i32(n * 32), tr_col32),
+            dtype=dtype,
+            lds_dma_scope=lds_dma_scope,
+        )
+        return b.vec_concat(A_r0, A_r1)
+    lane_row = b.add(
+        b.mul(lane_half32, b.const_i32(4)),
+        b.mod(b.div(lane_col32, b.const_i32(4)), b.const_i32(4)),
+    )
+    tr_row_base32 = b.add(b.const_i32(k * 16), lane_row)
+    tr_row_hi = b.add(tr_row_base32, b.const_i32(8))
+    col = b.add(b.const_i32(n * 32), tr_col32)
+    col_swz = b.xor(col, col_xor_of_row(lane_row))
     A_r0 = b.ds_read_tr16_b64(
-        V_lds, v_buf, tr_row_base32, col_r0, dtype=dtype, lds_alias=lds_alias
+        V_lds, v_buf, tr_row_base32, col_swz, dtype=dtype, lds_dma_scope=lds_dma_scope
     )
     A_r1 = b.ds_read_tr16_b64(
-        V_lds, v_buf, tr_row_hi, col_r1, dtype=dtype, lds_alias=lds_alias
+        V_lds, v_buf, tr_row_hi, col_swz, dtype=dtype, lds_dma_scope=lds_dma_scope
     )
     return b.vec_concat(A_r0, A_r1)

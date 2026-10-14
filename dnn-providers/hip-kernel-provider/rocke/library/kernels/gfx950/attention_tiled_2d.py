@@ -527,7 +527,7 @@ class UnifiedAttention2DTiledSpec:
     # softmax and PV. With this flag those barriers become ``lgkmcnt(0)`` +
     # ``s_barrier`` behind the explicit counted ``vmcnt`` wait, and the K/V
     # DMA writes and the K/V operand reads carry disjoint scoped-noalias
-    # metadata (``lds_alias``) so the backend waitcnt pass stops inserting its
+    # metadata (``lds_dma_scope``) so the backend waitcnt pass stops inserting its
     # own ``vmcnt(0)`` in front of the operand reads. Ordering between a tile's
     # DMA and its reads is carried entirely by the explicit waits + barriers.
     use_lds_dma_overlap: bool = False
@@ -2410,7 +2410,7 @@ def build_unified_attention_2d_tiled(
             # right hint for K-loop streaming tile loads.
             b.async_buffer_load_lds_addr(
                 k_rsrc, k_dst, voff, k_soff, 4, coherency=CACHE_STREAM,
-                lds_alias=LDS_DMA_TAG,
+                lds_dma_scope=LDS_DMA_TAG,
             )
 
     def _issue_v_load_runtime(kv_tile_idx: Value, buf_idx: Value) -> None:
@@ -2476,7 +2476,7 @@ def build_unified_attention_2d_tiled(
             # the rationale.
             b.async_buffer_load_lds_addr(
                 v_rsrc, v_dst, voff, v_soff, 4, coherency=CACHE_STREAM,
-                lds_alias=LDS_DMA_TAG,
+                lds_dma_scope=LDS_DMA_TAG,
             )
 
     # ---------------- FP8 K/V cache: async DMA loader (round 2) ----------------
@@ -3002,11 +3002,11 @@ def build_unified_attention_2d_tiled(
             )
             return b.smem_load_vN(
                 K_lds, buf_idx, slab, col_in_slab, dtype=dtype, n=8,
-                lds_alias=LDS_READ_TAG,
+                lds_dma_scope=LDS_READ_TAG,
             )
         if not K_FP8_MFMA:
             return b.smem_load_vN(
-                K_lds, buf_idx, k_row, k_off, dtype=dtype, n=8, lds_alias=LDS_READ_TAG
+                K_lds, buf_idx, k_row, k_off, dtype=dtype, n=8, lds_dma_scope=LDS_READ_TAG
             )
         if FP8_NATIVE_QK:
             # Native fp8 QK: hand the raw fp8 K straight to the fp8 MFMA --
@@ -4319,7 +4319,7 @@ def build_unified_attention_2d_tiled(
                                 lane_col32=lane_col32,
                                 dtype=dtype,
                                 col_xor_of_row=_v_swz_halves if V_LDS_SWZ else None,
-                                lds_alias=LDS_READ_TAG,
+                                lds_dma_scope=LDS_READ_TAG,
                             )
                             b_p_elems = []
                             for kk in range(8):
@@ -4347,7 +4347,7 @@ def build_unified_attention_2d_tiled(
                                 )
                                 v1 = b.smem_load_vN(
                                     V_lds, v_buf, v_row, v_dim32, dtype=dtype, n=1,
-                                    lds_alias=LDS_READ_TAG,
+                                    lds_dma_scope=LDS_READ_TAG,
                                 )
                                 a_v_elems.append(b.vec_extract(v1, 0))
                             # Then assemble the P operand. Each kk picks (k0,

@@ -256,6 +256,14 @@ def _check_axis(op: str, axis: object) -> str:
         raise ValueError(f"{op} axis must be x, y, or z, got {axis!r}")
     return str(axis)
 
+def _check_lds_dma_scope(scope: object) -> str:
+    """Validate an ``lds_dma_scope`` tag: ``"dma"`` (an LDS-DMA write) or
+    ``"read"`` (an LDS read declared disjoint from every tagged DMA write)."""
+    if scope not in ("dma", "read"):
+        raise ValueError(f"lds_dma_scope must be 'dma' or 'read', got {scope!r}")
+    return str(scope)
+
+
 
 # gfx1250 workgroup-cluster shape limits, matching what clang accepts for
 # ``__cluster_dims__``: each axis must fit the 4-bit field (1..15) and the
@@ -2203,7 +2211,12 @@ class IRBuilder:
         return self.smem_load_vN(smem, *indices, dtype=F16, n=n)
 
     def smem_load_vN(
-        self, smem: Value, *indices, dtype: Type, n: int = 0, lds_alias: Optional[str] = None
+        self,
+        smem: Value,
+        *indices,
+        dtype: Type,
+        n: int = 0,
+        lds_dma_scope: Optional[str] = None,
     ) -> Value:
         """LDS load of ``<N x dtype>``. Supports 8-bit (fp8e4m3 / bf8e5m2 /
         i8), 16-bit (f16 / bf16), 32-bit (f32 / i32) and 64-bit (f64, ``n in
@@ -2243,9 +2256,9 @@ class IRBuilder:
         if not indices:
             raise ValueError("smem_load_vN needs at least one index")
         attrs = {"elem_type": dtype.name, "vec": n, "rank": len(indices)}
-        if lds_alias is not None:
+        if lds_dma_scope is not None:
             # Scoped-noalias tag ("read"); see ``async_buffer_load_lds_addr``.
-            attrs["lds_alias"] = lds_alias
+            attrs["lds_dma_scope"] = _check_lds_dma_scope(lds_dma_scope)
         return self._op(
             "tile.smem_load_vN",
             [smem, *indices],
@@ -3728,7 +3741,7 @@ class IRBuilder:
         smem: Value,
         *indices: Value,
         dtype: Type = F16,
-        lds_alias: Optional[str] = None,
+        lds_dma_scope: Optional[str] = None,
     ) -> Value:
         """`ds_read_b64_tr_b16` — wave64 transpose-read of a 16x16 fp16 tile
         from LDS, returning the MFMA B-operand layout directly.
@@ -3748,14 +3761,14 @@ class IRBuilder:
         Use case: PV gemm where `V[T, HD]` is in LDS row-major and we want
         `B[k_chunk*4 + 0..3, n]` per lane without 4 strided `ds_read_u16`.
 
-        ``lds_alias``: optional scoped-noalias tag (``"read"``); see
+        ``lds_dma_scope``: optional scoped-noalias tag (``"read"``); see
         :meth:`async_buffer_load_lds_addr`.
         """
         if not indices:
             raise ValueError("ds_read_tr16_b64 needs at least one index")
         attrs = {"rank": len(indices), "elem_type": dtype.name}
-        if lds_alias is not None:
-            attrs["lds_alias"] = lds_alias
+        if lds_dma_scope is not None:
+            attrs["lds_dma_scope"] = _check_lds_dma_scope(lds_dma_scope)
         return self._op(
             "tile.ds_read_tr16_b64",
             [smem, *indices],
@@ -3856,7 +3869,7 @@ class IRBuilder:
         soffset: Value,
         dwords: int,
         coherency: int = 0,
-        lds_alias: Optional[str] = None,
+        lds_dma_scope: Optional[str] = None,
     ) -> None:
         """Variant of `async_buffer_load_lds` that takes a raw i64 LDS
         address instead of a typed `smem<...>` value. This is the form
@@ -3873,12 +3886,14 @@ class IRBuilder:
         the L1/L2 caching policy. ``CACHE_STREAM`` is the
         right hint for one-shot streaming loads in a
         ping-pong pipeline that won't reuse the data.
-        lds_alias: optional scoped-noalias tag. ``"dma"`` on the write and
-        ``"read"`` on LDS reads (``smem_load_vN``) declares the two
-        disjoint, so the backend need not drain this DMA (``vmcnt``)
-        before those reads. Only valid when the caller orders the
-        reads after the writes they consume with an explicit
-        ``s_waitcnt`` + barrier.
+        lds_dma_scope: optional scoped-noalias tag. ``"dma"`` on the write
+        and ``"read"`` on LDS reads (``smem_load_vN`` /
+        ``ds_read_tr16_b64``) declares the two disjoint, so the backend need
+        not drain this DMA (``vmcnt``) before those reads. The claim is
+        static (one domain, every tagged read vs every tagged write, across
+        loop iterations too), so it is only valid when every read of a DMA'd
+        slot is ordered after its write by an explicit ``s_waitcnt`` +
+        barrier.
         """
         if dwords not in (1, 3, 4):
             raise ValueError(
@@ -3887,8 +3902,8 @@ class IRBuilder:
         if coherency not in (0, 1, 2, 3):
             raise ValueError(f"coherency must be 0..3 (got {coherency})")
         attrs = {"dwords": int(dwords), "aux": int(coherency)}
-        if lds_alias is not None:
-            attrs["lds_alias"] = lds_alias
+        if lds_dma_scope is not None:
+            attrs["lds_dma_scope"] = _check_lds_dma_scope(lds_dma_scope)
         self._op(
             "tile.async_buffer_load_lds_addr",
             [rsrc, lds_addr, voffset, soffset],

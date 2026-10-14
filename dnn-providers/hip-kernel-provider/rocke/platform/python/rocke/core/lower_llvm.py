@@ -1601,8 +1601,8 @@ class _Lowerer:
         self._needs_nontemporal_md: bool = False
         # Scoped-noalias LDS metadata (``!9000``..``!9004``) referenced by
         # DTL ``buffer.load.lds`` writes and LDS reads that carry an
-        # ``lds_alias`` attr ("dma" / "read"); see ``_lds_alias_md``.
-        self._needs_lds_alias_md: bool = False
+        # ``lds_dma_scope`` attr ("dma" / "read"); see ``_lds_dma_scope_md``.
+        self._needs_lds_dma_scope_md: bool = False
         # Off unless the kernel was built with source-location capture (see
         # IRBuilder's ``capture_loc`` / ROCKE_DEBUG_LOC). When off, not one byte
         # of the emitted .ll changes, so the byte-identity gate and the IR
@@ -3461,7 +3461,8 @@ class _Lowerer:
         if vec == 1:
             scalar = self._fresh("smem.s")
             self._current().emit(
-                f"  {scalar} = load {volatile}{elem_ty}, ptr addrspace(3) {base}, align {align}"
+                f"  {scalar} = load {volatile}{elem_ty}, ptr addrspace(3) {base}, "
+                f"align {align}{self._lds_dma_scope_md(op)}"
             )
             self._current().emit(
                 f"  {op.result.name} = insertelement <1 x {elem_ty}> undef, {elem_ty} {scalar}, i32 0"
@@ -3469,11 +3470,11 @@ class _Lowerer:
         else:
             self._current().emit(
                 f"  {op.result.name} = load {volatile}<{vec} x {elem_ty}>, ptr addrspace(3) {base}, "
-                f"align {align}{self._lds_alias_md(op)}"
+                f"align {align}{self._lds_dma_scope_md(op)}"
             )
 
-    def _lds_alias_md(self, op: Op) -> str:
-        """Scoped-noalias metadata suffix for an op tagged ``lds_alias``.
+    def _lds_dma_scope_md(self, op: Op) -> str:
+        """Scoped-noalias metadata suffix for an op tagged ``lds_dma_scope``.
 
         Two scopes in one domain: ``dma`` (direct-to-LDS async writes) and
         ``read`` (LDS operand reads). Each side is ``noalias`` with the other,
@@ -3483,15 +3484,15 @@ class _Lowerer:
         disjoint LDS halves; cross-iteration ordering is enforced by the
         explicit ``s_waitcnt`` + barrier the caller places.
         """
-        tag = op.attrs.get("lds_alias")
+        tag = op.attrs.get("lds_dma_scope")
         if tag is None:
             return ""
-        self._needs_lds_alias_md = True
+        self._needs_lds_dma_scope_md = True
         if tag == "dma":
             return ", !alias.scope !9003, !noalias !9004"
         if tag == "read":
             return ", !alias.scope !9004, !noalias !9003"
-        raise ValueError(f"unknown lds_alias tag {tag!r}")
+        raise ValueError(f"unknown lds_dma_scope tag {tag!r}")
 
     def _op_tile_wmma_f32_16x16x16_f16(self, op: Op) -> None:
         # RDNA WMMA: emission is arch-specific, so it routes through the ISA
@@ -4558,7 +4559,7 @@ class _Lowerer:
         raw = self._fresh("tr.raw")
         self._current().emit(
             f"  {raw} = call <4 x i16> @llvm.amdgcn.ds.read.tr16.b64("
-            f"ptr addrspace(3) {base}){self._lds_alias_md(op)}"
+            f"ptr addrspace(3) {base}){self._lds_dma_scope_md(op)}"
         )
         elem_ty = _llvm_type(op.result.type.elem)  # type: ignore[attr-defined]
         self._current().emit(
@@ -4819,7 +4820,7 @@ class _Lowerer:
             f"i32 {size_bytes}, "
             f"i32 {self._operand(voff)}, "
             f"i32 {self._operand(soff)}, "
-            f"i32 0, i32 {aux}){self._lds_alias_md(op)}"
+            f"i32 0, i32 {aux}){self._lds_dma_scope_md(op)}"
         )
 
     def _op_tile_s_wait_asynccnt(self, op: Op) -> None:
@@ -6639,7 +6640,7 @@ class _Lowerer:
         if self._needs_nontemporal_md:
             out.append("!5 = !{i32 1}")
             out.append("")
-        if self._needs_lds_alias_md:
+        if self._needs_lds_dma_scope_md:
             out.append('!9000 = distinct !{!9000, !"rocke.lds"}')
             out.append('!9001 = distinct !{!9001, !9000, !"rocke.lds.dma"}')
             out.append('!9002 = distinct !{!9002, !9000, !"rocke.lds.read"}')

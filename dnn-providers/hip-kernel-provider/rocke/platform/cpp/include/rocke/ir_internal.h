@@ -146,6 +146,14 @@ int rocke_i_count_of(const rocke_type_t* t);
  * the Python ops pass to _op. These mutate via rocke_attr_set_* (public). */
 rocke_attr_map_t rocke_i_attrs(rocke_ir_builder_t* b);
 
+/* Python _check_lds_dma_scope + attrs["lds_dma_scope"] = scope: NULL leaves
+ * `attrs` untouched; "dma" / "read" set the attr; anything else sets the
+ * builder error and returns false. `what` names the op in the message. */
+bool rocke_i_set_lds_dma_scope(rocke_ir_builder_t* b,
+                               rocke_attr_map_t* attrs,
+                               const char* lds_dma_scope,
+                               const char* what);
+
 /* Deep-copy an attr map into the arena (for rocke_b_op which takes a borrowed
  * attrs pointer; Op.attrs is dict(attrs or {}) in Python). */
 void rocke_i_attrs_copy(rocke_ir_builder_t* b, rocke_attr_map_t* dst, const rocke_attr_map_t* src);

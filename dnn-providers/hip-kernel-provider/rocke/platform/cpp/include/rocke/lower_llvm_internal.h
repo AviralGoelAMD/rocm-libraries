@@ -402,6 +402,9 @@ struct rocke_lower
     bool needs_fp_atomic_md; /* _needs_fp_atomic_md      */
     bool needs_av_scope_md; /* agent-scope metadata for av.load/store.b128 */
     bool needs_nontemporal_md; /* _needs_nontemporal_md: "!5 = !{i32 1}" */
+    /* _needs_lds_dma_scope_md: the !9000..!9004 scoped-noalias LDS domain
+     * referenced by ops tagged lds_dma_scope ("dma" / "read"). */
+    bool needs_lds_dma_scope_md;
 
     /* dynamically-registered decls (Python self._decls mutation, e.g. vector
      * smax registers "llvm.smax.vNiW"). Keyed; consulted by _need fallback. */
@@ -560,6 +563,12 @@ int rocke_ll_anyptr_space(rocke_lower_t* L,
 /* LLVM aggregate storage type for a SmemType: nested arrays of the element
  * (Python _smem_storage_type). Arena-owned. */
 const char* rocke_ll_smem_storage_type(rocke_lower_t* L, const rocke_type_t* smem);
+
+/* Python _Lowerer._lds_dma_scope_md: the scoped-noalias suffix for an op
+ * tagged lds_dma_scope (", !alias.scope !9003, !noalias !9004" for "dma",
+ * the swapped pair for "read", "" when untagged). Sets
+ * needs_lds_dma_scope_md; fails on any other tag. */
+const char* rocke_ll_lds_dma_scope_md(rocke_lower_t* L, const rocke_op_t* op);
 
 /* True if `v` is produced by arith.constant (Python _is_constant). */
 bool rocke_ll_is_constant(const rocke_value_t* v);

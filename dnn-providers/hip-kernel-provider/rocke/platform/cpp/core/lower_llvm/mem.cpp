@@ -737,12 +737,13 @@ static void op_tile_smem_load_vN(rocke_lower_t* L, const rocke_op_t* op)
     {
         const char* scalar = rocke_ll_fresh(L, "smem.s");
         rocke_ll_emitf(L,
-                       "  %s = load %s%s, ptr addrspace(3) %s, align %lld",
+                       "  %s = load %s%s, ptr addrspace(3) %s, align %lld%s",
                        scalar,
                        volatile_kw,
                        elem_ty,
                        base,
-                       (long long)align);
+                       (long long)align,
+                       rocke_ll_lds_dma_scope_md(L, op));
         rocke_ll_emitf(L,
                        "  %s = insertelement <1 x %s> undef, %s %s, i32 0",
                        ll_res(op),
@@ -753,13 +754,14 @@ static void op_tile_smem_load_vN(rocke_lower_t* L, const rocke_op_t* op)
     else
     {
         rocke_ll_emitf(L,
-                       "  %s = load %s<%lld x %s>, ptr addrspace(3) %s, align %lld",
+                       "  %s = load %s<%lld x %s>, ptr addrspace(3) %s, align %lld%s",
                        ll_res(op),
                        volatile_kw,
                        (long long)vec,
                        elem_ty,
                        base,
-                       (long long)align);
+                       (long long)align,
+                       rocke_ll_lds_dma_scope_md(L, op));
     }
 }
 
@@ -1470,13 +1472,14 @@ static void op_tile_async_buffer_load_lds_addr(rocke_lower_t* L, const rocke_op_
     rocke_ll_emitf(L,
                    "  call void @llvm.amdgcn.raw.ptr.buffer.load.lds("
                    "ptr addrspace(8) %s, ptr addrspace(3) %s, i32 %lld, i32 %s, i32 %s, "
-                   "i32 0, i32 %lld)",
+                   "i32 0, i32 %lld)%s",
                    rocke_ll_operand(L, rsrc),
                    ptr_name,
                    (long long)size_bytes,
                    rocke_ll_operand(L, voff),
                    rocke_ll_operand(L, soff),
-                   (long long)aux);
+                   (long long)aux,
+                   rocke_ll_lds_dma_scope_md(L, op));
 }
 
 static void op_tile_async_buffer_load_lds(rocke_lower_t* L, const rocke_op_t* op)
