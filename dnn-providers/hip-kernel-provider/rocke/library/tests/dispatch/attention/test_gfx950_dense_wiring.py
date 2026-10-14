@@ -957,6 +957,60 @@ class TestGfx950DenseCandidates(unittest.TestCase):
         self.assertFalse(_spec(short, _GRID, block_m=256).wide_lds_dma)
         self.assertFalse(_spec(aligned, _PERSIST).wide_lds_dma)
 
+    def test_grid_default_takes_the_lookahead_levers(self):
+        """Wide-DMA grid problems default to the qk_lookahead loop on the LDS
+        alias rings: the 128-row tile below the windows length, the 256-row
+        mfma_windows tile (window_fence, pv_window_exp) from it on; levers
+        follow a swept tile and stay off where they were not measured."""
+        d128 = dict(hdim_q=128, hdim_v=128, nhead_q=32, nhead_k=8)
+
+        def grid(seqlen, mask_type=1, dtype="bf16", **kw):
+            req = _gfx950_dense_req(
+                **d128,
+                seqlen_q=seqlen,
+                seqlen_k=seqlen,
+                mask_type=mask_type,
+                dtype=dtype,
+                **kw,
+            )
+            return _spec(req, _GRID)
+
+        for seqlen, mask_type, windows in (
+            (1024, 1, False),
+            (2048, 1, False),
+            (4096, 1, True),
+            (16384, 1, True),
+            (1024, 0, False),
+            (1536, 0, True),
+            (8192, 0, True),
+        ):
+            with self.subTest(seqlen=seqlen, mask_type=mask_type):
+                spec = grid(seqlen, mask_type)
+                self.assertTrue(spec.qk_lookahead and spec.lds_dma_alias_ring)
+                self.assertEqual(spec.qk_lookahead_unroll, 2)
+                self.assertEqual(spec.pv_priority, 0)
+                self.assertEqual(spec.o_store_width, 8)
+                self.assertEqual(spec.block_m, 256 if windows else 128)
+                self.assertEqual(spec.mfma_windows, 4 if windows else 0)
+                self.assertEqual(spec.window_fence, windows)
+                self.assertEqual(spec.pv_window_exp, 1 if windows else 0)
+        fp16 = grid(8192, dtype="fp16")
+        self.assertEqual((fp16.mfma_windows, fp16.o_store_width), (4, 4))
+        # A swept tile carries its own levers.
+        req = _gfx950_dense_req(**d128, seqlen_q=8192, seqlen_k=8192)
+        bm128 = _spec(req, _GRID, block_m=128)
+        self.assertTrue(bm128.qk_lookahead)
+        self.assertEqual(bm128.mfma_windows, 0)
+        self.assertFalse(_spec(req, _GRID, block_n=128).qk_lookahead)
+        # No levers on the problems they were not measured on.
+        for kw in (dict(use_sinks=True), dict(emit_lse=True)):
+            with self.subTest(**kw):
+                spec = grid(8192, **kw)
+                self.assertFalse(spec.qk_lookahead)
+                self.assertEqual((spec.block_m, spec.pv_priority), (128, 1))
+        self.assertFalse(_spec(_gfx950_dense_req(), _GRID).qk_lookahead)
+        self.assertFalse(grid(8192, sliding_window=256).qk_lookahead)
+
     def test_wide_dma_starts_at_a_non_ragged_tile(self):
         """Wide DMA has no ragged path: where 256x64 is ragged its default is
         the 128x64 tile, and the same knob setting keeps one tuning_id across

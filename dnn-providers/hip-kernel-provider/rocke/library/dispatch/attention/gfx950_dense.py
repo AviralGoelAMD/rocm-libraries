@@ -20,7 +20,9 @@ stricter gate.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from dataclasses import fields as dataclass_fields
+from types import MappingProxyType
 from typing import Mapping, Tuple
 
 from rocke.dispatch.core import CandidateRegistry, KernelCandidate
@@ -38,14 +40,40 @@ from .common import (
 
 _DENSE_LAYOUT = "default"
 _DENSE_TILE = "default"
-# The grid body starts at the 128-row query tile; the persistent bodies keep
-# the default tile.
+# The grid body starts at the 128-row query tile (the 256-row tile from
+# _GRID_WINDOWS_MIN_SEQLEN on, where the qk_lookahead levers apply); the
+# persistent bodies keep the default tile.
 _GRID_TILE = "bm128"
+_GRID_WINDOWS_TILE = "default"
 # Base-spec values the knob space starts from (and sweeps away from): the
 # gfx950 CU count and the shipped occupancy hint.
 _DEFAULT_NUM_PERSISTENT = 256
 _DEFAULT_WAVES_PER_EU = 2
 _FEATURES = frozenset({"causal", "sliding_window", "sinks", "lse"})
+# The grid body's qk_lookahead loop on the LDS-DMA alias rings: the 128-row
+# tile runs it as is, the 256-row tile with the barrier-window ping-pong.
+_LOOKAHEAD_LEVERS = MappingProxyType(
+    {
+        "qk_lookahead": True,
+        "qk_lookahead_unroll": 2,
+        "lds_dma_alias_ring": True,
+        "permlane32_reduce": True,
+    }
+)
+_WINDOW_LEVERS = MappingProxyType(
+    {
+        **_LOOKAHEAD_LEVERS,
+        "lds_read_base": True,
+        "scalar_uniforms": True,
+        "wave_group_pingpong": True,
+        "mfma_windows": 4,
+        "window_fence": True,
+        "pv_window_exp": 1,
+    }
+)
+# Query length from which the grid default takes the 256-row windows tile
+# (causal, non-causal); shorter problems keep the 128-row lookahead tile.
+_GRID_WINDOWS_MIN_SEQLEN = MappingProxyType({True: 4096, False: 1536})
 
 
 @dataclass(frozen=True)
@@ -116,10 +144,39 @@ def _grid_wide_lds_dma(
     return head_size == 128 and block_n == 64 and not ragged and not moving_bottom_right
 
 
+def _grid_takes_levers(
+    wide: bool, sliding_window: int, use_sinks: bool, emit_lse: bool
+) -> bool:
+    """The qk_lookahead levers run on the wide-DMA grid body without a sliding
+    window, sinks or an LSE output (the requests they were measured on)."""
+    return wide and sliding_window == 0 and not use_sinks and not emit_lse
+
+
+def _grid_levers(takes: bool, block_m: int, dtype: str) -> Mapping[str, object]:
+    """Every lever field for one grid tile: the 128-row tile's lookahead set,
+    the 256-row tile's windows set, or all off (the dataclass defaults). Under
+    the levers PV runs at the base priority and bf16 O stores are 16 bytes."""
+    from kernels.gfx950.attention_dense import Gfx950AttentionDenseSpec
+
+    defaults = {
+        f.name: f.default
+        for f in dataclass_fields(Gfx950AttentionDenseSpec)
+        if f.name in _WINDOW_LEVERS or f.name in ("pv_priority", "o_store_width")
+    }
+    if not takes or block_m not in (128, 256):
+        return defaults
+    levers = _LOOKAHEAD_LEVERS if block_m == 128 else _WINDOW_LEVERS
+    out = {**defaults, **levers, "pv_priority": 0}
+    if dtype == "bf16":
+        out["o_store_width"] = 8
+    return out
+
+
 def _derived(base, knobs: Mapping[str, object]) -> Mapping[str, object]:
     """``ragged`` for the tile the knobs choose: non-tile-multiple
     self-attention lengths take the on-chip ragged path. The grid body's wide
-    DMA follows the same tile."""
+    DMA and qk_lookahead levers follow the same tile (an explicit
+    ``pv_priority`` / ``o_store_width`` knob overrides the levers' value)."""
     block_m = int(knobs.get("block_m", base.block_m))
     block_n = int(knobs.get("block_n", base.block_n))
     ragged = _ragged_self_attention(
@@ -134,7 +191,28 @@ def _derived(base, knobs: Mapping[str, object]) -> Mapping[str, object]:
     wide = _grid_wide_lds_dma(
         int(base.head_size), block_n, ragged, bool(base.causal_bottom_right)
     )
-    return {"ragged": ragged, "wide_lds_dma": wide}
+    takes = _grid_takes_levers(
+        wide, int(base.sliding_window), bool(base.use_sinks), bool(base.emit_lse)
+    )
+    levers = _grid_levers(takes, block_m, str(base.dtype))
+    return {
+        "ragged": ragged,
+        "wide_lds_dma": wide,
+        **{k: v for k, v in levers.items() if k not in knobs},
+    }
+
+
+def _grid_default(spec):
+    """The grid candidate's default for one problem: the 256-row windows tile
+    from ``_GRID_WINDOWS_MIN_SEQLEN`` on wherever its levers apply, else the
+    128-row tile, with that tile's levers."""
+    from kernels.common.attention_dense_spec import DENSE_TILE_GEOMETRIES
+
+    if spec.seqlen_q >= _GRID_WINDOWS_MIN_SEQLEN[bool(spec.causal)]:
+        tile = {k: int(v) for k, v in DENSE_TILE_GEOMETRIES[_GRID_WINDOWS_TILE].items()}
+        if _derived(spec, tile)["mfma_windows"]:
+            spec = replace(spec, **tile)
+    return replace(spec, **_derived(spec, {}))
 
 
 def _base_spec(req: AttentionRequest, variant: Gfx950DenseVariant):
@@ -181,7 +259,7 @@ def _base_spec(req: AttentionRequest, variant: Gfx950DenseVariant):
             ):
                 bm, bn, ragged = int(tile["block_m"]), int(tile["block_n"]), False
                 break
-    return Gfx950AttentionDenseSpec(
+    spec = Gfx950AttentionDenseSpec(
         batch=int(req.batch),
         seqlen_q=sq,
         seqlen_kv=sk,
@@ -200,14 +278,11 @@ def _base_spec(req: AttentionRequest, variant: Gfx950DenseVariant):
         ragged=ragged,
         sliding_window=int(req.sliding_window),
         use_sinks=bool(req.use_sinks),
-        wide_lds_dma=variant.wide_lds_dma
-        or (
-            not variant.persistent
-            and _grid_wide_lds_dma(int(req.hdim_q), bn, ragged, moving_bottom_right)
-        ),
+        wide_lds_dma=variant.wide_lds_dma,
         causal_bottom_right=moving_bottom_right,
         emit_lse=bool(req.emit_lse),
     )
+    return spec if variant.persistent else _grid_default(spec)
 
 
 def _supports(spec, *, arch):
@@ -230,7 +305,13 @@ def _make_gfx950_attention_dense_candidate(
         base_spec=lambda req: _base_spec(req, variant),
         supports=_supports,
         features=variant.features,
-        recorded=frozenset({"block_m"}) if variant.wide_lds_dma else frozenset(),
+        # The persistent wide variant's and the grid's tile is resolved per
+        # problem (see _base_spec / _grid_default).
+        recorded=(
+            frozenset({"block_m"})
+            if variant.wide_lds_dma or not variant.persistent
+            else frozenset()
+        ),
         derived=_derived,
     )
 

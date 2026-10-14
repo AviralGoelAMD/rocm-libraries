@@ -55,6 +55,33 @@ def _gfx950_dense_inert_knobs(spec) -> dict:
         spec.grid_order
     ):
         inert["grid_order"] = "read only by the dense-batch grid body"
+    if spec.qk_lookahead:
+        # The qk_lookahead loop owns the softmax/PV schedule and its waits.
+        for name in (
+            "exp_per_pv_step",
+            "partial_vmcnt_prefetch",
+            "pv_sched_fence",
+            "pv_sched_fence_mask",
+            "pv_sched_group_template",
+            "pv_sched_group_ds_read",
+        ):
+            if getattr(spec, name) != defaults[name]:
+                inert[name] = "not read by the qk_lookahead loop"
+    if spec.wave_group_pingpong and spec.pv_priority != 0:
+        inert["pv_priority"] = "not read by the ping-pong loop"
+    # The value the grid's lever preset gives these (gfx950_dense._grid_levers)
+    # is what leaving them unset compiles to.
+    preset = {
+        "pv_priority": 0 if spec.qk_lookahead else defaults["pv_priority"],
+        "o_store_width": (
+            8
+            if spec.qk_lookahead and spec.dtype == "bf16"
+            else defaults["o_store_width"]
+        ),
+    }
+    for name, value in preset.items():
+        if getattr(spec, name) == value:
+            inert.setdefault(name, f"{name}={value} restates the lever preset")
     return inert
 
 
@@ -272,15 +299,16 @@ def _dense_redundant_knob(spec, arch: str) -> Optional[str]:
 
 
 @lru_cache(maxsize=256)
-def _dense_defaults(base, recorded: frozenset) -> Tuple[Tuple[str, object], ...]:
+def _dense_defaults(base, excluded: frozenset) -> Tuple[Tuple[str, object], ...]:
     """The default spec's values that are neither request fields (problem or
-    output) nor resolved per problem: the candidate's body, the base constants
-    (the CU-count default, the shipped WPE, the layout pads) and every dataclass
+    output) nor resolved per problem (``excluded``: recorded, or derived from
+    the knobs and the problem): the candidate's body, the base constants (the
+    CU-count default, the shipped WPE, the layout pads) and every dataclass
     default."""
     return tuple(
         (f.name, getattr(base, f.name))
         for f in _dataclass_fields(base)
-        if f.name not in _REQUEST_FIELDS and f.name not in recorded
+        if f.name not in _REQUEST_FIELDS and f.name not in excluded
     )
 
 
@@ -291,9 +319,9 @@ class DenseSpace(WavesPerEuSpace):
 
     supports: DenseSupports = None
     recorded_fields: frozenset = frozenset()
-    # Problem fields that also depend on knobs, recomputed on every build:
+    # Fields that also depend on knobs, recomputed on every build:
     # ``derived(base, knobs) -> {field: value}`` (gfx950: ``ragged`` follows
-    # the swept tile).
+    # the swept tile; on the grid so do wide DMA and the qk_lookahead levers).
     derived: Optional[
         Callable[[object, Mapping[str, object]], Mapping[str, object]]
     ] = None
@@ -321,7 +349,8 @@ class DenseSpace(WavesPerEuSpace):
         return axis_knob_names(tuning_axes(self.arch, "dense"))
 
     def defaults(self, base, kernel):
-        return dict(_dense_defaults(base, self.recorded_fields))
+        derived = self.derived(base, {}) if self.derived is not None else {}
+        return dict(_dense_defaults(base, self.recorded_fields | frozenset(derived)))
 
     def build(self, base, knobs):
         extra = self.derived(base, knobs) if self.derived is not None else {}

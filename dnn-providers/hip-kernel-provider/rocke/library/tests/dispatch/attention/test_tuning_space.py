@@ -648,7 +648,10 @@ class TestGfx950DenseTuningSpace(unittest.TestCase):
 
     def test_production_gives_each_query_tile_its_own_pass(self):
         """``block_m`` is crossed with the other knobs, so the 128-row tile
-        gets the same one-knob-at-a-time coverage as the default tile."""
+        gets the same one-knob-at-a-time coverage as the default tile. On the
+        grid, the 256-row tile's windows levers read neither ``pv_priority``
+        (the ping-pong loop) nor a d_major ``pv_loop_order`` (pv_window_exp)."""
+        windows_unread = {"pv_priority", "pv_loop_order"}
         grouped = _by_candidate(_dense_combos(_dense_request()))
         for name, (_c, specs) in grouped.items():
             with self.subTest(candidate=name):
@@ -660,7 +663,11 @@ class TestGfx950DenseTuningSpace(unittest.TestCase):
                         )
                 self.assertEqual(set(by_tile), {128, 256})
                 self.assertTrue(by_tile[256])
-                self.assertEqual(by_tile[128], by_tile[256])
+                if name == "attention_gfx950_dense_grid":
+                    self.assertFalse(by_tile[256] & windows_unread)
+                    self.assertEqual(by_tile[128] - windows_unread, by_tile[256])
+                else:
+                    self.assertEqual(by_tile[128], by_tile[256])
 
     def test_causal_only_knobs_are_not_offered_without_causal(self):
         changed = set()
@@ -694,8 +701,13 @@ class TestGfx950DenseTuningSpace(unittest.TestCase):
         base = default.kernel_spec
 
         def canonical(**knobs):
-            return dict(tuning_spec_with_knobs(req, spec_id, knobs).knobs)
+            # The grid records its per-problem tile in every id.
+            out = dict(tuning_spec_with_knobs(req, spec_id, knobs).knobs)
+            self.assertEqual(out.pop("block_m"), knobs.get("block_m", base.block_m))
+            return out
 
+        # The lookahead preset (128-row tile at this length) restated.
+        self.assertTrue(base.qk_lookahead)
         restated = (
             dict(pv_loop_order=base.resolved_pv_loop_order()),
             dict(exp_per_pv_step=base.resolved_exp_per_pv_step()),
@@ -703,10 +715,14 @@ class TestGfx950DenseTuningSpace(unittest.TestCase):
             dict(interleave=True),  # the grid body never reads it
             dict(persist_decode="hkv_major"),
             dict(block_m=base.block_m, block_n=base.block_n),
+            dict(pv_priority=0, o_store_width=8),
+            dict(partial_vmcnt_prefetch=False),  # not read by the lookahead loop
         )
         for knobs in restated:
             with self.subTest(**knobs):
                 self.assertEqual(canonical(**knobs), {})
+        # Off the levers (a 128-key tile) the plain grid values are the preset.
+        self.assertEqual(canonical(block_n=128, pv_priority=1), {"block_n": 128})
         inert_partner = (
             (
                 dict(lazy_rescale=False, lazy_rescale_threshold=4.0),

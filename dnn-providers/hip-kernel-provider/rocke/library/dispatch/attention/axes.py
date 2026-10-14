@@ -127,6 +127,8 @@ _3D_AXES: Tuple[KnobAxis, ...] = (
 # (gfx950: the grid or persistent body, and wide DMA under persistent; gfx942
 # registers one candidate and sweeps persistence too); ``waves_per_eu`` is
 # walked by its own loop, as on the unified paths. The tile is swept on both.
+# The gfx950 grid body's qk_lookahead levers are a per-tile preset the grid
+# candidate resolves (like its wide DMA), so they are variant fields too.
 DENSE_PROBLEM_FIELDS = frozenset(
     {
         "batch",
@@ -148,7 +150,25 @@ DENSE_PROBLEM_FIELDS = frozenset(
     }
 )
 DENSE_VARIANT_FIELDS: Mapping[str, frozenset] = {
-    "gfx950": frozenset({"persistent", "wide_lds_dma"}),
+    "gfx950": frozenset(
+        {
+            "persistent",
+            "wide_lds_dma",
+            "qk_lookahead",
+            "qk_lookahead_unroll",
+            "lds_dma_alias_ring",
+            "permlane32_reduce",
+            "wave_group_pingpong",
+            "bulk_operand_reads",
+            "lds_read_base",
+            "scalar_uniforms",
+            "operand_read_ahead",
+            "mfma_windows",
+            "window_priority",
+            "pv_window_exp",
+            "window_fence",
+        }
+    ),
     "gfx942": frozenset(),
 }
 # Optional extra outputs each dense kernel implements. Set from the request, like
@@ -167,7 +187,14 @@ DENSE_UNTUNABLE_KNOBS: Mapping[str, frozenset] = {
 # Axes whose values are relative to the base spec (request or policy derived),
 # so a choice may equal a dataclass default; the base-equal choice is pruned.
 DENSE_BASE_RELATIVE_KNOBS = frozenset(
-    {"num_persistent", "persistent", "block_m", "block_n"}
+    {
+        "num_persistent",
+        "persistent",
+        "block_m",
+        "block_n",
+        "pv_priority",
+        "o_store_width",
+    }
 )
 
 _DENSE_LDS_PADS = (0, 8, 16, 24, 32)
@@ -230,10 +257,10 @@ _GFX950_DENSE_AXES: Tuple[KnobAxis, ...] = (
     _values("use_exp2_fast", True, (False,)),
     _values("exp_per_pv_step", None, _DENSE_EXP_PER_PV_STEP),
     _values("partial_vmcnt_prefetch", True, (False,)),
-    _values("pv_priority", 1, (0, 1, 2, 3)),
+    _choices_axis("pv_priority", (0, 1, 2, 3)),
     _values("pv_loop_order", None, ("d_major", "k_major")),
     _values("causal_diag_split", True, (False,)),
-    _values("o_store_width", 4, (1, 2, 4)),
+    _choices_axis("o_store_width", (1, 2, 4)),
     _values("grid_order", "lpt", ("default",)),
     _values("defer_row_sum", True, (False,)),
 )

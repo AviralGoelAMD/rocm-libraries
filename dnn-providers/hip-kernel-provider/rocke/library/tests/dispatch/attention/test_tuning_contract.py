@@ -48,7 +48,9 @@ class TestAttentionTuningContract(unittest.TestCase):
             ],
             [_req()],
             other_requests=[_req(batch=2, seqlen_q=4096, seqlen_k=4096)],
-            default_knobs={"pv_priority": 1},
+            # The shared lazy-rescale default (the grid's PV priority now
+            # follows its lever preset per problem).
+            default_knobs={"lazy_rescale": True},
             refused_knobs=[{"seqlen_q": 64}, {"lds_num_buffers": 3}],
         )
 

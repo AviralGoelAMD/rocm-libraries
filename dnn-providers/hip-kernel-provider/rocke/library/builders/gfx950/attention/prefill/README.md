@@ -98,7 +98,11 @@ independent: MHA and GQA shapes whose pair equations do not hold still use wide
 DMA with qb-major or hkv-major work ordering. The grid candidate
 (`gfx950_dense_grid`) takes wide DMA by default for D128/BN64 shapes with
 aligned lengths and a fixed (top-left) diagonal; D64, the 128-key tile, ragged
-lengths, and the moving bottom-right diagonal keep the per-row DMA.
+lengths, and the moving bottom-right diagonal keep the per-row DMA. On those
+wide shapes (no sliding window, sinks or LSE) the grid default also runs the
+`qk_lookahead` loop on the LDS-DMA alias rings: the 128-row tile for short
+sequences and the 256-row `mfma_windows` tile for long ones (see
+`dispatch/attention/README.md`).
 
 ## Measured (MI355X, bf16, D=128, Hq=128, Hkv=8, causal, Sq=8192)
 

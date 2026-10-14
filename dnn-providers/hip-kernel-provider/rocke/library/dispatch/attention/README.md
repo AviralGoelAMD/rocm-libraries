@@ -143,6 +143,16 @@ path, so where the 256×64 tile would be ragged the persistent wide variant's
 default starts at 128×64; it records `block_m` in every id so one id names one
 tile on every problem.
 
+On wide-DMA problems without a sliding window, sinks or an LSE output, the
+grid candidate also defaults to the `qk_lookahead` loop on the LDS-DMA alias
+rings (`lds_dma_alias_ring`, `permlane32_reduce`, PV at `s_setprio 0`, 16-byte
+bf16 O stores). Below `_GRID_WINDOWS_MIN_SEQLEN` (4096 causal, 1536
+non-causal) it runs the 128×64 tile; from there on the 256×64 tile with the
+barrier-window ping-pong (`mfma_windows=4`, `window_fence`, `pv_window_exp=1`).
+The levers follow the swept tile (off where wide DMA is off) and are variant
+fields, not axes; the grid records `block_m` in every id because its default
+tile now depends on the problem.
+
 Unified variant names are `attention_{arch}_u{path}_{variant_id}`, for example
 `attention_gfx950_u2d_narrow_nw1_mw16_t1xb_llvm` (the `spec_id` drops the
 `attention_` prefix). A codepath also fixes base knobs through
