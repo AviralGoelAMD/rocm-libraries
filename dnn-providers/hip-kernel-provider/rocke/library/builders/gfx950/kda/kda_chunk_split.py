@@ -38,15 +38,20 @@ except ImportError:  # running as a bare script outside the editable install
 import torch  # noqa: E402
 
 from kernels.gfx950.kda_chunkwise import (  # noqa: E402
+    KdaChunkOutSpec,
     KdaChunkPairSpec,
     KdaChunkPrepSpec,
     KdaChunkScanSpec,
     KdaTileSpec,
+    build_kda_chunk_out,
     build_kda_chunk_pair,
     build_kda_chunk_scan,
+    is_valid_out_spec,
     is_valid_pair_spec,
     is_valid_scan_spec,
     is_valid_spec,
+    kda_chunk_out_grid,
+    kda_chunk_out_signature,
     kda_chunk_pair_grid,
     kda_chunk_pair_signature,
     kda_chunk_scan_grid,
@@ -198,8 +203,13 @@ def run_scan(
     batch=None,
     heads=None,
     tseq=None,
+    snap=None,
 ):
-    """Launch the scan over tiles already materialized by the prep kernel."""
+    """Launch the scan over tiles already materialized by the prep kernel.
+
+    ``snap`` (``o_split`` scans only) is :func:`alloc_snapshots`' workspace;
+    the scan then leaves ``o`` untouched and :func:`run_out` writes it.
+    """
     if h0 is None:
         assert not spec.has_initial_state, "h0=None but the kernel reads h0_ptr"
     launcher = make_launcher(spec)
@@ -226,7 +236,58 @@ def run_scan(
     }
     if spec.token_major_io:
         args.update({"batch": int(batch), "heads": int(heads), "tseq": int(tseq)})
+    if spec.o_split:
+        args.update({"sn_ptr": snap["sn"], "vt_ptr": snap["vt"]})
     launcher(args, config=cfg)
+
+
+def alloc_snapshots(num_tiles: int, spec: KdaChunkScanSpec, device="cuda"):
+    """Per-chunk state mirror and V~^T an ``o_split`` scan hands to the output kernel."""
+    C, DK, EV = spec.tile.chunk, spec.head_k, spec.head_v
+    return {
+        "sn": torch.empty(num_tiles, EV, DK, dtype=torch.bfloat16, device=device),
+        "vt": torch.empty(num_tiles, EV, C, dtype=torch.bfloat16, device=device),
+    }
+
+
+def out_spec_of(spec: KdaChunkScanSpec) -> KdaChunkOutSpec:
+    """The output kernel that completes an ``o_split`` scan."""
+    return KdaChunkOutSpec(
+        head_k=spec.head_k, head_v=spec.head_v, dtype=spec.dtype, chunk=spec.tile.chunk
+    )
+
+
+def run_out(spec: KdaChunkOutSpec, ws, snap, o, num_tiles, nc, heads, tseq, stream=None):
+    """O for every chunk from the prep's GQ / Aqk and the scan's snapshots."""
+    key = spec.kernel_name()
+    if key not in _LAUNCHER_CACHE:
+        ok, why = is_valid_out_spec(spec)
+        if not ok:
+            raise ValueError(f"unsupported spec: {why}")
+        art = compile_kernel(
+            build_kda_chunk_out(spec), arch="gfx950", backend="python", capture_ir_text=False
+        )
+        _LAUNCHER_CACHE[key] = KernelLauncher(
+            hsaco=art.hsaco, kernel_name=art.kernel_name, signature=kda_chunk_out_signature(spec)
+        )
+    if stream is None:
+        stream = torch.cuda.current_stream().cuda_stream
+    cfg = LaunchConfig(
+        grid=kda_chunk_out_grid(spec, num_tiles), block=(spec.block_size, 1, 1), stream=stream
+    )
+    _LAUNCHER_CACHE[key](
+        {
+            "gq_ptr": ws["gq"],
+            "aqk_ptr": ws["aqk"],
+            "sn_ptr": snap["sn"],
+            "vt_ptr": snap["vt"],
+            "o_ptr": o,
+            "nc": int(nc),
+            "heads": int(heads),
+            "tseq": int(tseq),
+        },
+        config=cfg,
+    )
 
 
 def run_split(
