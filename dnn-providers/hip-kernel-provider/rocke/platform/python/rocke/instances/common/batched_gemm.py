@@ -9,21 +9,21 @@ kernel body verbatim, in batched mode:
 
     grid = (N_tiles, M_tiles, batch_count)
     kernel reads block_id_z as batch_idx
-    A_offset = batch_idx * stride_a + per-tile A index
-    B_offset = batch_idx * stride_b + per-tile B index
-    C_offset = batch_idx * stride_c + per-tile C index
+    A_base = A + batch_idx * stride_a * elem_bytes   (64-bit pointer math)
+    B_base = B + batch_idx * stride_b * elem_bytes
+    C_base = C + batch_idx * stride_c * elem_bytes
+    per-tile indices are i32 element offsets from those bases
 
-The strides are passed as additional ``i32`` kernel arguments so we can
-support irregular per-batch layouts (e.g. a 3D ``(B, M, K)`` torch
-tensor where ``stride_a = M*K`` packed, or one with extra row padding).
+The strides are passed as additional ``i32`` kernel arguments (read as
+unsigned) so we can support irregular per-batch layouts (e.g. a 3D
+``(B, M, K)`` torch tensor where ``stride_a = M*K`` packed, or one with
+extra row padding).
 
-Precondition (i32 offsets): because the strides are i32 and the per-batch
-offset ``block_id_z * stride_X`` is computed in i32, the caller must keep
-``batch * stride_X <= 2**31 - 1`` for each of A/B/C, or the index silently
-wraps and the kernel touches the wrong batch. Validate a concrete launch with
-:func:`check_batched_offsets_fit_i32` before packing the kernel arguments.
-Tensors larger than that need i64 strides (a coordinated ABI change, not yet
-implemented).
+Addressing: the batch slab is folded into each base pointer in 64-bit, so
+the whole tensor may exceed 2**31 elements. Only the within-slab index
+(``row * K + col`` for A/B, ``row * N + col`` for C) is i32: each single
+batch slab must stay below 2**31 elements. :func:`check_batched_strides_fit`
+validates the stride arguments of a concrete launch.
 
 The MFMA / LDS body is the same as ``build_universal_gemm`` (which is
 already battle-tested by the GEMM bake-off). This makes batched GEMM
@@ -32,24 +32,9 @@ inherit all of universal_gemm's perf knobs:
 cshuffle}``, warp grids up to 4x4, MFMA atoms 16x16x{16,32} and
 32x32x{8,16}.
 
-Out-of-scope perf note (the file you're reading is in-scope, but the
-universal-GEMM body it calls into is not):
-
-* The per-batch offsets ``batch_off_X = block_id_z() * stride_X`` in
-  :func:`rocke.instances.common.gemm_universal.build_universal_gemm`
-  (lines 487-495) are emitted with no ``to_sgpr_u32`` wrap. They
-  are CTA-uniform (block IDs are CTA constants and the strides are
-  i32 kernel-parameter scalars, already in SGPRs by the AMDGPU
-  calling convention), so wrapping them with
-  :meth:`IRBuilder.to_sgpr_u32` saves a ``v_readfirstlane_b32`` at
-  every use across the K-loop and the cshuffle / direct-epilogue
-  stores. CK Tile's reference does exactly this -- see
-  ``batched_gemm_kernel.hpp:215-230`` where every
-  ``batch_stride_X``, ``batch_offset_X``, ``i_m``, and ``i_n`` goes
-  through ``amd_wave_read_first_lane``. This is an out-of-scope
-  optimization here -- the change would live in
-  ``instances/gemm_universal.py``, outside this file's
-  scope.
+The per-batch slab offsets are CTA-uniform and are folded into the base
+pointers once per CTA (scalar registers), mirroring CK Tile's
+``batched_gemm_kernel.hpp:215-230``.
 """
 
 from __future__ import annotations
@@ -113,39 +98,40 @@ def is_valid_spec(spec: BatchedGemmSpec, arch: str = "gfx950") -> Tuple[bool, st
     return is_valid_gemm_spec(spec.to_universal_spec(), arch=arch)
 
 
-# Largest value representable in the i32 stride/index arithmetic the kernel uses.
+# Largest within-slab element index the kernel's i32 tile arithmetic can hold.
 _I32_MAX = (1 << 31) - 1
+# The stride arguments are i32 registers zero-extended to i64 in the kernel.
+_U32_MAX = (1 << 32) - 1
 
 
-def check_batched_offsets_fit_i32(
-    batch: int, stride_a: int, stride_b: int, stride_c: int
+def check_batched_strides_fit(
+    M: int, N: int, K: int, stride_a: int, stride_b: int, stride_c: int
 ) -> None:
     """Runtime precondition for a batched-GEMM launch.
 
-    The per-batch element offsets ``block_id_z * stride_X`` (plus the
-    within-batch tile index) are computed in **i32** -- the strides are i32
-    kernel arguments. The caller MUST therefore ensure every per-tensor index
-    fits a signed 32-bit integer; conservatively, ``batch * stride_X`` must stay
-    ``<= 2**31 - 1`` for each of A/B/C. Beyond that the index silently wraps and
-    the kernel reads/writes the wrong batch.
+    The batch slab ``block_id_z * stride_X`` is folded into each base pointer
+    in 64-bit, so the batch count is unbounded. Two limits remain:
 
-    This raises ``ValueError`` when the bound is exceeded (or a stride is
-    negative) so callers fail loudly instead of corrupting memory. Tensors that
-    exceed the bound need i64 strides -- a coordinated change to the kernel ABI
-    (the stride parameters and the offset arithmetic on both engines), not yet
-    implemented; this guard is the documented contract until then.
+    * each stride is passed as a 32-bit argument (zero-extended), so it must
+      lie in ``[0, 2**32 - 1]``;
+    * the within-slab index is i32, so one slab (``M*K`` for A, ``N*K`` for B,
+      ``M*N`` for C) must stay ``<= 2**31 - 1`` elements.
+
+    Raises ``ValueError`` on violation so callers fail loudly instead of
+    reading or writing the wrong rows.
     """
     for name, s in (
         ("stride_a", stride_a),
         ("stride_b", stride_b),
         ("stride_c", stride_c),
     ):
-        if s < 0:
-            raise ValueError(f"batched GEMM {name} must be non-negative (got {s})")
-        if batch > 0 and s > _I32_MAX // batch:
+        if not 0 <= s <= _U32_MAX:
+            raise ValueError(f"batched GEMM {name}={s} is outside [0, 2**32-1]")
+    for name, elems in (("A", M * K), ("B", N * K), ("C", M * N)):
+        if elems > _I32_MAX:
             raise ValueError(
-                f"batched GEMM offset overflows i32: batch={batch} * {name}={s} "
-                f"exceeds 2**31-1; i64 strides are required for tensors this large"
+                f"batched GEMM {name} slab of {elems} elements exceeds the i32 "
+                f"within-slab index range (2**31-1)"
             )
 
 

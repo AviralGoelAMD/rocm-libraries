@@ -1065,9 +1065,32 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
         # epilogue). Mirrors CK Tile ``batched_gemm_kernel.hpp:215-230``
         # ``amd_wave_read_first_lane`` pattern.
         batch_idx = b.to_sgpr_u32(b.block_id_z())
-        batch_off_a = b.to_sgpr_u32(b.mul(batch_idx, stride_a))
-        batch_off_b = b.to_sgpr_u32(b.mul(batch_idx, stride_b))
-        batch_off_c = b.to_sgpr_u32(b.mul(batch_idx, stride_c))
+        # The batch slab is folded into the A/B/C base pointers as a 64-bit
+        # byte offset: ``batch * stride`` in i32 elements wraps once a
+        # tensor passes 2^31 elements. The within-slab tile offsets stay
+        # i32 (and so does the DTL buffer resource, now rooted per slab).
+        from ...core.ir import I64 as _I64b
+
+        batch_i64 = b.zext(batch_idx, _I64b)
+        _ab_elem_bytes = b.const_i64(2)  # f16 / bf16 storage
+        A = b.global_ptr_add(
+            A, b.mul(b.mul(batch_i64, b.zext(stride_a, _I64b)), _ab_elem_bytes)
+        )
+        Bp = b.global_ptr_add(
+            Bp, b.mul(b.mul(batch_i64, b.zext(stride_b, _I64b)), _ab_elem_bytes)
+        )
+        _c_elem_bytes = b.const_i64(4 if _is_split_k else 2)
+        C = b.global_ptr_add(
+            C, b.mul(b.mul(batch_i64, b.zext(stride_c, _I64b)), _c_elem_bytes)
+        )
+        # The batch-axis origin is now zero, but as an opaque SGPR value
+        # rather than a literal: a literal 0 lets LLVM fold the add and
+        # widen the nsw ``row * K + col`` index into hoisted 64-bit
+        # (VGPR-pair) addresses, which raises register pressure. The
+        # opaque origin keeps the within-slab index math in 32 bits.
+        batch_off_a = b.pin_sgpr(c0)
+        batch_off_b = b.pin_sgpr(c0)
+        batch_off_c = b.pin_sgpr(c0)
     else:
         batch_off_a = c0
         batch_off_b = c0

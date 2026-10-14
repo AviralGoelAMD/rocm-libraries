@@ -139,9 +139,24 @@ void rocke_gemm_build_populate_ctx(rocke_gemm_build_ctx_t* ctx)
     if(spec->batched)
     {
         ctx->batch_idx = rocke_b_to_sgpr_u32(b, rocke_b_block_id_z(b));
-        ctx->batch_off_a = rocke_b_to_sgpr_u32(b, rocke_b_mul(b, ctx->batch_idx, ctx->stride_a));
-        ctx->batch_off_b = rocke_b_to_sgpr_u32(b, rocke_b_mul(b, ctx->batch_idx, ctx->stride_b));
-        ctx->batch_off_c = rocke_b_to_sgpr_u32(b, rocke_b_mul(b, ctx->batch_idx, ctx->stride_c));
+        /* i64 slab fold -- see gemm_universal.cpp (same builder order). */
+        rocke_value_t* batch_i64 = rocke_b_zext(b, ctx->batch_idx, rocke_i64());
+        rocke_value_t* ab_elem_bytes = rocke_b_const_i64(b, 2);
+        rocke_value_t* s64 = rocke_b_zext(b, ctx->stride_a, rocke_i64());
+        rocke_value_t* off64 = rocke_b_mul(b, rocke_b_mul(b, batch_i64, s64), ab_elem_bytes);
+        ctx->A = rocke_b_global_ptr_add(b, ctx->A, off64);
+        s64 = rocke_b_zext(b, ctx->stride_b, rocke_i64());
+        off64 = rocke_b_mul(b, rocke_b_mul(b, batch_i64, s64), ab_elem_bytes);
+        ctx->Bp = rocke_b_global_ptr_add(b, ctx->Bp, off64);
+        rocke_value_t* c_elem_bytes = rocke_b_const_i64(b, ctx->is_split_k ? 4 : 2);
+        s64 = rocke_b_zext(b, ctx->stride_c, rocke_i64());
+        off64 = rocke_b_mul(b, rocke_b_mul(b, batch_i64, s64), c_elem_bytes);
+        ctx->C = rocke_b_global_ptr_add(b, ctx->C, off64);
+        /* Opaque SGPR zero origin (not a literal): keeps LLVM from widening
+         * the nsw within-slab index into hoisted 64-bit VGPR addresses. */
+        ctx->batch_off_a = rocke_b_pin_sgpr(b, ctx->c0);
+        ctx->batch_off_b = rocke_b_pin_sgpr(b, ctx->c0);
+        ctx->batch_off_c = rocke_b_pin_sgpr(b, ctx->c0);
     }
     else
     {

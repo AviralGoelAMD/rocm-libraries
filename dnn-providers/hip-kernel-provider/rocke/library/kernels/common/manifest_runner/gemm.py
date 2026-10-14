@@ -8,6 +8,7 @@ from __future__ import annotations
 import struct
 from typing import Optional, Tuple
 
+from rocke.instances.common.batched_gemm import check_batched_strides_fit
 from rocke.runtime.hip_module import Runtime
 from kernels.common.manifest_runner.utils import as_u8_buffer, nbytes, require_numpy
 
@@ -135,6 +136,7 @@ def run_batched_gemm_manifest_problem(
     stride_a = M * K
     stride_b = N * K
     stride_c = M * N
+    check_batched_strides_fit(M, N, K, stride_a, stride_b, stride_c)
     flop = 2.0 * BATCH * M * N * K
     bytes_xfer = 2.0 * BATCH * (M * K + N * K + M * N)
 
