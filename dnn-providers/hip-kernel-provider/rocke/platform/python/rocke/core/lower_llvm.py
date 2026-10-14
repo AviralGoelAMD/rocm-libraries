@@ -1599,8 +1599,6 @@ class _Lowerer:
         self._needs_av_scope_md: bool = False
         # ``!5 = !{i32 1}`` referenced by ``!nontemporal`` loads/stores.
         self._needs_nontemporal_md: bool = False
-        # ``!4 .. !9`` alias-scope nodes (see ``_lds_scope_md``).
-        self._needs_lds_scope_md: bool = False
         # Off unless the kernel was built with source-location capture (see
         # IRBuilder's ``capture_loc`` / ROCKE_DEBUG_LOC). When off, not one byte
         # of the emitted .ll changes, so the byte-identity gate and the IR
@@ -3265,22 +3263,6 @@ class _Lowerer:
         self._needs_nontemporal_md = True
         return ", !nontemporal !5"
 
-    def _lds_scope_md(self, dma: bool) -> str:
-        """Alias-scope tags that separate async global->LDS DMAs from LDS
-        loads/stores, for kernels built with ``lds_dma_alias_scopes``.
-
-        Without scope info the backend's waitcnt pass must assume any LDS
-        access may alias any in-flight LDS DMA and inserts ``vmcnt(0)``
-        before it, which drains a prefetched tile before the current one is
-        read. With the tags it only waits for DMAs whose scope may alias the
-        access, i.e. none: the kernel orders DMA-written data with explicit
-        ``s_waitcnt`` (the attribute is that promise). Empty otherwise.
-        """
-        if not self.kernel.attrs.get("lds_dma_alias_scopes"):
-            return ""
-        self._needs_lds_scope_md = True
-        return ", !alias.scope !9, !noalias !4" if dma else ", !alias.scope !4, !noalias !9"
-
     def _op_tile_smem_store(self, op: Op) -> None:
         smem = op.operands[0]
         indices = op.operands[1:-1]
@@ -3380,7 +3362,7 @@ class _Lowerer:
         align = int(op.attrs.get("align", vec * elem_bytes))
         self._current().emit(
             f"  store <{vec} x {elem_ty}> {self._operand(value)}, ptr addrspace(3) {gep}, "
-            f"align {align}{self._lds_scope_md(False)}"
+            f"align {align}"
         )
 
     def _op_tile_smem_load_v4(self, op: Op) -> None:
@@ -3488,7 +3470,7 @@ class _Lowerer:
         else:
             self._current().emit(
                 f"  {op.result.name} = load {volatile}<{vec} x {elem_ty}>, ptr addrspace(3) {base}, "
-                f"align {align}{self._lds_scope_md(False)}"
+                f"align {align}"
             )
 
     def _op_tile_wmma_f32_16x16x16_f16(self, op: Op) -> None:
@@ -4556,7 +4538,7 @@ class _Lowerer:
         raw = self._fresh("tr.raw")
         self._current().emit(
             f"  {raw} = call <4 x i16> @llvm.amdgcn.ds.read.tr16.b64("
-            f"ptr addrspace(3) {base}){self._lds_scope_md(False)}"
+            f"ptr addrspace(3) {base})"
         )
         elem_ty = _llvm_type(op.result.type.elem)  # type: ignore[attr-defined]
         self._current().emit(
@@ -4817,7 +4799,7 @@ class _Lowerer:
             f"i32 {size_bytes}, "
             f"i32 {self._operand(voff)}, "
             f"i32 {self._operand(soff)}, "
-            f"i32 0, i32 {aux}){self._lds_scope_md(True)}"
+            f"i32 0, i32 {aux})"
         )
 
     def _op_tile_s_wait_asynccnt(self, op: Op) -> None:
@@ -6636,13 +6618,6 @@ class _Lowerer:
             out.append("")
         if self._needs_nontemporal_md:
             out.append("!5 = !{i32 1}")
-            out.append("")
-        if self._needs_lds_scope_md:
-            out.append('!6 = distinct !{!6, !"rocke.lds"}')
-            out.append('!7 = distinct !{!7, !6, !"rocke.lds.dma"}')
-            out.append('!8 = distinct !{!8, !6, !"rocke.lds.access"}')
-            out.append("!9 = !{!7}")
-            out.append("!4 = !{!8}")
             out.append("")
         if self._debug is not None:
             out.extend(self._debug.render())
