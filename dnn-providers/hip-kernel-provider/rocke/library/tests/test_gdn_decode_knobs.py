@@ -3,7 +3,7 @@
 
 """Performance knobs of the gfx950 GDN/KDA decode emitter, without a GPU.
 
-Covers the ``spec -> IR`` contract of the twelve knobs (ALGORITHM.md §4.10):
+Covers the ``spec -> IR`` contract of the thirteen knobs (ALGORITHM.md §4.10):
 
 * the validator rejects every non-bool flag, every unknown hint, every
   out-of-range ``waves_per_eu`` and every unknown ``row_loads``, and each
@@ -54,6 +54,7 @@ BOOL_KNOBS = (
     "conv_once",
     "norm_gate_once",
     "out_lds",
+    "norm_group_reduce",
     "kernarg_preload",
 )
 # One workgroup per head, Hk == Hv: the tile every fused mode accepts.

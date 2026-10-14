@@ -692,12 +692,13 @@ selection for the fused modes is dispatch's (§4.6), not this emitter's.
 
 ### 4.10 Performance knobs
 
-Twelve spec fields change how the warp-tiled kernel computes, not what it computes. Each one's default
+Thirteen spec fields change how the warp-tiled kernel computes, not what it computes. Each one's default
 is the code the kernel emitted before the knob existed, so with every knob at its default the
 kernel name and the emitted IR are byte-identical to the knob-free emitter (the golden IR test pins
 this). The registry exposes the first eleven as each tile's tuning space (§4.6), so a knob is reached by
-pinning a configuration. `auto` runs one knob stack per case (§4.6). `kernarg_preload` is a spec
-field only: it is not a registry axis yet, so neither a pin nor `auto` reaches it.
+pinning a configuration. `auto` runs one knob stack per case (§4.6). `norm_group_reduce` and
+`kernarg_preload` are spec fields only: they are not registry axes yet, so neither a pin nor `auto`
+reaches them.
 
 | Knob | Values (default first) | Changes code where | Effect |
 | --- | --- | --- | --- |
@@ -711,6 +712,7 @@ field only: it is not a registry axis yet, so neither a pin nor `auto` reaches i
 | `out_lds` | off, on | `fuse_out_norm` (required) | each row's pre-norm f32 output goes to LDS ahead of the norm's cross-wave barrier (a one-wave tile adds an LDS barrier); after it the first `DV / OUT_W` lanes each normalize `OUT_W` consecutive rows (`OUT_W` = 2, 4 or 8 as `DV` exceeds 2 and 4 wave widths; in more than one round when `DV / OUT_W` exceeds the workgroup size) and store them with one packed store, instead of one 2 B store per row from its k-lane-0 owner |
 | `waves_per_eu` | `0`, `1`–`8` | always, both emitters | `amdgpu-waves-per-eu` = `"N,8"`: the compiler must fit at least `N` waves per SIMD, which caps registers per lane; `0` emits no attribute |
 | `row_loads` | `auto`, `first`, `late` | single wave with `fuse_conv`, forcing the order `auto` does not choose | where each row's late inputs load (§4.3, "One exception"): each row's `v` conv inputs, each state chunk, and the per-lane `out_gate` / `norm_weight`. `auto` keeps `auto_late_row_inputs`' rule; `first` loads them with the other inputs ahead of the math, `late` where each is first used |
+| `norm_group_reduce` | off, on | `fuse_out_norm` (required), `WTK > 1` | the norm's sum of squares starts its butterfly at xor `WTK`: every k-lane of a row holds the same partial, so the k-lane-0 select and the in-group stages (which only added zeros) drop out. The remaining stages fold in the same order, so the sum is bit-identical |
 | `kernarg_preload` | off, on | warp-tiled | the parameters are reordered (`read_indices`, `write_indices`, `state`, then the per-token inputs and `out`; the rest keep their order) and the leading ones, up to 14 dwords, carry LLVM `inreg`, so the hardware preloads them into user SGPRs at wave launch instead of the kernel loading them from the kernarg segment. It changes the kernel ABI: `gdn_decode_signature` lists the reordered parameters, and the host packs arguments by name |
 
 **Inert knobs and names.** The name is the compile and launcher cache key (§4.8), so a knob adds
@@ -723,9 +725,9 @@ not the one `auto` already picks for that spec (its knobs and `waves_per_eu` inc
 does it change code and add its token; a forced order equal to auto's is auto's kernel under
 auto's name. The three fused-only knobs need no predicate, because the validator rejects
 them wherever they would be inert. The tokens are `lhnt` / `shnt` (streaming hints), `wpe<N>`,
-`dppr`, `xcd`, `sr`, `ic`, `co`, `ngo`, `olds`, `rlf` / `rll` (`row_loads` `first` / `late`) and
-`kp`. `kernarg_preload` adds `kp` only on the warp-tiled path; elsewhere it is legal and emits the
-knob-off kernel.
+`dppr`, `xcd`, `sr`, `ic`, `co`, `ngo`, `olds`, `rlf` / `rll` (`row_loads` `first` / `late`), `ngr`
+and `kp`. `norm_group_reduce` adds `ngr` only where `WTK > 1`, and `kernarg_preload` adds `kp` only
+on the warp-tiled path; elsewhere each is legal and emits the knob-off kernel.
 
 **`row_loads` and spills.** The validator refuses only a value outside `auto` / `first` / `late`
 (a non-`str` included): every forced order builds and compiles. A compile sweep of the single-wave

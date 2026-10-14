@@ -474,6 +474,11 @@ class GdnDecodeSpec:
     # force one order. A forced order equal to auto's is auto's kernel, and
     # elsewhere the field changes no code.
     row_loads: RowLoads = "auto"
+    # fuse_out_norm only: the sum of squares skips the butterfly stages inside
+    # the WTK-lane group. Every k-lane of a row holds the same out_val, so
+    # those stages only doubled a value the k-lane-0 select had zeroed
+    # elsewhere: the remaining stages give the same sum, bit for bit.
+    norm_group_reduce: bool = False
     # Preload the leading kernel arguments into SGPRs (LLVM ``inreg``): the
     # parameters are reordered so the pool indices, the state and the next
     # most latency-critical pointers come first, and the hardware hands
@@ -575,6 +580,9 @@ class GdnDecodeSpec:
                     token: self.row_loads == order and row_loads_overrides(self)
                     for order, token in _ROW_LOADS_TOKEN.items()
                 },
+                "ngr": self.norm_group_reduce
+                and not self.simple
+                and self.warp_threads_k > 1,
                 "kp": self.kernarg_preload and not self.simple,
             },
         )
@@ -605,6 +613,7 @@ def is_valid_spec(spec: GdnDecodeSpec, arch: str = "gfx950") -> Tuple[bool, str]
         "conv_once",
         "norm_gate_once",
         "out_lds",
+        "norm_group_reduce",
         "kernarg_preload",
     ):
         _value = getattr(spec, _field)
@@ -673,6 +682,8 @@ def is_valid_spec(spec: GdnDecodeSpec, arch: str = "gfx950") -> Tuple[bool, str]
         return False, "norm_gate_once requires fuse_out_norm"
     if spec.out_lds and not spec.fuse_out_norm:
         return False, "out_lds requires fuse_out_norm"
+    if spec.norm_group_reduce and not spec.fuse_out_norm:
+        return False, "norm_group_reduce requires fuse_out_norm"
     # An emitter coupling, not a functional limit (ALGORITHM.md §8, follow-up
     # 8): the products live in conv_once's LDS block, behind its barrier.
     if spec.norm_gate_once and not spec.conv_once:
@@ -1821,10 +1832,38 @@ def _build_warp_tiled(spec: GdnDecodeSpec) -> KernelDef:
             if LANE_NORM and LATE_ROW_INPUTS:
                 r_og, r_nw = norm_inputs()
             ss = tree_reduce(b, b.fadd, [b.fmul(o, o) for o in outs])
-            contrib = b.select(b.cmp_eq(k_lane, b.const_i32(0)), ss, b.const_f32(0.0))
-            total = block_lds_reduce_with_wave_prologue(
-                b, contrib, lds_rn, tid, block_size=BS, wave_size=WAVE
-            )
+            NGR = spec.norm_group_reduce and WTK > 1
+            if NGR:
+                # The helper's reduction with the in-group stages dropped
+                # (every k-lane holds ss). Same fold order, so the same sum.
+                part = ss
+                off = WTK
+                while off < WAVE:
+                    part = b.fadd(part, b.warp_shuffle_xor(part, off))
+                    off *= 2
+                if NW > 1:
+                    with b.scf_if(b.cmp_eq(w_tid, b.const_i32(0))):
+                        b.smem_store_vN_f32(lds_rn, [wid], part, 1)
+                    b.sync()
+                    total = tree_reduce(
+                        b,
+                        b.fadd,
+                        [
+                            b.vec_extract(
+                                b.smem_load_vN_f32(lds_rn, b.const_i32(w), n=1), 0
+                            )
+                            for w in range(NW)
+                        ],
+                    )
+                else:
+                    total = part
+            else:
+                contrib = b.select(
+                    b.cmp_eq(k_lane, b.const_i32(0)), ss, b.const_f32(0.0)
+                )
+                total = block_lds_reduce_with_wave_prologue(
+                    b, contrib, lds_rn, tid, block_size=BS, wave_size=WAVE
+                )
             rstd = b.rsqrt(b.fadd(b.fmul(total, b.const_f32(1.0 / DV)), norm_eps))
             if OLDS:
                 if NW == 1:

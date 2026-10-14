@@ -14,7 +14,7 @@ pins byte for byte. Every knob in ``KNOBS`` also runs at DK = DV = 64 and 256,
 and ``out_lds`` at DV = 256 and 512 and with two store rounds. ``row_loads``,
 which only applies to single-wave ``fuse_conv`` tiles, has its own tests: each
 forced order on every such BPV=1 tile at DK = DV = 128, and on a set of them at
-DK = DV = 64 and 256 and with an f16 state. All twelve knobs also run at once.
+DK = DV = 64 and 256 and with an f16 state. All thirteen knobs also run at once.
 
 ``check`` scores the output, the written recurrent state, the written conv
 state, and every untouched pool page against the fp32 reference, so a knob
@@ -68,6 +68,7 @@ KNOBS = {
     "norm_gate_once": dict(conv_once=True, norm_gate_once=True),
     "out_lds": dict(out_lds=True),
     "waves_per_eu": dict(waves_per_eu=4),
+    "norm_group_reduce": dict(norm_group_reduce=True),
     "kernarg_preload": dict(kernarg_preload=True),
 }
 _FUSED_HEADS = dict(num_k_heads=16, num_v_heads=16)
@@ -153,7 +154,8 @@ def test_knob_on_every_tile_it_applies_to(knob, gate, fused, state_dtype):
     if not specs:
         # Only the fused-only knobs on a plain class and interleave_cols on a
         # 2-byte state have no tile to change.
-        assert (not fused and knob in ("conv_once", "norm_gate_once", "out_lds")) or (
+        fused_only = ("conv_once", "norm_gate_once", "out_lds", "norm_group_reduce")
+        assert (not fused and knob in fused_only) or (
             knob == "interleave_cols" and state_dtype != "f32"
         ), (knob, gate, fused, state_dtype)
         pytest.skip(f"{knob} changes no code in this class")
@@ -188,7 +190,7 @@ def test_xcd_remap_on_a_grid_that_is_not_a_multiple_of_8(fused, batch):
 @pytest.mark.parametrize("gate", ["gdn", "kda"])
 @pytest.mark.parametrize("state_dtype", ["bf16", "f32"])
 def test_every_knob_together(gate, state_dtype):
-    """All twelve knobs on at once, at the fused (4,16,1) and (1,16,1) tiles
+    """All thirteen knobs on at once, at the fused (4,16,1) and (1,16,1) tiles
     (``row_loads`` forces ``"first"``, the order auto does not choose there;
     it changes code only on the one-wave tile)."""
     from kernels.gfx950.gdn_decode import GdnDecodeSpec
@@ -226,6 +228,7 @@ _BITWISE_KNOBS = [
     "conv_once",
     "out_lds",
     "waves_per_eu",
+    "norm_group_reduce",
     "kernarg_preload",
 ]
 

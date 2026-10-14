@@ -236,11 +236,13 @@ def _cases():
                     )
                 )
                 if fused and state_dtype != "f16":
-                    # kernarg_preload (inreg parameters, reordered ABI) on the
-                    # auto fused stack: both engines must emit the inreg
-                    # attribute.
+                    # kernarg_preload (inreg parameters, reordered ABI) and
+                    # norm_group_reduce on the auto fused stack, alone and
+                    # together: both engines must emit the inreg attribute.
                     for tag, knobs in (
                         ("kp", dict(kernarg_preload=True)),
+                        ("ngr", dict(norm_group_reduce=True)),
+                        ("kp_ngr", dict(kernarg_preload=True, norm_group_reduce=True)),
                     ):
                         cases[f"knob_{tag}_auto_{gate_kind}_{mode}_st{state_dtype}"] = (
                             lambda spec=dc.replace(result.spec.kernel_spec, **knobs): (
@@ -262,6 +264,7 @@ _KNOB_ON = {
     "norm_gate_once": dict(conv_once=True, norm_gate_once=True),
     "out_lds": dict(out_lds=True),
     "waves_per_eu": dict(waves_per_eu=4),
+    "norm_group_reduce": dict(norm_group_reduce=True),
     "kernarg_preload": dict(kernarg_preload=True),
 }
 _CV_RN = dict(fuse_conv=True, fuse_out_norm=True)
@@ -276,6 +279,7 @@ _FUSED_PATHS = {
         "cv_rn_ngo": dict(_CV_RN, conv_once=True, norm_gate_once=True),
     },
     "interleave_cols": {"cv_rn": _CV_RN, "cv_rn_co": dict(_CV_RN, conv_once=True)},
+    "norm_group_reduce": {"rn": dict(fuse_out_norm=True), "cv_rn": _CV_RN},
 }
 
 
