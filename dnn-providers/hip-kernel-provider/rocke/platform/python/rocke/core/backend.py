@@ -74,6 +74,7 @@ agrees.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
 from dataclasses import dataclass
@@ -874,14 +875,16 @@ def conv_implicit_gemm_spec_to_dict(spec: Any) -> Dict[str, Any]:
         # would build an unmerged kernel under a merged spec's name and grid.
         group_merge=getattr(spec, "group_merge", 1),
     )
-    # dtype_* and the vector-size/optional knobs are merge-target additions
-    # (#8624); forward them only when this branch's spec exposes them so the
-    # binding falls back to the engine default otherwise.
+    # The operand dtypes live on ``spec.data``; dropped, the engine builds its
+    # fp16 default under a bf16 spec's name.
+    data = getattr(spec, "data", None)
+    for f in ("dtype_a", "dtype_b", "dtype_d", "dtype_acc"):
+        v = getattr(data, f, None)
+        if v is not None:
+            d[f] = v
+    # Optional knobs: forwarded only when set, so the binding keeps the engine
+    # default (Python ``None``) otherwise.
     for f in (
-        "dtype_a",
-        "dtype_b",
-        "dtype_d",
-        "dtype_acc",
         "lds_k_pad",
         "waves_per_eu",
         "vector_size_a",
@@ -894,10 +897,27 @@ def conv_implicit_gemm_spec_to_dict(spec: Any) -> Dict[str, Any]:
     return d
 
 
+# Python builder per ``conv_direct_grouped`` binding kind. The binding reads the
+# same names from the dict's ``kind`` key.
+_CONV_DIRECT_GROUPED_BUILDERS = {
+    "16c": "build_direct_conv_16c",
+    "4c": "build_direct_conv_4c",
+    "generic": "build_direct_conv",
+    "transpose": "build_direct_transpose_weights_dgrad",
+    "dw_tiled": "build_direct_depthwise_tiled",
+    "dw_dgrad_stream": "build_direct_depthwise_dgrad_streaming",
+}
+
+
 def conv_direct_grouped_spec_to_dict(spec: Any, kind: str) -> Dict[str, Any]:
-    """:class:`DirectConv16cSpec` / :class:`DirectConv4cSpec` -> flat dict.
-    ``kind`` ("16c"|"4c") selects the binding's spec path. The 16c-only
-    ``double_buffer``/``fold_k32`` fields are forwarded when present."""
+    """A direct grouped-conv spec -> flat dict (problem nested).
+
+    ``kind`` (a key of ``_CONV_DIRECT_GROUPED_BUILDERS``) selects the
+    binding's spec path. Every dataclass field but ``problem`` is forwarded
+    under its own name; each kind's spec builder reads only the fields its
+    C struct has."""
+    if kind not in _CONV_DIRECT_GROUPED_BUILDERS:
+        raise ValueError(f"unknown conv_direct_grouped kind {kind!r}")
     p = spec.problem
     d = dict(
         kind=kind,
@@ -912,18 +932,14 @@ def conv_direct_grouped_spec_to_dict(spec: Any, kind: str) -> Dict[str, Any]:
             KW=p.KW,
             PAD=p.PAD,
             stride=p.stride,
+            dtype=p.dtype,
             dil_h=p.dil_h,
             dil_w=p.dil_w,
         ),
-        name=spec.name,
-        block_q=spec.block_q,
-        block_groups=spec.block_groups,
-        wave_size=spec.wave_size,
     )
-    for f in ("double_buffer", "fold_k32"):
-        v = getattr(spec, f, None)
-        if v is not None:
-            d[f] = v
+    for f in dataclasses.fields(spec):
+        if f.name != "problem":
+            d[f.name] = getattr(spec, f.name)
     return d
 
 
@@ -975,6 +991,17 @@ def img2col_spec_to_dict(spec: Any) -> Dict[str, Any]:
         block_tile_m=spec.block_tile_m,
         block_tile_k=spec.block_tile_k,
         vec_k=spec.vec_k,
+        name=spec.name,
+    )
+
+
+def conv_channel_pad_spec_to_dict(spec: Any) -> Dict[str, Any]:
+    """:class:`ChannelPadSpec` -> flat dict."""
+    return dict(
+        c_in=spec.c_in,
+        c_pad=spec.c_pad,
+        dtype=spec.dtype,
+        block_size=spec.block_size,
         name=spec.name,
     )
 
@@ -1507,17 +1534,14 @@ def lower_conv_direct_grouped(
     backend: Optional[str] = None,
     want_ir: bool = False,
 ) -> "GemmLowerResult":
-    """Lower a :class:`DirectConv16cSpec` / :class:`DirectConv4cSpec`.
-    ``kind`` ("16c"|"4c") selects the channel-blocking variant."""
+    """Lower a direct grouped-conv spec. ``kind`` selects the kernel variant;
+    see ``_CONV_DIRECT_GROUPED_BUILDERS``."""
 
     def py_fn(wi: bool) -> Tuple[str, str]:
-        from kernels.common.conv_direct_grouped import (
-            build_direct_conv_16c,
-            build_direct_conv_4c,
-        )
+        from kernels.common import conv_direct_grouped
         from .lower_llvm import lower_kernel_to_llvm
 
-        build = build_direct_conv_4c if kind == "4c" else build_direct_conv_16c
+        build = getattr(conv_direct_grouped, _CONV_DIRECT_GROUPED_BUILDERS[kind])
         k = build(spec, arch=arch)
         ll = lower_kernel_to_llvm(k, arch=arch)
         ir = ""
@@ -1612,6 +1636,43 @@ def lower_img2col(
         py_fn,
         lambda: eng.img2col_lower_llvm(sd, arch=arch),
         lambda: eng.img2col_serialize_ir(sd, arch=arch),
+        _name_of(spec),
+    )
+
+
+def lower_conv_channel_pad(
+    spec: Any,
+    *,
+    arch: str = "gfx950",
+    backend: Optional[str] = None,
+    want_ir: bool = False,
+) -> "GemmLowerResult":
+    """Lower a :class:`ChannelPadSpec` (the small-C stem pre-pass)."""
+
+    def py_fn(wi: bool) -> Tuple[str, str]:
+        from kernels.common.conv_channel_pad import build_conv_channel_pad
+        from .lower_llvm import lower_kernel_to_llvm
+
+        k = build_conv_channel_pad(spec, arch=arch)
+        ll = lower_kernel_to_llvm(k, arch=arch)
+        ir = ""
+        if wi:
+            from .ir_serialize import serialize
+
+            ir = serialize(k)
+        return ll, ir
+
+    eng = _import_engine()
+    sd = conv_channel_pad_spec_to_dict(spec)
+    return _lower_family(
+        "conv_channel_pad",
+        spec,
+        arch,
+        backend,
+        want_ir,
+        py_fn,
+        lambda: eng.conv_channel_pad_lower_llvm(sd, arch=arch),
+        lambda: eng.conv_channel_pad_serialize_ir(sd, arch=arch),
         _name_of(spec),
     )
 
