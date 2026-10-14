@@ -782,9 +782,12 @@ field:
 * **fp8-in-LDS** (decode) — per-block i64 buffer base.
 
 The dispatcher enables it automatically (`_enable_i64_kv_addr`) only when
-`num_kv_blocks × block_stride > 2³¹` (filled from `k.shape[0]`), so caches
-≤2 GiB keep the exact fast i32 path (zero change, bf16 1.1x preserved) and
-only larger caches pay the tiny per-block-base cost. Validated:
+`num_kv_blocks × block_stride > 0x7FFF0000` (filled from `k.shape[0]`). That
+is the `num_records` of the i32 path's whole-cache K/V buffer resource
+(`KV_BUFFER_NUM_RECORDS`, 2 GiB − 64 KiB): a load at or past it returns zero,
+so a cache of exactly 2 GiB must take the i64 path too. Smaller caches keep
+the exact fast i32 path (zero change, bf16 1.1x preserved) and only larger
+caches pay the tiny per-block-base cost. Validated:
 
 | cache | bf16 | fp8 |
 |---|---|---|

@@ -39,6 +39,7 @@ from kernels.common._attention_strided_kv import (
     strided_kv_offset,
     strided_kv_resource,
 )
+from kernels.common.attention_kv_cache import KV_BUFFER_NUM_RECORDS
 
 from rocke.core.ir import (
     BF16,
@@ -586,7 +587,7 @@ def build_unified_attention_3d_tiled(
     # attention_tiled_2d.py ASYNC_LDS_MAX_DWORDS for the same clamp.
     ASYNC_LDS_DWORDS = 1
     HALVES_PER_LANE = ASYNC_LDS_DWORDS * 2  # 4 bytes / 2 bytes-per-half
-    big_bytes = b.const_i32(0x7FFF0000)
+    big_bytes = b.const_i32(KV_BUFFER_NUM_RECORDS)
     if spec.kv_layout == "strided":
         key_rsrc = strided_kv_resource(b, key, k_strides, seq_idx, kv_head_idx)
         value_rsrc = strided_kv_resource(b, value, v_strides, seq_idx, kv_head_idx)

@@ -13,6 +13,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from operator import index
 
+# ``num_records`` of the K/V buffer resources the attention segment kernels
+# build over a whole cache (paged i32 path) or one head (strided path). A buffer
+# load at or past this byte offset returns zero, so every byte the kernel reads
+# through such a resource must lie below it. A paged cache larger than this
+# needs the per-block 64-bit base (``use_i64_kv_addr``).
+KV_BUFFER_NUM_RECORDS = 0x7FFF0000
+
+
+def paged_kv_needs_i64(num_kv_blocks: int, block_stride_bytes: int) -> bool:
+    """Whether a paged cache is too large for the whole-cache i32 resource."""
+    return num_kv_blocks * block_stride_bytes > KV_BUFFER_NUM_RECORDS
+
 
 @dataclass(frozen=True)
 class KvTensorLayout:
@@ -44,7 +56,10 @@ class KvTensorLayout:
             span += (extent - 1) * stride
         if span * 2 > (1 << 63) - 1:
             raise ValueError("strided KV address span exceeds signed 64-bit bytes")
-        if self.head_span_bytes > 0x7FFF0000 or strides[2] * 2 > 0x7FFF0000:
+        if (
+            self.head_span_bytes > KV_BUFFER_NUM_RECORDS
+            or strides[2] * 2 > KV_BUFFER_NUM_RECORDS
+        ):
             raise ValueError("strided KV per-head span exceeds the buffer-offset limit")
         if any(s * 2 > (1 << 63) - 1 for s in strides[:2]):
             raise ValueError("strided KV base strides exceed signed 64-bit bytes")

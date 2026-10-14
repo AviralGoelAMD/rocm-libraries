@@ -65,7 +65,7 @@ All remaining shapes.  Key knob decisions:
 | `use_sched_barrier` | `_enable_sched_barrier` (gfx950 spec only; field-presence guard) |
 | `use_k_single_buffer` | `_enable_k_single_buffer`: d128 small-tile cohort + env opt-in (gfx950 spec only) |
 | `use_fp8_mfma_qk` | `_enable_fp8_mfma_qk`: decode fp8 path only |
-| `use_i64_kv_addr` | cache size > 2 GiB (see gfx950 README "Paged-cache size" section) |
+| `use_i64_kv_addr` | cache size > `KV_BUFFER_NUM_RECORDS` (0x7FFF0000 B; see gfx950 README "Paged-cache size" section) |
 
 ### Tiled-3D dispatch cases
 
