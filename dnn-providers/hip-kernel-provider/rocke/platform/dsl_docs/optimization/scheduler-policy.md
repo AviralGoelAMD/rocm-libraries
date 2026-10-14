@@ -11,6 +11,7 @@ tuning knob.
 - [When to use this knob](#when-to-use-this-knob)
 - [Supported strategies](#supported-strategies)
 - [Apply a policy](#apply-a-policy)
+- [Floating-point policy](#floating-point-policy)
 - [Run a bounded sweep](#run-a-bounded-sweep)
 - [Validate a candidate](#validate-a-candidate)
 - [Artifact and cache handling](#artifact-and-cache-handling)
@@ -71,6 +72,23 @@ Apply `CodegenPolicy()` to remove an existing scheduler policy and return to
 the compiler default. The policy is carried by `KernelDef`, so it survives the
 serialized-IR handoff to the C++ lowering engine. The Python and C++ engines
 emit the attribute in the same position.
+
+## Floating-point policy
+
+`CodegenPolicy` also carries two floating-point fields. Both default off and
+leave the lowered IR unchanged:
+
+| Field | Emitted | Effect |
+|---|---|---|
+| `f32_denormal_mode` (`F32DenormalMode`: `"ieee"` or `"preserve-sign"`) | `"denormal-fp-math-f32"="preserve-sign,preserve-sign"` function attribute; `"ieee"` is the LLVM default and emits nothing | Precise `llvm.exp2` / `llvm.log2` / `llvm.sqrt` / `fdiv` lose the IEEE denormal range fix-up |
+| `fp_contract` (`bool`) | `contract` flag on every IR `fadd` / `fsub` / `fmul` | The backend may fuse multiply-add chains into `v_fma` / `v_pk_fma` (one-ulp rounding change per fused pair) |
+
+Flushing is safe where every value that could become denormal is negligible,
+for example max-subtracted softmax weights. Re-check any kernel that keeps
+tiny un-normalised values meaningful. Kernel specs expose these as typed knobs
+(for example `use_f32_denormal_flush` / `use_fp_contract` on the gfx950
+unified-attention specs) so they reach the kernel name and dispatcher cache
+key.
 
 ## Run a bounded sweep
 
@@ -153,9 +171,12 @@ for persistent dispatch or autotune decisions.
 
 ## Limitations
 
-- The policy applies to the LLVM-direct COMGR path used by `compile_kernel()`.
-  `compile_kernel_via_hipcc()` rejects an explicit scheduler policy because the
-  HIP lowering path does not currently carry this LLVM function attribute.
+- The scheduler policy applies to the LLVM-direct COMGR path used by
+  `compile_kernel()`. `compile_kernel_via_hipcc()` rejects an explicit
+  scheduler policy because the HIP lowering path does not currently carry this
+  LLVM function attribute. It maps `f32_denormal_mode="preserve-sign"` to
+  `-fgpu-flush-denormals-to-zero`; FMA contraction is already clang's HIP
+  default there.
 - Strategy names are an LLVM backend interface. Revalidate generated code and
   numeric correctness when changing the LLVM or ROCm toolchain.
 - The policy controls machine scheduling only. It does not replace kernel-level
