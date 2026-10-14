@@ -510,10 +510,14 @@ class UnifiedAttention2DTiledSpec:
     # async DMA still writes lane-contiguous LDS; each lane instead *fetches*
     # the global chunk that belongs at its LDS slot, so no ABI or LDS-size
     # change. K uses ``s(r) = (r / RPP) % CPR`` (16 consecutive rows spread over
-    # all 64 banks); V uses ``s(r) = ((r / RPP) % 8 << 1) % CPR`` (matches the
-    # 8-row x 4-chunk footprint of one ``ds_read_b64_tr_b16``). RPP = rows per
-    # 256-byte period, CPR = 16-byte chunks per row. Same data, permuted
-    # addresses: numerics are bit-identical.
+    # all 64 banks). V uses ``s(r) = ((r / RPP) % 4 << 2) % CPR``: one
+    # ``ds_read_b64_tr_b16`` half-wave (32 lanes, one bank phase) covers 4 rows
+    # x 2 column groups x 4 lane columns; XOR-ing the 32-byte column unit with
+    # ``2 * (r % 4)`` maps those 32 lanes onto 32 distinct 8-byte bank slots of
+    # the 256-byte period. Only row bits below 4 * RPP feed the V XOR, so the
+    # read can hoist it out of the k loop. RPP = rows per 256-byte period, CPR
+    # = 16-byte chunks per row. Same data, permuted addresses: numerics are
+    # bit-identical.
     use_k_lds_xor_swizzle: bool = False
     use_v_lds_xor_swizzle: bool = False
     # Keep the next-tile K/V async DMA in flight across the barriers that only
@@ -2078,10 +2082,12 @@ def build_unified_attention_2d_tiled(
         return b.shl(chunk, b.const_i32(3))
 
     def _v_swz_halves(row: Value) -> Value:
+        # Depends only on row bits [SWZ_RPP_SHIFT, SWZ_RPP_SHIFT + 2): see the
+        # ``use_v_lds_xor_swizzle`` comment for the bank derivation.
         chunk = b.land(
             b.shl(
-                b.land(b.lshr(row, b.const_i32(SWZ_RPP_SHIFT)), b.const_i32(7)),
-                b.const_i32(1),
+                b.land(b.lshr(row, b.const_i32(SWZ_RPP_SHIFT)), b.const_i32(3)),
+                b.const_i32(2),
             ),
             b.const_i32(SWZ_CPR - 1),
         )
