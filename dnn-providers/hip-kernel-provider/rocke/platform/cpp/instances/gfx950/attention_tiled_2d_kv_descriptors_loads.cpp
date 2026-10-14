@@ -176,6 +176,47 @@ static rocke_value_t* rocke__wave_lds_offset_i64(rocke_gfx950_attn2d_build_ctx_t
 }
 
 /* ==========================================================================
+ * K/V LDS XOR swizzle (use_k_lds_xor_swizzle / use_v_lds_xor_swizzle).
+ * Chunk = 8 halves (16 bytes); SWZ_CPR chunks per row; 2^SWZ_RPP_SHIFT rows per
+ * 256-byte bank period. Each returns the XOR (chunk XOR << 3) to apply to a
+ * half-index column. Sub-expressions are bound in Python evaluation order.
+ * ========================================================================== */
+rocke_value_t* rocke_gfx950_attn2d_k_swz_halves(rocke_gfx950_attn2d_build_ctx_t* ctx,
+                                                rocke_value_t* row)
+{
+    rocke_ir_builder_t* b = ctx->b;
+    rocke_value_t* sh = rocke_b_lshr(b, row, rocke_b_const_i32(b, ctx->SWZ_RPP_SHIFT));
+    rocke_value_t* chunk = rocke_b_land(b, sh, rocke_b_const_i32(b, ctx->SWZ_CPR - 1));
+    return rocke_b_shl(b, chunk, rocke_b_const_i32(b, 3));
+}
+
+rocke_value_t* rocke_gfx950_attn2d_v_swz_halves(rocke_gfx950_attn2d_build_ctx_t* ctx,
+                                                rocke_value_t* row)
+{
+    rocke_ir_builder_t* b = ctx->b;
+    rocke_value_t* sh = rocke_b_lshr(b, row, rocke_b_const_i32(b, ctx->SWZ_RPP_SHIFT));
+    rocke_value_t* low2 = rocke_b_land(b, sh, rocke_b_const_i32(b, 3));
+    rocke_value_t* spread = rocke_b_shl(b, low2, rocke_b_const_i32(b, 2));
+    rocke_value_t* chunk = rocke_b_land(b, spread, rocke_b_const_i32(b, ctx->SWZ_CPR - 1));
+    return rocke_b_shl(b, chunk, rocke_b_const_i32(b, 3));
+}
+
+typedef rocke_value_t* (*rocke__swz_fn)(rocke_gfx950_attn2d_build_ctx_t*, rocke_value_t*);
+
+/* _swizzle_dma_linear_half: the DMA lane owns LDS slot (row, chunk p) of the
+ * natural layout and fetches the global chunk p ^ s(row) stored there. */
+static rocke_value_t* rocke__swizzle_dma_linear_half(rocke_gfx950_attn2d_build_ctx_t* ctx,
+                                                     rocke_value_t* linear_half,
+                                                     rocke__swz_fn swz)
+{
+    rocke_ir_builder_t* b = ctx->b;
+    rocke_value_t* row
+        = rocke_b_lshr(b, linear_half, rocke_b_const_i32(b, ctx->SWZ_HD_SHIFT));
+    rocke_value_t* x = swz(ctx, row);
+    return rocke_b_xor(b, linear_half, x);
+}
+
+/* ==========================================================================
  * Pre-loop: K/V buffer resources, byte derivation, paged-KV descriptor
  * (Python lines 1163-1630, the K/V-descriptor parts).
  * ========================================================================== */
@@ -433,6 +474,9 @@ void rocke_gfx950_attn2d_issue_k_load_runtime(rocke_gfx950_attn2d_build_ctx_t* c
              * physical_block term into a 64-bit buffer base. */
             rocke_value_t* linear_half
                 = rocke_b_add(b, rocke_b_const_i32(b, call * kv_halves_per_call), lane_half_base);
+            if(ctx->K_LDS_SWZ)
+                linear_half = rocke__swizzle_dma_linear_half(
+                    ctx, linear_half, rocke_gfx950_attn2d_k_swz_halves);
             const char* in_names[3] = {"tile_idx", "linear_half", "kv_head"};
             rocke_value_t* in_values[3] = {kv_tile_idx, linear_half, ctx->kv_head_idx};
             rocke_value_t* valid = NULL;
@@ -523,6 +567,9 @@ void rocke_gfx950_attn2d_issue_v_load_runtime(rocke_gfx950_attn2d_build_ctx_t* c
              * physical_block term into a 64-bit buffer base. */
             rocke_value_t* linear_half
                 = rocke_b_add(b, rocke_b_const_i32(b, call * kv_halves_per_call), lane_half_base);
+            if(ctx->V_LDS_SWZ)
+                linear_half = rocke__swizzle_dma_linear_half(
+                    ctx, linear_half, rocke_gfx950_attn2d_v_swz_halves);
             const char* in_names[3] = {"tile_idx", "linear_half", "kv_head"};
             rocke_value_t* in_values[3] = {kv_tile_idx, linear_half, ctx->kv_head_idx};
             rocke_value_t* valid = NULL;
@@ -607,6 +654,12 @@ rocke_value_t* rocke_gfx950_attn2d_read_k8_mfma_operand(rocke_gfx950_attn2d_buil
 {
     rocke_ir_builder_t* b = ctx->b;
     rocke_value_t* idx[3];
+    /* Logical chunk c of row r lives at physical chunk c ^ s_K(r). */
+    if(ctx->K_LDS_SWZ)
+    {
+        rocke_value_t* x = rocke_gfx950_attn2d_k_swz_halves(ctx, k_row);
+        k_off = rocke_b_xor(b, k_off, x);
+    }
     idx[0] = buf_idx;
     idx[1] = k_row;
     idx[2] = k_off;

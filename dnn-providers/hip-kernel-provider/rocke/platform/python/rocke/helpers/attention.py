@@ -801,6 +801,7 @@ def pv32_v_load_paired(
     lane_half32: Value,
     lane_col32: Value,
     dtype: Type,
+    col_xor_of_row=None,
 ) -> Value:
     """Promoted 32x32x16 PV V-load (P50): two paired ``ds_read_tr16_b64``
     + concat → ``<8 x dtype>`` per lane.
@@ -825,31 +826,39 @@ def pv32_v_load_paired(
     Output: per-lane ``<8 x dtype>`` ready to feed
     ``mfma_f32_32x32x16_<dtype>`` as the A operand of the transposed
     PV.
+
+    ``col_xor_of_row`` (optional) maps an LDS row to the half-index XOR of a
+    swizzled V layout (logical column ``c`` of row ``r`` stored at
+    ``c ^ col_xor_of_row(r)``); ``None`` reads the natural row-major tile. It
+    must depend only on row bits below 8 (``f(r + 8m) == f(r)``): it is then
+    evaluated once on the lane part of the row, so the swizzled column is
+    k-invariant and the ``k * 16`` / ``+ 8`` row steps stay constant address
+    offsets.
     """
     col_group16 = b.mul(b.div(lane_col32, b.const_i32(16)), b.const_i32(16))
     tr_col32 = b.add(
         col_group16,
         b.mul(b.mod(lane_col32, b.const_i32(4)), b.const_i32(4)),
     )
-    tr_row_base32 = b.add(
-        b.add(
-            b.const_i32(k * 16),
+    if col_xor_of_row is None:
+        tr_row_base32 = b.add(
+            b.add(
+                b.const_i32(k * 16),
+                b.mul(lane_half32, b.const_i32(4)),
+            ),
+            b.mod(b.div(lane_col32, b.const_i32(4)), b.const_i32(4)),
+        )
+        tr_row_hi = b.add(tr_row_base32, b.const_i32(8))
+        col_r0 = col_r1 = b.add(b.const_i32(n * 32), tr_col32)
+    else:
+        lane_row = b.add(
             b.mul(lane_half32, b.const_i32(4)),
-        ),
-        b.mod(b.div(lane_col32, b.const_i32(4)), b.const_i32(4)),
-    )
-    A_r0 = b.ds_read_tr16_b64(
-        V_lds,
-        v_buf,
-        tr_row_base32,
-        b.add(b.const_i32(n * 32), tr_col32),
-        dtype=dtype,
-    )
-    A_r1 = b.ds_read_tr16_b64(
-        V_lds,
-        v_buf,
-        b.add(tr_row_base32, b.const_i32(8)),
-        b.add(b.const_i32(n * 32), tr_col32),
-        dtype=dtype,
-    )
+            b.mod(b.div(lane_col32, b.const_i32(4)), b.const_i32(4)),
+        )
+        tr_row_base32 = b.add(b.const_i32(k * 16), lane_row)
+        tr_row_hi = b.add(tr_row_base32, b.const_i32(8))
+        col = b.add(b.const_i32(n * 32), tr_col32)
+        col_r0 = col_r1 = b.xor(col, col_xor_of_row(lane_row))
+    A_r0 = b.ds_read_tr16_b64(V_lds, v_buf, tr_row_base32, col_r0, dtype=dtype)
+    A_r1 = b.ds_read_tr16_b64(V_lds, v_buf, tr_row_hi, col_r1, dtype=dtype)
     return b.vec_concat(A_r0, A_r1)

@@ -996,6 +996,14 @@ static int make_spec(int idx, rocke_attention_tiled_2d_spec_t* s)
         pipe_d128_t64(s);
         s->use_reverse_q_block_order = true;
         break;
+    case 63:
+        pipe_d128_t64(s);
+        s->use_k_lds_xor_swizzle = true;
+        break;
+    case 64:
+        pipe_d128_t64(s);
+        s->use_v_lds_xor_swizzle = true;
+        break;
 
     default:
         return -1;

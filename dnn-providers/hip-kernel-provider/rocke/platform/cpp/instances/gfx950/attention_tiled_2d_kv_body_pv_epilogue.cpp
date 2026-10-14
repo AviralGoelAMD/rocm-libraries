@@ -92,15 +92,17 @@ static rocke_value_t* rocke__attn2d_mfma_16x16x32(rocke_ir_builder_t* b,
  *  Every sub-expression is bound in Python source (left-to-right) order so C's
  *  unspecified arg-eval order does not shuffle the SSA value numbering.
  * ============================================================ */
-static rocke_value_t* rocke_pv32_v_load_paired(rocke_ir_builder_t* b,
+static rocke_value_t* rocke_pv32_v_load_paired(rocke_gfx950_attn2d_build_ctx_t* ctx,
                                                rocke_value_t* V_lds,
                                                rocke_value_t* v_buf,
                                                int n,
                                                int k,
                                                rocke_value_t* lane_half32,
                                                rocke_value_t* lane_col32,
-                                               const rocke_type_t* dtype)
+                                               const rocke_type_t* dtype,
+                                               bool swizzled)
 {
+    rocke_ir_builder_t* b = ctx->b;
     /* col_group16 = (lane_col32 / 16) * 16. Python emits the div (with its const
      * 16) BEFORE the mul's const 16; bind the div first. */
     rocke_value_t* col_div16 = rocke_b_div(b, lane_col32, rocke_b_const_i32(b, 16));
@@ -109,24 +111,48 @@ static rocke_value_t* rocke_pv32_v_load_paired(rocke_ir_builder_t* b,
     rocke_value_t* tr_col_mod = rocke_b_mod(b, lane_col32, rocke_b_const_i32(b, 4));
     rocke_value_t* tr_col_rhs = rocke_b_mul(b, tr_col_mod, rocke_b_const_i32(b, 4));
     rocke_value_t* tr_col32 = rocke_b_add(b, col_group16, tr_col_rhs);
-    /* tr_row_base32 = (k*16 + lane_half32*4) + ((lane_col32 / 4) % 4). Python
-     * evaluates the inner add (const(k*16), mul(lane_half32,4)) BEFORE the mod. */
-    rocke_value_t* tr_row_k = rocke_b_const_i32(b, (int64_t)(k * 16));
-    rocke_value_t* tr_row_inner
-        = rocke_b_add(b, tr_row_k, rocke_b_mul(b, lane_half32, rocke_b_const_i32(b, 4)));
-    rocke_value_t* tr_row_div4 = rocke_b_div(b, lane_col32, rocke_b_const_i32(b, 4));
-    rocke_value_t* tr_row_mod = rocke_b_mod(b, tr_row_div4, rocke_b_const_i32(b, 4));
-    rocke_value_t* tr_row_base32 = rocke_b_add(b, tr_row_inner, tr_row_mod);
+    if(!swizzled)
+    {
+        /* Natural layout: the historical emission order (each read builds its
+         * own column add; the +8 row is built between the reads).
+         * tr_row_base32 = (k*16 + lane_half32*4) + ((lane_col32 / 4) % 4). Python
+         * evaluates the inner add (const(k*16), mul(lane_half32,4)) BEFORE the
+         * mod. */
+        rocke_value_t* tr_row_k = rocke_b_const_i32(b, (int64_t)(k * 16));
+        rocke_value_t* tr_row_inner
+            = rocke_b_add(b, tr_row_k, rocke_b_mul(b, lane_half32, rocke_b_const_i32(b, 4)));
+        rocke_value_t* tr_row_div4 = rocke_b_div(b, lane_col32, rocke_b_const_i32(b, 4));
+        rocke_value_t* tr_row_mod = rocke_b_mod(b, tr_row_div4, rocke_b_const_i32(b, 4));
+        rocke_value_t* tr_row_base32 = rocke_b_add(b, tr_row_inner, tr_row_mod);
 
-    /* Python computes col = add(const(n*32), tr_col32) INLINE inside EACH
-     * ds_read call (helpers/attention.py 844-846, 851-853), so it is emitted
-     * TWICE -- once per read. Mirror that (do NOT hoist) for value numbering. */
-    rocke_value_t* col0 = rocke_b_add(b, rocke_b_const_i32(b, (int64_t)(n * 32)), tr_col32);
-    rocke_value_t* idx0[3] = {v_buf, tr_row_base32, col0};
+        /* Python computes col = add(const(n*32), tr_col32) INLINE inside EACH
+         * ds_read call, so it is emitted TWICE -- once per read. Mirror that (do
+         * NOT hoist) for value numbering. */
+        rocke_value_t* col0 = rocke_b_add(b, rocke_b_const_i32(b, (int64_t)(n * 32)), tr_col32);
+        rocke_value_t* idx0[3] = {v_buf, tr_row_base32, col0};
+        rocke_value_t* A_r0 = rocke_b_ds_read_tr16_b64(b, V_lds, idx0, 3, dtype);
+        rocke_value_t* row1 = rocke_b_add(b, tr_row_base32, rocke_b_const_i32(b, 8));
+        rocke_value_t* col1 = rocke_b_add(b, rocke_b_const_i32(b, (int64_t)(n * 32)), tr_col32);
+        rocke_value_t* idx1[3] = {v_buf, row1, col1};
+        rocke_value_t* A_r1 = rocke_b_ds_read_tr16_b64(b, V_lds, idx1, 3, dtype);
+        return rocke_b_vec_concat(b, A_r0, A_r1);
+    }
+    /* Swizzled V (use_v_lds_xor_swizzle): the column XOR depends only on the
+     * lane part of the row, so it is evaluated once on lane_row and the k*16 /
+     * +8 row steps stay constant offsets. */
+    rocke_value_t* lr_hi = rocke_b_mul(b, lane_half32, rocke_b_const_i32(b, 4));
+    rocke_value_t* lr_div4 = rocke_b_div(b, lane_col32, rocke_b_const_i32(b, 4));
+    rocke_value_t* lr_lo = rocke_b_mod(b, lr_div4, rocke_b_const_i32(b, 4));
+    rocke_value_t* lane_row = rocke_b_add(b, lr_hi, lr_lo);
+    rocke_value_t* tr_row_base32
+        = rocke_b_add(b, rocke_b_const_i32(b, (int64_t)(k * 16)), lane_row);
+    rocke_value_t* tr_row_hi = rocke_b_add(b, tr_row_base32, rocke_b_const_i32(b, 8));
+    rocke_value_t* col = rocke_b_add(b, rocke_b_const_i32(b, (int64_t)(n * 32)), tr_col32);
+    rocke_value_t* col_x = rocke_gfx950_attn2d_v_swz_halves(ctx, lane_row);
+    rocke_value_t* col_swz = rocke_b_xor(b, col, col_x);
+    rocke_value_t* idx0[3] = {v_buf, tr_row_base32, col_swz};
     rocke_value_t* A_r0 = rocke_b_ds_read_tr16_b64(b, V_lds, idx0, 3, dtype);
-    rocke_value_t* row1 = rocke_b_add(b, tr_row_base32, rocke_b_const_i32(b, 8));
-    rocke_value_t* col1 = rocke_b_add(b, rocke_b_const_i32(b, (int64_t)(n * 32)), tr_col32);
-    rocke_value_t* idx1[3] = {v_buf, row1, col1};
+    rocke_value_t* idx1[3] = {v_buf, tr_row_hi, col_swz};
     rocke_value_t* A_r1 = rocke_b_ds_read_tr16_b64(b, V_lds, idx1, 3, dtype);
     return rocke_b_vec_concat(b, A_r0, A_r1);
 }
@@ -180,8 +206,15 @@ rocke_value_t* rocke_gfx950_attn2d_apply_transposed_pv_regs(rocke_gfx950_attn2d_
             /* Half-local PV (Python 3361-3391). Each 32-lane half consumes only
              * the P rows already local to that half via the paired transpose
              * V-read so V and P share the same permuted K order. */
-            A_v_t = rocke_pv32_v_load_paired(
-                b, ctx->V_lds, v_buf, n, k, ctx->lane_half32_v, ctx->lane_col32_v, dtype);
+            A_v_t = rocke_pv32_v_load_paired(ctx,
+                                             ctx->V_lds,
+                                             v_buf,
+                                             n,
+                                             k,
+                                             ctx->lane_half32_v,
+                                             ctx->lane_col32_v,
+                                             dtype,
+                                             ctx->V_LDS_SWZ);
             for(kk = 0; kk < 8; ++kk)
             {
                 int local_in_group = kk % 4;
