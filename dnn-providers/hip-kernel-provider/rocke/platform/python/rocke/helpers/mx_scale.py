@@ -63,13 +63,15 @@ def decode_mx_scale_e8m0(b: IRBuilder, e8m0: Value) -> Value:
     MFMA hardware path.
     * ``1 <= e <= 254`` -> ``2^(e - 127)``, exact.
 
-    Lowering: ``sitofp(sext(e)) - 127.0`` then ``exp2``; with both
+    Lowering: ``sitofp(zext(e)) - 127.0`` then ``exp2``; with both
     sentinels handled via ``select``. The AMDGPU backend fuses the
-    select chain into a single ``v_med3_f32`` + ``v_exp_f32``.
+    select chain into a single ``v_med3_f32`` + ``v_exp_f32``. The byte is
+    unsigned: sign-extending it would turn every exponent ``>= 128``
+    (scales ``>= 2.0``) negative and make the ``255`` sentinel unreachable.
     """
     if e8m0.type.name != "i8":
         raise ValueError(f"decode_mx_scale_e8m0 expects i8 input, got {e8m0.type.name}")
-    e_i32 = b.sext(e8m0, I32)
+    e_i32 = b.zext(e8m0, I32)
     is_zero = b.cmp_eq(e_i32, b.const_i32(0))
     is_nan = b.cmp_eq(e_i32, b.const_i32(255))
     e_minus_127_f32 = b.fsub(b.sitofp_f32(e_i32), b.const_f32(127.0))

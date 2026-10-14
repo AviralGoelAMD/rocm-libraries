@@ -14,7 +14,7 @@
  *     def decode_mx_scale_e8m0(b: IRBuilder, e8m0: Value) -> Value:
  *         if e8m0.type.name != "i8":
  *             raise ValueError(...)
- *         e_i32 = b.sext(e8m0, I32)
+ *         e_i32 = b.zext(e8m0, I32)
  *         is_zero = b.cmp_eq(e_i32, b.const_i32(0))
  *         is_nan  = b.cmp_eq(e_i32, b.const_i32(255))
  *         e_minus_127_f32 = b.fsub(b.sitofp_f32(e_i32), b.const_f32(127.0))
@@ -24,7 +24,8 @@
  *
  * Sentinels: ``e == 0`` (subnormal) and ``e == 255`` (NaN) both decode to
  * ``0.0`` so downstream accumulators are not poisoned, matching the AMDGPU MX
- * MFMA hardware path. ``1 <= e <= 254`` decodes to ``2^(e - 127)``.
+ * MFMA hardware path. ``1 <= e <= 254`` decodes to ``2^(e - 127)``. The byte is
+ * read unsigned (zero-extended), so exponents >= 128 encode scales >= 2.0.
  *
  * The Python raises ValueError on a non-i8 input. C99 has no exceptions, so the
  * builder-aware spelling follows the rest of the C port's sticky-error model:

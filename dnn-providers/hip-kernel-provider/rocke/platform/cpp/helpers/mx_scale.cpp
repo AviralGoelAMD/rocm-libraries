@@ -10,7 +10,7 @@
  *         if e8m0.type.name != "i8":
  *             raise ValueError(
  *                 f"decode_mx_scale_e8m0 expects i8 input, got {e8m0.type.name}")
- *         e_i32 = b.sext(e8m0, I32)
+ *         e_i32 = b.zext(e8m0, I32)
  *         is_zero = b.cmp_eq(e_i32, b.const_i32(0))
  *         is_nan  = b.cmp_eq(e_i32, b.const_i32(255))
  *         e_minus_127_f32 = b.fsub(b.sitofp_f32(e_i32), b.const_f32(127.0))
@@ -51,8 +51,9 @@ rocke_value_t* rocke_decode_mx_scale_e8m0(rocke_ir_builder_t* b, rocke_value_t* 
             b, ROCKE_ERR_VALUE, "decode_mx_scale_e8m0 expects i8 input, got %s", got);
     }
 
-    /* e_i32 = b.sext(e8m0, I32) */
-    e_i32 = rocke_b_sext(b, e8m0, rocke_i32());
+    /* e_i32 = b.zext(e8m0, I32) -- the E8M0 byte is unsigned; sign-extending it
+     * would turn every exponent >= 128 negative. */
+    e_i32 = rocke_b_zext(b, e8m0, rocke_i32());
     /* is_zero = b.cmp_eq(e_i32, b.const_i32(0)) */
     is_zero = rocke_b_cmp_eq(b, e_i32, rocke_b_const_i32(b, 0));
     /* is_nan = b.cmp_eq(e_i32, b.const_i32(255)) */
