@@ -268,8 +268,9 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # that separate operand reads (all K, then all V operands of a tile) from
     # MFMA runs (QK, then PV). The lagging wave group runs one window behind,
     # so on each SIMD one wave reads operands while the other issues MFMAs.
-    # 4: K reads | QK | V reads | PV. 3: the K reads share the QK window.
-    # K is prefetched two tiles ahead. 0 = off.
+    # 4: K reads | QK | V reads | PV (the only mode; K(j+3) refills the buffer
+    # the lagging group reads in window 1, so the K reads cannot share the QK
+    # window). K is prefetched two tiles ahead. 0 = off.
     mfma_windows: int = field(default=0, kw_only=True)
     # mfma_windows only: 0 = the lagging group runs at s_setprio 1; 1 = every
     # wave raises its priority for its MFMA windows; 2 = for its operand
@@ -513,14 +514,14 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
                 "lds_read_base, and excludes bulk_operand_reads; got "
                 f"{self.operand_read_ahead}"
             )
-        if self.mfma_windows not in (0, 3, 4) or self.window_priority not in (
+        if self.mfma_windows not in (0, 4) or self.window_priority not in (
             0,
             1,
             2,
             3,
         ):
             raise ValueError(
-                "mfma_windows must be 0, 3 or 4 and window_priority 0..3, got "
+                "mfma_windows must be 0 or 4 and window_priority 0..3, got "
                 f"{self.mfma_windows}, {self.window_priority}"
             )
         if self.window_priority and not self.mfma_windows:
@@ -1900,8 +1901,7 @@ def build_attention_dense(
                 # boundary ahead of its reads in window 3.
                 async_load_v(V_lds_addr, buf_j1, b.mul(j1, b.const_i32(BN)))
                 kops = read_k_tile(buf_j1)
-                if WINDOWS == 4:
-                    window_barrier(lgkmcnt=0, vmcnt=WIN_VMCNT, opens="mfma")
+                window_barrier(lgkmcnt=0, vmcnt=WIN_VMCNT, opens="mfma")
             else:
                 kops = None
                 b.s_waitcnt(vmcnt=0)
@@ -1991,12 +1991,7 @@ def build_attention_dense(
                 # tile's window 1, which also carries the softmax finish and
                 # the O rescale below.
                 o_acc = pv_mfma_run(o_acc, p_packs, vops, after_mfma=max_hook)
-                # Three windows: V(j+1), read in the next tile's window 3, must
-                # land one boundary early, so wait for all but K(j+3) here.
-                window_barrier(
-                    vmcnt=WIN_VMCNT // 2 if WINDOWS == 3 else -1,
-                    opens="mfma" if WINDOWS == 3 else "read",
-                )
+                window_barrier(opens="read")
             else:
                 o_acc = do_pv(
                     o_acc, p_packs, buf_j, after_mfma=max_hook, bulk=BULK_V, pre=pv_pre

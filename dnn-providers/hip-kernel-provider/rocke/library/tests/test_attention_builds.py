@@ -2963,7 +2963,6 @@ class TestAttentionDenseGfx950CodegenKnobs(unittest.TestCase):
                 ("call void @llvm.amdgcn.sched.barrier(i32 1030)", True),
             ),
             ("lookahead", la, dict(win, mfma_windows=4), None),
-            ("lookahead", la, dict(win, mfma_windows=3), None),
             (
                 "lookahead",
                 la,
