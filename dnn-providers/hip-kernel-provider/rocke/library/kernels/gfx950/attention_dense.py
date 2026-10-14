@@ -232,6 +232,10 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # K/V DMA (vmcnt(0)) before the first LDS read after it. The body's own
     # s_waitcnt + s_barrier already order each DMA before its reads.
     lds_dma_manual_wait: bool = field(default=False, kw_only=True)
+    # qk_lookahead only: split the waves into two halves that run one barrier
+    # apart (two barriers per KV tile), so while one half is in its QK phase
+    # the other is in its PV phase; the lagging half runs at s_setprio 1.
+    wave_group_pingpong: bool = field(default=False, kw_only=True)
     # qk_lookahead only: KV tiles per loop trip (1 or 2). Two alternates the
     # carried score registers instead of copying them at every back edge.
     qk_lookahead_unroll: int = field(default=1, kw_only=True)
@@ -436,6 +440,10 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
                     "qk_lookahead owns the softmax schedule; disable "
                     "pv_sched_group_template"
                 )
+        if self.wave_group_pingpong and (not self.qk_lookahead or self.num_waves % 2):
+            raise ValueError(
+                "wave_group_pingpong requires qk_lookahead and an even wave count"
+            )
         if self.qk_lookahead_unroll not in (1, 2):
             raise ValueError(
                 f"qk_lookahead_unroll must be 1 or 2, got {self.qk_lookahead_unroll}"
@@ -581,6 +589,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "qk_lookahead",
             "permlane32_reduce",
             "lds_dma_manual_wait",
+            "wave_group_pingpong",
             "qk_lookahead_unroll",
         )
     }
@@ -712,6 +721,7 @@ def build_attention_dense(
     PV_FENCE = spec.resolved_pv_sched_fence()
     PV_FENCE_MASK = int(spec.pv_sched_fence_mask)
     PV_PRIORITY = int(spec.pv_priority)
+    PINGPONG = spec.wave_group_pingpong
     UNROLL = int(spec.qk_lookahead_unroll)
     IGLP = spec.resolved_iglp_mode()
     gqa = Hq // Hkv
@@ -1512,7 +1522,8 @@ def build_attention_dense(
             async_load_k(
                 K_lds_addr, buf_j, b.mul(b.add(j, b.const_i32(2)), b.const_i32(BN))
             )
-            async_load_v(V_lds_addr, buf_j1, b.mul(j1, b.const_i32(BN)))
+            if not PINGPONG:
+                async_load_v(V_lds_addr, buf_j1, b.mul(j1, b.const_i32(BN)))
 
             # Phase A: QK(j+1) with the exp2 of tile j in its shadow. The exps
             # run in PV-operand order so each bf16 P pack, and the two partial
@@ -1554,6 +1565,13 @@ def build_attention_dense(
             l_acc = b.fadd(l_i, l_local)
 
             # Phase B: PV(j) with the mask + row max of tile j+1 in its shadow.
+            if PINGPONG:
+                # Second barrier: the lagging group runs phase A of this tile
+                # while the leading group runs phase B. V(j+1) refills V buffer
+                # (j+1) % 2 only after both groups are past PV(j-1).
+                b.s_waitcnt(vmcnt=0)
+                b.s_barrier_bare()
+                async_load_v(V_lds_addr, buf_j1, b.mul(j1, b.const_i32(BN)))
             if mask_next:
                 do_mask(s_next, j1)
             maxes = [neg_inf]
@@ -1567,10 +1585,10 @@ def build_attention_dense(
                     n, i = slot
                     maxes[0] = b.fmax(maxes[0], s_next[n][i])
 
-            if PV_PRIORITY:
+            if PV_PRIORITY and not PINGPONG:
                 b.s_setprio(PV_PRIORITY)
             o_acc = do_pv(o_acc, p_packs, buf_j, after_mfma=max_hook)
-            if PV_PRIORITY:
+            if PV_PRIORITY and not PINGPONG:
                 b.s_setprio(0)
             for n, i in mslots:
                 maxes[0] = b.fmax(maxes[0], s_next[n][i])
@@ -1619,6 +1637,14 @@ def build_attention_dense(
             return lp1
 
         last = b.sub(n_upper, b.const_i32(1))
+        if PINGPONG:
+            # Waves [WAVES/2, WAVES) lag the leading half by one barrier and
+            # win issue arbitration; the leading half pays the extra barrier
+            # back after the loop so both halves meet the epilogue barrier.
+            lag = b.cmp_ge(b.readfirstlane(wave), b.const_i32(WAVES // 2))
+            with b.scf_if(lag):
+                b.s_setprio(1)
+                b.s_barrier_bare()
         if causal and spec.causal_diag_split:
             # Tile j+1 needs the causal mask once it reaches the diagonal.
             diag_start = b.mul(qb, b.const_i32(n_per))
@@ -1656,6 +1682,11 @@ def build_attention_dense(
         l_i = b.fadd(l_i, l_local)
         if spec.defer_row_sum:
             l_i = half_combine(l_i, b.fadd)
+        if PINGPONG:
+            with b.scf_if(b.lnot(lag)):
+                b.s_barrier_bare()
+            with b.scf_if(lag):
+                b.s_setprio(0)
         # V(last) was issued at the top of the final iteration (or the prologue).
         b.s_waitcnt(vmcnt=0)
         b.s_barrier_bare()
