@@ -30,7 +30,8 @@ Three arch families are supported, each with its own hard-coded tile config:
 * **gfx942** — wave64, MFMA 16×16×16 atom (largest fp16/bf16 atom available):
       tile 64×64×64, warp 2×2, atom 16×16×16, pipeline ``mem``
 * **gfx950** — wave64, MFMA 32×32×16 atom:
-      tile 64×64×64, warp 2×2, atom 32×32×16, pipeline ``mem``
+      tile 64×64×64, warp 2×2, atom 32×32×16, pipeline ``mem``; fwd moves
+      to a 128×128 tile on large problems (``_gfx950_fwd_big_tile``)
 * **gfx1250** (wave32, WMMA) — WMMA 16×16×32 atom:
       tile 32×32×32, warp 2×2, atom 16×16×32, pipeline ``mem``
   (gfx1250 restricts WMMA conv to pipeline=``mem``, groups=1, no cshuffle
@@ -196,6 +197,46 @@ _GFX950_WARP_M = 2
 _GFX950_WARP_N = 2
 _GFX950_WARP_TILE_MN = 32
 _GFX950_WARP_TILE_K = 16
+
+# gfx950 large-tile rule (fwd): same 2x2 warps and 32x32x16 atom, but a
+# 128x128 CTA tile, i.e. 16 MFMA per wave per K tile instead of 4, so the
+# per-tile address/LDS work is amortised over four times the math. It needs a
+# grid that still fills the device at a quarter of the CTA count, a long enough
+# reduction to repay the larger prologue/epilogue, and at least 128 GEMM-N
+# columns (a 64-wide channel axis would leave half of every tile idle). Fit on
+# a cold A/B over ResNet-50 / SD-UNet / 3-D shapes and checked on held-out ones.
+_GFX950_BIG_TILE_MN = 128
+_GFX950_BIG_TILE_MIN_KRED = 1024  # reduction length Y*X*C (per group)
+# fwd: output tiles at the default 64x64 geometry.
+_GFX950_FWD_BIG_TILE_MIN_TILES = 1536
+
+
+def _gfx950_fwd_big_tile(p: "ConvProblem") -> bool:
+    """Whether the gfx950 fwd candidate takes the 128x128 tile for ``p``."""
+    if p.groups != 1:
+        return False
+    k_red = (p.Z if p.is_3d else 1) * p.Y * p.X * p.cpg
+    tiles = -(-p.M // _GFX950_TILE_M) * -(-p.kpg // _GFX950_TILE_N)
+    return (
+        p.kpg >= _GFX950_BIG_TILE_MN
+        and tiles >= _GFX950_FWD_BIG_TILE_MIN_TILES
+        and k_red >= _GFX950_BIG_TILE_MIN_KRED
+    )
+
+
+def _gfx950_tile(big: bool) -> Tuple[int, int, int, int, int, int, int]:
+    """The gfx950 (tile_m, tile_n, tile_k, warp_m, warp_n, atom_mn, atom_k)."""
+    tile_mn = _GFX950_BIG_TILE_MN if big else _GFX950_TILE_M
+    return (
+        tile_mn,
+        _GFX950_BIG_TILE_MN if big else _GFX950_TILE_N,
+        _GFX950_TILE_K,
+        _GFX950_WARP_M,
+        _GFX950_WARP_N,
+        _GFX950_WARP_TILE_MN,
+        _GFX950_WARP_TILE_K,
+    )
+
 
 # gfx942 — wave64, MFMA 16x16x16 (largest fp16/bf16 atom available)
 _GFX942_TILE_M = 64
@@ -892,15 +933,7 @@ def _make_gfx950_fwd_candidate() -> KernelCandidate:
     algorithm = "implicit_gemm_fwd"
 
     def _tile(req: ConvGroupedRequest):
-        return (
-            _GFX950_TILE_M,
-            _GFX950_TILE_N,
-            _GFX950_TILE_K,
-            _GFX950_WARP_M,
-            _GFX950_WARP_N,
-            _GFX950_WARP_TILE_MN,
-            _GFX950_WARP_TILE_K,
-        )
+        return _gfx950_tile(_gfx950_fwd_big_tile(_problem(req)))
 
     def _build_instance_spec(req: ConvGroupedRequest) -> ImplicitGemmConvSpec:
         tm, tn, tk, wm, wn, wtmn, wtk = _tile(req)
