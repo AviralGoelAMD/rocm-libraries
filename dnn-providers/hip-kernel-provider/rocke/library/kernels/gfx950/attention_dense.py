@@ -264,12 +264,17 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # scheduler). Holds that many operands in registers; a fence per MFMA
     # keeps the distance.
     operand_read_ahead: int = field(default=0, kw_only=True)
-    # wave_group_pingpong + lds_read_base only: four barrier windows per KV tile
-    # that alternate operand reads (all K, then all V operands of a tile) with
+    # wave_group_pingpong + lds_read_base only: barrier windows per KV tile
+    # that separate operand reads (all K, then all V operands of a tile) from
     # MFMA runs (QK, then PV). The lagging wave group runs one window behind,
     # so on each SIMD one wave reads operands while the other issues MFMAs.
-    # K is prefetched two tiles ahead.
-    mfma_windows: bool = field(default=False, kw_only=True)
+    # 4: K reads | QK | V reads | PV. 3: the K reads share the QK window.
+    # K is prefetched two tiles ahead. 0 = off.
+    mfma_windows: int = field(default=0, kw_only=True)
+    # mfma_windows only: 0 = the lagging group runs at s_setprio 1; 1 = every
+    # wave raises its priority for its MFMA windows; 2 = for its operand
+    # windows; 3 = no s_setprio.
+    window_priority: int = field(default=0, kw_only=True)
 
     def resolved_exp_per_pv_step(self) -> int:
         if self.exp_per_pv_step is not None:
@@ -508,6 +513,18 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
                 "lds_read_base, and excludes bulk_operand_reads; got "
                 f"{self.operand_read_ahead}"
             )
+        if self.mfma_windows not in (0, 3, 4) or self.window_priority not in (
+            0,
+            1,
+            2,
+            3,
+        ):
+            raise ValueError(
+                "mfma_windows must be 0, 3 or 4 and window_priority 0..3, got "
+                f"{self.mfma_windows}, {self.window_priority}"
+            )
+        if self.window_priority and not self.mfma_windows:
+            raise ValueError("window_priority needs mfma_windows")
         if self.mfma_windows and (
             not (
                 self.wave_group_pingpong
@@ -671,6 +688,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "scalar_uniforms",
             "operand_read_ahead",
             "mfma_windows",
+            "window_priority",
         )
     }
 )
@@ -807,7 +825,8 @@ def build_attention_dense(
     BULK_V = bool(spec.bulk_operand_reads & 2)
     LDS_READ_BASE = spec.lds_read_base
     READ_AHEAD = int(spec.operand_read_ahead)
-    WINDOWS = spec.mfma_windows
+    WINDOWS = int(spec.mfma_windows)
+    WIN_PRIO = int(spec.window_priority)
     IGLP = spec.resolved_iglp_mode()
     gqa = Hq // Hkv
     stride_q_tok = Hq * D
@@ -1779,13 +1798,16 @@ def build_attention_dense(
     start_buf = b.mod(start_tile, b.const_i32(NBUF))
     start_buf1 = b.mod(b.add(start_tile, b.const_i32(1)), b.const_i32(NBUF))
 
-    def window_barrier(lgkmcnt=-1, vmcnt=-1):
+    def window_barrier(lgkmcnt=-1, vmcnt=-1, opens=None):
         """mfma_windows: one window boundary. The fences keep every MFMA and
-        LDS access of a window on its side of the barrier."""
+        LDS access of a window on its side of the barrier. ``opens`` ("mfma"
+        or "read") names the next window for window_priority 1 and 2."""
         b.sched_barrier(0)
         if lgkmcnt >= 0 or vmcnt >= 0:
             b.s_waitcnt(vmcnt=vmcnt, lgkmcnt=lgkmcnt)
         b.s_barrier_bare()
+        if opens is not None and WIN_PRIO in (1, 2):
+            b.s_setprio(int((opens == "mfma") == (WIN_PRIO == 1)))
         b.sched_barrier(0)
 
     def _emit_lookahead_main():
@@ -1878,7 +1900,8 @@ def build_attention_dense(
                 # boundary ahead of its reads in window 3.
                 async_load_v(V_lds_addr, buf_j1, b.mul(j1, b.const_i32(BN)))
                 kops = read_k_tile(buf_j1)
-                window_barrier(lgkmcnt=0, vmcnt=WIN_VMCNT)
+                if WINDOWS == 4:
+                    window_barrier(lgkmcnt=0, vmcnt=WIN_VMCNT, opens="mfma")
             else:
                 kops = None
                 b.s_waitcnt(vmcnt=0)
@@ -1937,10 +1960,10 @@ def build_attention_dense(
                 # Window 3 (operands): K(j+3) refills K buffer (j+1) % 2, which
                 # both groups finished reading in window 1, then every V(j)
                 # operand is read; K(j+2) must land one boundary early.
-                window_barrier()
+                window_barrier(opens="read")
                 async_load_k(K_lds_addr, buf_j1, b.mul(b.add(j, b.const_i32(3)), b.const_i32(BN)))
                 vops = read_v_tile(buf_j)
-                window_barrier(lgkmcnt=0, vmcnt=WIN_VMCNT)
+                window_barrier(lgkmcnt=0, vmcnt=WIN_VMCNT, opens="mfma")
             elif PINGPONG:
                 # Second barrier: the lagging group runs phase A of this tile
                 # while the leading group runs phase B. V(j+1) refills V buffer
@@ -1968,7 +1991,12 @@ def build_attention_dense(
                 # tile's window 1, which also carries the softmax finish and
                 # the O rescale below.
                 o_acc = pv_mfma_run(o_acc, p_packs, vops, after_mfma=max_hook)
-                window_barrier()
+                # Three windows: V(j+1), read in the next tile's window 3, must
+                # land one boundary early, so wait for all but K(j+3) here.
+                window_barrier(
+                    vmcnt=WIN_VMCNT // 2 if WINDOWS == 3 else -1,
+                    opens="mfma" if WINDOWS == 3 else "read",
+                )
             else:
                 o_acc = do_pv(
                     o_acc, p_packs, buf_j, after_mfma=max_hook, bulk=BULK_V, pre=pv_pre
@@ -2030,7 +2058,8 @@ def build_attention_dense(
                 b.readfirstlane(wave), b.const_i32(WAVES // 2)
             )
             with b.scf_if(lag):
-                b.s_setprio(1)
+                if WIN_PRIO == 0:
+                    b.s_setprio(1)
                 b.s_barrier_bare()
         if causal and spec.causal_diag_split:
             # Tile j+1 needs the causal mask once it reaches the diagonal.
@@ -2070,7 +2099,10 @@ def build_attention_dense(
         if PINGPONG:
             with b.scf_if(b.lnot(lag)):
                 b.s_barrier_bare()
-            with b.scf_if(lag):
+            if WIN_PRIO == 0:
+                with b.scf_if(lag):
+                    b.s_setprio(0)
+            elif WIN_PRIO in (1, 2):
                 b.s_setprio(0)
         # V(last) was issued at the top of the final iteration (or the prologue).
         b.s_waitcnt(vmcnt=0)
