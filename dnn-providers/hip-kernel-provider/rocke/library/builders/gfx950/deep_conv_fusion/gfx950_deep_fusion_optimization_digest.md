@@ -117,9 +117,10 @@ Useful FLOP accounting for the target shape:
 
 - Input-footprint LDS cache: slower. It adds LDS fill, sync, and address math
   without recovering a meaningful HBM stall.
-- Direct footprint path: slower, and later found incorrect at full target shape.
-  It removes regular A-tile materialization but replaces it with scalar LDS
-  gathers and more coordinate arithmetic.
+- Direct footprint path: slower. It removes regular A-tile materialization but
+  replaces it with scalar LDS gathers and more coordinate arithmetic. (It was
+  once also wrong at the full target shape; that was the footprint-fill tail
+  bug shared with the input-footprint cache, now fixed.)
 - `async_dma=True`: incorrect for this fused carrier and slower even when judged
   only by timing. There is no memory-latency wall to hide.
 - `unroll_k=True`: incorrect because it drops synchronization needed by the

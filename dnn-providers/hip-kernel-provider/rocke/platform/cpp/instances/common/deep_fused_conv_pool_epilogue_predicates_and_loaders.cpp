@@ -447,7 +447,20 @@ rocke_value_t* rocke_dfcp_setup_input_footprint_cache(rocke_ir_builder_t* b,
         v = rocke_b_buffer_load_f16(b, a_rsrc, safe_off, rocke_b_const_i32(b, 0));
         idxv[0] = t0;
         idxv[1] = ci;
-        rocke_b_smem_store_f16(b, input_smem, idxv, 2, v);
+        /* Lanes past `total` clamp to index 0; an unguarded store would write
+         * their zero over footprint element [0, 0]. Only the last iteration can
+         * overrun, and only when block_size does not divide total. */
+        if((e + 1) * block_size > total)
+        {
+            rocke_if_t iff = rocke_b_scf_if(b, idx_ok);
+            rocke_b_region_enter(b, iff.then_region);
+            rocke_b_smem_store_f16(b, input_smem, idxv, 2, v);
+            rocke_b_region_leave(b);
+        }
+        else
+        {
+            rocke_b_smem_store_f16(b, input_smem, idxv, 2, v);
+        }
     }
 
     rocke_b_sync(b);
@@ -578,7 +591,18 @@ void rocke_dfcp_load_conv0_a_tile_from_input_cache(rocke_ir_builder_t* b,
         v = rocke_b_select(b, rocke_b_land(b, idx_ok, kg_ok), v, zero_h);
         idxv[0] = row;
         idxv[1] = col;
-        rocke_b_smem_store_f16(b, a_dst, idxv, 2, v);
+        /* Same overrun as the footprint fill: clamped lanes alias A[0, 0]. */
+        if((e + 1) * block_size > total)
+        {
+            rocke_if_t iff = rocke_b_scf_if(b, idx_ok);
+            rocke_b_region_enter(b, iff.then_region);
+            rocke_b_smem_store_f16(b, a_dst, idxv, 2, v);
+            rocke_b_region_leave(b);
+        }
+        else
+        {
+            rocke_b_smem_store_f16(b, a_dst, idxv, 2, v);
+        }
     }
 }
 

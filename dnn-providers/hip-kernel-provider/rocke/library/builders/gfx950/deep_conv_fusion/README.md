@@ -99,8 +99,8 @@ PYTHONPATH=$(pwd) $VENV -m rocke.examples.gfx950.deep_conv_fusion.deep_fused_con
 | `--pipeline` | `mem` | pipeline mode: `mem`, `compv3`, or `compv4` |
 | `--async-dma` | off | async global→LDS DMA (a rejected lever — see below) |
 | `--unroll-k` | off | unroll the K-loop (a rejected lever — see below) |
-| `--cache-input-footprint` | off | stage the input footprint in LDS (a rejected lever) |
-| `--direct-conv0-input-cache` | off | direct conv0 load from the input cache (a rejected lever) |
+| `--cache-input-footprint` | off | stage the input footprint in LDS (a rejected lever: correct, slower) |
+| `--direct-conv0-input-cache` | off | direct conv0 load from the input cache (a rejected lever: correct, slower) |
 | `--n` | `1` | batch |
 | `--h` | `16` | input height |
 | `--w` | `16` | input width |
@@ -112,7 +112,7 @@ The conv0 filter is fixed to `3×3`, stride 1, pad 1, dilation 1; the pool is fi
 to `2×2 stride-2`. `--async-dma`, `--unroll-k`, `--cache-input-footprint`, and
 `--direct-conv0-input-cache` are exposed for experimentation but are **rejected
 levers** (incorrect and/or slower — see the digest); the verified default path is
-all of them off.
+all of them off. The two input-cache levers are correct but slower.
 
 ### A/B compare two configs at the full target shape
 
@@ -223,11 +223,12 @@ idle).
 - **`no fp16 32x32 MFMA atom for <arch>`** — the requested arch lacks the
   `32×32×16` fp16 MFMA atom the kernel selects; only CDNA arches that expose it
   are supported.
-- **Verify fails (`bad > 0`)** at a custom shape — the rejected levers
-  (`--async-dma`, `--unroll-k`, `--cache-input-footprint`,
-  `--direct-conv0-input-cache`) are known to be incorrect for the fused carrier
-  and/or only correct at small shapes; leave them off. `--direct-conv0-input-cache`
-  in particular was found incorrect at the full target shape.
+- **Verify fails (`bad > 0`)** at a custom shape — `--async-dma` and
+  `--unroll-k` are known to be incorrect for the fused carrier; leave them off.
+  The two input-cache levers used to corrupt one halo pixel per interior tile
+  whenever the block size did not divide `foot_h * foot_w * C` (e.g. `C=8`);
+  that is fixed and pinned by
+  `tests/test_deep_fused_conv_pool_gfx950_numeric.py`.
 - **Slower than expected** — confirm you are on the known-good config (`4×4`,
   `tile_m=64`, `tile_k=32`, `mem`, all rejected levers off). The `4×4/tk32`
   geometry intentionally accepts more padded MFMA work because it cuts per-CTA

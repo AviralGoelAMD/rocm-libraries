@@ -676,7 +676,14 @@ def _setup_input_footprint_cache(
         off_bytes = b.mul(off_elems, c_half_bytes)
         safe_off = b.select(valid, off_bytes, oob)
         v = b.buffer_load_f16(a_rsrc, safe_off, b.const_i32(0))
-        b.smem_store_f16(input_smem, [t0, ci], v)
+        # Lanes past ``total`` clamp to index 0; an unguarded store would write
+        # their zero over footprint element [0, 0]. Only the last iteration can
+        # overrun, and only when ``block_size`` does not divide ``total``.
+        if (e + 1) * spec.block_size > total:
+            with b.scf_if(idx_ok):
+                b.smem_store_f16(input_smem, [t0, ci], v)
+        else:
+            b.smem_store_f16(input_smem, [t0, ci], v)
 
     b.sync()
     return input_smem
@@ -733,7 +740,12 @@ def _load_conv0_a_tile_from_input_cache(
         foot_row = b.add(b.mul(ih, c_foot_w), iw)
         v = b.vec_extract(b.smem_load_vN_f16(input_smem, foot_row, ci, n=1), 0)
         v = b.select(b.land(idx_ok, kg_ok), v, zero_h)
-        b.smem_store_f16(a_dst, [row, col], v)
+        # Same overrun as the footprint fill: clamped lanes alias A[0, 0].
+        if (e + 1) * spec.block_size > total:
+            with b.scf_if(idx_ok):
+                b.smem_store_f16(a_dst, [row, col], v)
+        else:
+            b.smem_store_f16(a_dst, [row, col], v)
 
 
 def _load_conv0_a_operand_from_input_cache(
