@@ -125,6 +125,8 @@ class BlockScaleGemmSpec:
     # Tiled body only: "bf16" rounds the f32 accumulators in the epilogue
     # and C becomes a bf16 (M, N) tensor (needs split_k == 1).
     out_dtype: str = "f32"
+    # Tiled body only: XCD-aware grouped CTA order (0 = off; G = tile-row group).
+    tile_swizzle: int = 0
 
     @property
     def tiled(self) -> bool:
@@ -138,6 +140,7 @@ class BlockScaleGemmSpec:
             or self.k_unroll != 1
             or self.lds
             or self.out_dtype != "f32"
+            or self.tile_swizzle != 0
         )
 
     def tiled_config(self) -> TiledScaledGemmConfig:
@@ -158,6 +161,7 @@ class BlockScaleGemmSpec:
             k_unroll=self.k_unroll,
             lds=self.lds,
             out_dtype=self.out_dtype,
+            tile_swizzle=self.tile_swizzle,
         )
 
     @property
@@ -206,6 +210,7 @@ class BlockScaleGemmSpec:
                 f"tl{self.b_layout}m{self.mfma_m}n{self.mfma_n}w{self.warp_m}x{self.warp_n}"
                 f"k{self.k_atom}s{self.split_k}{'pf' if self.prefetch else ''}u{self.k_unroll}"
                 f"{'lds' if self.lds else ''}{'' if self.out_dtype == 'f32' else self.out_dtype}"
+                f"{f'sw{self.tile_swizzle}' if self.tile_swizzle else ''}"
             )
         return kernel_name_join(self.name, *parts, flags={"psb": self.preshuffle_b})
 

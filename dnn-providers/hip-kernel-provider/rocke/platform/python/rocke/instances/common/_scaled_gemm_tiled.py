@@ -55,6 +55,9 @@ class TiledScaledGemmConfig:
     lds: bool = False
     # "f32" or "bf16" (rounded in the epilogue; needs split_k == 1).
     out_dtype: str = "f32"
+    # 0: CTA (m, n) = (block_id_y, block_id_x). G > 0: XCD-aware remap, then
+    # G-tile-row grouped order (see _cta_coords).
+    tile_swizzle: int = 0
 
     @property
     def tile_m(self) -> int:
@@ -123,6 +126,8 @@ def validate_tiled(cfg: TiledScaledGemmConfig) -> Tuple[bool, str]:
         return False, f"out_dtype must be 'f32' or 'bf16' (got {cfg.out_dtype!r})"
     if cfg.out_dtype != "f32" and cfg.split_k > 1:
         return False, "split_k accumulates f32 atomically; out_dtype must be 'f32'"
+    if cfg.tile_swizzle < 0 or (cfg.tile_swizzle and (cfg.M // cfg.tile_m) % cfg.tile_swizzle):
+        return False, f"tile_swizzle ({cfg.tile_swizzle}) must divide the M tile count ({cfg.M // cfg.tile_m})"
     return True, "ok"
 
 
@@ -183,14 +188,11 @@ def emit_tiled_scaled_gemm(
     wn = b.div(warp, b.const_i32(cfg.warp_m))
     lane16 = b.mod(lane, c16)
     k_blk = b.div(lane, c16)
-    m_wave = b.add(
-        b.mul(b.block_id_y(), b.const_i32(cfg.tile_m)),
-        b.mul(wm, b.const_i32(16 * cfg.mfma_m)),
-    )
-    n_wave = b.add(
-        b.mul(b.block_id_x(), b.const_i32(cfg.tile_n)),
-        b.mul(wn, b.const_i32(16 * cfg.mfma_n)),
-    )
+    cta_m, cta_n = _cta_coords(b, cfg)
+    m_cta = b.mul(cta_m, b.const_i32(cfg.tile_m))
+    n_cta = b.mul(cta_n, b.const_i32(cfg.tile_n))
+    m_wave = b.add(m_cta, b.mul(wm, b.const_i32(16 * cfg.mfma_m)))
+    n_wave = b.add(n_cta, b.mul(wn, b.const_i32(16 * cfg.mfma_n)))
     # Per-lane loop-invariant fragment bases (row * K + lane-group K start).
     # 16x16x32: 8 contiguous K per lane group; 16x16x128: see _load_fp8_frag.
     k_lane = b.mul(k_blk, b.const_i32(16 if atom.k == 128 else atom.a_per_lane))
@@ -282,6 +284,7 @@ def emit_tiled_scaled_gemm(
             b, cfg, A=A, Bp=Bp, AScale=AScale, BScale=BScale, dtype=dtype, loop_k=loop_k,
             atoms_per_iter=atoms_per_iter, init=init, tr_lo=tr_lo, tr_hi=tr_hi, tid=tid,
             wm=wm, wn=wn, lane16=lane16, k_blk=k_blk, a_rows=a_rows, b_cols=b_cols,
+            m_cta=m_cta, n_cta=n_cta,
             compute_step=compute_step,
         )
     else:
@@ -325,11 +328,38 @@ def emit_tiled_scaled_gemm(
 
 
 _LDS_PAD = 16  # bytes of row padding: 144-byte rows keep 16 lanes' ds_read_b128 conflict-free
+_NUM_XCD = 8  # gfx950 dispatches consecutive workgroups round-robin over its 8 XCDs
+
+
+def _cta_coords(b, cfg):
+    """(m, n) tile indices of this CTA.
+
+    Default: (block_id_y, block_id_x). With ``tile_swizzle = G`` the linear
+    workgroup id is first remapped so each XCD (one L2) receives a
+    contiguous run of tiles instead of every 8th tile, then the run is
+    walked in groups of G tile-rows (column-major inside a group), so the
+    CTAs that share an L2 also share A row panels and B column panels."""
+    if not cfg.tile_swizzle:
+        return b.block_id_y(), b.block_id_x()
+    gx, gy = cfg.N // cfg.tile_n, cfg.M // cfg.tile_m
+    total = gx * gy
+    pid = b.add(b.mul(b.block_id_y(), b.const_i32(gx)), b.block_id_x())
+    if total % _NUM_XCD == 0:
+        per = total // _NUM_XCD
+        pid = b.add(
+            b.mul(b.mod(pid, b.const_i32(_NUM_XCD)), b.const_i32(per)),
+            b.div(pid, b.const_i32(_NUM_XCD)),
+        )
+    G = cfg.tile_swizzle
+    in_group = G * gx
+    first_m = b.mul(b.div(pid, b.const_i32(in_group)), b.const_i32(G))
+    local = b.mod(pid, b.const_i32(in_group))
+    return b.add(first_m, b.mod(local, b.const_i32(G))), b.div(local, b.const_i32(G))
 
 
 def _lds_mainloop(
     b, cfg, *, A, Bp, AScale, BScale, dtype, loop_k, atoms_per_iter, init, tr_lo, tr_hi,
-    tid, wm, wn, lane16, k_blk, a_rows, b_cols, compute_step,
+    tid, wm, wn, lane16, k_blk, a_rows, b_cols, m_cta, n_cta, compute_step,
 ):
     """CTA-shared operand staging: every K step the whole CTA copies its
     ``tile_m x loop_k`` A panel and ``tile_n x loop_k`` B panel into LDS with
@@ -345,8 +375,6 @@ def _lds_mainloop(
     chunks = loop_k // 16
     A_s = b.smem_alloc(dtype, [TM, row_bytes], name_hint="A_s")
     B_s = b.smem_alloc(dtype, [TN, row_bytes], name_hint="B_s")
-    m_cta = b.mul(b.block_id_y(), b.const_i32(TM))
-    n_cta = b.mul(b.block_id_x(), b.const_i32(TN))
 
     def copy_slots(rows, base_row):
         slots = []
