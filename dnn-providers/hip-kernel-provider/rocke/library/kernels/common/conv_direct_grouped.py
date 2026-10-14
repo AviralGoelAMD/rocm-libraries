@@ -6199,6 +6199,10 @@ class DirectDepthwiseSpec:
     block_w: int = 8  # output W positions per block
     block_waves: int = 1  # waves per block
     wave_size: int = 64
+    # Consecutive channels per lane (1, 2, 4 or 8). Above 1 a lane moves its
+    # channels with one 4/8/16-byte buffer access instead of ``vec_c`` 2-byte
+    # ones; ``groups`` must be a multiple of it.
+    vec_c: int = 1
 
     @property
     def threads_per_block(self) -> int:
@@ -6206,7 +6210,7 @@ class DirectDepthwiseSpec:
 
     @property
     def block_ch(self) -> int:
-        return self.block_waves * self.wave_size
+        return self.block_waves * self.wave_size * self.vec_c
 
     def kernel_name(self) -> str:
         from rocke.helpers.spec import kernel_name_join
@@ -6217,7 +6221,7 @@ class DirectDepthwiseSpec:
             p.short(),
             f"bw{self.block_w}",
             f"bw{self.block_waves}wv",
-            flags={"bf16": p.dtype == "bf16"},
+            flags={"bf16": p.dtype == "bf16", f"vc{self.vec_c}": self.vec_c > 1},
         )
 
     def validate(self) -> None:
@@ -6292,6 +6296,13 @@ def is_valid_depthwise_spec(
             f"max {_DW_MAX_PRELOAD_TAPS}; use DirectDepthwiseColSpec, whose "
             f"live-register cost is linear in KH and independent of KW"
         )
+    if spec.vec_c not in (1, 2, 4, 8):
+        return False, f"vec_c must be 1, 2, 4 or 8 (got {spec.vec_c})"
+    if p.groups % spec.vec_c != 0:
+        return False, (
+            f"vec_c {spec.vec_c} does not divide groups {p.groups}: a lane's "
+            f"channel run would straddle the end of the channel axis"
+        )
     return True, "ok"
 
 
@@ -6324,6 +6335,7 @@ def build_direct_depthwise(
     WAVE = spec.wave_size
     THREADS = spec.threads_per_block
     BLOCK_CH = spec.block_ch
+    VEC = spec.vec_c
     Wo = p.Wo
     c_stride_dw = p.stride
 
@@ -6359,12 +6371,15 @@ def build_direct_depthwise(
     by = b.block_id_y()
     n = b.block_id_z()
     q_tile_start = b.mul(bx, b.const_i32(BLOCK_W))
-    # Absolute channel for this lane: by*BLOCK_CH + wave_id*WAVE + lane.
-    ch = b.add(
-        b.mul(by, b.const_i32(BLOCK_CH)),
+    # Absolute (first) channel for this lane: by*BLOCK_CH + (wave_id*WAVE +
+    # lane)*VEC -- a lane owns VEC consecutive channels.
+    lane_slot = b.add(
+        b.mul(by, b.const_i32(BLOCK_CH // VEC)),
         b.add(b.mul(wave_id, c_wave), lane),
     )
-    # Guard: lanes beyond groups are inactive (partial last tile).
+    ch = lane_slot if VEC == 1 else b.mul(lane_slot, b.const_i32(VEC))
+    # Guard: lanes beyond groups are inactive (partial last tile). groups is a
+    # multiple of VEC, so the first channel decides for the whole run.
     ch_in_range = b.cmp_lt(ch, c_groups)
 
     a_rsrc = b.buffer_rsrc(A, A_bytes)
@@ -6381,28 +6396,34 @@ def build_direct_depthwise(
     # D[N, Ho, Wo, total_k] NHWK descriptor.
     d_desc = direct_d_descriptor_dynamic(b, params)
 
-    # ---- Preload weights into registers (KH * KW fp16 → f32 values per lane) ----
-    # Each lane owns one channel (ch), so weight[ch, r, s, 0] is a scalar.
+    # ---- Preload weights into registers (KH * KW * VEC fp16 → f32 per lane) ----
+    # weight[ch + v, r, s, 0] is a scalar per channel; consecutive channels sit
+    # KH*KW elements apart, so they are loaded one at a time (once per kernel).
     # Lanes beyond groups (partial last tile) load from OOB sentinel → zero.
-    weights_f32: List[List[Value]] = []
+    # weights_f32[r][s][v]
+    weights_f32: List[List[List[Value]]] = []
     for r_const in range(p.KH):
-        row: List[Value] = []
+        row: List[List[Value]] = []
         for s_const in range(p.KW):
-            w_off, _ = b_desc.offset(
-                b,
-                k=ch,
-                r=b.const_i32(r_const),
-                s=b.const_i32(s_const),
-                c=c0,
-            )
-            safe_w_off = b.select(ch_in_range, b.mul(w_off, c_half_bytes), oob_sentinel)
-            w_h = (
-                b.buffer_load_bf16(b_rsrc, safe_w_off, c0)
-                if p.dtype == "bf16"
-                else b.buffer_load_f16(b_rsrc, safe_w_off, c0)
-            )
-            w_f32 = b.select(ch_in_range, b.cast_to_f32(w_h), zero_f32)
-            row.append(w_f32)
+            taps_v: List[Value] = []
+            for v in range(VEC):
+                w_off, _ = b_desc.offset(
+                    b,
+                    k=ch if v == 0 else b.add(ch, b.const_i32(v)),
+                    r=b.const_i32(r_const),
+                    s=b.const_i32(s_const),
+                    c=c0,
+                )
+                safe_w_off = b.select(
+                    ch_in_range, b.mul(w_off, c_half_bytes), oob_sentinel
+                )
+                w_h = (
+                    b.buffer_load_bf16(b_rsrc, safe_w_off, c0)
+                    if p.dtype == "bf16"
+                    else b.buffer_load_f16(b_rsrc, safe_w_off, c0)
+                )
+                taps_v.append(b.select(ch_in_range, b.cast_to_f32(w_h), zero_f32))
+            row.append(taps_v)
         weights_f32.append(row)
 
     # ---- H-streaming loop ----
@@ -6469,6 +6490,10 @@ def build_direct_depthwise(
         for col_term in col_terms:
             s_term = b.select(row_ok, b.add(row_off, col_term), oob_sentinel)
             v_off = b.add(ch_off, s_term)
+            if VEC > 1:
+                # One buffer access for the lane's VEC consecutive channels.
+                vals.append(_buf_load_vN(b, p.dtype, a_rsrc, v_off, c0, VEC // 2))
+                continue
             vals.append(
                 b.buffer_load_bf16(a_rsrc, v_off, c0)
                 if p.dtype == "bf16"
@@ -6504,16 +6529,25 @@ def build_direct_depthwise(
             out_q = b.add(q_tile_start, b.const_i32(w_out))
             out_q_ok = b.land(b.cmp_lt(out_q, c_W), ch_in_range)
             store_ok = b.land(out_q_ok, should_flush)
-            acc_val = accs[P_FLUSH_j * BLOCK_W + w_out]  # STATIC index
+            slot = (P_FLUSH_j * BLOCK_W + w_out) * VEC  # STATIC index
             d_off, _ = d_desc.offset(b, n=n, h=ho_row_j, w=out_q, k=ch)
             safe_d = b.select(store_ok, b.mul(d_off, c_half_bytes), oob_sentinel)
+            if VEC > 1:
+                packed = b.vec_pack(accs[slot : slot + VEC], F32)
+                _buf_store_vN(
+                    b, p.dtype, d_rsrc, safe_d, c0, _trunc_f32(b, p.dtype, packed),
+                    VEC // 2,
+                )
+                continue
+            acc_val = accs[slot]
             if p.dtype == "bf16":
                 b.buffer_store_bf16(d_rsrc, safe_d, c0, b.trunc_f32_to_bf16(acc_val))
             else:
                 b.buffer_store_f16(d_rsrc, safe_d, c0, b.trunc_f32_to_f16(acc_val))
 
         for w_out in range(BLOCK_W):
-            accs[P_FLUSH_j * BLOCK_W + w_out] = zero_f32
+            for v in range(VEC):
+                accs[(P_FLUSH_j * BLOCK_W + w_out) * VEC + v] = zero_f32
 
     # The input rows are software-pipelined PF rows ahead: step y issues the
     # loads of row y + PF before computing row y, and the PF rows in flight
@@ -6524,9 +6558,16 @@ def build_direct_depthwise(
     # accumulators and the KH x KW weights; a few rows hide the latency as
     # well.
     PF = min(p.KH, -(-16 // n_cols))
-    n_acc = p.KH * BLOCK_W
+    n_acc = p.KH * BLOCK_W * VEC
+
+    def _acc_name(prefix: str, kh: int, w: int, v: int) -> str:
+        return f"{prefix}_kh{kh}_w{w}" + (f"_v{v}" if VEC > 1 else "")
+
     dw_iter_args = [
-        (f"dw_acc_kh{kh}_w{w}", zero_f32) for kh in range(p.KH) for w in range(BLOCK_W)
+        (_acc_name("dw_acc", kh, w, v), zero_f32)
+        for kh in range(p.KH)
+        for w in range(BLOCK_W)
+        for v in range(VEC)
     ]
     for k in range(PF):
         for col, a_h in zip(row_cols, load_row(b.const_i32(p.PAD + k))):
@@ -6550,7 +6591,13 @@ def build_direct_depthwise(
             y_j = row_y(grp_iv, j)
             # Issue row y_j + PF, then compute row y_j (the oldest in flight).
             window.append(load_row(b.add(y_j, b.const_i32(PF))))
-            a_row = [b.cast_to_f32(a_h) for a_h in window.pop(0)]
+            if VEC > 1:
+                a_row = [
+                    [b.cast_to_f32(b.vec_extract(a_h, v)) for v in range(VEC)]
+                    for a_h in window.pop(0)
+                ]
+            else:
+                a_row = [[b.cast_to_f32(a_h)] for a_h in window.pop(0)]
 
             for w_out in range(BLOCK_W):
                 for s_const in range(p.KW):
@@ -6558,10 +6605,13 @@ def build_direct_depthwise(
                     for r_const in range(p.KH):
                         # STATIC slot of output row (y_j - r) / stride.
                         p_idx = (p.PAD + j - r_const) % p.KH
-                        idx = p_idx * BLOCK_W + w_out
-                        new_accs[idx] = b.fma(
-                            weights_f32[r_const][s_const], a_f32, new_accs[idx]
-                        )
+                        idx = (p_idx * BLOCK_W + w_out) * VEC
+                        for v in range(VEC):
+                            new_accs[idx + v] = b.fma(
+                                weights_f32[r_const][s_const][v],
+                                a_f32[v],
+                                new_accs[idx + v],
+                            )
 
             flush(grp_iv, j, y_j, new_accs)
 
@@ -6582,9 +6632,13 @@ def build_direct_depthwise(
         n_groups_v,
         c1,
         [
-            (f"dw_tail_acc_kh{kh}_w{w}", fma_loop.results[kh * BLOCK_W + w])
+            (
+                _acc_name("dw_tail_acc", kh, w, v),
+                fma_loop.results[(kh * BLOCK_W + w) * VEC + v],
+            )
             for kh in range(p.KH)
             for w in range(BLOCK_W)
+            for v in range(VEC)
         ],
         iv_name="dw_tail",
         elide_trailing_barrier=False,
@@ -6622,7 +6676,10 @@ def depthwise_stream_register_reason(spec) -> Optional[str]:
     cols = spec.block_w if isinstance(spec, DirectDepthwiseSpec) else 1
     n_cols = (cols - 1) * p.stride + p.KW
     pf = min(p.KH, -(-16 // n_cols))
-    live = p.KH * p.KW + p.KH * cols + pf * n_cols
+    vec = getattr(spec, "vec_c", 1)
+    # Weights and accumulators are f32 per channel; a prefetched load holds
+    # vec 16-bit channels, i.e. vec/2 registers once vec >= 2.
+    live = vec * (p.KH * p.KW + p.KH * cols) + pf * n_cols * max(1, vec // 2)
     if live > _DW_STREAM_REG_BUDGET:
         return (
             f"~{live} live registers per lane exceed the {_DW_STREAM_REG_BUDGET} "
