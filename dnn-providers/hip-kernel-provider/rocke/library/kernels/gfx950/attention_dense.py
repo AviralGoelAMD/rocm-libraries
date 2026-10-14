@@ -217,6 +217,9 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # and combine the two halves once before the epilogue, instead of a
     # cross-half exchange per KV tile.
     defer_row_sum: bool = field(default=True, kw_only=True)
+    # Grid body only: compute the exp2 arguments and the per-tile row sum on
+    # two-element vectors (packed f32 FMA).
+    packed_softmax: bool = field(default=False, kw_only=True)
 
     def resolved_exp_per_pv_step(self) -> int:
         if self.exp_per_pv_step is not None:
@@ -544,6 +547,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "o_store_width",
             "grid_order",
             "defer_row_sum",
+            "packed_softmax",
         )
     }
 )
@@ -1291,6 +1295,8 @@ def build_attention_dense(
         # fma(s, qk_scale, -m) is not bounded for huge scores: see the KNOWN
         # LIMITATION note at _MAX_SCALE.
         neg_m = b.fneg(m_new)
+        if spec.packed_softmax:
+            return _pv_fused_exp_packed(o_acc_in, p_packs, vbuf, s_reg, neg_m)
         slots = [(nsub, i) for nsub in range(N_SUB) for i in range(16)]
         p_vals = [[None] * 16 for _ in range(N_SUB)]
         it = iter(slots)
@@ -1319,6 +1325,56 @@ def build_attention_dense(
         for nsub in range(N_SUB):
             for i in range(16):
                 l_local = b.fadd(l_local, p_vals[nsub][i])
+        if spec.defer_row_sum:
+            l_tile = l_local
+        else:
+            l_tile = b.fadd(l_local, b.warp_shuffle_xor(l_local, 32))
+        return out, p_vals, l_tile
+
+    def _pv_fused_exp_packed(o_acc_in, p_packs, vbuf, s_reg, neg_m):
+        """``pv_fused_exp`` with the exp2 arguments and the row sum computed two
+        lanes-of-a-pair at a time (``v_pk_fma_f32``): the same fused multiply-add
+        per score, half the VALU issue slots."""
+        qs2 = b.vector_splat(qk_scale, 2)
+        nm2 = b.vector_splat(neg_m, 2)
+        one2 = b.vector_splat(b.const_f32(1.0), 2)
+        slots = [(nsub, i) for nsub in range(N_SUB) for i in range(16)]
+        pairs = iter([slots[k : k + 2] for k in range(0, len(slots), 2)])
+        p_vals = [[None] * 16 for _ in range(N_SUB)]
+        lsum = [None]
+
+        def emit(pair):
+            (n0, i0), (n1, i1) = pair
+            arg = b.vector_fma(
+                b.vec_pack([s_reg[n0][i0], s_reg[n1][i1]], F32), qs2, nm2
+            )
+            p0 = _exp2(b.vec_extract(arg, 0))
+            p1 = _exp2(b.vec_extract(arg, 1))
+            p_vals[n0][i0] = p0
+            p_vals[n1][i1] = p1
+            pv = b.vec_pack([p0, p1], F32)
+            lsum[0] = pv if lsum[0] is None else b.vector_fma(pv, one2, lsum[0])
+
+        out = list(o_acc_in)
+        for dt, kk_step in PV_STEPS:
+            out[dt] = mfma_32x32x16_for_dtype(
+                b, dtype, read_v(dt, kk_step, vbuf), p_packs[kk_step], out[dt]
+            )
+            n_emit = 0
+            for _ in range(max(1, EXP_PER // 2)):
+                pair = next(pairs, None)
+                if pair is None:
+                    break
+                emit(pair)
+                n_emit += 2
+            if SCHED_GROUP:
+                b.sched_group_barrier(DS_READ, SCHED_GROUP_DS_READ, 0)
+                b.sched_group_barrier(MFMA, 1, 0)
+                b.sched_group_barrier(VALU, max(1, n_emit // 2), 0)
+                b.sched_group_barrier(TRANS, max(1, n_emit), 0)
+        for pair in pairs:
+            emit(pair)
+        l_local = b.fadd(b.vec_extract(lsum[0], 0), b.vec_extract(lsum[0], 1))
         if spec.defer_row_sum:
             l_tile = l_local
         else:
