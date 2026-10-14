@@ -203,8 +203,10 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # diagonal tail, versus masking every tile. Sliding window keeps its phases.
     causal_diag_split: bool = field(default=True, kw_only=True)
     # Output elements per global store; alignment follows the width. bf16 only
-    # below 4: narrower fp16 stores change which f32->f16 conversion the backend
-    # selects for some elements, moving them by one ulp, so fp16 is fixed at 4.
+    # away from 4: narrower fp16 stores change which f32->f16 conversion the
+    # backend selects for some elements, moving them by one ulp, so fp16 is
+    # fixed at 4. 8 pairs the two half-waves with v_permlane32_swap so each lane
+    # writes one 16-byte store.
     o_store_width: int = field(default=4, kw_only=True)
     # Grid body only (not read by the persistent body, varlen, or paged): map
     # the launch grid's linear workgroup id to work items.
@@ -397,9 +399,9 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
                 f"pv_loop_order must be one of {sorted(_PV_LOOP_ORDERS)} or None, "
                 f"got {self.pv_loop_order!r}"
             )
-        if self.o_store_width not in (1, 2, 4):
+        if self.o_store_width not in (1, 2, 4, 8):
             raise ValueError(
-                f"o_store_width must be 1, 2 or 4, got {self.o_store_width}"
+                f"o_store_width must be 1, 2, 4 or 8, got {self.o_store_width}"
             )
         if self.o_store_width != 4 and self.dtype == "fp16":
             raise ValueError(
@@ -1702,6 +1704,37 @@ def _emit_o_store(
     ``row_has_key`` (LSE path only) zeroes rows that see no key; ``None`` emits the
     unchanged store sequence.
     """
+    if width == 8:
+        # Each lane holds 4 contiguous head-dim values per 8-wide group; the
+        # other 4 sit in lane ^ 32 (same query row). One v_permlane32_swap per
+        # register pair hands the low half-wave all of group g and the high
+        # half-wave all of group g+1, so every lane stores 8 contiguous values.
+        lane_h = b.div(d_half, b.const_i32(4))
+        for dt in range(d_tiles):
+            for g in range(0, 4, 2):
+                own_lo, own_hi, got_lo, got_hi = [], [], [], []
+                for kk in range(4):
+                    a = b.fmul(b.vec_extract(o_acc[dt], g * 4 + kk), rcp_l)
+                    c = b.fmul(b.vec_extract(o_acc[dt], (g + 1) * 4 + kk), rcp_l)
+                    lo, hi = b.permlane32_swap(b.bitcast(a, I32), b.bitcast(c, I32))
+                    own_lo.append(a)
+                    own_hi.append(c)
+                    got_lo.append(b.bitcast(lo, F32))
+                    got_hi.append(b.bitcast(hi, F32))
+                first = b.cmp_eq(lane_h, b.const_i32(0))
+                vals = [
+                    b.cast_f32_to(b.select(first, x, y), dtype)
+                    for x, y in zip(own_lo + got_hi, got_lo + own_hi)
+                ]
+                packed = b.vec_pack(vals, dtype)
+                if row_has_key is not None:
+                    packed = zero_keyless_row(b, packed, row_has_key, dtype, 8)
+                addr = b.add(
+                    q_row_byte,
+                    b.add(b.const_i32(dt * 32 + g * 8), b.mul(lane_h, b.const_i32(8))),
+                )
+                b.global_store_vN(o, addr, packed, 8, align=16)
+        return
     for dt in range(d_tiles):
         for g in range(4):
             for c in range(0, 4, width):
