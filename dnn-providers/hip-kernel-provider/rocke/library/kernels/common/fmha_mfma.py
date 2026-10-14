@@ -34,7 +34,7 @@ the spec surface the multi-warp + cshuffle hoist consumes verbatim.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 from rocke.core.ir import KernelDef
 from rocke.helpers.mfma_attention import (
@@ -78,18 +78,44 @@ class FmhaMfmaSpec:
     pv_k32: bool = False
     v_lds_tr: bool = False
     v_lds_pad: int = 0
+    # ``lazy_l``: per-lane softmax denominator, folded across lanes once
+    # after the K-loop. ``prefetch_k``: issue tile kt+1's K loads at the top
+    # of tile kt. ``waves_per_eu``: ``amdgpu-waves-per-eu`` occupancy hint.
+    lazy_l: bool = False
+    prefetch_k: bool = False
+    # ``causal_trim``: causal masks stop the K-loop after the last visible
+    # K-tile instead of masking the remainder.
+    causal_trim: bool = False
+    # ``num_waves``: waves per CTA (each owns 16 Q rows; K / V tiles shared
+    # through double-buffered LDS). Requires ``reg_p`` + ``v_lds_tr``.
+    num_waves: int = 1
+    waves_per_eu: Optional[int] = None
+
+    @property
+    def block_m(self) -> int:
+        return MFMA_ATTN_BLOCK_M * self.num_waves
 
     def body_tag(self) -> str:
-        if not self.reg_p:
-            return ""
-        tag = "rp"
-        if self.qk_k32:
-            tag += "_qk32"
-        if self.pv_k32:
-            tag += "_pv32"
-        if self.v_lds_tr:
-            tag += f"_vtr{self.v_lds_pad}"
-        return tag
+        tag = ""
+        if self.reg_p:
+            tag = "rp"
+            if self.qk_k32:
+                tag += "_qk32"
+            if self.pv_k32:
+                tag += "_pv32"
+            if self.v_lds_tr:
+                tag += f"_vtr{self.v_lds_pad}"
+            if self.lazy_l:
+                tag += "_ll"
+            if self.prefetch_k:
+                tag += "_pfk"
+            if self.causal_trim:
+                tag += "_ct"
+            if self.num_waves > 1:
+                tag += f"_nw{self.num_waves}"
+        if self.waves_per_eu is not None:
+            tag += f"_w{self.waves_per_eu}"
+        return tag.lstrip("_")
 
     def kernel_name(self) -> str:
         s = self.common.shape
@@ -155,10 +181,10 @@ def is_valid_spec(spec: FmhaMfmaSpec, arch: str = "gfx950") -> Tuple[bool, str]:
     s = spec.common.shape
     if s.head_size % 16 != 0:
         return False, (f"tiled FMHA needs head_size % 16 == 0 (got {s.head_size})")
-    if spec.seqlen_q % MFMA_ATTN_BLOCK_M != 0:
+    if spec.seqlen_q % spec.block_m != 0:
         return False, (
             f"seqlen_q ({spec.seqlen_q}) must be a multiple of BLOCK_M "
-            f"({MFMA_ATTN_BLOCK_M})"
+            f"({spec.block_m})"
         )
     if spec.seqlen_k % MFMA_ATTN_BLOCK_K != 0:
         return False, (
@@ -197,8 +223,15 @@ def is_valid_spec(spec: FmhaMfmaSpec, arch: str = "gfx950") -> Tuple[bool, str]:
         return False, (
             f"LDS budget {bytes_lds} > {target.lds_capacity_bytes} cap on {arch}"
         )
-    if (spec.qk_k32 or spec.pv_k32 or spec.v_lds_tr) and not spec.reg_p:
-        return False, "qk_k32 / pv_k32 / v_lds_tr require reg_p"
+    if (
+        spec.qk_k32
+        or spec.pv_k32
+        or spec.v_lds_tr
+        or spec.lazy_l
+        or spec.prefetch_k
+        or spec.causal_trim
+    ) and not spec.reg_p:
+        return False, "qk_k32 / pv_k32 / v_lds_tr / lazy_l / prefetch_k require reg_p"
     if spec.reg_p:
         if family != "mma":
             return False, "reg_p is the wave64 MFMA body only"
@@ -210,6 +243,11 @@ def is_valid_spec(spec: FmhaMfmaSpec, arch: str = "gfx950") -> Tuple[bool, str]:
             return False, f"16x16x32 f16 MFMA not available on {arch}"
         if spec.v_lds_tr and not target.memory.has_ds_read_tr:
             return False, f"v_lds_tr needs ds_read_b64_tr_b16 (absent on {arch})"
+    if spec.num_waves != 1:
+        if not (spec.reg_p and spec.v_lds_tr) or spec.prefetch_k:
+            return False, "num_waves > 1 needs reg_p + v_lds_tr (and no prefetch_k)"
+        if spec.num_waves not in (2, 4, 8):
+            return False, f"num_waves must be 1, 2, 4 or 8 (got {spec.num_waves})"
     return True, "ok"
 
 
@@ -274,7 +312,9 @@ def build_fmha_fwd_mfma(spec: FmhaMfmaSpec, arch: str = "gfx950") -> KernelDef:
     wave_size = ArchTarget.from_gfx(arch).wave_size
 
     kb = FmhaKernelBuilder(spec.kernel_name(), s)
-    kb.block_size(wave_size)  # one wave per CTA (64 on CDNA, 32 on RDNA)
+    kb.block_size(wave_size * spec.num_waves)  # waves per CTA (64-lane on CDNA)
+    if spec.waves_per_eu is not None:
+        kb.builder.kernel.attrs["waves_per_eu"] = spec.waves_per_eu
     _declare_params(kb)
     kb.decode_grid(has_batch_axis=True)
     b = kb.builder
@@ -288,7 +328,7 @@ def build_fmha_fwd_mfma(spec: FmhaMfmaSpec, arch: str = "gfx950") -> KernelDef:
     # block_id_x is the Q-tile index; q_tile_local is its first Q row
     # within the current batch.
     q_tile_idx = kb.q_token  # reuses block_id_x; semantically a tile, not a token
-    q_tile_local = b.mul(q_tile_idx, b.const_i32(MFMA_ATTN_BLOCK_M))
+    q_tile_local = b.mul(q_tile_idx, b.const_i32(spec.block_m))
 
     # Per-batch shift in rows (for Q and O). The helper multiplies
     # the row index by stride_q_token / stride_o_token internally, so
@@ -353,6 +393,10 @@ def build_fmha_fwd_mfma(spec: FmhaMfmaSpec, arch: str = "gfx950") -> KernelDef:
         pv_k32=spec.pv_k32,
         v_lds_tr=spec.v_lds_tr,
         v_lds_pad=spec.v_lds_pad,
+        lazy_l=spec.lazy_l,
+        prefetch_k=spec.prefetch_k,
+        causal_trim=spec.causal_trim,
+        num_waves=spec.num_waves,
         arch=arch,
     )
     b.ret()
@@ -360,7 +404,7 @@ def build_fmha_fwd_mfma(spec: FmhaMfmaSpec, arch: str = "gfx950") -> KernelDef:
 
 
 def fmha_fwd_mfma_grid(spec: FmhaMfmaSpec, *, batch: int) -> Tuple[int, int, int]:
-    q_tiles = spec.seqlen_q // MFMA_ATTN_BLOCK_M
+    q_tiles = spec.seqlen_q // spec.block_m
     return (q_tiles, spec.common.shape.num_query_heads, batch)
 
 

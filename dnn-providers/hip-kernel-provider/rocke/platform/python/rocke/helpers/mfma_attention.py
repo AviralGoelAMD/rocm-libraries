@@ -284,6 +284,10 @@ def _mfma_attention_fwd_regp_body(
     pv_k32: bool,
     v_lds_tr: bool,
     v_lds_pad: int,
+    lazy_l: bool,
+    prefetch_k: bool,
+    causal_trim: bool,
+    num_waves: int,
     arch: str,
     target,
 ) -> None:
@@ -332,7 +336,26 @@ def _mfma_attention_fwd_regp_body(
     n_qk = head_size // qk_atom.k
     n_pv = head_size // 16
 
-    lane = b.thread_id_x()
+    nw = num_waves
+    # CTA-uniform first query position (the causal trim must give every wave
+    # of a multi-wave CTA the same trip count: the loop contains barriers).
+    q_cta_pos = q_pos_base if q_pos_base is not None else q_tile_base
+    if nw > 1:
+        # Multi-wave CTA: wave w owns Q rows [q_tile_base + 16*w, +16); the
+        # K and V tiles are staged once per CTA in double-buffered LDS and
+        # shared by all waves (one barrier per K-tile).
+        if not v_lds_tr:
+            raise ValueError("num_waves > 1 requires v_lds_tr")
+        if prefetch_k or k_block_iter_fn is not None:
+            raise ValueError("num_waves > 1 does not support prefetch_k / k_block_iter_fn")
+        tid = b.thread_id_x()
+        lane = b.mod(tid, b.const_i32(64))
+        wave_row = b.mul(b.div(tid, b.const_i32(64)), b.const_i32(16))
+        q_tile_base = b.add(q_tile_base, wave_row)
+        if q_pos_base is not None:
+            q_pos_base = b.add(q_pos_base, wave_row)
+    else:
+        tid = lane = b.thread_id_x()
     c16 = b.const_i32(16)
     m16 = b.mod(lane, c16)  # query row owned by this lane (and K row it loads)
     g = b.div(lane, c16)  # 0..3
@@ -385,17 +408,62 @@ def _mfma_attention_fwd_regp_body(
 
     if v_lds_tr:
         v_row_elems = head_size + v_lds_pad
-        V_lds = b.smem_alloc(dtype_ir, [kt_keys, v_row_elems], name_hint="Vtr")
+        lds_lead = [2] if nw > 1 else []
+        V_lds = b.smem_alloc(dtype_ir, lds_lead + [kt_keys, v_row_elems], name_hint="Vtr")
+        if nw > 1:
+            K_lds = b.smem_alloc(dtype_ir, [2, kt_keys, head_size + 8], name_hint="Kst")
         lanes_per_row = head_size // 8
-        if 64 % lanes_per_row != 0:
+        if (64 * nw) % lanes_per_row != 0:
             raise ValueError(f"v_lds_tr needs 64 % (head_size/8) == 0 (head_size={head_size})")
-        rows_per_pass = 64 // lanes_per_row
+        rows_per_pass = 64 * nw // lanes_per_row
         if kt_keys % rows_per_pass != 0:
             raise ValueError("v_lds_tr: K-tile rows not a multiple of rows per pass")
-        st_row = b.div(lane, b.const_i32(lanes_per_row))
-        st_col = b.mul(b.mod(lane, b.const_i32(lanes_per_row)), b.const_i32(8))
+        st_row = b.div(tid, b.const_i32(lanes_per_row))
+        st_col = b.mul(b.mod(tid, b.const_i32(lanes_per_row)), b.const_i32(8))
         tr_col = b.mul(b.mod(lane, b.const_i32(4)), b.const_i32(4))
         tr_row0 = b.add(b.mul(g, b.const_i32(npl)), b.div(m16, b.const_i32(4)))
+
+    def _stage_rows(src, dst, k_base, row_fn, buf):
+        # Cooperative 16-byte loads of a [kt_keys, head_size] tile into LDS.
+        for p in range(kt_keys // rows_per_pass):
+            key = b.add(st_row, b.const_i32(p * rows_per_pass))
+            addr = b.add(row_fn(b.add(k_base, key)), st_col)
+            if fp8_kv:
+                v8 = _load_kv_dequant_packed(
+                    b,
+                    src=src,
+                    addr=addr,
+                    n_elems=8,
+                    kv_dtype_eff=kv_dtype_eff,
+                    kv_dtype_ir=kv_dtype_ir,
+                    out_dtype_ir=dtype_ir,
+                )
+            else:
+                v8 = b.global_load_vN(src, addr, dtype_ir, 8, align=16)
+            idx = [buf, key, st_col] if buf is not None else [key, st_col]
+            b.smem_store_vN(dst, idx, v8, 8)
+
+    def _load_k_vec(k_row: Value, a: int) -> Value:
+        k_addr = b.add(k_row, b.add(b.const_i32(a * qk_atom.k), q_lane_d))
+        if fp8_kv:
+            return _load_kv_dequant_packed(
+                b,
+                src=K,
+                addr=k_addr,
+                n_elems=qk_atom.a_per_lane,
+                kv_dtype_eff=kv_dtype_eff,
+                kv_dtype_ir=kv_dtype_ir,
+                out_dtype_ir=dtype_ir,
+            )
+        return b.global_load_vN(
+            K, k_addr, dtype_ir, qk_atom.a_per_lane, align=qk_atom.a_per_lane * 2
+        )
+
+    def _load_k_tile(k_base: Value):
+        return [
+            [_load_k_vec(_k_row(b.add(k_base, _key_local_a(t))), a) for a in range(n_qk)]
+            for t in range(nsub)
+        ]
 
     neg_inf = b.const_f32(-1e30)
     iter_args = [("m", neg_inf), ("l", b.const_f32(0.0))]
@@ -405,14 +473,47 @@ def _mfma_attention_fwd_regp_body(
     c_kt = b.const_i32(kt_keys)
     loop_start = k_tile_start if k_tile_start is not None else b.const_i32(0)
     loop_stop = k_tile_stop if k_tile_stop is not None else b.div(seqlen_k, c_kt)
+    if causal_trim and mask_mode == "causal" and k_block_iter_fn is None:
+        # Stop after the last K-tile any row of this Q tile can see
+        # (k <= q_pos + ctx); later tiles are fully masked.
+        q0 = q_cta_pos
+        ctx = causal_ctx_offset if causal_ctx_offset is not None else b.const_i32(0)
+        need = b.div(b.add(b.add(q0, ctx), b.const_i32(16 * nw + kt_keys - 1)), c_kt)
+        loop_stop = b.select(b.cmp_lt(need, loop_stop), need, loop_stop)
+    if prefetch_k:
+        # Software pipeline: K for tile kt+1 is issued at the top of tile
+        # kt (clamped to the last tile) and carried as loop state.
+        if k_block_iter_fn is not None:
+            raise ValueError("prefetch_k does not support k_block_iter_fn")
+        k0 = _load_k_tile(b.mul(loop_start, c_kt))
+        for t in range(nsub):
+            for a in range(n_qk):
+                iter_args.append((f"kpf{t}_{a}", k0[t][a]))
+        last_tile = b.sub(loop_stop, b.const_i32(1))
     kloop = b.scf_for_iter(loop_start, loop_stop, b.const_i32(1), iter_args=iter_args, iv_name="kt")
     with kloop as (kt, state):
         m_old, l_old = state[0], state[1]
-        accs = list(state[2:])
+        accs = list(state[2 : 2 + n_pv])
         if k_block_iter_fn is not None:
             k_base = b.mul(k_block_iter_fn(b, kt), c_kt)
         else:
             k_base = b.mul(kt, c_kt)
+        if prefetch_k:
+            kf = list(state[2 + n_pv :])
+            k_cur = [kf[t * n_qk : (t + 1) * n_qk] for t in range(nsub)]
+            nxt = b.add(kt, b.const_i32(1))
+            nxt = b.select(b.cmp_lt(nxt, loop_stop), nxt, last_tile)
+            k_next = _load_k_tile(b.mul(nxt, c_kt))
+        else:
+            k_cur = None
+        buf = None
+        if nw > 1:
+            # Double-buffered CTA-shared K / V tiles: a buffer is rewritten
+            # two tiles later, after every wave passed this tile's barrier.
+            buf = b.mod(kt, b.const_i32(2))
+            _stage_rows(K, K_lds, k_base, _k_row, buf)
+            _stage_rows(V, V_lds, k_base, _v_row, buf)
+            b.sync()
 
         # ---- QK^T chain per 16-key sub-tile: S^T = K . Q^T ----
         scores = []  # scores[t][r]
@@ -422,24 +523,21 @@ def _mfma_attention_fwd_regp_body(
             if extra_skip_predicate is not None:
                 skip = extra_skip_predicate(b, kt_sub)
                 keep = b.land(keep, skip) if keep is not None else skip
-            k_row = _k_row(b.add(k_base, _key_local_a(t)))
+            if k_cur is None and nw == 1:
+                k_row = _k_row(b.add(k_base, _key_local_a(t)))
             acc_s = qk_atom.zero_acc(b)
             for a in range(n_qk):
-                k_addr = b.add(k_row, b.add(b.const_i32(a * qk_atom.k), q_lane_d))
-                if fp8_kv:
-                    k_vec = _load_kv_dequant_packed(
-                        b,
-                        src=K,
-                        addr=k_addr,
-                        n_elems=qk_atom.a_per_lane,
-                        kv_dtype_eff=kv_dtype_eff,
-                        kv_dtype_ir=kv_dtype_ir,
-                        out_dtype_ir=dtype_ir,
+                if nw > 1:
+                    k_vec = b.smem_load_vN(
+                        K_lds,
+                        buf,
+                        _key_local_a(t),
+                        b.add(b.const_i32(a * qk_atom.k), q_lane_d),
+                        dtype=dtype_ir,
+                        n=qk_atom.a_per_lane,
                     )
                 else:
-                    k_vec = b.global_load_vN(
-                        K, k_addr, dtype_ir, qk_atom.a_per_lane, align=qk_atom.a_per_lane * 2
-                    )
+                    k_vec = k_cur[t][a] if k_cur is not None else _load_k_vec(k_row, a)
                 acc_s = b.mma(qk_op, k_vec, q_vecs[a], acc_s)
             row = []
             for r in range(4):
@@ -474,8 +572,12 @@ def _mfma_attention_fwd_regp_body(
         for row in ps:
             for p in row:
                 sm = p if sm is None else b.fadd(sm, p)
-        sm = b.fadd(sm, b.warp_shuffle_xor(sm, 16))
-        sm = b.fadd(sm, b.warp_shuffle_xor(sm, 32))
+        if not lazy_l:
+            # lazy_l keeps a per-lane partial denominator (alpha is uniform
+            # across the row's lanes) and folds it across lanes once after
+            # the K-loop instead of every K-tile.
+            sm = b.fadd(sm, b.warp_shuffle_xor(sm, 16))
+            sm = b.fadd(sm, b.warp_shuffle_xor(sm, 32))
         l_new = b.fadd(b.fmul(l_old, alpha), sm)
 
         # P^T B operand straight from registers (slot j -> key npl*g + j).
@@ -483,7 +585,7 @@ def _mfma_attention_fwd_regp_body(
         for j in range(npl):
             p_vec = b.vec_insert(p_vec, b.cast_f32_to(ps[j // 4][j % 4], dtype_ir), j)
 
-        if v_lds_tr:
+        if v_lds_tr and nw == 1:
             for p in range(kt_keys // rows_per_pass):
                 key = b.add(st_row, b.const_i32(p * rows_per_pass))
                 v_addr = b.add(_v_row(b.add(k_base, key)), st_col)
@@ -510,12 +612,13 @@ def _mfma_attention_fwd_regp_body(
                 acc = b.vec_insert(acc, b.fmul(b.vec_extract(acc, r), alpha), r)
             if v_lds_tr:
                 col = b.add(b.const_i32(16 * n), tr_col)
-                v_vec = b.ds_read_tr16_b64(V_lds, tr_row0, col, dtype=dtype_ir)
+                vi = [buf] if nw > 1 else []
+                v_vec = b.ds_read_tr16_b64(V_lds, *vi, tr_row0, col, dtype=dtype_ir)
                 for rr in range(1, npl // 4):
                     v_vec = b.vec_concat(
                         v_vec,
                         b.ds_read_tr16_b64(
-                            V_lds, b.add(tr_row0, b.const_i32(4 * rr)), col, dtype=dtype_ir
+                            V_lds, *vi, b.add(tr_row0, b.const_i32(4 * rr)), col, dtype=dtype_ir
                         ),
                     )
             else:
@@ -536,10 +639,17 @@ def _mfma_attention_fwd_regp_body(
                         v_s = b.global_load(V, v_addr, dtype_ir, align=2)
                     v_vec = b.vec_insert(v_vec, v_s, j)
             accs[n] = b.mma(pv_op, v_vec, p_vec, acc)
-        b.scf_yield(m_new, l_new, *accs)
+        if prefetch_k:
+            b.scf_yield(m_new, l_new, *accs, *[v for row in k_next for v in row])
+        else:
+            b.scf_yield(m_new, l_new, *accs)
 
     final = kloop.results
-    inv_l = safe_inv_l(b, final[1])
+    l_fin = final[1]
+    if lazy_l:
+        l_fin = b.fadd(l_fin, b.warp_shuffle_xor(l_fin, 16))
+        l_fin = b.fadd(l_fin, b.warp_shuffle_xor(l_fin, 32))
+    inv_l = safe_inv_l(b, l_fin)
     if v_scale is not None:
         inv_l = b.fmul(inv_l, v_scale)
     o_row = b.add(
@@ -607,6 +717,10 @@ def mfma_attention_fwd_inner_body(
     pv_k32: bool = False,
     v_lds_tr: bool = False,
     v_lds_pad: int = 0,
+    lazy_l: bool = False,
+    prefetch_k: bool = False,
+    causal_trim: bool = False,
+    num_waves: int = 1,
     arch: str = "gfx950",
 ) -> None:
     """One MFMA-tiled QK→softmax→PV pass for a ``BLOCK_M``-row Q tile.
@@ -881,6 +995,10 @@ def mfma_attention_fwd_inner_body(
             pv_k32=pv_k32,
             v_lds_tr=v_lds_tr,
             v_lds_pad=v_lds_pad,
+            lazy_l=lazy_l,
+            prefetch_k=prefetch_k,
+            causal_trim=causal_trim,
+            num_waves=num_waves,
             arch=arch,
             target=target,
         )
