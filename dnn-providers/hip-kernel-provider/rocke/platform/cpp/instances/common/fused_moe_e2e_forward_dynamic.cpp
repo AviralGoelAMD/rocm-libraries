@@ -243,11 +243,11 @@ rocke_status_t rocke_fmoe_forward_dynamic(rocke_fmoe_build_ctx_t* ctx)
      *     Offsets, Counts, SortedTokenIds, SortedTopkIds, SortedWeights,
      *     GroupedInput, GateOut, UpOut, Hidden, DownOut, Y_f32 into ctx->ws.* */
 
-    /* ---- pre-zero accumulator + per-expert GEMM A/C buffers (lines 1696-1708) ----
+    /* ---- pre-zero the accumulators only (lines 1696-1708) ----
+     * GroupedInput is fully overwritten by the gather; GateOut / UpOut /
+     * Hidden / DownOut are unused by both dynamic dispatches.
      * TODO(port):
-     *   hist.zero_(); counter.zero_(); y_f32.zero_();
-     *   grouped_input.zero_(); gate_out.zero_(); up_out.zero_();
-     *   hidden_buf.zero_(); down_out.zero_(); */
+     *   hist.zero_(); counter.zero_(); y_f32.zero_(); */
 
     /* ---- warm the topk + grouped GEMM launchers (lines 1710-1718) ---- *
      * topk_launcher is referenced by the router callable below; the grouped

@@ -1775,28 +1775,19 @@ class FusedMoeForward:
         sorted_topk_ids = ws["SortedTopkIds"]
         sorted_weights = ws["SortedWeights"]
         grouped_input = ws["GroupedInput"]
-        gate_out = ws["GateOut"]
-        up_out = ws["UpOut"]
-        hidden_buf = ws["Hidden"]
-        down_out = ws["DownOut"]
         y_f32 = ws["Y_f32"]
 
         # Pre-zero the buffers that act as accumulators (atomic-add
         # targets in the histogram + scatter counters and the topk-
-        # reduce output).
+        # reduce output). The unpadded GroupedInput is fully overwritten
+        # by the gather (every one of the tokens*topk pairs is routed),
+        # and GateOut / UpOut / Hidden / DownOut are not read or written
+        # by either dynamic dispatch (the grouped path uses its packed
+        # buffers, the uniform path its padded buffers, both zeroed where
+        # they are allocated), so none of them needs a memset.
         hist.zero_()
         counter.zero_()
         y_f32.zero_()
-        # Pre-zero per-expert GEMM A / C buffers; zeroing the input
-        # buffer makes the ``pad_m=True`` GEMM kernel's reads of
-        # padded rows contribute zero, and zeroing the output buffer
-        # keeps the inter-expert padded-write region clean across
-        # subsequent expert dispatches.
-        grouped_input.zero_()
-        gate_out.zero_()
-        up_out.zero_()
-        hidden_buf.zero_()
-        down_out.zero_()
 
         topk_launcher = self._ensure_topk_launcher()
         # The grouped (single-launch-per-expert) GEMM launcher is
