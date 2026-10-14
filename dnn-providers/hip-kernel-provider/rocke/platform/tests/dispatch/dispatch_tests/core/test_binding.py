@@ -176,6 +176,37 @@ class TestGemmBinding(unittest.TestCase):
             with self.subTest(candidate=candidate.name):
                 self.assertIsNotNone(candidate.bind)
 
+    def test_split_k_binding_hands_the_kernel_an_f32_workspace(self):
+        # A split-K spec replaces C with an f32 ``Cf32[M, N]`` workspace the
+        # kernel atomic-adds into. The binding must allocate it at f32 size
+        # (a storage-dtype C is half as large, so the kernel writes past it)
+        # and verify after the f32 -> output-dtype finalisation cast.
+        import numpy as np
+
+        from rocke.dispatch.gemm.binding import _SEED
+
+        req = GemmRequest(M=64, N=1024, K=8192, arch="gfx950", dtype="bf16")
+        result = dispatch_gemm_bf16(req)
+        self.assertGreater(result.spec.trait.split_k, 1, "shape must engage split-K")
+        binding = result.bind(verify=True)
+        rt = FakeRuntime()
+        _args, ptrs = binding.make_args(rt)
+        self.assertGreaterEqual(len(rt.mem[ptrs[2]]), req.M * req.N * 4)
+
+        rng = np.random.default_rng(_SEED)
+        a = rng.integers(-5, 6, size=(req.M, req.K), dtype=np.int16)
+        b = rng.integers(-5, 6, size=(req.N, req.K), dtype=np.int16)
+        ref = (a.astype(np.float32) @ b.astype(np.float32).T).astype(np.float32)
+        rt.mem[ptrs[2]][: ref.nbytes] = ref.tobytes()
+        _diff, bad, total = binding.check(rt, ptrs)
+        self.assertEqual(bad, 0, "an exact split-K workspace must verify clean")
+        self.assertEqual(total, req.M * req.N)
+
+        rt_zero = FakeRuntime()
+        _args, zero_ptrs = binding.make_args(rt_zero)
+        _diff, bad_zero, _total = binding.check(rt_zero, zero_ptrs)
+        self.assertGreater(bad_zero, 0, "a silent split-K kernel must fail verify")
+
 
 class TestBindingRatchet(unittest.TestCase):
     """`bind` is mandatory per family, and the set of exempt families shrinks.
