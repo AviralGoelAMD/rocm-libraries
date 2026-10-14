@@ -180,6 +180,13 @@ class UnifiedAttention3DTiledSpec:
     # straddle a page boundary), and the page is looked up per call, so a
     # tile may span several non-contiguous pages. 1 keeps T == block_size.
     kv_tile_mult: int = 1
+    # Prefetch the NEXT tile's K *and* V at the top of each KV iteration so
+    # both loads overlap the whole QK/softmax/PV body (the default issues V
+    # after QK and drains every VMEM load before PV). bf16/fp16: async DMA
+    # into the free LDS buffer, mid-loop barrier drains LDS only. fp8: the
+    # raw fp8 chunks ride in registers for one iteration and are dequantized
+    # into LDS at the top of the next.
+    kv_prefetch: bool = False
 
     def __post_init__(self):
         if type(self.use_f32_denormal_flush) is not bool:
@@ -265,6 +272,7 @@ class UnifiedAttention3DTiledSpec:
             "stridedkv" if self.kv_layout == "strided" else "",
             "dec" if self.decode_fast_path else "",
             f"t{self.tile_size}" if self.kv_tile_mult > 1 else "",
+            "pf" if self.kv_prefetch else "",
         )
 
 
@@ -840,55 +848,68 @@ def build_unified_attention_3d_tiled(
         the comment block in the 2D sync loader (~lines 1600-1630) for
         the full correctness argument.
         """
-        scale = k_scale_p if lds_token == "K" else v_scale_p
-        lds = K_lds if lds_token == "K" else V_lds
-        src = key if lds_token == "K" else value
         assert fp8_elems_per_chunk == 8, (
             f"FP8 dequant loader expects 8-elem chunks (got "
             f"{fp8_elems_per_chunk}); the packed-cvt path needs the chunk "
             f"to split cleanly into 2× <4 x fp8> sub-chunks."
         )
         for call in range(fp8_chunks_per_thread):
-            chunk_id = b.add(b.mul(b.const_i32(call), b.const_i32(THREADS)), tid)
-            row = b.div(chunk_id, b.const_i32(HD // fp8_elems_per_chunk))
-            col = b.mul(
-                b.mod(chunk_id, b.const_i32(HD // fp8_elems_per_chunk)),
-                b.const_i32(fp8_elems_per_chunk),
+            fp8_vec, row, col = _fp8_chunk_load(kv_tile_idx, call, lds_token)
+            _fp8_chunk_store(fp8_vec, buf_idx, row, col, lds_token)
+
+    def _fp8_chunk_coords(call: int):
+        chunk_id = b.add(b.mul(b.const_i32(call), b.const_i32(THREADS)), tid)
+        row = b.div(chunk_id, b.const_i32(HD // fp8_elems_per_chunk))
+        col = b.mul(
+            b.mod(chunk_id, b.const_i32(HD // fp8_elems_per_chunk)),
+            b.const_i32(fp8_elems_per_chunk),
+        )
+        return row, col
+
+    def _fp8_chunk_load(kv_tile_idx: Value, call: int, lds_token: str):
+        """Raw ``<8 x fp8>`` global load of one chunk; returns (vec, row, col)."""
+        src = key if lds_token == "K" else value
+        row, col = _fp8_chunk_coords(call)
+        linear_half_first = b.add(b.mul(row, b.const_i32(HD)), col)
+        page_idx = kv_tile_idx
+        if TILE_MULT > 1:
+            # chunk_id * 8 == call * 512 + tid * 8: one page per call.
+            page_idx, linear_half_first = _paged_coords(
+                kv_tile_idx, call * THREADS * fp8_elems_per_chunk, lane_half_base
             )
-            linear_half_first = b.add(b.mul(row, b.const_i32(HD)), col)
-            page_idx = kv_tile_idx
-            if TILE_MULT > 1:
-                # chunk_id * 8 == call * 512 + tid * 8: one page per call.
-                page_idx, linear_half_first = _paged_coords(
-                    kv_tile_idx, call * THREADS * fp8_elems_per_chunk, lane_half_base
-                )
-            if I64_KV_ADDR:
-                # Flat per-lane global load: full i64 byte/element offset so
-                # the per-thread physical_block * stride cannot overflow the
-                # cache addressing for paged caches > 2 GiB.
-                voff, _ = paged_kv_desc.offset_i64(
-                    b,
-                    "physical_block",
-                    tile_idx=page_idx,
-                    linear_half=linear_half_first,
-                    kv_head=kv_head_idx,
-                )
-            else:
-                voff, _ = paged_kv_desc.offset(
-                    b,
-                    tile_idx=page_idx,
-                    linear_half=linear_half_first,
-                    kv_head=kv_head_idx,
-                )
-            fp8_vec = b.global_load_vN(
-                src, voff, FP8E4M3, n=fp8_elems_per_chunk, align=fp8_elems_per_chunk
+        if I64_KV_ADDR:
+            # Flat per-lane global load: full i64 byte/element offset so
+            # the per-thread physical_block * stride cannot overflow the
+            # cache addressing for paged caches > 2 GiB.
+            voff, _ = paged_kv_desc.offset_i64(
+                b,
+                "physical_block",
+                tile_idx=page_idx,
+                linear_half=linear_half_first,
+                kv_head=kv_head_idx,
             )
-            # Split <8 x fp8> into 2x <4 x fp8> for the packed cvt; the
-            # backend collapses the extract+pack chain back into a
-            # bitcast-equivalent shuffle once it sees the
-            # cvt.pk.f32.fp8 operand is whole-i32.
-            packed = dequant_fp8x8_to_dtype(b, fp8_vec, scale, dtype)
-            b.smem_store_vN(lds, [buf_idx, row, col], packed, fp8_elems_per_chunk)
+        else:
+            voff, _ = paged_kv_desc.offset(
+                b,
+                tile_idx=page_idx,
+                linear_half=linear_half_first,
+                kv_head=kv_head_idx,
+            )
+        fp8_vec = b.global_load_vN(
+            src, voff, FP8E4M3, n=fp8_elems_per_chunk, align=fp8_elems_per_chunk
+        )
+        return fp8_vec, row, col
+
+    def _fp8_chunk_store(fp8_vec, buf_idx: Value, row, col, lds_token: str) -> None:
+        """Dequantize one ``<8 x fp8>`` chunk and store it to K/V LDS."""
+        scale = k_scale_p if lds_token == "K" else v_scale_p
+        lds = K_lds if lds_token == "K" else V_lds
+        # Split <8 x fp8> into 2x <4 x fp8> for the packed cvt; the
+        # backend collapses the extract+pack chain back into a
+        # bitcast-equivalent shuffle once it sees the
+        # cvt.pk.f32.fp8 operand is whole-i32.
+        packed = dequant_fp8x8_to_dtype(b, fp8_vec, scale, dtype)
+        b.smem_store_vN(lds, [buf_idx, row, col], packed, fp8_elems_per_chunk)
 
     def _issue_k(tile_idx: Value, buf_idx: Value) -> None:
         if KV_FP8:
@@ -902,10 +923,38 @@ def build_unified_attention_3d_tiled(
         else:
             _issue_v_load(tile_idx, buf_idx)
 
+    PREFETCH = spec.kv_prefetch
+    FP8_REG_PREFETCH = PREFETCH and KV_FP8
+    last_tile = b.sub(tile_end, b.const_i32(1)) if FP8_REG_PREFETCH else None
+
+    def _fp8_raw_tile(kv_tile_idx: Value):
+        """Raw fp8 K then V chunks of one tile (registers, not yet in LDS)."""
+        return [
+            _fp8_chunk_load(kv_tile_idx, call, tok)[0]
+            for tok in ("K", "V")
+            for call in range(fp8_chunks_per_thread)
+        ]
+
+    def _fp8_stage_tile(raw, buf_idx: Value) -> None:
+        """Dequantize a raw tile from ``_fp8_raw_tile`` into K/V LDS ``buf_idx``."""
+        i = 0
+        for tok in ("K", "V"):
+            for call in range(fp8_chunks_per_thread):
+                row, col = _fp8_chunk_coords(call)
+                _fp8_chunk_store(raw[i], buf_idx, row, col, tok)
+                i += 1
+
     _issue_k(tile_start, b.const_i32(0))
+    if PREFETCH:
+        _issue_v(tile_start, b.const_i32(0))
 
     cur_buf_init = b.const_i32(0)
     iter_args.append(("cur_buf", cur_buf_init))
+    if FP8_REG_PREFETCH:
+        nxt0 = b.add(tile_start, b.const_i32(1))
+        raw0 = _fp8_raw_tile(b.select(b.cmp_lt(nxt0, tile_end), nxt0, last_tile))
+        for i, v in enumerate(raw0):
+            iter_args.append((f"kvraw{i}", v))
 
     # LICM hoist: per-reg invariants that are constant across all KV tiles.
     # qp_r, qh_r, row_ok, and causal_lim depend only on CTA-level constants
@@ -958,8 +1007,22 @@ def build_unified_attention_3d_tiled(
         in_range_next = b.cmp_lt(next_tile_iv_raw, tile_end)
         safe_next_tile = b.select(in_range_next, next_tile_iv_raw, kv_tile_iv)
 
-        b.s_waitcnt(vmcnt=0, lgkmcnt=0)
-        b.sync()
+        new_raw = None
+        if FP8_REG_PREFETCH:
+            # LDS[cur] was staged last iteration; only LDS needs draining, the
+            # raw fp8 registers for tile+1 (and tile+2 below) stay in flight.
+            b.sync_lds_only()
+            raw = carry[9 + PV_N_TILES : 9 + PV_N_TILES + 2 * fp8_chunks_per_thread]
+            _fp8_stage_tile(raw, nxt_buf)
+            nxt2 = b.add(kv_tile_iv, b.const_i32(2))
+            new_raw = _fp8_raw_tile(b.select(b.cmp_lt(nxt2, tile_end), nxt2, last_tile))
+        else:
+            b.s_waitcnt(vmcnt=0, lgkmcnt=0)
+            b.sync()
+            if PREFETCH:
+                with b.scf_if(in_range_next):
+                    _issue_k(next_tile_iv_raw, nxt_buf)
+                    _issue_v(next_tile_iv_raw, nxt_buf)
 
         # QK
         A_kits = []
@@ -976,8 +1039,9 @@ def build_unified_attention_3d_tiled(
                 acc_v = _mfma_16x16x32(b, dtype, A_kits[k], B_v, acc_v)
             S_n.append(acc_v)
 
-        _issue_v(kv_tile_iv, cur_buf)
-        _issue_k(safe_next_tile, nxt_buf)
+        if not PREFETCH:
+            _issue_v(kv_tile_iv, cur_buf)
+            _issue_k(safe_next_tile, nxt_buf)
 
         # See attention_tiled_2d.py for the rationale on applying ALiBi /
         # QQ-bias before the select-with-(-inf) (equivalent to Triton's
@@ -1055,7 +1119,11 @@ def build_unified_attention_3d_tiled(
         new_l_vals = [
             b.fadd(b.fmul(l_vals[r], alpha_regs[r]), l_local[r]) for r in range(4)
         ]
-        if KV_FP8:
+        if PREFETCH:
+            # K/V[cur] already landed (top-of-loop drain); only the P tile
+            # written above must be visible. Next tile's loads stay in flight.
+            b.sync_lds_only()
+        elif KV_FP8:
             # FP8 sync loader has no in-flight async work.
             b.s_waitcnt(vmcnt=0, lgkmcnt=0)
             b.sync()
@@ -1104,6 +1172,8 @@ def build_unified_attention_3d_tiled(
         for n in range(PV_N_TILES):
             yields.append(new_acc[n])
         yields.append(nxt_buf)
+        if FP8_REG_PREFETCH:
+            yields.extend(new_raw)
         b.scf_yield(*yields)
 
     # ---------------- write segment workspace ----------------
