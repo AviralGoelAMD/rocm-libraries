@@ -3666,10 +3666,13 @@ class _Lowerer:
         Reference: CK Tile ``BlockGemmMxARegBSmemCRegV1::operator()``.
         """
         a, b, c, a_scale, b_scale = op.operands
-        self._need("mfma.scale.f32.16x16x128.f8f6f4")
-        # Bitcast a / b to <8 x i32>; they arrive as <16 x byte>-style
-        # vectors — we accept both <16 x i8>/<16 x fp8e4m3> and
-        # <8 x i32> at the IR-level and normalise here.
+        # The f8f6f4 scale-MFMA intrinsic is the nine-argument form on every
+        # supported compiler: (A, B, C, cbsz, blgp, opsel_a, scale_a, opsel_b,
+        # scale_b). The eleven-argument spelling previously emitted for
+        # llvm20/llvm22 placed the scale values in immarg slots that the
+        # backend reads as zero, which selects the *unscaled* instruction and
+        # silently drops the E8M0 scales. Share the hero atom's declaration.
+        self._need("mfma.f32.16x16x128.fp8.hero")
         a_packed = self._fresh("mxa")
         b_packed = self._fresh("mxb")
         a_ty = _llvm_type(a.type)
@@ -3686,24 +3689,14 @@ class _Lowerer:
             )
         else:
             b_packed = self._operand(b)
-        if self._flavor == LLVM_FLAVOR_LLVM23:
-            self._current().emit(
-                f"  {op.result.name} = call <4 x float> "
-                f"@llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4("
-                f"<8 x i32> {a_packed}, <8 x i32> {b_packed}, "
-                f"<4 x float> {self._operand(c)}, "
-                f"i32 0, i32 0, i32 0, i32 {self._operand(a_scale)}, "
-                f"i32 0, i32 {self._operand(b_scale)})"
-            )
-        else:
-            self._current().emit(
-                f"  {op.result.name} = call <4 x float> "
-                f"@llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4("
-                f"<8 x i32> {a_packed}, <8 x i32> {b_packed}, "
-                f"<4 x float> {self._operand(c)}, "
-                f"i32 0, i32 0, i32 0, i32 0, i32 {self._operand(a_scale)}, "
-                f"i32 0, i32 {self._operand(b_scale)}, i32 0)"
-            )
+        self._current().emit(
+            f"  {op.result.name} = call <4 x float> "
+            f"@llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4("
+            f"<8 x i32> {a_packed}, <8 x i32> {b_packed}, "
+            f"<4 x float> {self._operand(c)}, "
+            f"i32 0, i32 0, i32 0, i32 {self._operand(a_scale)}, "
+            f"i32 0, i32 {self._operand(b_scale)})"
+        )
 
     def _op_tile_mfma_f32_16x16x128_fp4(self, op: Op) -> None:
         a, b, c = op.operands
