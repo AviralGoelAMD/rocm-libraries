@@ -18,7 +18,6 @@ def _spec(idx: int) -> MxGemmSpec:
         block_tile_m=16,
         block_tile_n=16,
         name="rocke_mx_gemm",
-        per_input_row=True,
     )
     if idx == 0:
         return MxGemmSpec(M=16, N=16, K=64, **{**common, "mantissa_dtype": "fp8e4m3"})

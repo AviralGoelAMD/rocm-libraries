@@ -25,7 +25,6 @@ static int make_spec(int idx, rocke_mx_gemm_spec_t* spec)
     spec->group_k = 32;
     spec->block_tile_m = 16;
     spec->block_tile_n = 16;
-    spec->per_input_row = true;
 
     switch(idx)
     {

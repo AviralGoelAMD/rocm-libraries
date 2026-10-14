@@ -43,9 +43,12 @@ rocke_mx_gemm_spec_t rocke_mx_gemm_spec_default(void)
     s.block_tile_m = 16;
     s.block_tile_n = 16;
     s.name = "rocke_mx_gemm";
-    s.per_input_row = true;
     return s;
 }
+
+/* Largest accumulator fragment of any MFMA atom (32x32: 16 f32 per lane); sizes
+ * the per-slot scale arrays in build_mx_gemm. */
+#define ROCKE_MXG_MAX_C_PER_LANE 16
 
 /* ===================================================================== *
  *  MxGemmSpec.block_size property: one wave64 warp per CTA = 64.
@@ -243,9 +246,10 @@ rocke_kernel_def_t*
     rocke_value_t* m_tile_base;
     rocke_value_t* n_tile_base;
     rocke_lane_decode_t lane_decode;
-    rocke_value_t* m_global_row;
     rocke_value_t* n_global_col;
-    rocke_value_t* a_scale_row_base;
+    rocke_value_t* out_row_blk;
+    rocke_value_t* a_scale_row_bases[ROCKE_MXG_MAX_C_PER_LANE];
+    int i;
 
     rocke_iter_arg_t iter_arg;
     rocke_for_t outer;
@@ -372,13 +376,37 @@ rocke_kernel_def_t*
     k_scale_count = spec->K / spec->group_k;
     atoms_per_group = spec->group_k / atom->k;
 
-    /* Loop-invariant scale-address bases (hoisted out of the K-group loop). */
-    /* m_global_row = b.add(m_tile_base, lane_decode.m_in_atom) */
-    m_global_row = rocke_b_add(b, m_tile_base, lane_decode.m_in_atom);
-    /* n_global_col = b.add(n_tile_base, lane_decode.n_in_atom) */
+    /* Loop-invariant scale-address bases (hoisted out of the K-group loop).
+     * Accumulator slot i of a lane holds output row k_blk * c_per_lane + i of
+     * the 16x16 atom (MfmaAtom.lane_to_output), which is NOT the lane's
+     * A-operand row m_in_atom, so each slot gets its own output row's A scale.
+     *
+     *   n_global_col = b.add(n_tile_base, lane_decode.n_in_atom)
+     *   out_row_blk = b.add(m_tile_base,
+     *                       b.mul(lane_decode.k_blk, b.const_i32(c_per_lane)))
+     *   a_scale_row_bases = [b.mul(b.add(out_row_blk, b.const_i32(i)),
+     *                              b.const_i32(k_scale_count)) for i ...]
+     *
+     * Each sub-expression is bound to a temporary in Python's left-to-right
+     * evaluation order so the value numbering matches. */
+    if(atom->c_per_lane > ROCKE_MXG_MAX_C_PER_LANE)
+    {
+        return (rocke_kernel_def_t*)rocke_i_set_err(
+            b, ROCKE_ERR_VALUE, "mx_gemm: c_per_lane %d unsupported", atom->c_per_lane);
+    }
     n_global_col = rocke_b_add(b, n_tile_base, lane_decode.n_in_atom);
-    /* a_scale_row_base = b.mul(m_global_row, b.const_i32(k_scale_count)) */
-    a_scale_row_base = rocke_b_mul(b, m_global_row, rocke_b_const_i32(b, k_scale_count));
+    {
+        rocke_value_t* c_cpl = rocke_b_const_i32(b, atom->c_per_lane);
+        rocke_value_t* row_mul = rocke_b_mul(b, lane_decode.k_blk, c_cpl);
+        out_row_blk = rocke_b_add(b, m_tile_base, row_mul);
+    }
+    for(i = 0; i < atom->c_per_lane; ++i)
+    {
+        rocke_value_t* c_i = rocke_b_const_i32(b, i);
+        rocke_value_t* row = rocke_b_add(b, out_row_blk, c_i);
+        rocke_value_t* c_ksc = rocke_b_const_i32(b, k_scale_count);
+        a_scale_row_bases[i] = rocke_b_mul(b, row, c_ksc);
+    }
 
     /* outer = b.scf_for_iter(0, k_scale_count, 1, [("oacc", atom.zero_acc(b))],
      *                        iv_name="kg")
@@ -409,28 +437,32 @@ rocke_kernel_def_t*
         rocke_value_t* kg = outer.iv;
         rocke_value_t* outer_acc = outer.iter_vars[0];
 
-        rocke_value_t* a_scale_off;
         rocke_value_t* b_scale_off;
-        rocke_value_t* a_scale;
         rocke_value_t* b_scale;
-        rocke_value_t* ab_scale;
+        rocke_value_t* ab_scales[ROCKE_MXG_MAX_C_PER_LANE];
         rocke_value_t* k_group_base;
         rocke_value_t* group_acc;
         rocke_value_t* ab_scale_vec;
         rocke_value_t* new_outer;
 
-        /* a_scale_off = b.add(a_scale_row_base, kg) */
-        a_scale_off = rocke_b_add(b, a_scale_row_base, kg);
         /* b_scale_off = b.add(b.mul(kg, b.const_i32(N)), n_global_col) */
         b_scale_off
             = rocke_b_add(b, rocke_b_mul(b, kg, rocke_b_const_i32(b, spec->N)), n_global_col);
-
-        /* a_scale = decode_mx_scale_e8m0(b, b.global_load_i8(AScale, a_scale_off)) */
-        a_scale = rocke_decode_mx_scale_e8m0(b, rocke_b_global_load_i8(b, AScale, a_scale_off, 0));
         /* b_scale = decode_mx_scale_e8m0(b, b.global_load_i8(BScale, b_scale_off)) */
         b_scale = rocke_decode_mx_scale_e8m0(b, rocke_b_global_load_i8(b, BScale, b_scale_off, 0));
-        /* ab_scale = b.fmul(a_scale, b_scale) */
-        ab_scale = rocke_b_fmul(b, a_scale, b_scale);
+        /* ab_scale_vec = b.vec_pack(
+         *     [b.fmul(decode_mx_scale_e8m0(
+         *                 b, b.global_load_i8(AScale, b.add(row_base, kg))),
+         *             b_scale)
+         *      for row_base in a_scale_row_bases], F32) */
+        for(i = 0; i < atom->c_per_lane; ++i)
+        {
+            rocke_value_t* a_scale_off = rocke_b_add(b, a_scale_row_bases[i], kg);
+            rocke_value_t* a_scale
+                = rocke_decode_mx_scale_e8m0(b, rocke_b_global_load_i8(b, AScale, a_scale_off, 0));
+            ab_scales[i] = rocke_b_fmul(b, a_scale, b_scale);
+        }
+        ab_scale_vec = rocke_b_vec_pack(b, ab_scales, atom->c_per_lane, rocke_f32());
 
         /* k_group_base = b.mul(kg, b.const_i32(group_k)) */
         k_group_base = rocke_b_mul(b, kg, rocke_b_const_i32(b, spec->group_k));
@@ -458,8 +490,6 @@ rocke_kernel_def_t*
             group_acc = rocke_b_mma(b, atom->name, a_vec, b_vec, group_acc, NULL, 0);
         }
 
-        /* ab_scale_vec = b.vector_splat(ab_scale, atom.c_per_lane) */
-        ab_scale_vec = rocke_b_vector_splat(b, ab_scale, atom->c_per_lane);
         /* new_outer = b.vector_fma(group_acc, ab_scale_vec, outer_acc) */
         new_outer = rocke_b_vector_fma(b, group_acc, ab_scale_vec, outer_acc);
         /* b.scf_yield(new_outer) */

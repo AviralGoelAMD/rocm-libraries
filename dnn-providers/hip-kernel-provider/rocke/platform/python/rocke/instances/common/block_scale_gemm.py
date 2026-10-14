@@ -96,11 +96,6 @@ class BlockScaleGemmSpec:
     block_tile_m: int = 16
     block_tile_n: int = 16
     name: str = "rocke_block_scale_gemm"
-    # P77 sibling: per-output-row scale broadcast, same shape as
-    # :class:`rocke.instances.common.mx_gemm.MxGemmSpec.per_input_row`.
-    # Defaults to True for backwards compat; flip on per-row
-    # varying-scale workloads.
-    per_input_row: bool = True
 
     @property
     def atom(self) -> MfmaAtom:
@@ -320,6 +315,24 @@ def build_block_scale_gemm(spec: BlockScaleGemmSpec, arch: str = "gfx950") -> Ke
     n_scale_count_b = (spec.N + gn - 1) // gn
     k_scale_count_a = (spec.K + gk - 1) // gk
 
+    # Per-output-row scale addressing, hoisted out of the K-group loop (the
+    # DSL pass pipeline does not run LICM). Accumulator slot ``i`` of a lane
+    # holds output row ``k_blk * c_per_lane + i`` of the 16x16 atom (see
+    # :meth:`MfmaAtom.lane_to_output`), which is NOT the lane's A-operand row
+    # ``m_in_atom``. So each slot gets the A scale of its own output row; B's
+    # scale is per output column, which is the lane's ``n_in_atom``.
+    out_row_blk = b.add(
+        m_tile_base, b.mul(lane_decode.k_blk, b.const_i32(atom.c_per_lane))
+    )
+    a_scale_row_bases = [
+        b.mul(
+            b.div(b.add(out_row_blk, b.const_i32(i)), b.const_i32(gm)),
+            b.const_i32(k_scale_count_a),
+        )
+        for i in range(atom.c_per_lane)
+    ]
+    b_scale_col = b.div(b.add(n_tile_base, lane_decode.n_in_atom), b.const_i32(gn))
+
     # Per-group MFMA pipeline: run ``atoms_per_group`` MFMAs into a
     # zero-initialised group accumulator, multiply by ``a_scale *
     # b_scale``, fold into the outer accumulator. Mathematically
@@ -336,21 +349,18 @@ def build_block_scale_gemm(spec: BlockScaleGemmSpec, arch: str = "gfx950") -> Ke
         iv_name="kg",
     )
     with outer as (kg, (outer_acc,)):
-        # Load per-group scales (one f32 each).
-        a_scale_off = b.add(
-            b.mul(
-                b.div(b.add(m_tile_base, lane_decode.m_in_atom), b.const_i32(gm)),
-                b.const_i32(k_scale_count_a),
-            ),
-            kg,
+        # Per-group scales (f32): one B scale for the lane's output column,
+        # one A scale per accumulator slot's output row.
+        b_scale_v = b.global_load_f32(
+            BScale, b.add(b.mul(kg, b.const_i32(n_scale_count_b)), b_scale_col)
         )
-        b_scale_off = b.add(
-            b.mul(kg, b.const_i32(n_scale_count_b)),
-            b.div(b.add(n_tile_base, lane_decode.n_in_atom), b.const_i32(gn)),
+        ab_scale_vec = b.vec_pack(
+            [
+                b.fmul(b.global_load_f32(AScale, b.add(row_base, kg)), b_scale_v)
+                for row_base in a_scale_row_bases
+            ],
+            F32,
         )
-        a_scale_v = b.global_load_f32(AScale, a_scale_off)
-        b_scale_v = b.global_load_f32(BScale, b_scale_off)
-        ab_scale = b.fmul(a_scale_v, b_scale_v)
 
         # Run atoms_per_group MFMA invocations on a fresh acc; their K
         # range is [kg * gk, (kg+1) * gk).
@@ -389,16 +399,12 @@ def build_block_scale_gemm(spec: BlockScaleGemmSpec, arch: str = "gfx950") -> Ke
         )
 
         # Tile-level scale-and-accumulate the group's MFMA result.
-        # ``group_acc`` and ``outer_acc`` are both ``<c_per_lane x f32>``
-        # per-lane vectors; broadcast the scalar ``ab_scale`` to that
-        # width and emit one vector fmul + one vector fadd, which lower
-        # to packed ``v_pk_mul_f32`` / ``v_pk_add_f32`` (or a fused
-        # ``v_pk_fma_f32``) on AMDGPU instead of the c_per_lane scalar
-        # fmul/fadd chain the prior implementation produced. The
-        # ab_scale broadcast is correct under the spec's current
-        # uniform-scale assumption (group_m=group_n=1 collapses to per-
-        # row/col scales that map 1:1 to lane outputs).
-        ab_scale_vec = b.vector_splat(ab_scale, atom.c_per_lane)
+        # ``group_acc``, ``ab_scale_vec`` and ``outer_acc`` are all
+        # ``<c_per_lane x f32>`` per-lane vectors (slot ``i`` of
+        # ``ab_scale_vec`` is that slot's output-row A scale times the
+        # column's B scale); emit one vector fmul + one vector fadd, which
+        # lower to packed ``v_pk_mul_f32`` / ``v_pk_add_f32`` (or a fused
+        # ``v_pk_fma_f32``) on AMDGPU.
         scaled_group = b.vector_mul(group_acc, ab_scale_vec)
         new_outer = b.vector_add(outer_acc, scaled_group)
         b.scf_yield(new_outer)

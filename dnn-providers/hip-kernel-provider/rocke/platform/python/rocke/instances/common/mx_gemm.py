@@ -85,20 +85,6 @@ class MxGemmSpec:
     block_tile_m: int = 16
     block_tile_n: int = 16
     name: str = "rocke_mx_gemm"
-    # P77: row-aware scale correctness mode. The historical
-    # ``per_input_row=True`` (default) loads ``AScale[m_in_atom +
-    # m_tile_base, kg]`` per lane and applies it to the lane's
-    # ``c_per_lane=4`` *output* cells. For ``k_blk > 0`` lanes
-    # (16-63), ``m_in_atom`` does not equal the output-row index so
-    # the scale doesn't correspond to any output cell — masked by
-    # parity tests using uniform per-row scales but mathematically
-    # wrong on real workloads. ``per_input_row=False`` switches to
-    # per-output-row scale broadcast: lane-broadcast via
-    # :func:`rocke.helpers.mx_scale.load_and_decode_mx_scales_wave`
-    # so each lane sees the scale matching its actual output row.
-    # Defaults to True for backwards compatibility; flip to False
-    # on real per-row varying-scale workloads.
-    per_input_row: bool = True
 
     @property
     def atom(self) -> MfmaAtom:
@@ -234,22 +220,33 @@ def build_mx_gemm(spec: MxGemmSpec, arch: str = "gfx950") -> KernelDef:
 
     # Loop-invariant scale-address bases. The DSL pass pipeline does not
     # run LICM (it never moves loads and only constant-folds/CSEs pure
-    # ops), so the per-lane (m_row, n_col) coordinates and the A-scale row
-    # stride must be hoisted out of the K-group loop by hand -- otherwise
-    # they are recomputed every group. Inside the loop only the
-    # ``kg``-dependent term is added.
-    m_global_row = b.add(m_tile_base, lane_decode.m_in_atom)
+    # ops), so the per-lane scale coordinates must be hoisted out of the
+    # K-group loop by hand -- otherwise they are recomputed every group.
+    # Inside the loop only the ``kg``-dependent term is added.
+    #
+    # Accumulator slot ``i`` of a lane holds output row ``k_blk *
+    # c_per_lane + i`` of the 16x16 atom (see :meth:`MfmaAtom.lane_to_output`),
+    # which is NOT the lane's A-operand row ``m_in_atom``. So each slot gets
+    # the A scale of its own output row; B's scale is per output column,
+    # which is the lane's ``n_in_atom``.
     n_global_col = b.add(n_tile_base, lane_decode.n_in_atom)
-    a_scale_row_base = b.mul(m_global_row, b.const_i32(k_scale_count))
+    out_row_blk = b.add(
+        m_tile_base, b.mul(lane_decode.k_blk, b.const_i32(atom.c_per_lane))
+    )
+    a_scale_row_bases = [
+        b.mul(b.add(out_row_blk, b.const_i32(i)), b.const_i32(k_scale_count))
+        for i in range(atom.c_per_lane)
+    ]
 
     # Single-level K iteration over MX shared-exponent groups (one E8M0
-    # byte per group, decoded once per iter). Each group's
-    # ``atoms_per_group`` MFMA invocations are Python-unrolled into a
-    # fresh per-group acc, then scaled by ``a_scale * b_scale`` and folded
-    # into the outer accumulator with one fused ``v_pk_fma_f32`` per lane
-    # element. The MX ``mfma_f32_16x16x128_f8f6f4`` intrinsic does the
-    # scale in-instruction; the v1 chain replicates it explicitly so
-    # parity isn't blocked on the in-instruction intrinsic.
+    # byte per (row, group) for A and per (group, column) for B, decoded
+    # once per iter). Each group's ``atoms_per_group`` MFMA invocations
+    # are Python-unrolled into a fresh per-group acc, then scaled per
+    # accumulator slot and folded into the outer accumulator with one
+    # fused ``v_pk_fma_f32`` per lane element pair. The MX
+    # ``mfma_f32_16x16x128_f8f6f4`` intrinsic does the scale
+    # in-instruction; the v1 chain replicates it explicitly so parity
+    # isn't blocked on the in-instruction intrinsic.
     outer = b.scf_for_iter(
         b.const_i32(0),
         b.const_i32(k_scale_count),
@@ -260,24 +257,29 @@ def build_mx_gemm(spec: MxGemmSpec, arch: str = "gfx950") -> KernelDef:
     with outer as (kg, (outer_acc,)):
         # Per-group E8M0 scale loads + decode. Only the ``kg``-dependent
         # term is added here; the per-lane (row, col) bases are hoisted.
-        a_scale_off = b.add(a_scale_row_base, kg)
+        # The MX-spec apply is ``elem * 2^(scale_unbiased - 127)``; since
+        # the decoded scales are the f32 multipliers, each slot's combined
+        # scale is its output row's A scale times the column's B scale.
         b_scale_off = b.add(
             b.mul(kg, b.const_i32(spec.N)),
             n_global_col,
-        )
-        a_scale = decode_mx_scale_e8m0(
-            b,
-            b.global_load_i8(AScale, a_scale_off),
         )
         b_scale = decode_mx_scale_e8m0(
             b,
             b.global_load_i8(BScale, b_scale_off),
         )
-        # The MX-spec apply is ``elem * 2^(scale_unbiased - 127)``;
-        # mathematically equivalent to ``elem * 2^scale_unbiased / 2^127``
-        # and since a_scale / b_scale are already the post-decode f32
-        # multipliers, the combined scale is just their product.
-        ab_scale = b.fmul(a_scale, b_scale)
+        ab_scale_vec = b.vec_pack(
+            [
+                b.fmul(
+                    decode_mx_scale_e8m0(
+                        b, b.global_load_i8(AScale, b.add(row_base, kg))
+                    ),
+                    b_scale,
+                )
+                for row_base in a_scale_row_bases
+            ],
+            F32,
+        )
 
         k_group_base = b.mul(kg, b.const_i32(spec.group_k))
 
@@ -313,12 +315,11 @@ def build_mx_gemm(spec: MxGemmSpec, arch: str = "gfx950") -> KernelDef:
             group_acc = atom.emit(b, a_vec, b_vec, group_acc)
 
         # Tile-level scale-and-accumulate the group's MFMA result.
-        # ``group_acc`` and ``outer_acc`` are both ``<c_per_lane x f32>``
-        # per-lane vectors; broadcast the scalar ``ab_scale`` to that
-        # width and fold with a single fused multiply-add per lane element
-        # (``new = outer + group * ab_scale``), which lowers to packed
-        # ``v_pk_fma_f32`` on AMDGPU instead of a separate mul + add.
-        ab_scale_vec = b.vector_splat(ab_scale, atom.c_per_lane)
+        # ``group_acc``, ``ab_scale_vec`` and ``outer_acc`` are all
+        # ``<c_per_lane x f32>`` per-lane vectors; fold with a single fused
+        # multiply-add per lane element (``new = outer + group * ab_scale``),
+        # which lowers to packed ``v_pk_fma_f32`` on AMDGPU instead of a
+        # separate mul + add.
         new_outer = b.vector_fma(group_acc, ab_scale_vec, outer_acc)
         b.scf_yield(new_outer)
 

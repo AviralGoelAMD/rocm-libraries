@@ -58,7 +58,6 @@ typedef struct rocke_mx_gemm_spec
     int block_tile_m; /* default 16 */
     int block_tile_n; /* default 16 */
     const char* name; /* default "rocke_mx_gemm" */
-    bool per_input_row; /* default true (v1 experimental scale mode) */
 } rocke_mx_gemm_spec_t;
 
 /* Default-constructed spec (every field == Python dataclass default). The
