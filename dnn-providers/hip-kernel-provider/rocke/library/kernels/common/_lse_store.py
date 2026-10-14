@@ -46,7 +46,7 @@ def dense_row_has_key(b, query_row, kv_length, *, causal, diagonal, window):
 def zero_keyless_row(b, packed, row_has_key, dtype, width=4):
     """Zero O for rows without keys by masking the packed dtype bits.
 
-    ``packed`` holds ``width`` 16-bit values (1, 2 or 4). A float select, before
+    ``packed`` holds ``width`` 16-bit values (1, 2, 4 or 8). A float select, before
     or after the cast, lets LLVM fuse multiply and convert into
     ``v_fma_mixlo_f16``, which changes nonempty FP16 O versus LSE-off; an
     integer AND on the same bits cannot fuse.
@@ -55,7 +55,7 @@ def zero_keyless_row(b, packed, row_has_key, dtype, width=4):
     if width == 1:
         lane, lanes = I16, 1
         mask = b.trunc(mask, I16)
-    elif width in (2, 4):
+    elif width in (2, 4, 8):
         lane, lanes = I32, width // 2
     else:
         raise ValueError(f"unsupported O store width {width}")

@@ -333,11 +333,18 @@ class TestDenseNumeric:
     @pytest.mark.gpu
     @pytest.mark.parametrize(
         "d,persistent,width",
-        [(128, False, 1), (128, True, 2), (64, False, 2), (64, True, 1)],
+        [
+            (128, False, 1),
+            (128, True, 2),
+            (64, False, 2),
+            (64, True, 1),
+            (128, False, 8),
+            (64, True, 8),
+        ],
     )
     def test_bf16_narrow_output_store_is_bit_identical(self, d, persistent, width):
-        """bf16 o_store_width 1/2 must write the same bits as the width-4 store
-        (fp16 is rejected below 4 because it does not)."""
+        """bf16 o_store_width 1/2/8 must write the same bits as the width-4 store
+        (fp16 is rejected away from 4 because it does not)."""
         import torch
 
         hq, hkv, B, S = 16, 4, 1, 512
@@ -1068,12 +1075,12 @@ class TestDenseLseNumeric:
         # Every row has a key. Empty-row corrections are enabled-path-only.
         assert torch.equal(out, off_out)
 
-    @pytest.mark.parametrize("width", [1, 2])
+    @pytest.mark.parametrize("width", [1, 2, 8])
     @pytest.mark.parametrize(
         "persistent", [False, True], ids=["ordinary", "persistent"]
     )
     def test_narrow_o_store(self, width, persistent):
-        """BF16 store widths 1/2: keyless rows are zero, keyed rows match LSE-off."""
+        """BF16 store widths 1/2/8: keyless rows are zero, keyed rows match LSE-off."""
         spec = Gfx950AttentionDenseSpec(
             batch=1,
             seqlen_q=256,
