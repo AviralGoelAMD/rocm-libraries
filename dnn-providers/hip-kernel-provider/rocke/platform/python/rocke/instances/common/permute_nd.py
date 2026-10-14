@@ -61,15 +61,17 @@ gathering ``vec`` non-adjacent halves. The kernel falls back to the
 What we cover today
 -------------------
 
-* Dtypes ``f16`` / ``bf16``. The CK Tile reference also handles
-  ``fp8`` and ``fp32``; f8/f32 just need their own ``load_scalar`` /
-  ``load_vec`` dispatch in :mod:`rocke.helpers.tensor_view`.
+* Dtypes ``f16`` / ``bf16`` / ``f32``. The CK Tile reference also
+  handles ``fp8``; f8 just needs its own ``load_scalar`` / ``load_vec``
+  dispatch in :mod:`rocke.helpers.tensor_view`.
 * Rank up to 8 (the same cap as ``GenericPermuteHostArgs::kMaxRanks``).
 * Arbitrary permutations; the kernel is shape-specialised at build
   time (compile-time shape + permutation -> compile-time strides + the
   index-decomposition arithmetic folds at IR construction).
-* Vec widths ``{2, 4, 8}`` automatically when ``perm[-1] == rank - 1``
-  and ``x_shape[-1] % vec == 0``; falls back to scalar otherwise.
+* Vec widths up to 16 bytes per access (``{2, 4, 8}`` for 16-bit
+  dtypes, ``{2, 4}`` for ``f32``) automatically when
+  ``perm[-1] == rank - 1`` and ``x_shape[-1] % vec == 0``; falls back
+  to scalar otherwise.
 """
 
 from __future__ import annotations
@@ -79,7 +81,7 @@ import operator
 from dataclasses import dataclass
 from typing import Literal, Tuple
 
-from ...core.ir import BF16, F16, IRBuilder, KernelDef, PtrType
+from ...core.ir import BF16, F16, F32, IRBuilder, KernelDef, PtrType, Type
 from ...helpers.io import io_ir_type
 from ...helpers.spec import SignatureBuilder, ceil_div_grid, kernel_name_join
 from ...helpers.tensor_view import make_global_view
@@ -87,8 +89,22 @@ from ...helpers.transforms import TensorDescriptor as RichTensorDescriptor
 from ...helpers.transforms import pass_through, unmerge
 
 
-DType = Literal["f16", "bf16"]
+DType = Literal["f16", "bf16", "f32"]
 MAX_RANK = 8
+
+
+def _io_type(dtype: str) -> Type:
+    """IR element type of ``dtype``; ``f32`` is a pure data-movement type here."""
+    if dtype == "f32":
+        return F32
+    return io_ir_type(dtype)
+
+
+def _vec_candidates(dtype: str) -> Tuple[int, ...]:
+    """Vector widths to try, widest first, capped at 16 bytes per access."""
+    if dtype == "f32":
+        return (4, 2)
+    return (8, 4, 2)
 
 
 @dataclass(frozen=True)
@@ -132,14 +148,14 @@ class PermuteSpec:
         rank - 1``), with the inner length divisible by the chosen
         vec width.
 
-        We pick the largest vec in ``{8, 4, 2}`` that divides the
-        inner length; this matches the dword-x8 / dword-x4 / dword-x2
-        global load widths the AMDGPU backend supports for 16-bit
-        elements.
+        We pick the largest vec that divides the inner length, capped
+        at 16 bytes per access: ``{8, 4, 2}`` for 16-bit elements and
+        ``{4, 2}`` for ``f32`` (the dword-x4 / dword-x2 / dword global
+        load widths the AMDGPU backend supports).
         """
         if self.perm[-1] == self.rank - 1:
             inner = self.x_shape[-1]
-            for v in (8, 4, 2):
+            for v in _vec_candidates(self.dtype):
                 if inner % v == 0 and self.total_elements % v == 0:
                     return v
             return 1
@@ -181,7 +197,7 @@ def is_valid_spec(spec: PermuteSpec, arch: str = "gfx950") -> Tuple[bool, str]:
     except KeyError as e:
         return False, str(e)
 
-    if spec.dtype not in ("f16", "bf16"):
+    if spec.dtype not in ("f16", "bf16", "f32"):
         return False, f"unsupported dtype {spec.dtype!r}"
     _legal_bs = tuple(
         bs for bs in (64, 128, 256, 512, 1024) if bs <= target.max_threads_per_block
@@ -292,7 +308,7 @@ def build_permute(spec: PermuteSpec, arch: str = "gfx950") -> KernelDef:
     if not ok:
         raise ValueError(f"invalid permute spec: {why}")
 
-    io_ty = io_ir_type(spec.dtype)
+    io_ty = _io_type(spec.dtype)
     total = spec.total_elements
     vec = spec.vec_width
 
@@ -346,8 +362,14 @@ def build_permute(spec: PermuteSpec, arch: str = "gfx950") -> KernelDef:
         in_bounds = b.cmp_lt(out_idx, c_total)
         with b.scf_if(in_bounds):
             src_offset, _valid = in_desc.offset(b, out_idx=out_idx)
-            val = X_view.load_scalar_at(b, src_offset)
-            Y_view.store_scalar_at(b, out_idx, val)
+            if spec.dtype == "f32":
+                # The global view's generic scalar branch would claim
+                # byte alignment; f32 elements are naturally 4-byte aligned.
+                val = b.global_load_f32(X, src_offset)
+                b.global_store(Y, out_idx, val, align=4)
+            else:
+                val = X_view.load_scalar_at(b, src_offset)
+                Y_view.store_scalar_at(b, out_idx, val)
 
     return b.kernel
 

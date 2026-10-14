@@ -52,14 +52,14 @@ extern "C" {
  *
  * Mirror of Python PermuteSpec. `x_shape` is the input tensor shape (row-major
  * contiguous); `perm` is a length-`rank` permutation of range(rank). `dtype` is
- * "f16" or "bf16". `name` defaults to "rocke_permute" in the Python dataclass;
+ * "f16", "bf16" or "f32". `name` defaults to "rocke_permute" in the Python dataclass;
  * use rocke_permute_spec_default() to get that default. */
 typedef struct rocke_permute_spec
 {
     int x_shape[ROCKE_PERMUTE_MAX_RANK];
     int perm[ROCKE_PERMUTE_MAX_RANK];
     int rank; /* len(x_shape) == len(perm)              */
-    const char* dtype; /* "f16" | "bf16"  (default "f16")        */
+    const char* dtype; /* "f16" | "bf16" | "f32" (default "f16") */
     int block_size; /* default 256                            */
     const char* name; /* default "rocke_permute"               */
 } rocke_permute_spec_t;
@@ -78,8 +78,9 @@ int rocke_permute_y_shape(const rocke_permute_spec_t* spec, int out[ROCKE_PERMUT
 /* PermuteSpec.total_elements @property: product of x_shape. */
 int rocke_permute_total_elements(const rocke_permute_spec_t* spec);
 
-/* PermuteSpec.vec_width @property. Returns the largest of {8,4,2} that divides
- * both inner length and total_elements when perm[-1]==rank-1, else 1. */
+/* PermuteSpec.vec_width @property. When perm[-1]==rank-1, returns the largest
+ * width that divides both inner length and total_elements, capped at 16 bytes
+ * per access ({8,4,2} for 16-bit dtypes, {4,2} for f32); else 1. */
 int rocke_permute_vec_width(const rocke_permute_spec_t* spec);
 
 /* PermuteSpec.kernel_name() -> NUL-terminated into out (capacity out_cap).

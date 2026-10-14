@@ -35,6 +35,10 @@ def _spec(idx: int) -> PermuteSpec:
         )
     if idx == 5:
         return PermuteSpec(x_shape=(256,), perm=(0,), dtype="f16", block_size=256)
+    if idx == 6:
+        return PermuteSpec(
+            x_shape=(4, 16, 32), perm=(1, 0, 2), dtype="f32", block_size=256
+        )
     raise SystemExit(f"unknown config index {idx}")
 
 
@@ -42,7 +46,7 @@ def main() -> int:
     return run_emit(
         _spec,
         build_permute,
-        usage="usage: permute_nd_emit.py <config_index 0..5> [mode]\n",
+        usage="usage: permute_nd_emit.py <config_index 0..6> [mode]\n",
     )
 
 

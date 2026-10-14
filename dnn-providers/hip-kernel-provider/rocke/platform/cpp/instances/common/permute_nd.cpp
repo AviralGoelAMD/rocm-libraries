@@ -108,17 +108,31 @@ int rocke_permute_vec_width(const rocke_permute_spec_t* spec)
     int inner;
     int total;
     int i;
-    static const int kVecs[3] = {8, 4, 2};
+    int n_vecs;
+    const int* vecs;
+    static const int kVecs16[3] = {8, 4, 2};
+    static const int kVecs32[2] = {4, 2};
     if(spec == NULL || spec->rank == 0)
         return 1;
     /* perm[-1] == rank - 1 */
     if(spec->perm[spec->rank - 1] == spec->rank - 1)
     {
+        /* _vec_candidates(dtype): widest first, capped at 16 bytes per access. */
+        if(spec->dtype != NULL && strcmp(spec->dtype, "f32") == 0)
+        {
+            vecs = kVecs32;
+            n_vecs = 2;
+        }
+        else
+        {
+            vecs = kVecs16;
+            n_vecs = 3;
+        }
         inner = spec->x_shape[spec->rank - 1];
         total = rocke_permute_total_elements(spec);
-        for(i = 0; i < 3; ++i)
+        for(i = 0; i < n_vecs; ++i)
         {
-            int v = kVecs[i];
+            int v = vecs[i];
             if(inner % v == 0 && total % v == 0)
                 return v;
         }
@@ -239,9 +253,10 @@ bool rocke_permute_is_valid_spec(const rocke_permute_spec_t* spec,
     }
     max_tpb = rocke_archtarget_max_threads_per_block(target);
 
-    /* dtype in ("f16", "bf16") */
+    /* dtype in ("f16", "bf16", "f32") */
     if(!(spec->dtype != NULL
-         && (strcmp(spec->dtype, "f16") == 0 || strcmp(spec->dtype, "bf16") == 0)))
+         && (strcmp(spec->dtype, "f16") == 0 || strcmp(spec->dtype, "bf16") == 0
+             || strcmp(spec->dtype, "f32") == 0)))
     {
         snprintf(buf, sizeof(buf), "unsupported dtype %s", spec->dtype ? spec->dtype : "(null)");
         permute_reason(reason, reason_cap, buf);
@@ -433,7 +448,11 @@ rocke_kernel_def_t*
             return NULL;
         }
 
-        io_ty = rocke_b_io_ir_type(b, spec->dtype);
+        /* _io_type(dtype): f32 -> F32, else io_ir_type(dtype) -> F16/BF16. */
+        if(strcmp(spec->dtype, "f32") == 0)
+            io_ty = rocke_f32();
+        else
+            io_ty = rocke_b_io_ir_type(b, spec->dtype);
         if(io_ty == NULL)
             return NULL;
         total = rocke_permute_total_elements(spec);
@@ -538,14 +557,23 @@ rocke_kernel_def_t*
                     return NULL;
                 }
                 (void)_valid;
-                /* X_view.load_scalar_at(b, src_offset) over global:
-                 *   f16  -> global_load_f16; bf16 -> global_load_bf16. */
-                if(strcmp(spec->dtype, "f16") == 0)
-                    val = rocke_b_global_load_f16(b, X, src_offset, 0);
+                if(strcmp(spec->dtype, "f32") == 0)
+                {
+                    /* global_load_f32 (align 4) + global_store(..., align=4). */
+                    val = rocke_b_global_load_f32(b, X, src_offset, 4);
+                    rocke_b_global_store(b, Y, out_idx, val, 4);
+                }
                 else
-                    val = rocke_b_global_load_bf16(b, X, src_offset, 0);
-                /* Y_view.store_scalar_at(b, out_idx, val) over global == global_store. */
-                rocke_b_global_store(b, Y, out_idx, val, 0);
+                {
+                    /* X_view.load_scalar_at(b, src_offset) over global:
+                     *   f16  -> global_load_f16; bf16 -> global_load_bf16. */
+                    if(strcmp(spec->dtype, "f16") == 0)
+                        val = rocke_b_global_load_f16(b, X, src_offset, 0);
+                    else
+                        val = rocke_b_global_load_bf16(b, X, src_offset, 0);
+                    /* Y_view.store_scalar_at(b, out_idx, val) over global == global_store. */
+                    rocke_b_global_store(b, Y, out_idx, val, 0);
+                }
             }
             rocke_b_region_leave(b);
         }

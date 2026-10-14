@@ -88,6 +88,17 @@ static int make_spec(int idx, rocke_permute_spec_t* spec)
         spec->dtype = "f16";
         spec->block_size = 256;
         break;
+    case 6: /* (4,16,32) perm (1,0,2) f32 bs256 -> vec4 */
+        spec->rank = 3;
+        spec->x_shape[0] = 4;
+        spec->x_shape[1] = 16;
+        spec->x_shape[2] = 32;
+        spec->perm[0] = 1;
+        spec->perm[1] = 0;
+        spec->perm[2] = 2;
+        spec->dtype = "f32";
+        spec->block_size = 256;
+        break;
     default:
         return -1;
     }
@@ -98,7 +109,7 @@ int main(int argc, char** argv)
 {
     if(argc < 2)
     {
-        fprintf(stderr, "usage: %s <config_index 0..5> [mode]\n", argv[0]);
+        fprintf(stderr, "usage: %s <config_index 0..6> [mode]\n", argv[0]);
         return 2;
     }
     int idx = atoi(argv[1]);
