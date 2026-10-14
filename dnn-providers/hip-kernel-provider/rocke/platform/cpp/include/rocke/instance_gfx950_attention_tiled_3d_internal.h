@@ -178,8 +178,6 @@ typedef struct rocke_gfx950_attn_tiled_3d_config
     bool PREFETCH; /* spec.kv_prefetch                      */
     bool PREFETCH_IDS; /* kv_prefetch and paged (build entry)   */
     bool FP8_REG_PREFETCH; /* PREFETCH and KV_FP8                   */
-    bool TRANS; /* spec.transposed_softmax               */
-    int NR; /* softmax state rows per lane: 1 if TRANS else 4 */
 
     const rocke_type_t* dtype; /* F16 / BF16                                 */
     const rocke_type_t* kv_io_dtype; /* FP8E4M3 if KV_FP8 else dtype               */
@@ -311,15 +309,7 @@ typedef struct rocke_gfx950_attention_tiled_3d_build_ctx
     rocke_value_t* Q_lds; /* [BLOCK_M, HD]                             */
     rocke_value_t* K_lds; /* [2, T, HD]                                */
     rocke_value_t* V_lds; /* [2, T, HD]                                */
-    rocke_value_t* P_lds; /* [BLOCK_M, T]; NULL when TRANS           */
-
-    /* ---------- transposed softmax (TRANS) ---------- *
-     * Q B-operands held in registers for the whole loop (Q staged in K buffer 1),
-     * the permuted K row of each lane and its key offset. */
-    rocke_value_t* q_kits[8]; /* QK_K_ITERS <= 8                          */
-    rocke_value_t* k_row_lane;
-    rocke_value_t* key_lane;
-
+    rocke_value_t* P_lds; /* [BLOCK_M, T]                              */
     /* ---------- multi-page tiles / block-id prefetch ---------- */
     rocke_value_t* last_page; /* last valid page of the sequence (clamp)    */
     rocke_tensor_descriptor_t* phys_kv_desc; /* paged_kv_bytes addressed by physical block */

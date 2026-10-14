@@ -203,8 +203,6 @@ typedef struct rocke_unified_attention_3d_tiled_spec
     int kv_tile_mult; /* 1 */
     /* Prefetch the next tile's K and V (and its block-table ids) one tile ahead. */
     bool kv_prefetch; /* False */
-    /* Transposed QK/PV: one query row per lane, P stays in registers. */
-    bool transposed_softmax; /* False */
 } rocke_unified_attention_3d_tiled_spec_t;
 
 rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_default(void);

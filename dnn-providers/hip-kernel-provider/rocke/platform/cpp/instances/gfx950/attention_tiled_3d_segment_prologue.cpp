@@ -424,26 +424,17 @@ void rocke_gfx950_attention_tiled_3d_emit_prologue(rocke_gfx950_attention_tiled_
     /* early-out zero-fill block (lines 416-461) */
     rocke_gfx950_attention_tiled_3d_emit_early_zero_fill(ctx);
 
-    /* ---- LDS layout ----
-     * Transposed softmax reads Q into registers once before the loop, so Q is
-     * staged in K buffer 1 (first written by the tile_start+1 DMA, issued after
-     * those reads) and P stays in registers: no Q / P slabs. */
+    /* ---- LDS layout (lines 464-467) ---- */
     {
         const int q_shape[2] = {BLOCK_M, HD};
         const int k_shape[3] = {2, T, HD};
-        const int p_shape[2] = {BLOCK_M, T};
-        if(CFG.TRANS)
-        {
-            ctx->K_lds = rocke_b_smem_alloc(B, dtype, k_shape, 3, "Klds");
-            ctx->Q_lds = NULL;
-        }
-        else
-        {
-            ctx->Q_lds = rocke_b_smem_alloc(B, dtype, q_shape, 2, "Qlds");
-            ctx->K_lds = rocke_b_smem_alloc(B, dtype, k_shape, 3, "Klds");
-        }
+        ctx->Q_lds = rocke_b_smem_alloc(B, dtype, q_shape, 2, "Qlds");
+        ctx->K_lds = rocke_b_smem_alloc(B, dtype, k_shape, 3, "Klds");
         ctx->V_lds = rocke_b_smem_alloc(B, dtype, k_shape, 3, "Vlds");
-        ctx->P_lds = CFG.TRANS ? NULL : rocke_b_smem_alloc(B, dtype, p_shape, 2, "Plds");
+    }
+    {
+        const int p_shape[2] = {BLOCK_M, T};
+        ctx->P_lds = rocke_b_smem_alloc(B, dtype, p_shape, 2, "Plds");
     }
 
     /* ---- PV transpose-read state (gfx950-only, lines 471-472) ----
@@ -720,21 +711,10 @@ void rocke_gfx950_attention_tiled_3d_emit_q_to_lds(rocke_gfx950_attention_tiled_
             = rocke__q_offset(ctx, q_off_tok, qh_safe, rocke_b_const_i32(B, 0));
         rocke_value_t* v8_idx = rocke_b_add(B, q_off_base, Q_col);
         rocke_value_t* v8 = rocke_b_global_load_vN(B, ctx->query, v8_idx, dtype, 8, 16);
-        /* _q_lds_at(Q_row, Q_col): TRANS stages Q in K buffer 1 (the buffer
-         * index constant is emitted here, before the mask splat). */
-        rocke_value_t* q_buf1 = CFG.TRANS ? rocke_b_const_i32(B, 1) : NULL;
         rocke_value_t* splat = rocke_b_vector_splat(B, qmask_t, 8);
         rocke_value_t* sel = rocke_b_vector_select(B, splat, v8, ctx->z8);
-        if(CFG.TRANS)
-        {
-            rocke_value_t* idxs[3] = {q_buf1, Q_row, Q_col};
-            rocke_b_smem_store_vN(B, ctx->K_lds, idxs, 3, sel, 8);
-        }
-        else
-        {
-            rocke_value_t* idxs[2] = {Q_row, Q_col};
-            rocke_b_smem_store_vN(B, ctx->Q_lds, idxs, 2, sel, 8);
-        }
+        rocke_value_t* idxs[2] = {Q_row, Q_col};
+        rocke_b_smem_store_vN(B, ctx->Q_lds, idxs, 2, sel, 8);
     }
     rocke_b_sync(B);
 }

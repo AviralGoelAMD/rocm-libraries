@@ -95,36 +95,6 @@ static rocke_value_t* rocke__c_row(rocke_gfx950_attention_tiled_3d_build_ctx_t* 
     return rocke_gfx950_attention_tiled_3d_mfma_16x16_c_row(ctx, ctx->tid, reg);
 }
 
-/* Combine v with lane l ^ 32 (one VALU permlane32 swap) -- Python _xor32_reduce. */
-static rocke_value_t* rocke__xor32_reduce(rocke_ir_builder_t* b, rocke_value_t* v, bool is_sum)
-{
-    rocke_value_t* vi = rocke_b_bitcast(b, v, rocke_i32());
-    rocke_value_t* lo = NULL;
-    rocke_value_t* hi = NULL;
-    rocke_value_t* lo_f;
-    rocke_value_t* hi_f;
-    rocke_b_permlane32_swap(b, vi, vi, &lo, &hi);
-    lo_f = rocke_b_bitcast(b, lo, rocke_f32());
-    hi_f = rocke_b_bitcast(b, hi, rocke_f32());
-    return is_sum ? rocke_b_fadd(b, lo_f, hi_f) : rocke_b_fmax(b, lo_f, hi_f);
-}
-
-/* Combine v across the 4 lane groups lane / 16 (same lane % 16) -- Python
- * _group_reduce (fmax when !is_sum, fadd when is_sum). */
-static rocke_value_t* rocke__group_reduce(rocke_ir_builder_t* b, rocke_value_t* v, bool is_sum)
-{
-    rocke_value_t* other = rocke_b_warp_shuffle_xor(b, v, 16);
-    rocke_value_t* c = is_sum ? rocke_b_fadd(b, v, other) : rocke_b_fmax(b, v, other);
-    return rocke__xor32_reduce(b, c, is_sum);
-}
-
-/* Query row (within BLOCK_M) of softmax state slot r of this lane (Python
- * _state_row): the lane's own row when transposed, else the MFMA C row. */
-static rocke_value_t* rocke__state_row(rocke_gfx950_attention_tiled_3d_build_ctx_t* ctx, int r)
-{
-    return ctx->cfg.TRANS ? ctx->lane_col : rocke__c_row(ctx, r);
-}
-
 /* Append a block-id list (TILE_MULT entries, or NULL) to a prefetch carry. */
 static void rocke__append_pf(rocke_value_t** dst, int* n, rocke_value_t* const* src, int count)
 {
@@ -140,8 +110,8 @@ static void rocke__append_pf(rocke_value_t** dst, int* n, rocke_value_t* const* 
 }
 
 /* ============================================================ *
- * emit_loop_init: transposed-softmax Q operands, softmax/acc carry inits,
- * async DMA infra, and the first K/V issue (incl. the prefetch carry).
+ * emit_loop_init: softmax/acc carry inits, async DMA infra, and the first
+ * K/V issue (incl. the prefetch carry).
  * ============================================================ */
 void rocke_gfx950_attention_tiled_3d_emit_loop_init(
     rocke_gfx950_attention_tiled_3d_build_ctx_t* ctx)
@@ -149,33 +119,16 @@ void rocke_gfx950_attention_tiled_3d_emit_loop_init(
     rocke_ir_builder_t* b = ctx->b;
     const rocke_gfx950_attn_tiled_3d_config_t* cfg = &ctx->cfg;
     const rocke_type_t* dtype = cfg->dtype;
-    int n, r, k;
-
-    if(cfg->TRANS)
-    {
-        /* Lane owns query row lane % 16; Q is the loop-invariant B operand of
-         * the transposed QK MFMA, held in registers for the whole loop. */
-        for(k = 0; k < cfg->QK_K_ITERS; k++)
-        {
-            rocke_value_t* q_col_c = rocke_b_const_i32(b, k * 32);
-            rocke_value_t* q_col_m = rocke_b_mul(b, ctx->lane_rg, rocke_b_const_i32(b, 8));
-            rocke_value_t* q_col_off = rocke_b_add(b, q_col_c, q_col_m);
-            rocke_value_t* idx[3];
-            idx[0] = rocke_b_const_i32(b, 1);
-            idx[1] = ctx->lane_col;
-            idx[2] = q_col_off;
-            ctx->q_kits[k] = rocke_b_smem_load_vN(b, ctx->K_lds, idx, 3, dtype, 8);
-        }
-    }
+    int n, r;
 
     /* ---- m_inits (sinks-conditioned) ---- */
     if(cfg->USE_SINKS)
     {
         /* Triton's 3D applies sinks only when segm_idx == 0. */
         rocke_value_t* seg0 = rocke_b_cmp_eq(b, ctx->seg_idx, rocke_b_const_i32(b, 0));
-        for(r = 0; r < cfg->NR; r++)
+        for(r = 0; r < 4; r++)
         {
-            rocke_value_t* row = rocke__state_row(ctx, r);
+            rocke_value_t* row = rocke__c_row(ctx, r);
             rocke_value_t* qh_mul
                 = rocke_b_mul(b, ctx->kv_head_idx, rocke_b_const_i32(b, cfg->NQK));
             rocke_value_t* qh_mod = rocke_b_mod(b, row, rocke_b_const_i32(b, cfg->NQK));
@@ -189,24 +142,14 @@ void rocke_gfx950_attention_tiled_3d_emit_loop_init(
     }
     else
     {
-        for(r = 0; r < cfg->NR; r++)
+        for(r = 0; r < 4; r++)
         {
             ctx->m_inits[r] = ctx->neg_inf;
         }
     }
-    if(cfg->TRANS)
+    for(r = 0; r < 4; r++)
     {
-        /* The row sum is a per-lane partial over this lane's keys, reduced
-         * across the 4 lane groups after the loop: seed the 1 on group 0 only. */
-        rocke_value_t* g0 = rocke_b_cmp_eq(b, ctx->lane_rg, rocke_b_const_i32(b, 0));
-        ctx->l_inits[0] = rocke_b_select(b, g0, ctx->one_f, ctx->zero_f);
-    }
-    else
-    {
-        for(r = 0; r < 4; r++)
-        {
-            ctx->l_inits[r] = ctx->one_f;
-        }
+        ctx->l_inits[r] = ctx->one_f;
     }
 
     /* ---- acc_inits ---- */
@@ -292,13 +235,11 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
     const rocke_gfx950_attn_tiled_3d_config_t* cfg = &ctx->cfg;
     const rocke_type_t* dtype = cfg->dtype;
     const rocke_type_t* f32 = rocke_f32();
-    const int NR = cfg->NR;
-    const bool TRANS = cfg->TRANS;
     const int TM = cfg->TILE_MULT;
     int r, n, k, reg;
 
-    /* iter_args: m<r>,l<r> (r < NR), acc0..accN-1, cur_buf, kvpf<i> */
-    int num_iter = 2 * NR + cfg->PV_N_TILES + 1 + ctx->n_pf;
+    /* iter_args: m0,l0..m3,l3, acc0..accN-1, cur_buf, kvpf<i> */
+    int num_iter = 8 + cfg->PV_N_TILES + 1 + ctx->n_pf;
     rocke_iter_arg_t* iter_args
         = (rocke_iter_arg_t*)rocke_arena_alloc(&b->arena, (size_t)num_iter * sizeof(*iter_args));
     if(iter_args == NULL)
@@ -309,7 +250,7 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
         int ai = 0;
         int i;
         char buf[24];
-        for(r = 0; r < NR; r++)
+        for(r = 0; r < 4; r++)
         {
             snprintf(buf, sizeof(buf), "m%d", r);
             iter_args[ai].name = rocke_arena_strdup(&b->arena, buf);
@@ -344,9 +285,9 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
      * per-thread row index. ALiBi slopes are per query-head: also invariant. */
     {
         int hoist_reg;
-        for(hoist_reg = 0; hoist_reg < NR; hoist_reg++)
+        for(hoist_reg = 0; hoist_reg < 4; hoist_reg++)
         {
-            rocke_value_t* row = rocke__state_row(ctx, hoist_reg);
+            rocke_value_t* row = rocke__c_row(ctx, hoist_reg);
             rocke_value_t* qp_r_div = rocke_b_div(b, row, rocke_b_const_i32(b, cfg->NQK));
             rocke_value_t* qp_r = rocke_b_add(b, ctx->qb_start_pos, qp_r_div);
             rocke_value_t* qh_mul
@@ -373,29 +314,6 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
         }
     }
 
-    if(TRANS)
-    {
-        /* Transposed QK: A = K rows, B = Q (q_kits), C[key_slot, query]. Lane
-         * (g = lane/16, c = lane%16) gets key slots g*4 + r of each 16-key
-         * n-tile. For 32-key PV steps, n-tile 2kk+t loads K row
-         * kk*32 + (c//4)*8 + t*4 + c%4 into A slot c, so slot g*4 + r holds key
-         * kk*32 + g*8 + t*4 + r: the lane's 8 P values over (t, r) are the 8
-         * consecutive keys the V transpose-read gives the lane. */
-        if(cfg->PV_K_STEP == 32)
-        {
-            rocke_value_t* c_div = rocke_b_div(b, ctx->lane_col, rocke_b_const_i32(b, 4));
-            rocke_value_t* c_mul = rocke_b_mul(b, c_div, rocke_b_const_i32(b, 8));
-            rocke_value_t* c_mod = rocke_b_mod(b, ctx->lane_col, rocke_b_const_i32(b, 4));
-            ctx->k_row_lane = rocke_b_add(b, c_mul, c_mod);
-            ctx->key_lane = rocke_b_mul(b, ctx->lane_rg, rocke_b_const_i32(b, 8));
-        }
-        else
-        {
-            ctx->k_row_lane = ctx->lane_col;
-            ctx->key_lane = rocke_b_mul(b, ctx->lane_rg, rocke_b_const_i32(b, 4));
-        }
-    }
-
     rocke_for_t kvloop = rocke_b_scf_for_iter(b,
                                               ctx->tile_start,
                                               ctx->tile_end,
@@ -410,7 +328,7 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
     {
         rocke_value_t* kv_tile_iv = kvloop.iv;
         rocke_value_t** carry = kvloop.iter_vars;
-        const int pf_base = 2 * NR + cfg->PV_N_TILES + 1;
+        const int pf_base = 9 + cfg->PV_N_TILES;
 
         rocke_value_t* m_vals[4];
         rocke_value_t* l_vals[4];
@@ -432,8 +350,6 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
         rocke_value_t** new_acc;
         rocke_value_t** new_pf;
         int n_new_pf = 0;
-        rocke_value_t** p_t = NULL; /* TRANS: P per (n, r), indexed n*4+r */
-        rocke_value_t** p_ops = NULL; /* TRANS: PV B operand per k step   */
 
         /* masked[(n,reg)] indexed n*4+reg; s_local[(reg,n)] indexed reg*N+n */
         rocke_value_t** masked;
@@ -457,16 +373,16 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
             return;
         }
 
-        for(r = 0; r < NR; r++)
+        for(r = 0; r < 4; r++)
         {
             m_vals[r] = carry[2 * r];
             l_vals[r] = carry[2 * r + 1];
         }
         for(n = 0; n < cfg->PV_N_TILES; n++)
         {
-            acc_vals[n] = carry[2 * NR + n];
+            acc_vals[n] = carry[8 + n];
         }
-        cur_buf = carry[2 * NR + cfg->PV_N_TILES];
+        cur_buf = carry[8 + cfg->PV_N_TILES];
         nxt_buf = rocke_b_sub(b, rocke_b_const_i32(b, 1), cur_buf);
         tile_off = rocke_b_mul(b, kv_tile_iv, rocke_b_const_i32(b, cfg->T));
 
@@ -518,62 +434,34 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
         }
 
         /* ---------------- QK (wide 16x16x32, K-step 32) ---------------- */
-        if(TRANS)
+        for(k = 0; k < cfg->QK_K_ITERS; k++)
         {
-            /* S^T n-tile = K(permuted rows) x Q^T; Q operands live in q_kits. */
-            for(n = 0; n < cfg->QK_N_TILES; n++)
-            {
-                rocke_value_t* acc_v = rocke_b_zero_vec_f32(b, 4);
-                const int row_c = (cfg->PV_K_STEP == 32) ? (n / 2) * 32 + (n % 2) * 4 : n * 16;
-                rocke_value_t* k_row = rocke_b_add(b, rocke_b_const_i32(b, row_c), ctx->k_row_lane);
-                for(k = 0; k < cfg->QK_K_ITERS; k++)
-                {
-                    rocke_value_t* kc_c = rocke_b_const_i32(b, k * 32);
-                    rocke_value_t* kc_m = rocke_b_mul(b, ctx->lane_rg, rocke_b_const_i32(b, 8));
-                    rocke_value_t* kc_off = rocke_b_add(b, kc_c, kc_m);
-                    rocke_value_t* idx[3];
-                    rocke_value_t* K_v;
-                    idx[0] = cur_buf;
-                    idx[1] = k_row;
-                    idx[2] = kc_off;
-                    K_v = rocke_b_smem_load_vN(b, ctx->K_lds, idx, 3, dtype, 8);
-                    acc_v = rocke__mfma_16x16x32(b, dtype, K_v, ctx->q_kits[k], acc_v);
-                }
-                S_n[n] = acc_v;
-            }
+            rocke_value_t* q_col_c = rocke_b_const_i32(b, k * 32);
+            rocke_value_t* q_col_m = rocke_b_mul(b, ctx->lane_rg, rocke_b_const_i32(b, 8));
+            rocke_value_t* q_col_off = rocke_b_add(b, q_col_c, q_col_m);
+            rocke_value_t* idx[2];
+            idx[0] = ctx->lane_col;
+            idx[1] = q_col_off;
+            A_kits[k] = rocke_b_smem_load_vN(b, ctx->Q_lds, idx, 2, dtype, 8);
         }
-        else
+        for(n = 0; n < cfg->QK_N_TILES; n++)
         {
+            rocke_value_t* acc_v = rocke_b_zero_vec_f32(b, 4);
             for(k = 0; k < cfg->QK_K_ITERS; k++)
             {
-                rocke_value_t* q_col_c = rocke_b_const_i32(b, k * 32);
-                rocke_value_t* q_col_m = rocke_b_mul(b, ctx->lane_rg, rocke_b_const_i32(b, 8));
-                rocke_value_t* q_col_off = rocke_b_add(b, q_col_c, q_col_m);
-                rocke_value_t* idx[2];
-                idx[0] = ctx->lane_col;
-                idx[1] = q_col_off;
-                A_kits[k] = rocke_b_smem_load_vN(b, ctx->Q_lds, idx, 2, dtype, 8);
+                rocke_value_t* kc_c = rocke_b_const_i32(b, k * 32);
+                rocke_value_t* kc_m = rocke_b_mul(b, ctx->lane_rg, rocke_b_const_i32(b, 8));
+                rocke_value_t* kc_off = rocke_b_add(b, kc_c, kc_m);
+                rocke_value_t* k_row = rocke_b_add(b, rocke_b_const_i32(b, n * 16), ctx->lane_col);
+                rocke_value_t* idx[3];
+                rocke_value_t* B_v;
+                idx[0] = cur_buf;
+                idx[1] = k_row;
+                idx[2] = kc_off;
+                B_v = rocke_b_smem_load_vN(b, ctx->K_lds, idx, 3, dtype, 8);
+                acc_v = rocke__mfma_16x16x32(b, dtype, A_kits[k], B_v, acc_v);
             }
-            for(n = 0; n < cfg->QK_N_TILES; n++)
-            {
-                rocke_value_t* acc_v = rocke_b_zero_vec_f32(b, 4);
-                for(k = 0; k < cfg->QK_K_ITERS; k++)
-                {
-                    rocke_value_t* kc_c = rocke_b_const_i32(b, k * 32);
-                    rocke_value_t* kc_m = rocke_b_mul(b, ctx->lane_rg, rocke_b_const_i32(b, 8));
-                    rocke_value_t* kc_off = rocke_b_add(b, kc_c, kc_m);
-                    rocke_value_t* k_row
-                        = rocke_b_add(b, rocke_b_const_i32(b, n * 16), ctx->lane_col);
-                    rocke_value_t* idx[3];
-                    rocke_value_t* B_v;
-                    idx[0] = cur_buf;
-                    idx[1] = k_row;
-                    idx[2] = kc_off;
-                    B_v = rocke_b_smem_load_vN(b, ctx->K_lds, idx, 3, dtype, 8);
-                    acc_v = rocke__mfma_16x16x32(b, dtype, A_kits[k], B_v, acc_v);
-                }
-                S_n[n] = acc_v;
-            }
+            S_n[n] = acc_v;
         }
 
         if(!cfg->PREFETCH)
@@ -589,40 +477,7 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
         }
 
         /* ---------------- masked scores ---------------- */
-        if(TRANS)
-        {
-            /* One query row per lane; slot (n, r) is key tile_key + _trans_key. */
-            rocke_value_t* row_ok = ctx->hoist_row_ok[0];
-            rocke_value_t* causal_lim = ctx->hoist_causal_lim[0];
-            rocke_value_t* tile_key = rocke_b_add(b, tile_off, ctx->key_lane);
-            for(n = 0; n < cfg->QK_N_TILES; n++)
-            {
-                for(r = 0; r < 4; r++)
-                {
-                    const int tkey
-                        = (cfg->PV_K_STEP == 32) ? (n / 2) * 32 + (n % 2) * 4 + r : n * 16 + r;
-                    rocke_value_t* col_abs = rocke_b_add(b, tile_key, rocke_b_const_i32(b, tkey));
-                    rocke_value_t* causal_ok = rocke_b_cmp_le(b, col_abs, causal_lim);
-                    rocke_value_t* in_prefix = rocke_b_cmp_lt(b, col_abs, ctx->max_seq_prefix_len);
-                    rocke_value_t* m_ok
-                        = rocke_b_land(b, rocke_b_land(b, row_ok, causal_ok), in_prefix);
-                    rocke_value_t* s_scaled;
-                    if(cfg->SLIDING_WINDOW > 0)
-                    {
-                        rocke_value_t* dist = rocke_b_sub(b, causal_lim, col_abs);
-                        m_ok = rocke_b_land(b, m_ok, rocke_b_cmp_lt(b, dist, ctx->sw_const));
-                    }
-                    s_scaled = rocke_b_fmul(b, rocke_b_vec_extract(b, S_n[n], r), ctx->qk_scale);
-                    if(cfg->USE_SOFTCAP)
-                    {
-                        s_scaled = rocke_b_fmul(
-                            b, rocke_apply_softcap_log2(b, s_scaled, ctx->softcap_p), ctx->rcp_ln2);
-                    }
-                    masked[n * 4 + r] = rocke_b_select(b, m_ok, s_scaled, ctx->neg_inf);
-                }
-            }
-        }
-        for(reg = 0; reg < (TRANS ? 0 : 4); reg++)
+        for(reg = 0; reg < 4; reg++)
         {
             rocke_value_t* qp_r = ctx->hoist_qp_r[reg];
             rocke_value_t* row_ok = ctx->hoist_row_ok[reg];
@@ -682,43 +537,6 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
         }
 
         /* ---------------- online (m,l) update ---------------- */
-        if(TRANS)
-        {
-            /* Row max: in-lane over the tile, then across the 4 lane groups. */
-            rocke_value_t* local_max = ctx->neg_inf;
-            rocke_value_t* full_max_raw;
-            rocke_value_t* ok;
-            rocke_value_t* sum_p = ctx->zero_f;
-            p_t = (rocke_value_t**)rocke_arena_alloc(
-                &b->arena, (size_t)(cfg->QK_N_TILES * 4) * sizeof(rocke_value_t*));
-            if(p_t == NULL)
-            {
-                rocke_b_region_leave(b);
-                return;
-            }
-            for(n = 0; n < cfg->QK_N_TILES; n++)
-            {
-                for(r = 0; r < 4; r++)
-                {
-                    local_max = rocke_b_fmax(b, local_max, masked[n * 4 + r]);
-                }
-            }
-            full_max_raw = rocke_b_fmax(b, m_vals[0], rocke__group_reduce(b, local_max, false));
-            ok = rocke_b_fcmp(b, "ogt", full_max_raw, ctx->neg_inf);
-            m_new[0] = rocke_b_select(b, ok, full_max_raw, ctx->zero_f);
-            for(n = 0; n < cfg->QK_N_TILES; n++)
-            {
-                for(r = 0; r < 4; r++)
-                {
-                    p_t[n * 4 + r] = rocke_b_exp2(b, rocke_b_fsub(b, masked[n * 4 + r], m_new[0]));
-                    sum_p = rocke_b_fadd(b, sum_p, p_t[n * 4 + r]);
-                }
-            }
-            alpha_regs[0] = rocke_b_exp2(b, rocke_b_fsub(b, m_vals[0], m_new[0]));
-            /* Per-lane partial row sum; reduced across lane groups after the loop. */
-            new_l_vals[0] = rocke_b_fadd(b, rocke_b_fmul(b, l_vals[0], alpha_regs[0]), sum_p);
-        }
-        else
         {
             rocke_value_t** s_local = (rocke_value_t**)rocke_arena_alloc(
                 &b->arena, (size_t)(4 * cfg->QK_N_TILES) * sizeof(rocke_value_t*));
@@ -782,12 +600,9 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
 
         if(cfg->PREFETCH)
         {
-            if(!TRANS)
-            {
-                /* K/V[cur] already landed; only the P tile written above must
-                 * be visible. Next tile's loads stay in flight. */
-                rocke_b_sync_lds_only(b);
-            }
+            /* K/V[cur] already landed; only the P tile written above must
+             * be visible. Next tile's loads stay in flight. */
+            rocke_b_sync_lds_only(b);
         }
         else if(cfg->KV_FP8)
         {
@@ -832,43 +647,6 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
             rocke_b_region_leave(b);
         }
 
-        if(TRANS)
-        {
-            /* P^T operands straight from registers: PV step k covers keys
-             * k*PV_K_STEP + key_lane + (t*4 + r), the lane's V transpose-read rows. */
-            p_ops = (rocke_value_t**)rocke_arena_alloc(
-                &b->arena, (size_t)cfg->PV_K_ITERS * sizeof(rocke_value_t*));
-            if(p_ops == NULL)
-            {
-                rocke_b_region_leave(b);
-                return;
-            }
-            for(k = 0; k < cfg->PV_K_ITERS; k++)
-            {
-                rocke_value_t* comps[8];
-                int nc = 0;
-                if(cfg->PV_K_STEP == 32)
-                {
-                    int t;
-                    for(t = 0; t < 2; t++)
-                    {
-                        for(r = 0; r < 4; r++)
-                        {
-                            comps[nc++] = rocke_b_cast_f32_to(b, p_t[(2 * k + t) * 4 + r], dtype);
-                        }
-                    }
-                }
-                else
-                {
-                    for(r = 0; r < 4; r++)
-                    {
-                        comps[nc++] = rocke_b_cast_f32_to(b, p_t[k * 4 + r], dtype);
-                    }
-                }
-                p_ops[k] = rocke_b_vec_pack(b, comps, nc, dtype);
-            }
-        }
-
         /* ---------------- PV (wide 16x16x32 or narrow 16x16x16 via ds_read_tr) -- */
         for(n = 0; n < cfg->PV_N_TILES; n++)
         {
@@ -878,7 +656,7 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
             for(reg = 0; reg < 4; reg++)
             {
                 rocke_value_t* e = rocke_b_vec_extract(b, acc_vals[n], reg);
-                scaled_comps[reg] = rocke_b_fmul(b, e, alpha_regs[TRANS ? 0 : reg]);
+                scaled_comps[reg] = rocke_b_fmul(b, e, alpha_regs[reg]);
             }
             acc_v = rocke_b_vec_pack(b, scaled_comps, 4, f32);
 
@@ -892,7 +670,11 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
             {
                 if(cfg->PV_K_STEP == 32)
                 {
-                    rocke_value_t* A_p = NULL;
+                    rocke_value_t* p_off_c = rocke_b_const_i32(b, k * 32);
+                    rocke_value_t* p_off_m = rocke_b_mul(b, ctx->lane_rg, rocke_b_const_i32(b, 8));
+                    rocke_value_t* p_off = rocke_b_add(b, p_off_c, p_off_m);
+                    rocke_value_t* p_idx[2];
+                    rocke_value_t* A_p;
                     rocke_value_t* row_r0;
                     rocke_value_t* row_r1;
                     rocke_value_t* B_r0;
@@ -900,17 +682,9 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
                     rocke_value_t* B_v;
                     rocke_value_t* b0_idx[3];
                     rocke_value_t* b1_idx[3];
-                    if(!TRANS)
-                    {
-                        rocke_value_t* p_off_c = rocke_b_const_i32(b, k * 32);
-                        rocke_value_t* p_off_m
-                            = rocke_b_mul(b, ctx->lane_rg, rocke_b_const_i32(b, 8));
-                        rocke_value_t* p_off = rocke_b_add(b, p_off_c, p_off_m);
-                        rocke_value_t* p_idx[2];
-                        p_idx[0] = ctx->lane_col;
-                        p_idx[1] = p_off;
-                        A_p = rocke_b_smem_load_vN(b, ctx->P_lds, p_idx, 2, dtype, 8);
-                    }
+                    p_idx[0] = ctx->lane_col;
+                    p_idx[1] = p_off;
+                    A_p = rocke_b_smem_load_vN(b, ctx->P_lds, p_idx, 2, dtype, 8);
                     row_r0 = rocke_bound_transpose_lds_reader_row(b, ctx->pv_tr_reader, k * 32, 0);
                     row_r1 = rocke_bound_transpose_lds_reader_row(b, ctx->pv_tr_reader, k * 32, 1);
                     b0_idx[0] = cur_buf;
@@ -922,47 +696,28 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
                     b1_idx[2] = n_col_base;
                     B_r1 = rocke_b_ds_read_tr16_b64(b, ctx->V_lds, b1_idx, 3, dtype);
                     B_v = rocke_b_vec_concat(b, B_r0, B_r1);
-                    if(TRANS)
-                    {
-                        /* O^T += V^T P^T: the V read is the A operand. */
-                        acc_v = rocke__mfma_16x16x32(b, dtype, B_v, p_ops[k], acc_v);
-                    }
-                    else
-                    {
-                        acc_v = rocke__mfma_16x16x32(b, dtype, A_p, B_v, acc_v);
-                    }
+                    acc_v = rocke__mfma_16x16x32(b, dtype, A_p, B_v, acc_v);
                 }
                 else
                 {
-                    rocke_value_t* A_p = NULL;
+                    rocke_value_t* p_off_c = rocke_b_const_i32(b, k * 16);
+                    rocke_value_t* p_off_m = rocke_b_mul(b, ctx->lane_rg, rocke_b_const_i32(b, 4));
+                    rocke_value_t* p_off = rocke_b_add(b, p_off_c, p_off_m);
+                    rocke_value_t* p_idx[2];
+                    rocke_value_t* A_p;
                     rocke_value_t* row_lane;
                     rocke_value_t* B_v;
                     rocke_value_t* bv_idx[3];
-                    if(!TRANS)
-                    {
-                        rocke_value_t* p_off_c = rocke_b_const_i32(b, k * 16);
-                        rocke_value_t* p_off_m
-                            = rocke_b_mul(b, ctx->lane_rg, rocke_b_const_i32(b, 4));
-                        rocke_value_t* p_off = rocke_b_add(b, p_off_c, p_off_m);
-                        rocke_value_t* p_idx[2];
-                        p_idx[0] = ctx->lane_col;
-                        p_idx[1] = p_off;
-                        A_p = rocke_b_smem_load_vN(b, ctx->P_lds, p_idx, 2, dtype, 4);
-                    }
+                    p_idx[0] = ctx->lane_col;
+                    p_idx[1] = p_off;
+                    A_p = rocke_b_smem_load_vN(b, ctx->P_lds, p_idx, 2, dtype, 4);
                     row_lane
                         = rocke_bound_transpose_lds_reader_row(b, ctx->pv_tr_reader, k * 16, 0);
                     bv_idx[0] = cur_buf;
                     bv_idx[1] = row_lane;
                     bv_idx[2] = n_col_base;
                     B_v = rocke_b_ds_read_tr16_b64(b, ctx->V_lds, bv_idx, 3, dtype);
-                    if(TRANS)
-                    {
-                        acc_v = rocke__mfma_16x16x16(b, dtype, B_v, p_ops[k], acc_v);
-                    }
-                    else
-                    {
-                        acc_v = rocke__mfma_16x16x16(b, dtype, A_p, B_v, acc_v);
-                    }
+                    acc_v = rocke__mfma_16x16x16(b, dtype, A_p, B_v, acc_v);
                 }
             }
             new_acc[n] = acc_v;
@@ -979,7 +734,7 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
                 rocke_b_region_leave(b);
                 return;
             }
-            for(r = 0; r < NR; r++)
+            for(r = 0; r < 4; r++)
             {
                 yields[yi++] = m_new[r];
                 yields[yi++] = new_l_vals[r];
@@ -1001,65 +756,16 @@ void rocke_gfx950_attention_tiled_3d_emit_softmax_loop(
     /* ---------------- stash final (m,l,acc) into ctx ---------- */
     {
         rocke_value_t** final = kvloop.op->results;
-        for(r = 0; r < NR; r++)
+        for(r = 0; r < 4; r++)
         {
             ctx->m_final[r] = final[2 * r];
             ctx->l_final[r] = final[2 * r + 1];
         }
         for(n = 0; n < cfg->PV_N_TILES; n++)
         {
-            ctx->acc_final[n] = final[2 * NR + n];
+            ctx->acc_final[n] = final[8 + n];
         }
     }
-}
-
-/* Transposed-softmax epilogue: lane holds O[row = lane % 16][d = n*16 +
- * (lane/16)*4 + 0..3], one 16-byte store per n-tile. Lane group 0 writes the
- * row's m and the row sum reduced over the 4 lane groups. */
-static void rocke__emit_epilogue_trans(rocke_gfx950_attention_tiled_3d_build_ctx_t* ctx)
-{
-    rocke_ir_builder_t* b = ctx->b;
-    const rocke_gfx950_attn_tiled_3d_config_t* cfg = &ctx->cfg;
-    rocke_value_t* row_ok = ctx->hoist_row_ok[0];
-    rocke_value_t* qtoken = rocke_b_add(b, ctx->cu_q_start, ctx->hoist_qp_r[0]);
-    rocke_value_t* d_lane = rocke_b_mul(b, ctx->lane_rg, rocke_b_const_i32(b, 4));
-    rocke_value_t* l_row;
-    rocke_value_t* ml_idx = NULL;
-    rocke_value_t* lane0;
-    rocke_if_t ml_guard;
-    int n;
-    for(n = 0; n < cfg->PV_N_TILES; n++)
-    {
-        const char* names[4] = {"token", "head", "seg", "dim"};
-        rocke_value_t* vals[4];
-        rocke_value_t* seg_acc_idx = NULL;
-        rocke_if_t guard;
-        vals[0] = qtoken;
-        vals[1] = ctx->hoist_qh_r[0];
-        vals[2] = ctx->seg_idx;
-        vals[3] = rocke_b_add(b, rocke_b_const_i32(b, n * 16), d_lane);
-        rocke_transforms_descriptor_offset(
-            b, ctx->seg_acc_desc, names, vals, 4, &seg_acc_idx, NULL);
-        guard = rocke_b_scf_if(b, row_ok);
-        rocke_b_region_enter(b, guard.then_region);
-        rocke_b_global_store_vN(b, ctx->segm_output_ptr, seg_acc_idx, ctx->acc_final[n], 4, 16);
-        rocke_b_region_leave(b);
-    }
-    l_row = rocke__group_reduce(b, ctx->l_final[0], true);
-    {
-        const char* names[3] = {"token", "head", "seg"};
-        rocke_value_t* vals[3];
-        vals[0] = qtoken;
-        vals[1] = ctx->hoist_qh_r[0];
-        vals[2] = ctx->seg_idx;
-        rocke_transforms_descriptor_offset(b, ctx->ml_desc, names, vals, 3, &ml_idx, NULL);
-    }
-    lane0 = rocke_b_cmp_eq(b, ctx->lane_rg, rocke_b_const_i32(b, 0));
-    ml_guard = rocke_b_scf_if(b, rocke_b_land(b, row_ok, lane0));
-    rocke_b_region_enter(b, ml_guard.then_region);
-    rocke_b_global_store(b, ctx->segm_max_ptr, ml_idx, ctx->m_final[0], 4);
-    rocke_b_global_store(b, ctx->segm_expsum_ptr, ml_idx, l_row, 4);
-    rocke_b_region_leave(b);
 }
 
 /* ============================================================ *
@@ -1071,12 +777,6 @@ void rocke_gfx950_attention_tiled_3d_emit_epilogue(rocke_gfx950_attention_tiled_
     const rocke_gfx950_attn_tiled_3d_config_t* cfg = &ctx->cfg;
     int n, reg;
     rocke_value_t* lane_writes_ml;
-
-    if(cfg->TRANS)
-    {
-        rocke__emit_epilogue_trans(ctx);
-        return;
-    }
 
     /* ---- segm_output stores (lines 912-933) ---- */
     for(n = 0; n < cfg->PV_N_TILES; n++)
