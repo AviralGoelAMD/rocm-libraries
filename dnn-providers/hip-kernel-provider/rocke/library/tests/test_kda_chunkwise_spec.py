@@ -520,14 +520,12 @@ def test_g_ptr_signature_matches_the_single_source():
     assert seen["kda cooked"] == "f32" and seen["gdn raw"] == "f32", seen
 
 
-def test_non_power_of_two_kv_group_is_rejected():
-    """kv_group=3 is arithmetically fine and refused anyway.
+def test_any_kv_group_is_accepted():
+    """Non-power-of-two GQA ratios (Qwen3.5-style 3, and 6) are valid.
 
-    `khead = head // kv_group` is emitted per staged element. A power-of-two
-    divisor lowers to a shift; 3 lowers to a magic-number multiply-and-shift in
-    the inner loop. That is a silent cost nobody would trace back to a head-count
-    ratio, so the validator refuses it rather than paying it quietly. Real GQA
-    ratios are 2/4/8.
+    ``khead = head // kv_group`` depends only on the workgroup's tile, so the
+    constant divide is uniform and paid once per workgroup (scalar ALU), not
+    per staged element.
     """
     import dataclasses
 
@@ -540,13 +538,11 @@ def test_non_power_of_two_kv_group_is_rejected():
         fuse_qk_l2norm=True,
         fuse_beta_sigmoid=True,
     )
-    for good in (1, 2, 4, 8):
+    for good in (1, 2, 3, 4, 5, 6, 8, 12):
         ok, why = is_valid_spec(dataclasses.replace(gdn, kv_group=good))
         assert ok, f"kv_group={good} should be accepted: {why}"
-    for bad in (3, 5, 6, 12):
-        ok, why = is_valid_spec(dataclasses.replace(gdn, kv_group=bad))
-        assert not ok, f"kv_group={bad} should be refused"
-        assert "power of two" in why, why
+    ok, why = is_valid_spec(dataclasses.replace(gdn, kv_group=0))
+    assert not ok and ">= 1" in why, why
 
 
 def test_shortcut_rejections_say_they_are_shortcuts():

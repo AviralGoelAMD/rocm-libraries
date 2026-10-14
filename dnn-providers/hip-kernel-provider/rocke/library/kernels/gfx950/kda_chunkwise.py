@@ -490,17 +490,9 @@ def is_valid_spec(spec: KdaChunkPrepSpec, arch: str = "gfx950") -> Tuple[bool, s
                 )
     if spec.kv_group < 1:
         return False, f"kv_group must be >= 1 (got {spec.kv_group})"
-    if spec.kv_group & (spec.kv_group - 1):
-        # khead = head // kv_group is emitted per staged element (see the
-        # qk_off sites). A power-of-two divisor lowers to a shift; 3 or 6 lower
-        # to a magic-number multiply-and-shift in the inner loop -- a silent
-        # cost nobody would attribute to a head-count ratio. Real GQA ratios are
-        # 2/4/8, so this refuses rather than quietly paying it.
-        return False, (
-            f"kv_group must be a power of two (got {spec.kv_group}): the "
-            f"per-element key-head divide lowers to a shift only for powers "
-            f"of two"
-        )
+    # Any GQA ratio (Qwen3.5-style 3 and 6 included): khead = head // kv_group
+    # depends only on the workgroup's tile, so the constant divide is uniform
+    # and is paid once per workgroup, not per staged element.
     if spec.kv_group > 1 and spec.gate_kind != "gdn":
         # NOT a hardware limit. The GQA gather itself is gate-independent
         # (khead = head if KVG == 1 else div(head, KVG)), so KDA+GQA would
