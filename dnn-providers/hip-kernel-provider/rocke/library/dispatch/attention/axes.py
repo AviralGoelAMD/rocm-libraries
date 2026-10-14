@@ -234,6 +234,8 @@ _GFX950_DENSE_AXES: Tuple[KnobAxis, ...] = (
     _values("pv_loop_order", None, ("d_major", "k_major")),
     _values("causal_diag_split", True, (False,)),
     _values("o_store_width", 4, (1, 2, 4)),
+    _values("grid_order", "lpt", ("default",)),
+    _values("defer_row_sum", True, (False,)),
 )
 
 # gfx942 registers one dense candidate, so persistent is a knob here as well
