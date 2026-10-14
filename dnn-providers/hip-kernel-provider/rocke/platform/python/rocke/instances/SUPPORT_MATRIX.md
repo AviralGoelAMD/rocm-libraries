@@ -80,7 +80,9 @@ See the [packed FP6 input contract](../examples/gfx1250/gemm/FP6.md).
 | `conv_implicit_gemm_wgrad` | ✅ | ✅ | ✅ | gfx1151/gfx1201/gfx1250: WMMA, `default` epilogue, `split_k=1` |
 | `conv_implicit_gemm_wgrad` stream-K | ✅ | ✅ | ❌ | CK iteration-balanced partition; `linear`/`tree` deterministic fixups need the cross-workgroup flag ops |
 | `conv_direct_nongrouped` | ✅ | ✅ | ❌ | `groups=1`; gfx942 uses 32x32x8 / 16x16x16 atoms, gfx950 also 32x32x16 / 16x16x32; MFMA-only; the only direct kernel with dilation. Built from `library/kernels`; not yet wired into dispatch |
-| `direct_depthwise_tiled` | ✅ | ✅ | ❌ | `cpg=kpg=1`, filters up to 31x31, any padding; scalar FMA, wave64. Built from `library/kernels`; not yet wired into dispatch |
+| `direct_depthwise_tiled` | ✅ | ✅ | ❌ | `cpg=kpg=1`, filters up to 31x31, any padding; scalar FMA, wave64. Built from `library/kernels`; the gfx950 grouped-conv dispatcher's depthwise forward route |
+| `direct_depthwise_dgrad_stream` | ✅ | ✅ | ❌ | `cpg=kpg=1`, any stride; scalar FMA, wave64, dY rows streamed through circular dX slots. Built from `library/kernels`; the gfx950 grouped-conv dispatcher's depthwise dgrad route |
+| `conv_channel_pad` | – | ✅ | – | zero-pads the innermost channel run of X and W into a workspace in one launch; the pre-pass of the gfx950 small-C stem route. The IR is arch-neutral but only gfx950 runs it |
 
 ---
 
@@ -159,8 +161,10 @@ as described in the notes.
   wgrad additionally rejects `split_k > 1` without `two_stage=True`, and a
   merged GEMM that does not fit one tile (`Gm > tile_m`, or `Z*Y*X*Gm > tile_n`).
   Forward merged kernels are built into the AOT kernel cache at every
-  admissible degree and selected there by timing; the grouped-conv dispatcher
-  does not select a forward merge degree. **Both directions are implemented in
+  admissible degree and selected there by timing; on gfx950 the grouped-conv
+  dispatcher's implicit-GEMM forward candidate also takes the largest
+  admissible degree (depthwise forward itself routes to `direct_depthwise_tiled`
+  first). **Both directions are implemented in
   both engines.** Forward: `group_merge` is a field on the C-ABI spec
   struct (`rocke_implicit_gemm_conv_spec`), is carried across the pybind
   boundary, and the fwd parity emitters build eight depthwise configs
