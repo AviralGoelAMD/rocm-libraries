@@ -202,6 +202,7 @@ rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_de
     s.use_wide_kv_load = false;
     s.use_i64_kv_addr = false;
     s.use_f32_denormal_flush = false;
+    s.decode_fast_path = false;
     return s;
 }
 
@@ -311,13 +312,18 @@ int rocke_gfx950_unified_attention_3d_tiled_spec_binary_search_iters(
     return r < 1 ? 1 : r;
 }
 
-int rocke_gfx950_unified_attention_3d_tiled_spec_kernel_name(
-    const rocke_unified_attention_3d_tiled_spec_t* s, char* buf, size_t cap)
+/* kernel_name() with the strided-KV tag. Python joins "stridedkv" (from
+ * kv_layout) after "ftz" and before the decode-path tags; the C POD carries the
+ * layout as the separate strided build entry, so it is passed in here. */
+static int rocke_attn3d950_kernel_name(const rocke_unified_attention_3d_tiled_spec_t* s,
+                                       bool strided_kv,
+                                       char* buf,
+                                       size_t cap)
 {
     /* kernel_name_join("rocke_uattn3d_tiled", d.., b.., h..kv.., seg.., dtype,
-     *   kv<...> if kv_storage_dtype else "", "sinks" if use_sinks else "",
-     *   "sw<sw>" if sw>0 else "", "softcap" if has_softcap else "",
-     *   "alibi" if use_alibi else "", "qqb" if use_qq_bias else "")
+     *   kv<...> if kv_storage_dtype else "", "i64kv", "sinks", "sw<sw>",
+     *   "softcap", "alibi", "qqb", "ftz", "stridedkv", "dec") -- each only when
+     *   its knob is set.
      *
      * Positional parts list (NOT flags=...): empty parts are skipped by
      * kernel_name_join. We materialise each part and feed the non-empty ones in
@@ -329,7 +335,7 @@ int rocke_gfx950_unified_attention_3d_tiled_spec_kernel_name(
     char seg_part[32];
     char kv_part[32];
     char sw_part[32];
-    const char* parts[16];
+    const char* parts[32];
     size_t np = 0;
     size_t out_len = 0;
     rocke_status_t st;
@@ -384,6 +390,14 @@ int rocke_gfx950_unified_attention_3d_tiled_spec_kernel_name(
     {
         parts[np++] = "ftz";
     }
+    if(strided_kv)
+    {
+        parts[np++] = "stridedkv";
+    }
+    if(s->decode_fast_path)
+    {
+        parts[np++] = "dec";
+    }
 
     st = rocke_kernel_name_join("", parts, np, NULL, NULL, 0, buf, cap, &out_len);
     if(st != ROCKE_OK)
@@ -391,6 +405,12 @@ int rocke_gfx950_unified_attention_3d_tiled_spec_kernel_name(
         return -1;
     }
     return (int)out_len;
+}
+
+int rocke_gfx950_unified_attention_3d_tiled_spec_kernel_name(
+    const rocke_unified_attention_3d_tiled_spec_t* s, char* buf, size_t cap)
+{
+    return rocke_attn3d950_kernel_name(s, false, buf, cap);
 }
 
 /* ===================================================================== *
@@ -704,6 +724,9 @@ bool rocke_gfx950_attn_tiled_3d_config_from_spec(
     out->Q_VECS_PER_THREAD = (out->BLOCK_M * out->Q_VECS_PER_ROW) / out->THREADS;
     out->bm1_div_nqk = nqk > 0 ? (out->BLOCK_M - 1) / nqk : -1;
 
+    /* decode-path knobs. */
+    out->DECODE_FAST_PATH = spec->decode_fast_path;
+
     /* reduce-kernel-only fields stay 0 for the segment kind. */
     out->HALFS_PER_THREAD = 0;
     out->SEG_PER_LANE = 0;
@@ -897,24 +920,13 @@ static rocke_kernel_def_t* build_segment_gfx950(rocke_ir_builder_t* b,
         if(b->kernel != NULL)
         {
             char name[256];
-            if(rocke_gfx950_unified_attention_3d_tiled_spec_kernel_name(spec, name, sizeof(name))
-               < 0)
+            if(rocke_attn3d950_kernel_name(spec, strided_kv, name, sizeof(name)) < 0)
             {
                 rocke_i_set_err(
                     b,
                     ROCKE_ERR_VALUE,
                     "build_unified_attention_3d_tiled_gfx950: kernel_name encode failed");
                 return NULL;
-            }
-            if(strided_kv)
-            {
-                const size_t len = strlen(name);
-                if(len + sizeof("_stridedkv") > sizeof(name))
-                {
-                    rocke_i_set_err(b, ROCKE_ERR_VALUE, "strided KV kernel name too long");
-                    return NULL;
-                }
-                memcpy(name + len, "_stridedkv", sizeof("_stridedkv"));
             }
             b->kernel->name = rocke_arena_strdup(&b->arena, name);
             if(b->kernel->name == NULL)

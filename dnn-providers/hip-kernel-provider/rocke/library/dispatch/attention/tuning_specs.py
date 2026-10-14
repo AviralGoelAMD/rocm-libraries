@@ -273,6 +273,10 @@ def make_explicit_attention_3d_specs(
         for name in ("use_invariant_hoist", "use_wide_kv_load")
     ):
         raise ValueError("gfx950 3D does not implement hoist/wide-KV tuning knobs")
+    if knobs.get("decode_fast_path", False) and int(problem.max_seqlen_q) != 1:
+        # The all-decode kernel maps CTA x to sequence x and serves one query
+        # token per sequence; a longer query would be silently dropped.
+        raise ValueError("decode_fast_path requires max_seqlen_q == 1")
     segment = spec_type(
         **_semantic_fields(problem),
         num_segments=int(config.num_segments),

@@ -163,6 +163,9 @@ typedef struct rocke_unified_attention_3d_tiled_spec
      * only: the gfx942 builder rejects it. Kept byte-identical with the gfx950
      * header. */
     bool use_f32_denormal_flush; /* False */
+    /* gfx950 decode-path knobs (see the gfx950 header). The gfx942 builder
+     * ignores them. Kept byte-identical with the gfx950 header. */
+    bool decode_fast_path; /* False */
 } rocke_unified_attention_3d_tiled_spec_t;
 
 /* Materialise every defaulted field. Required fields are zero/NULL-init; the

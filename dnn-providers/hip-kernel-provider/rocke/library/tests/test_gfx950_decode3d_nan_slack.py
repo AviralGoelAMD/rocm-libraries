@@ -125,9 +125,11 @@ def test_production_3d_path_ignores_nan_slack(gpu, fp8):
     _check(torch, out, inp, fp8)
 
 
+_FAST = {"decode_fast_path": True}
 _KNOBS = [
     ({}, False),
-    ({}, True),
+    (_FAST, False),
+    (_FAST, True),
 ]
 
 
@@ -154,7 +156,7 @@ def test_3d_variants_ignore_nan_slack(gpu, over, fp8, nseg):
     redL = KernelLauncher(hsaco=ra.hsaco, kernel_name=ra.kernel_name,
                           signature=au._reduce_signature("bf16"),
                           cache_key=("nan_slack_red", ra.kernel_name))
-    gx = B // (16 // (HQ // HKV)) + B
+    gx = B if seg.decode_fast_path else B // (16 // (HQ // HKV)) + B
     so = torch.empty(B, HQ, nseg, D, dtype=torch.float32, device="cuda")
     sm = torch.empty(B, HQ, nseg, dtype=torch.float32, device="cuda")
     se = torch.empty_like(sm)

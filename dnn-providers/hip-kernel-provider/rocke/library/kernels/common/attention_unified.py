@@ -4485,10 +4485,19 @@ def _get_3d_pipeline(
         cache_key=("3d_red",) + cache_key,
     )
     pipeline = PipelineLauncher([seg_launcher, red_launcher])
-    block_q = (
-        16 // problem.num_queries_per_kv if problem.num_queries_per_kv <= 16 else 1
+    decode_fast_path = tuning_spec is not None and bool(
+        getattr(tuning_spec.kernel_spec, "decode_fast_path", False)
     )
-    total_num_q_blocks = problem.total_q // block_q + problem.num_seqs
+    if decode_fast_path:
+        # All-decode kernel contract: CTA x owns sequence x.
+        total_num_q_blocks = problem.num_seqs
+    else:
+        block_q = (
+            16 // problem.num_queries_per_kv
+            if problem.num_queries_per_kv <= 16
+            else 1
+        )
+        total_num_q_blocks = problem.total_q // block_q + problem.num_seqs
     # gfx1250 (gfx1250) runs the split-KV segment + reduce as one wave32 CTA; the
     # CDNA wave64 archs (gfx950/gfx942) use a wave64 CTA.
     wave_size = 32 if _resolve_attention_arch() == "gfx1250" else 64

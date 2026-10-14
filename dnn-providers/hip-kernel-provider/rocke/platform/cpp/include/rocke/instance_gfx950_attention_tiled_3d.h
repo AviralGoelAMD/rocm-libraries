@@ -194,6 +194,11 @@ typedef struct rocke_unified_attention_3d_tiled_spec
      * softmax exp2 lowers without the IEEE denormal fix-up. gfx950 only (the
      * gfx942 builder rejects it). */
     bool use_f32_denormal_flush; /* False */
+    /* ---- gfx950 decode-path knobs (Python field names/defaults; the gfx942
+     * builder ignores them). Kept byte-identical with the gfx942 header. ---- */
+    /* All-decode launch: grid x == num_seqs, CTA x owns sequence x (no cu_q
+     * binary search). */
+    bool decode_fast_path; /* False */
 } rocke_unified_attention_3d_tiled_spec_t;
 
 rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_default(void);
