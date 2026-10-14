@@ -23,6 +23,22 @@
         .warp_tile_m = wtm, .warp_tile_n = wtn, .warp_tile_k = wtk                          \
     }
 
+/* gfx950 bf16 DTL routing trait (dispatch/gemm/bf16_rcr.py _dtl_trait). */
+static void dtl_routing(rocke_gemm_universal_spec_t* spec, int depth)
+{
+    spec->trait.pipeline = "compv4";
+    spec->trait.scheduler = "intrawave";
+    spec->trait.epilogue = "default";
+    spec->trait.direct_to_lds = true;
+    spec->trait.dtl_prefetch = true;
+    spec->trait.dtl_lds_alias = true;
+    spec->trait.dtl_prefetch_depth = depth;
+    spec->trait.lds_swizzle = true;
+    spec->data.dtype_a = "bf16";
+    spec->data.dtype_b = "bf16";
+    spec->data.dtype_c = "bf16";
+}
+
 static int make_spec(int idx, rocke_gemm_universal_spec_t* spec)
 {
     *spec = rocke_gemm_universal_spec_default();
@@ -340,6 +356,53 @@ static int make_spec(int idx, rocke_gemm_universal_spec_t* spec)
         spec->trait.direct_to_lds = true;
         spec->trait.dtl_prefetch = true;
         spec->trait.dtl_lds_alias = true;
+        spec->block_size = 256;
+        break;
+    case 40: /* 64x128 depth-2 ring + split-K */
+        spec->name = "s40";
+        spec->tile = TILE(64, 128, 64, 2, 2, 1, 16, 16, 32);
+        dtl_routing(spec, 2);
+        spec->trait.split_k = 4;
+        spec->block_size = 256;
+        break;
+    case 41: /* 128x128 depth-2 ring + pad clamp */
+        spec->name = "s41";
+        spec->tile = TILE(128, 128, 64, 2, 2, 1, 16, 16, 32);
+        dtl_routing(spec, 2);
+        spec->trait.pad_m = true;
+        spec->trait.pad_n = true;
+        spec->block_size = 256;
+        break;
+    case 42: /* 128x128x128 ping-pong + split-K */
+        spec->name = "s42";
+        spec->tile = TILE(128, 128, 128, 2, 2, 1, 16, 16, 32);
+        dtl_routing(spec, 1);
+        spec->trait.split_k = 2;
+        spec->block_size = 256;
+        break;
+    case 43: /* 128x256 depth-2 ring + chiplet swizzle */
+        spec->name = "s43";
+        spec->tile = TILE(128, 256, 64, 2, 4, 1, 16, 16, 32);
+        dtl_routing(spec, 2);
+        spec->trait.chiplet_swizzle = true;
+        spec->block_size = 512;
+        break;
+    case 44: /* 256x256 ping-pong + split-K + pad clamp + chiplet swizzle */
+        spec->name = "s44";
+        spec->tile = TILE(256, 256, 64, 2, 4, 1, 16, 16, 32);
+        dtl_routing(spec, 1);
+        spec->trait.split_k = 2;
+        spec->trait.pad_m = true;
+        spec->trait.pad_n = true;
+        spec->trait.chiplet_swizzle = true;
+        spec->block_size = 512;
+        break;
+    case 45: /* 64x128 depth-2 ring + pad clamp */
+        spec->name = "s45";
+        spec->tile = TILE(64, 128, 64, 2, 2, 1, 16, 16, 32);
+        dtl_routing(spec, 2);
+        spec->trait.pad_m = true;
+        spec->trait.pad_n = true;
         spec->block_size = 256;
         break;
     default:

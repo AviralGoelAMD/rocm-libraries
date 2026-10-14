@@ -338,6 +338,58 @@ def _specs():
         ),
         block_size=256,
     )
+    # ---- gfx950 bf16 DTL routing traits (dispatch/gemm/bf16_rcr.py) ----
+    bf16 = DataSpec(dtype_a="bf16", dtype_b="bf16", dtype_c="bf16")
+
+    def dtl_trait(depth, **kw):
+        return TraitSpec(
+            pipeline="compv4",
+            scheduler="intrawave",
+            epilogue="default",
+            direct_to_lds=True,
+            dtl_prefetch=True,
+            dtl_lds_alias=True,
+            dtl_prefetch_depth=depth,
+            lds_swizzle=True,
+            **kw,
+        )
+
+    # 64x128 depth-2 ring + split-K (M=64 candidate)
+    add("s40", (64, 128, 64, 2, 2, 1, 16, 16, 32), dtl_trait(2, split_k=4), bf16, block_size=256)
+    # 128x128 depth-2 ring + pad_m/pad_n load clamp
+    add(
+        "s41",
+        (128, 128, 64, 2, 2, 1, 16, 16, 32),
+        dtl_trait(2, pad_m=True, pad_n=True),
+        bf16,
+        block_size=256,
+    )
+    # 128x128x128 ping-pong + split-K (deep-K fill split)
+    add("s42", (128, 128, 128, 2, 2, 1, 16, 16, 32), dtl_trait(1, split_k=2), bf16, block_size=256)
+    # 128x256 depth-2 ring + chiplet swizzle
+    add(
+        "s43",
+        (128, 256, 64, 2, 4, 1, 16, 16, 32),
+        dtl_trait(2, chiplet_swizzle=True),
+        bf16,
+        block_size=512,
+    )
+    # 256x256 ping-pong + split-K + pad clamp + chiplet swizzle
+    add(
+        "s44",
+        (256, 256, 64, 2, 4, 1, 16, 16, 32),
+        dtl_trait(1, split_k=2, pad_m=True, pad_n=True, chiplet_swizzle=True),
+        bf16,
+        block_size=512,
+    )
+    # 64x128 depth-2 ring + pad clamp, no split
+    add(
+        "s45",
+        (64, 128, 64, 2, 2, 1, 16, 16, 32),
+        dtl_trait(2, pad_m=True, pad_n=True),
+        bf16,
+        block_size=256,
+    )
     return S
 
 
