@@ -332,9 +332,49 @@ void rocke_gfx950_attention_tiled_3d_emit_prologue(rocke_gfx950_attention_tiled_
     const rocke_type_t* dtype = CFG.dtype;
 
     /* ---- grid ids + thread ---- */
-    ctx->q_block_global_idx = rocke_b_block_id_x(B);
-    ctx->kv_head_idx = rocke_b_block_id_y(B);
-    ctx->seg_idx = rocke_b_block_id_z(B);
+    if(CFG.SEG_MAJOR_ORDER)
+    {
+        /* Segment-fastest CTA order: re-split the linear launch id (x fastest)
+         * into (segment, kv head, query block). Grid x is num_seqs on the
+         * decode fast path, else the launcher's total_q // BLOCK_Q + num_seqs. */
+        rocke_value_t* grid_x;
+        rocke_value_t* bx;
+        rocke_value_t* by;
+        rocke_value_t* bz;
+        rocke_value_t* zk;
+        rocke_value_t* yz;
+        rocke_value_t* gyz;
+        rocke_value_t* lin;
+        rocke_value_t* rest;
+        if(CFG.DECODE_FAST_PATH)
+        {
+            grid_x = ctx->num_seqs_p;
+        }
+        else
+        {
+            rocke_value_t* total_q = rocke_b_global_load_i32(B, ctx->cu_q, ctx->num_seqs_p, 0);
+            rocke_value_t* bq = rocke_b_const_i32(B, BLOCK_Q);
+            rocke_value_t* nqb = rocke_b_div(B, total_q, bq);
+            grid_x = rocke_b_add(B, nqb, ctx->num_seqs_p);
+        }
+        bx = rocke_b_block_id_x(B);
+        by = rocke_b_block_id_y(B);
+        bz = rocke_b_block_id_z(B);
+        zk = rocke_b_mul(B, bz, rocke_b_const_i32(B, CFG.NUM_KV));
+        yz = rocke_b_add(B, by, zk);
+        gyz = rocke_b_mul(B, grid_x, yz);
+        lin = rocke_b_add(B, bx, gyz);
+        ctx->seg_idx = rocke_b_mod(B, lin, rocke_b_const_i32(B, NUM_SEG));
+        rest = rocke_b_div(B, lin, rocke_b_const_i32(B, NUM_SEG));
+        ctx->kv_head_idx = rocke_b_mod(B, rest, rocke_b_const_i32(B, CFG.NUM_KV));
+        ctx->q_block_global_idx = rocke_b_div(B, rest, rocke_b_const_i32(B, CFG.NUM_KV));
+    }
+    else
+    {
+        ctx->q_block_global_idx = rocke_b_block_id_x(B);
+        ctx->kv_head_idx = rocke_b_block_id_y(B);
+        ctx->seg_idx = rocke_b_block_id_z(B);
+    }
     ctx->tid = rocke_b_thread_id_x(B);
 
     if(CFG.DECODE_FAST_PATH)

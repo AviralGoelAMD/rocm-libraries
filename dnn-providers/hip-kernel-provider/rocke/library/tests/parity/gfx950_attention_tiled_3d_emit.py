@@ -420,6 +420,48 @@ _CONFIGS = {
         kv_split_wait=True,
         scalar_block_ids=True,
     ),
+    28: dict(
+        # seg_major_order only (grid x from cu_q)
+        head_size=128,
+        block_size=16,
+        num_query_heads=32,
+        num_kv_heads=8,
+        dtype="bf16",
+        num_segments=16,
+        use_sinks=False,
+        sliding_window=0,
+        has_softcap=False,
+        seg_major_order=True,
+    ),
+    29: dict(
+        # seg_major_order + decode_fast_path
+        head_size=128,
+        block_size=16,
+        num_query_heads=32,
+        num_kv_heads=8,
+        dtype="bf16",
+        num_segments=16,
+        use_sinks=False,
+        sliding_window=0,
+        has_softcap=False,
+        seg_major_order=True,
+        decode_fast_path=True,
+    ),
+    30: dict(
+        # QQ bias + kv_prefetch + seg_major_order
+        head_size=128,
+        block_size=16,
+        num_query_heads=32,
+        num_kv_heads=8,
+        dtype="bf16",
+        num_segments=16,
+        use_sinks=False,
+        sliding_window=0,
+        has_softcap=False,
+        use_qq_bias=True,
+        kv_prefetch=True,
+        seg_major_order=True,
+    ),
 }
 
 

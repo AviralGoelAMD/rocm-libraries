@@ -173,6 +173,7 @@ typedef struct rocke_unified_attention_3d_tiled_spec
     bool fold_kv_scale; /* False */
     int kv_load_aux; /* 0 */
     bool scalar_block_ids; /* False */
+    bool seg_major_order; /* False */
 } rocke_unified_attention_3d_tiled_spec_t;
 
 /* Materialise every defaulted field. Required fields are zero/NULL-init; the

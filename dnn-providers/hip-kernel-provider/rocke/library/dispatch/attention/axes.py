@@ -139,6 +139,7 @@ _GFX950_3D_AXES: Tuple[KnobAxis, ...] = (
     _flag("transposed_softmax", enabler=True),
     *_3D_AXES,
     _flag("use_f32_denormal_flush"),
+    _flag("seg_major_order"),
     _flag("scalar_block_ids"),
     _flag("kv_split_wait"),
     _flag("fold_kv_scale"),

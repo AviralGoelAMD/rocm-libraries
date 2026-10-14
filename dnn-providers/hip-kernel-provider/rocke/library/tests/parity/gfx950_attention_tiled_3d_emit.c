@@ -422,6 +422,48 @@ static int make_spec(int idx, rocke_unified_attention_3d_tiled_spec_t* s)
         s->kv_split_wait = true;
         s->scalar_block_ids = true;
         break;
+    case 28:
+        /* seg_major_order only (grid x from cu_q) */
+        s->head_size = 128;
+        s->block_size = 16;
+        s->num_query_heads = 32;
+        s->num_kv_heads = 8;
+        s->dtype = "bf16";
+        s->num_segments = 16;
+        s->use_sinks = false;
+        s->sliding_window = 0;
+        s->has_softcap = false;
+        s->seg_major_order = true;
+        break;
+    case 29:
+        /* seg_major_order + decode_fast_path */
+        s->head_size = 128;
+        s->block_size = 16;
+        s->num_query_heads = 32;
+        s->num_kv_heads = 8;
+        s->dtype = "bf16";
+        s->num_segments = 16;
+        s->use_sinks = false;
+        s->sliding_window = 0;
+        s->has_softcap = false;
+        s->seg_major_order = true;
+        s->decode_fast_path = true;
+        break;
+    case 30:
+        /* QQ bias + kv_prefetch + seg_major_order */
+        s->head_size = 128;
+        s->block_size = 16;
+        s->num_query_heads = 32;
+        s->num_kv_heads = 8;
+        s->dtype = "bf16";
+        s->num_segments = 16;
+        s->use_sinks = false;
+        s->sliding_window = 0;
+        s->has_softcap = false;
+        s->use_qq_bias = true;
+        s->kv_prefetch = true;
+        s->seg_major_order = true;
+        break;
     default:
         return -1;
     }

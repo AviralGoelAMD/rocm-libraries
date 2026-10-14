@@ -208,6 +208,12 @@ class UnifiedAttention3DTiledSpec:
     # selects a scalar s_load: the ids then never sit in the vmcnt queue ahead
     # of (or behind) the K/V DMAs.
     scalar_block_ids: bool = False
+    # Hand out CTAs segment-fastest: the linear launch id (x fastest, which is
+    # how the dispatcher deals CTAs round-robin across XCDs) is re-split into
+    # (segment, kv head, query block), so one sequence's segments land on
+    # every XCD instead of the XCDs that own its grid-x residue. Unequal
+    # sequence lengths otherwise load some XCDs more than others.
+    seg_major_order: bool = False
 
     def __post_init__(self):
         if type(self.use_f32_denormal_flush) is not bool:
@@ -307,6 +313,7 @@ class UnifiedAttention3DTiledSpec:
             "fks" if self.fold_kv_scale else "",
             f"aux{self.kv_load_aux}" if self.kv_load_aux else "",
             "sbt" if self.scalar_block_ids else "",
+            "smo" if self.seg_major_order else "",
         )
 
 
@@ -493,9 +500,26 @@ def build_unified_attention_3d_tiled(
         k_strides = declare_strided_kv_params(b, "k")
         v_strides = declare_strided_kv_params(b, "v")
 
-    q_block_global_idx = b.block_id_x()
-    kv_head_idx = b.block_id_y()
-    seg_idx = b.block_id_z()
+    if spec.seg_major_order:
+        # Grid x size: num_seqs on the decode fast path, else the launcher's
+        # total_q // BLOCK_Q + num_seqs.
+        if spec.decode_fast_path:
+            grid_x = num_seqs_p
+        else:
+            total_q = b.global_load_i32(cu_q, num_seqs_p)
+            grid_x = b.add(b.div(total_q, b.const_i32(BLOCK_Q)), num_seqs_p)
+        lin = b.add(
+            b.block_id_x(),
+            b.mul(grid_x, b.add(b.block_id_y(), b.mul(b.block_id_z(), b.const_i32(NUM_KV)))),
+        )
+        seg_idx = b.mod(lin, b.const_i32(NUM_SEG))
+        rest = b.div(lin, b.const_i32(NUM_SEG))
+        kv_head_idx = b.mod(rest, b.const_i32(NUM_KV))
+        q_block_global_idx = b.div(rest, b.const_i32(NUM_KV))
+    else:
+        q_block_global_idx = b.block_id_x()
+        kv_head_idx = b.block_id_y()
+        seg_idx = b.block_id_z()
     tid = b.thread_id_x()
 
     if spec.decode_fast_path:
