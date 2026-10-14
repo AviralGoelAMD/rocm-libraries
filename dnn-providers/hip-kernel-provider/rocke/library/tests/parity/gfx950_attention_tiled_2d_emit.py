@@ -966,6 +966,7 @@ _CONFIGS = {
     65: dict(_PIPE_D128_T64, use_lds_dma_overlap=True, use_v_double_buffer=True),
     66: dict(_PIPE_D128_T64, use_lds_dma_overlap=True),
     67: dict(_PIPE_D128_T64, use_kv_block_id_prefetch=True),
+    68: dict(_PIPE_D128_T64, use_softmax_scale_fold=True),
 }
 
 

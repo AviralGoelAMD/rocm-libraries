@@ -541,6 +541,12 @@ class UnifiedAttention2DTiledSpec:
     # ``soffset``, and the per-call voffset is loop-invariant. K and V share
     # the ids.
     use_kv_block_id_prefetch: bool = False
+    # Transposed 32x32 softmax VALU diet: reduce the tile max on the raw QK
+    # scores and scale only the reduced max (the softmax scale is positive),
+    # fold scale + max-subtract into one FMA feeding exp2. The row sum stays a
+    # single serial chain (see the softmax body). Inactive with softcap /
+    # ALiBi / QQ-bias, which are defined on the scaled score.
+    use_softmax_scale_fold: bool = False
 
     def __post_init__(self):
         for knob in ("use_f32_denormal_flush", "use_fp_contract"):
@@ -895,6 +901,10 @@ class UnifiedAttention2DTiledSpec:
                 # One wave's DMA call (64 lanes x 8 halves) must stay inside
                 # one block for its block id to be wave-uniform.
                 raise ValueError("use_kv_block_id_prefetch needs 512/head_size <= block_size")
+        if self.use_softmax_scale_fold and not (
+            self.use_mfma_32x32 and self.use_transposed_qk_32x32
+        ):
+            raise ValueError("use_softmax_scale_fold requires the transposed 32x32 path")
 
     @property
     def num_queries_per_kv(self) -> int:
@@ -1021,6 +1031,7 @@ class UnifiedAttention2DTiledSpec:
             "rqb" if self.use_reverse_q_block_order else "",
             "kswz" if self.use_k_lds_xor_swizzle else "",
             "vswz" if self.use_v_lds_xor_swizzle else "",
+            "smfold" if self.use_softmax_scale_fold else "",
             "dmaov" if self.use_lds_dma_overlap else "",
             "bidpf" if self.use_kv_block_id_prefetch else "",
         )
@@ -1217,6 +1228,11 @@ def build_unified_attention_2d_tiled(
     USE_SINKS = spec.use_sinks
     USE_ALIBI = spec.use_alibi
     USE_QQ_BIAS = spec.use_qq_bias
+    # ``use_softmax_scale_fold`` only rewrites the plain causal softmax; the
+    # softcap / ALiBi / QQ-bias terms are defined on the scaled score.
+    SOFTMAX_SCALE_FOLD = bool(spec.use_softmax_scale_fold) and not (
+        USE_SOFTCAP or USE_ALIBI or USE_QQ_BIAS
+    )
     TRANSPOSED_SCALAR_STATE = spec.use_transposed_scalar_state
     TRANSPOSED_INVARIANT_HOIST = spec.use_transposed_invariant_hoist
     TRANSPOSED_MASK_ONCE = spec.use_transposed_mask_once
@@ -3759,7 +3775,9 @@ def build_unified_attention_2d_tiled(
                                     dist = b.sub(causal_lim, col_abs)
                                     m_ok = b.land(m_ok, b.cmp_lt(dist, sw_const))
                             s_raw = b.vec_extract(st_regs[n], reg)
-                            s_scaled = b.fmul(s_raw, qk_scale)
+                            s_scaled = (
+                                s_raw if SOFTMAX_SCALE_FOLD else b.fmul(s_raw, qk_scale)
+                            )
                             if USE_SOFTCAP:
                                 s_scaled = b.fmul(
                                     _apply_softcap(b, s_scaled, softcap_p), rcp_ln2
@@ -3803,6 +3821,10 @@ def build_unified_attention_2d_tiled(
                             st_local_max = b.fmax(st_local_max, score)
                 st_remote_max = b.warp_shuffle_xor(st_local_max, 32)
                 st_tile_max = b.fmax(st_local_max, st_remote_max)
+                if SOFTMAX_SCALE_FOLD:
+                    # Scores are still raw: the scale is positive, so scaling
+                    # the reduced max equals reducing the scaled tile.
+                    st_tile_max = b.fmul(st_tile_max, qk_scale)
                 st_m_raw = b.fmax(m_vals[0], st_tile_max)
                 st_ok = b.fcmp("ogt", st_m_raw, neg_inf)
                 st_m_new = b.select(st_ok, st_m_raw, zero_f)
@@ -3810,13 +3832,29 @@ def build_unified_attention_2d_tiled(
                     [[None] * 16 for _ in range(QK_N_TILES)]
                     for _ in range(len(st_groups))
                 ]
+                # Row sum as ONE serial fadd chain (both softmax variants). Any
+                # pairable form (a stride-halving tree, explicit <2 x f32> adds,
+                # two interleaved chains) lets the backend emit v_pk_add_f32,
+                # and after it unpacks the adds that sit in an MFMA shadow the
+                # register allocator can hand the repacked add a half-swapped
+                # src1 (``op_sel:[0,1]``), which gfx950 executes wrongly while an
+                # MFMA is in flight. A single dependency chain has nothing to pair.
                 st_l_local = zero_f
+                st_neg_m = b.fsub(zero_f, st_m_new) if SOFTMAX_SCALE_FOLD else None
                 for group_idx in range(len(st_groups)):
                     for n in range(QK_N_TILES):
                         for reg in range(16):
-                            p_t = b.exp2(
-                                b.fsub(st_scores[(group_idx, n, reg)], st_m_new)
-                            )
+                            if SOFTMAX_SCALE_FOLD:
+                                # One FMA per score: s * scale - m_new.
+                                p_t = b.exp2(
+                                    b.fma(
+                                        st_scores[(group_idx, n, reg)], qk_scale, st_neg_m
+                                    )
+                                )
+                            else:
+                                p_t = b.exp2(
+                                    b.fsub(st_scores[(group_idx, n, reg)], st_m_new)
+                                )
                             PT32_groups[group_idx][n][reg] = p_t
                             st_l_local = b.fadd(st_l_local, p_t)
                 PT32_n = PT32_groups[0]

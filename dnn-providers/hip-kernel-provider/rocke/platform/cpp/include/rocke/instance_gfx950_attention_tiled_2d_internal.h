@@ -144,7 +144,7 @@ typedef struct rocke_gfx950_attn2d_build_ctx
      * during iteration i; PV reads V[i] from cur_buf. */
     bool V_DOUBLE_BUF;
     /* Pipeline levers (Python locals of the same names). */
-    bool K_LDS_SWZ, V_LDS_SWZ, LDS_DMA_OVERLAP, BLOCK_ID_PREFETCH;
+    bool K_LDS_SWZ, V_LDS_SWZ, LDS_DMA_OVERLAP, BLOCK_ID_PREFETCH, SOFTMAX_SCALE_FOLD;
     int SWZ_CPR, SWZ_RPP_SHIFT, SWZ_HD_SHIFT;
     const char* LDS_DMA_TAG; /* "dma" under LDS_DMA_OVERLAP, else NULL  */
     const char* LDS_READ_TAG; /* "read" under LDS_DMA_OVERLAP, else NULL */

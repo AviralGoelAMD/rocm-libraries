@@ -1513,6 +1513,7 @@ def _selector_parity_row(problem_dict, arch):
                 "use_v_lds_xor_swizzle",
                 "use_lds_dma_overlap",
                 "use_kv_block_id_prefetch",
+                "use_softmax_scale_fold",
             }
         }
     except Exception as e:  # noqa: BLE001

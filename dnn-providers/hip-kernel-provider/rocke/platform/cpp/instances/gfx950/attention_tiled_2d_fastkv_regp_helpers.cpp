@@ -130,6 +130,7 @@ static rocke_status_t rocke__fastkv_gfx950_base_name(const rocke_attention_tiled
             s->use_reverse_q_block_order ? "rqb" : "",
             s->use_k_lds_xor_swizzle ? "kswz" : "",
             s->use_v_lds_xor_swizzle ? "vswz" : "",
+            s->use_softmax_scale_fold ? "smfold" : "",
             s->use_lds_dma_overlap ? "dmaov" : "",
             s->use_kv_block_id_prefetch ? "bidpf" : "",
         };

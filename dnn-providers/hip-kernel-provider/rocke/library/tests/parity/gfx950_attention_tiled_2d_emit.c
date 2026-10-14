@@ -1017,6 +1017,10 @@ static int make_spec(int idx, rocke_attention_tiled_2d_spec_t* s)
         pipe_d128_t64(s);
         s->use_kv_block_id_prefetch = true;
         break;
+    case 68:
+        pipe_d128_t64(s);
+        s->use_softmax_scale_fold = true;
+        break;
 
     default:
         return -1;
