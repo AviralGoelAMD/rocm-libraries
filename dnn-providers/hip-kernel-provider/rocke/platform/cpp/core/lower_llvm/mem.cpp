@@ -134,12 +134,20 @@ static void op_memref_global_load_typed(rocke_lower_t* L, const rocke_op_t* op)
                    elem_ty,
                    rocke_ll_operand(L, ptr),
                    rocke_ll_operand(L, idx));
+    const char* md = "";
+    if(rocke_attr_get_bool(&op->attrs, "invariant", false))
+    {
+        /* Shares the empty `!1 = !{}` node with the FP-atomic metadata. */
+        L->needs_fp_atomic_md = true;
+        md = ", !invariant.load !1";
+    }
     rocke_ll_emitf(L,
-                   "  %s = load %s, ptr addrspace(1) %s, align %lld",
+                   "  %s = load %s, ptr addrspace(1) %s, align %lld%s",
                    ll_res(op),
                    elem_ty,
                    gep,
-                   (long long)align);
+                   (long long)align,
+                   md);
 }
 
 static void op_memref_global_store(rocke_lower_t* L, const rocke_op_t* op)
