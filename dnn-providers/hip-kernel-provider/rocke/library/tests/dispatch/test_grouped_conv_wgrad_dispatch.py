@@ -581,7 +581,9 @@ class TestWgradMergeDegree(unittest.TestCase):
             (13, 13): (1, 64),  # spatial 169
         }
         for (Y, X), (want, tile_n) in cases.items():
-            req = self._dw(2048, Y, X)
+            # N*Ho*Wo well above the short-reduction floor, so only the tile
+            # bound decides.
+            req = self._dw(2048, Y, X, N=32)
             self.assertEqual(_wgrad_merge_degree(req), want, f"{Y}x{X}")
             spec = dispatch_conv_grouped(req).spec
             self.assertEqual(spec.group_merge, want, f"{Y}x{X}")
@@ -593,6 +595,21 @@ class TestWgradMergeDegree(unittest.TestCase):
         # offers. (Checked on the selector directly: grouped pointwise wgrad is
         # refused upstream, so this shape never reaches dispatch.)
         from dispatch.grouped_convolution import _wgrad_merge_degree
+
+    def test_short_reduction_keeps_the_shipped_tile(self):
+        # Batch 1, 14x14: N*Ho*Wo = 196. A 3x3 filter already merges 4 groups
+        # at the 64-wide tile, so the tile is not widened; a 7x7 one cannot
+        # merge at 64 and still widens.
+        from dispatch.grouped_convolution import _wgrad_merge_degree
+
+        req = self._dw(480, 3, 3, N=1, Hi=14, Wi=14)
+        self.assertEqual(_wgrad_merge_degree(req), 4)
+        self.assertEqual(dispatch_conv_grouped(req).spec.tile_n, 64)
+        req = self._dw(96, 7, 7, N=1, Hi=14, Wi=14)
+        self.assertEqual(dispatch_conv_grouped(req).spec.tile_n, 256)
+        # 5x5 stride 2 at batch 1 (EfficientNet 28->14): merges 2 at 64, keeps it.
+        req = self._dw(240, 5, 5, N=1, Hi=28, Wi=28, stride_h=2, stride_w=2)
+        self.assertEqual(dispatch_conv_grouped(req).spec.tile_n, 64)
 
         self.assertEqual(_wgrad_merge_degree(self._dw(2048, 1, 1)), 64)
 
