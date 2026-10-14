@@ -107,6 +107,7 @@ def _launch(problem, data, value_cache):
         seqused_k=data["kv_lens"],
         softmax_scale=data["scale"],
         block_table=data["block_tables"],
+        softcap=0.0,
         backend="auto",
     )
     torch.cuda.synchronize()
