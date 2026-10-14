@@ -1598,10 +1598,7 @@ const char* rocke_ll_param_attrs(rocke_lower_t* L, const rocke_param_t* p)
     {
         return "";
     }
-    if(!p->type || p->type->kind != ROCKE_TYPE_PTR)
-    {
-        return "";
-    }
+    const bool is_ptr = p->type && p->type->kind == ROCKE_TYPE_PTR;
     char buf[256];
     size_t w = 0;
     buf[0] = '\0';
@@ -1614,6 +1611,14 @@ const char* rocke_ll_param_attrs(rocke_lower_t* L, const rocke_param_t* p)
             w += (size_t)_n;                                                     \
         }                                                                        \
     } while(0)
+    /* `inreg` on an amdgpu_kernel argument asks the backend to preload it into
+     * user SGPRs (kernarg preload); arguments without it are unchanged. */
+    if(rocke_attr_get_bool(&p->attrs, "inreg", false))
+        LL_APPEND_ATTR("inreg");
+    if(!is_ptr)
+    {
+        return w ? rocke_arena_printf(&L->arena, " %s", buf) : "";
+    }
     if(rocke_attr_get_bool(&p->attrs, "noalias", false))
         LL_APPEND_ATTR("noalias");
     if(rocke_attr_get_bool(&p->attrs, "readonly", false))

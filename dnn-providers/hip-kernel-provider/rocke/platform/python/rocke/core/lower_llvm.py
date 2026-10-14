@@ -6262,8 +6262,12 @@ def _format_agpr_alloc(value: object) -> str:
 
 def _param_attrs(attrs: Dict[str, object], t: Type) -> str:
     out: List[str] = []
+    # ``inreg`` on an amdgpu_kernel argument asks the backend to preload it
+    # into user SGPRs (kernarg preload); arguments without it are unchanged.
+    if attrs.get("inreg"):
+        out.append("inreg")
     if not isinstance(t, PtrType):
-        return ""
+        return (" " + " ".join(out)) if out else ""
     if attrs.get("noalias"):
         out.append("noalias")
     if attrs.get("readonly"):
