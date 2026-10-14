@@ -807,8 +807,11 @@ static void _op_tile_ds_read_tr16_b64(rocke_lower_t* L, const rocke_op_t* op)
     }
     rocke_ll_need(L, "ds.read.tr16.b64");
     raw = rocke_ll_fresh(L, "tr.raw");
-    rocke_ll_emitf(
-        L, "  %s = call <4 x i16> @llvm.amdgcn.ds.read.tr16.b64(ptr addrspace(3) %s)", raw, base);
+    rocke_ll_emitf(L,
+                   "  %s = call <4 x i16> @llvm.amdgcn.ds.read.tr16.b64(ptr addrspace(3) %s)%s",
+                   raw,
+                   base,
+                   rocke_ll_lds_alias_md(L, op));
     elem_ty = rocke_ll_llvm_type(L, op->results[0]->type->elem);
     rocke_ll_emitf(L, "  %s = bitcast <4 x i16> %s to <4 x %s>", ll_result_name(op), raw, elem_ty);
 }
@@ -850,17 +853,23 @@ static void _op_tile_ds_read_tr16_b128(rocke_lower_t* L, const rocke_op_t* op)
     if(strcmp(spec.ret_ty, want_ty) == 0)
     {
         rocke_ll_emitf(L,
-                       "  %s = call %s @%s(ptr addrspace(3) %s)",
+                       "  %s = call %s @%s(ptr addrspace(3) %s)%s",
                        ll_result_name(op),
                        spec.ret_ty,
                        spec.intrinsic,
-                       base);
+                       base,
+                       rocke_ll_lds_alias_md(L, op));
         return;
     }
     {
         const char* raw = rocke_ll_fresh(L, "trw.raw");
-        rocke_ll_emitf(
-            L, "  %s = call %s @%s(ptr addrspace(3) %s)", raw, spec.ret_ty, spec.intrinsic, base);
+        rocke_ll_emitf(L,
+                       "  %s = call %s @%s(ptr addrspace(3) %s)%s",
+                       raw,
+                       spec.ret_ty,
+                       spec.intrinsic,
+                       base,
+                       rocke_ll_lds_alias_md(L, op));
         rocke_ll_emitf(
             L, "  %s = bitcast %s %s to %s", ll_result_name(op), spec.ret_ty, raw, want_ty);
     }

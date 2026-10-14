@@ -733,16 +733,18 @@ static void op_tile_smem_load_vN(rocke_lower_t* L, const rocke_op_t* op)
                    agg_ty,
                    base_ptr,
                    idx_strs);
+    const char* md = rocke_ll_lds_alias_md(L, op);
     if(vec == 1)
     {
         const char* scalar = rocke_ll_fresh(L, "smem.s");
         rocke_ll_emitf(L,
-                       "  %s = load %s%s, ptr addrspace(3) %s, align %lld",
+                       "  %s = load %s%s, ptr addrspace(3) %s, align %lld%s",
                        scalar,
                        volatile_kw,
                        elem_ty,
                        base,
-                       (long long)align);
+                       (long long)align,
+                       md);
         rocke_ll_emitf(L,
                        "  %s = insertelement <1 x %s> undef, %s %s, i32 0",
                        ll_res(op),
@@ -753,13 +755,14 @@ static void op_tile_smem_load_vN(rocke_lower_t* L, const rocke_op_t* op)
     else
     {
         rocke_ll_emitf(L,
-                       "  %s = load %s<%lld x %s>, ptr addrspace(3) %s, align %lld",
+                       "  %s = load %s<%lld x %s>, ptr addrspace(3) %s, align %lld%s",
                        ll_res(op),
                        volatile_kw,
                        (long long)vec,
                        elem_ty,
                        base,
-                       (long long)align);
+                       (long long)align,
+                       md);
     }
 }
 
@@ -1470,13 +1473,14 @@ static void op_tile_async_buffer_load_lds_addr(rocke_lower_t* L, const rocke_op_
     rocke_ll_emitf(L,
                    "  call void @llvm.amdgcn.raw.ptr.buffer.load.lds("
                    "ptr addrspace(8) %s, ptr addrspace(3) %s, i32 %lld, i32 %s, i32 %s, "
-                   "i32 0, i32 %lld)",
+                   "i32 0, i32 %lld)%s",
                    rocke_ll_operand(L, rsrc),
                    ptr_name,
                    (long long)size_bytes,
                    rocke_ll_operand(L, voff),
                    rocke_ll_operand(L, soff),
-                   (long long)aux);
+                   (long long)aux,
+                   rocke_ll_lds_dma_md(L, op));
 }
 
 static void op_tile_async_buffer_load_lds(rocke_lower_t* L, const rocke_op_t* op)
@@ -1494,13 +1498,14 @@ static void op_tile_async_buffer_load_lds(rocke_lower_t* L, const rocke_op_t* op
     rocke_ll_emitf(L,
                    "  call void @llvm.amdgcn.raw.ptr.buffer.load.lds("
                    "ptr addrspace(8) %s, ptr addrspace(3) %s, i32 %lld, i32 %s, i32 %s, "
-                   "i32 0, i32 %lld)",
+                   "i32 0, i32 %lld)%s",
                    rocke_ll_operand(L, rsrc),
                    lds,
                    (long long)bytes_per_lane,
                    rocke_ll_operand(L, voffset),
                    rocke_ll_operand(L, soffset),
-                   (long long)aux);
+                   (long long)aux,
+                   rocke_ll_lds_dma_md(L, op));
 }
 
 static void op_tile_buffer_load_lds_async(rocke_lower_t* L, const rocke_op_t* op)
@@ -1925,11 +1930,12 @@ static void op_tile_global_load_lds(rocke_lower_t* L, const rocke_op_t* op)
         L, "  %s = inttoptr i64 %s to ptr addrspace(3)", ptr_name, rocke_ll_operand(L, lds_addr));
     rocke_ll_emitf(L,
                    "  call void @llvm.amdgcn.global.load.lds("
-                   "ptr addrspace(1) %s, ptr addrspace(3) %s, i32 %lld, i32 0, i32 %lld)",
+                   "ptr addrspace(1) %s, ptr addrspace(3) %s, i32 %lld, i32 0, i32 %lld)%s",
                    gep,
                    ptr_name,
                    (long long)size_bytes,
-                   (long long)aux);
+                   (long long)aux,
+                   rocke_ll_lds_dma_md(L, op));
 }
 
 /* ====================================================================== */

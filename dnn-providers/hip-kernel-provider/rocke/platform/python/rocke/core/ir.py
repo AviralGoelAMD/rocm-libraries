@@ -470,6 +470,52 @@ class KernelDef:
         return None if value is None else check_cluster_dims(value)
 
 
+# ------------------------- LDS-DMA alias rings ----------------------------
+
+# Caps shared with the C++ engine (ROCKE_LDS_ALIAS_MAX_RINGS / _MAX_SLOTS).
+LDS_ALIAS_MAX_RINGS = 8
+LDS_ALIAS_MAX_SLOTS = 8
+# Slot of an access whose ring slot is only known at run time.
+LDS_ALIAS_ANY_SLOT = -1
+
+
+@dataclass(frozen=True)
+class LdsAliasTag:
+    """The ring slot one LDS-DMA write or LDS read touches.
+
+    Build it with :meth:`LdsAliasRing.slot` or :attr:`LdsAliasRing.any_slot`
+    and pass it as ``lds_alias=`` to the tagged ops (see
+    :meth:`IRBuilder.lds_alias_ring`).
+    """
+
+    ring: int
+    slot: int
+
+
+@dataclass(frozen=True, eq=False)
+class LdsAliasRing:
+    """An ``smem_alloc`` buffer split into ``slots`` disjoint slots (a ping-pong
+    or deeper LDS-DMA ring). Returned by :meth:`IRBuilder.lds_alias_ring`."""
+
+    index: int
+    slots: int
+    smem: Value
+
+    def slot(self, i: int) -> LdsAliasTag:
+        """Tag for an access that touches only slot ``i`` (a Python int)."""
+        if isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < self.slots:
+            raise ValueError(
+                f"LDS alias ring {self.index} has slots 0..{self.slots - 1}; got {i!r} "
+                "(a slot chosen at run time must use any_slot)"
+            )
+        return LdsAliasTag(self.index, i)
+
+    @property
+    def any_slot(self) -> LdsAliasTag:
+        """Tag for an access to this ring whose slot is chosen at run time."""
+        return LdsAliasTag(self.index, LDS_ALIAS_ANY_SLOT)
+
+
 # -------------------------- source locations ------------------------------
 
 # Opt-in only. Capturing a Python frame per op costs real time on dispatch
@@ -677,6 +723,7 @@ class IRBuilder:
         self._region_stack: List[Region] = []
         self._params: List[Param] = []
         self._param_values: Dict[str, Value] = {}
+        self._lds_alias_rings: List[LdsAliasRing] = []
         self.kernel = KernelDef(
             name=kernel_name,
             params=self._params,
@@ -1837,6 +1884,95 @@ class IRBuilder:
             result_name_hint=name_hint,
         ).result
 
+    def lds_alias_ring(self, smem: Value, slots: int) -> LdsAliasRing:
+        """Declare ``smem`` an LDS-DMA ring of ``slots`` disjoint slots.
+
+        Each ring gets its own alias-scope domain with one scope per slot.
+        An LDS-DMA write (``async_buffer_load_lds[_addr]``, ``global_load_lds``)
+        or LDS read (``smem_load_vN``, ``ds_read_tr16_b64/b128``) passed
+        ``lds_alias=ring.slot(i)`` lowers with ``!alias.scope`` = slot ``i`` and
+        ``!noalias`` = every other slot of every ring; ``ring.any_slot`` (a
+        slot picked at run time) is in scope for all of its ring's slots. The
+        backend waitcnt pass then makes a read wait only for in-flight DMA
+        into the slot it reads, so a read of slot 0 no longer drains the DMA
+        filling slot 1 with ``s_waitcnt vmcnt(0)``.
+
+        Every claim the metadata makes is true for every execution, so
+        correctness never rests on a wait the caller placed: a static slot
+        must be a compile-time fact (unroll the ring loop by its depth so the
+        slot of each copy is a Python int), and a dynamic slot uses
+        ``any_slot``. The caller asserts only that slot ``i`` accesses stay
+        inside slot ``i``'s bytes. Rules the lowering enforces: once a kernel
+        declares a ring, every LDS-DMA write must name its ring slot (the
+        backend skips untagged DMA when it checks a tagged read), and the pool
+        byte ranges of different rings must not overlap.
+
+        The tags only remove waits inside one wave. A slot filled by several
+        waves still needs the wait on the issuing wave plus a barrier before
+        other waves read it (``sync`` / ``sync(keep_lds_dma=N)``).
+        """
+        if smem.op is None or smem.op.name != "tile.smem_alloc":
+            raise ValueError(
+                f"lds_alias_ring needs an smem_alloc result, got {smem.name}"
+            )
+        if "lds_ring" in smem.op.attrs:
+            raise ValueError(f"{smem.name} is already LDS alias ring {smem.op.attrs['lds_ring']}")
+        if isinstance(slots, bool) or not isinstance(slots, int):
+            raise ValueError(f"lds_alias_ring slots must be an int, got {slots!r}")
+        if not 1 <= slots <= LDS_ALIAS_MAX_SLOTS:
+            raise ValueError(
+                f"lds_alias_ring slots must be 1..{LDS_ALIAS_MAX_SLOTS}, got {slots}"
+            )
+        if len(self._lds_alias_rings) >= LDS_ALIAS_MAX_RINGS:
+            raise ValueError(f"at most {LDS_ALIAS_MAX_RINGS} LDS alias rings per kernel")
+        ring = LdsAliasRing(len(self._lds_alias_rings), slots, smem)
+        # The ring id rides on the allocation itself, so it survives
+        # serialization and the lowering can find every ring's pool range.
+        smem.op.attrs["lds_ring"] = ring.index
+        smem.op.attrs["lds_ring_slots"] = slots
+        self._lds_alias_rings.append(ring)
+        return ring
+
+    def _lds_alias_attrs(
+        self, what: str, tag: Optional[LdsAliasTag], smem: Value
+    ) -> Dict[str, int]:
+        """Op attrs for an ``lds_alias=`` tag on an access to ``smem``."""
+        if tag is None:
+            return {}
+        if not isinstance(tag, LdsAliasTag):
+            raise TypeError(f"{what}: lds_alias must be an LdsAliasTag, got {tag!r}")
+        if not 0 <= tag.ring < len(self._lds_alias_rings):
+            raise ValueError(f"{what}: unknown LDS alias ring {tag.ring}")
+        ring = self._lds_alias_rings[tag.ring]
+        if tag.slot != LDS_ALIAS_ANY_SLOT and not 0 <= tag.slot < ring.slots:
+            raise ValueError(
+                f"{what}: LDS alias ring {tag.ring} has slots 0..{ring.slots - 1}, "
+                f"got {tag.slot}"
+            )
+        if smem is not ring.smem:
+            raise ValueError(
+                f"{what}: lds_alias names ring {tag.ring} ({ring.smem.name}) but the "
+                f"access targets {smem.name}"
+            )
+        return {"lds_ring": tag.ring, "lds_slot": tag.slot}
+
+    @staticmethod
+    def _lds_addr_allocation(what: str, addr: Value) -> Value:
+        """The ``smem_alloc`` an i64 LDS address is derived from.
+
+        Follows ``smem_ptr_add`` back to ``smem_addr_of``; any other producer
+        cannot be tied to one allocation, so a tagged DMA rejects it.
+        """
+        v = addr
+        while v.op is not None and v.op.name == "tile.smem_ptr_add":
+            v = v.op.operands[0]
+        if v.op is None or v.op.name != "tile.smem_addr_of":
+            raise ValueError(
+                f"{what}: an lds_alias-tagged LDS address must be built from "
+                "smem_addr_of / smem_ptr_add"
+            )
+        return v.op.operands[0]
+
     def global_load(
         self, ptr: Value, idx: Value, dtype: Type, *, align: int = 1
     ) -> Value:
@@ -2202,13 +2338,21 @@ class IRBuilder:
         """
         return self.smem_load_vN(smem, *indices, dtype=F16, n=n)
 
-    def smem_load_vN(self, smem: Value, *indices, dtype: Type, n: int = 0) -> Value:
+    def smem_load_vN(
+        self,
+        smem: Value,
+        *indices,
+        dtype: Type,
+        n: int = 0,
+        lds_alias: Optional[LdsAliasTag] = None,
+    ) -> Value:
         """LDS load of ``<N x dtype>``. Supports 8-bit (fp8e4m3 / bf8e5m2 /
         i8), 16-bit (f16 / bf16), 32-bit (f32 / i32) and 64-bit (f64, ``n in
         {1, 2}``) element types; loads exactly N elements. In addition to
         power-of-two widths, accepts 96-bit payloads (12 bytes, six halfwords,
         or three words), using element alignment. The target and alignment
-        determine instruction selection.
+        determine instruction selection. ``lds_alias``: the ring slot read
+        (see :meth:`lds_alias_ring`).
         """
         if dtype.name not in (
             "f16",
@@ -2240,11 +2384,13 @@ class IRBuilder:
             )
         if not indices:
             raise ValueError("smem_load_vN needs at least one index")
+        attrs = {"elem_type": dtype.name, "vec": n, "rank": len(indices)}
+        attrs.update(self._lds_alias_attrs("smem_load_vN", lds_alias, smem))
         return self._op(
             "tile.smem_load_vN",
             [smem, *indices],
             [VectorType(dtype, n)],
-            attrs={"elem_type": dtype.name, "vec": n, "rank": len(indices)},
+            attrs=attrs,
             result_name_hint=f"av{n}",
         ).result
 
@@ -3718,7 +3864,11 @@ class IRBuilder:
         raise ValueError(f"warp_shuffle_xor_dpp: unsupported type {v.type.name}")
 
     def ds_read_tr16_b64(
-        self, smem: Value, *indices: Value, dtype: Type = F16
+        self,
+        smem: Value,
+        *indices: Value,
+        dtype: Type = F16,
+        lds_alias: Optional[LdsAliasTag] = None,
     ) -> Value:
         """`ds_read_b64_tr_b16` — wave64 transpose-read of a 16x16 fp16 tile
         from LDS, returning the MFMA B-operand layout directly.
@@ -3737,14 +3887,17 @@ class IRBuilder:
 
         Use case: PV gemm where `V[T, HD]` is in LDS row-major and we want
         `B[k_chunk*4 + 0..3, n]` per lane without 4 strided `ds_read_u16`.
+        ``lds_alias``: the ring slot read (see :meth:`lds_alias_ring`).
         """
         if not indices:
             raise ValueError("ds_read_tr16_b64 needs at least one index")
+        attrs = {"rank": len(indices), "elem_type": dtype.name}
+        attrs.update(self._lds_alias_attrs("ds_read_tr16_b64", lds_alias, smem))
         return self._op(
             "tile.ds_read_tr16_b64",
             [smem, *indices],
             [VectorType(dtype, 4)],
-            attrs={"rank": len(indices), "elem_type": dtype.name},
+            attrs=attrs,
             # "dtr" prefix (not "tr...digits") so the fresh-name counter can never
             # collide with an arith.trunc result ("tr"+id): e.g. trunc id 16631
             # and tr16 id 631 both stringify to "tr16631".
@@ -3752,7 +3905,11 @@ class IRBuilder:
         ).result
 
     def ds_read_tr16_b128(
-        self, smem: Value, *indices: Value, dtype: Type = F16
+        self,
+        smem: Value,
+        *indices: Value,
+        dtype: Type = F16,
+        lds_alias: Optional[LdsAliasTag] = None,
     ) -> Value:
         """``ds_read_b128_tr_b16`` — gfx950 wide transpose-read.
 
@@ -3764,15 +3921,17 @@ class IRBuilder:
 
         Used by transpose phase-2 and the PV-V LDS read in
         ``attention_tiled_2d`` 32x32 path: 8 scalar ``ds_read_u16``
-        per lane → 1 transposed read.
+        per lane → 1 transposed read. ``lds_alias``: the ring slot read.
         """
         if not indices:
             raise ValueError("ds_read_tr16_b128 needs at least one index")
+        attrs = {"rank": len(indices), "elem_type": dtype.name}
+        attrs.update(self._lds_alias_attrs("ds_read_tr16_b128", lds_alias, smem))
         return self._op(
             "tile.ds_read_tr16_b128",
             [smem, *indices],
             [VectorType(dtype, 8)],
-            attrs={"rank": len(indices), "elem_type": dtype.name},
+            attrs=attrs,
             result_name_hint="dtr16w",
         ).result
 
@@ -3840,6 +3999,7 @@ class IRBuilder:
         soffset: Value,
         dwords: int,
         coherency: int = 0,
+        lds_alias: Optional[LdsAliasTag] = None,
     ) -> None:
         """Variant of `async_buffer_load_lds` that takes a raw i64 LDS
         address instead of a typed `smem<...>` value. This is the form
@@ -3856,6 +4016,9 @@ class IRBuilder:
         the L1/L2 caching policy. ``CACHE_STREAM`` is the
         right hint for one-shot streaming loads in a
         ping-pong pipeline that won't reuse the data.
+        lds_alias: the ring slot written (see :meth:`lds_alias_ring`);
+        ``lds_addr`` must then be built from ``smem_addr_of`` /
+        ``smem_ptr_add`` of that ring's allocation.
         """
         if dwords not in (1, 3, 4):
             raise ValueError(
@@ -3863,16 +4026,47 @@ class IRBuilder:
             )
         if coherency not in (0, 1, 2, 3):
             raise ValueError(f"coherency must be 0..3 (got {coherency})")
+        attrs = {"dwords": int(dwords), "aux": int(coherency)}
+        if lds_alias is not None:
+            what = "async_buffer_load_lds_addr"
+            smem = self._lds_addr_allocation(what, lds_addr)
+            attrs.update(self._lds_alias_attrs(what, lds_alias, smem))
         self._op(
             "tile.async_buffer_load_lds_addr",
             [rsrc, lds_addr, voffset, soffset],
-            attrs={"dwords": int(dwords), "aux": int(coherency)},
+            attrs=attrs,
         )
 
     # ----- scheduler / synchronisation hints -----
 
-    def sync(self) -> None:
-        self._op("tile.sync")
+    def sync(self, *, keep_lds_dma: int = 0) -> None:
+        """Workgroup barrier after draining this wave's LDS traffic and
+        vector-memory loads.
+
+        ``keep_lds_dma=0`` (default) waits for every load (``s_waitcnt
+        vmcnt(0) lgkmcnt(0)`` + ``s_barrier``). ``keep_lds_dma=N`` lets the
+        ``N`` most recently issued LDS-DMA writes stay in flight across the
+        barrier (``s_waitcnt vmcnt(N) lgkmcnt(0)`` + ``s_barrier``): a ring
+        that already issued the next tiles' DMA waits only for the tile the
+        barrier publishes.
+
+        Count only LDS-DMA ops (``async_buffer_load_lds[_addr]``,
+        ``global_load_lds``) issued after the ones the barrier guards; never
+        count other global loads. The vmcnt counter retires a wave's loads in
+        issue order, so any other load in flight only makes the wait stricter,
+        while counting one can release the barrier before a guarded DMA lands
+        (the backend schedules ordinary loads freely around the DMA, so their
+        position in the build order is not their issue order).
+        :meth:`sync_lds_only` is the form that waits for no load at all.
+        """
+        n = keep_lds_dma
+        if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= 63:
+            raise ValueError(f"sync keep_lds_dma must be an int in 0..63, got {n!r}")
+        if n == 0:
+            self._op("tile.sync")
+            return
+        self.s_waitcnt(vmcnt=n, lgkmcnt=0)
+        self.s_barrier_bare()
 
     def s_barrier_bare(self) -> None:
         """Bare workgroup barrier: ``s_barrier`` with NO implicit waitcnt.
@@ -4744,6 +4938,7 @@ class IRBuilder:
         soffset: Value,
         dwords: int,
         coherency: int = 0,
+        lds_alias: Optional[LdsAliasTag] = None,
     ) -> None:
         """Async DRAM->LDS copy via `raw_ptr_buffer_load_lds`.
 
@@ -4758,6 +4953,7 @@ class IRBuilder:
         ``coherency`` selects AUX-bit cache-coherence hints — see
         :data:`CACHE_ALL` / :data:`CACHE_GLOBAL` /
         :data:`CACHE_STREAM` / :data:`NON_TEMPORAL`.
+        ``lds_alias``: the ring slot written (see :meth:`lds_alias_ring`).
         """
         if dwords not in (1, 3, 4):
             raise ValueError(
@@ -4765,10 +4961,15 @@ class IRBuilder:
             )
         if coherency not in (0, 1, 2, 3):
             raise ValueError(f"coherency must be 0..3 (got {coherency})")
+        attrs = {"dwords": int(dwords), "aux": int(coherency)}
+        if lds_alias is not None:
+            what = "async_buffer_load_lds"
+            smem = self._lds_addr_allocation(what, lds_ptr)
+            attrs.update(self._lds_alias_attrs(what, lds_alias, smem))
         self._op(
             "tile.async_buffer_load_lds",
             [rsrc, lds_ptr, voffset, soffset],
-            attrs={"dwords": int(dwords), "aux": int(coherency)},
+            attrs=attrs,
         )
 
     def global_load_lds(
@@ -4778,6 +4979,7 @@ class IRBuilder:
         lds_addr: Value,
         size_bytes: int,
         coherency: int = 0,
+        lds_alias: Optional[LdsAliasTag] = None,
     ) -> None:
         """Direct DRAM->LDS DMA via ``llvm.amdgcn.global.load.lds``.
 
@@ -4810,6 +5012,8 @@ class IRBuilder:
             :data:`CACHE_GLOBAL`, :data:`CACHE_STREAM`,
             :data:`NON_TEMPORAL`. ``CACHE_ALL`` is the right hint for
             reused weights so they stay resident in L2.
+        lds_alias
+            The ring slot written (see :meth:`lds_alias_ring`).
 
         Completion is signalled via the VMEM counter, exactly like
         :meth:`async_buffer_load_lds`; consumers must place an
@@ -4825,10 +5029,14 @@ class IRBuilder:
             )
         if coherency not in (0, 1, 2, 3):
             raise ValueError(f"coherency must be 0..3 (got {coherency})")
+        attrs = {"size_bytes": int(size_bytes), "aux": int(coherency)}
+        if lds_alias is not None:
+            smem = self._lds_addr_allocation("global_load_lds", lds_addr)
+            attrs.update(self._lds_alias_attrs("global_load_lds", lds_alias, smem))
         self._op(
             "tile.global_load_lds",
             [src_ptr, byte_off, lds_addr],
-            attrs={"size_bytes": int(size_bytes), "aux": int(coherency)},
+            attrs=attrs,
         )
 
     # ----- f32 LDS ops (cshuffle epilogue) -----
