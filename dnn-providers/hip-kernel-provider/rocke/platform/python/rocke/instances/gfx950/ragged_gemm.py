@@ -26,6 +26,7 @@ from typing import Optional
 from rocke.core.ir import BF16, I32, I64, IRBuilder, PtrType, VectorType
 from rocke.helpers.mfma_gemm_inner import decode_mfma_lanes, mfma_atom_for_dtype
 from rocke.helpers.spec import SignatureBuilder
+from rocke.instances.gfx950.grouped_gemm import lds_wait_tied
 
 
 @dataclass(frozen=True)
@@ -413,6 +414,12 @@ def build_ragged_gemm(spec: RaggedGemmSpec):
     # transpose: nn x2 b64; RCR: nn b128). Used to size the CKSCHED interleave.
     n_ds_prefetch = mm + (nn * 2 if b_rrr else nn)
 
+    def lds_wait(a_fr, b_fr):
+        # Tied drain: keeps the MFMAs that read inline-asm ds_read fragments
+        # from being scheduled above the lgkmcnt(0) wait.
+        fenced = lds_wait_tied(b, [*a_fr, *b_fr])
+        return fenced[: len(a_fr)], fenced[len(a_fr) :]
+
     def compute(ai, bi, acc, store_on_last=None):
         if prio and not burstprio:
             b.s_setprio(1)
@@ -421,7 +428,7 @@ def build_ragged_gemm(spec: RaggedGemmSpec):
             for kk in range(kchunks):
                 if burstprio:
                     b.s_setprio(0)
-                b.s_waitcnt(lgkmcnt=0)
+                a_fr, b_fr = lds_wait(a_fr, b_fr)
                 na = nb = None
                 has_next = kk + 1 < kchunks
                 if has_next:
@@ -444,7 +451,7 @@ def build_ragged_gemm(spec: RaggedGemmSpec):
             a_fr, b_fr = read_chunk(ai, bi, 0)
             for kk in range(kchunks):
                 if asm_reads:
-                    b.s_waitcnt(lgkmcnt=0)
+                    a_fr, b_fr = lds_wait(a_fr, b_fr)
                 sr = store_on_last if kk == kchunks - 1 else None
                 _mma_block(a_fr, b_fr, acc, store_row_cb=sr)
                 if kk + 1 < kchunks:
