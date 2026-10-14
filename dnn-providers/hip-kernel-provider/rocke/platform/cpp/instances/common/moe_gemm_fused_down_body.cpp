@@ -227,7 +227,17 @@ bool rocke_moe_down_build_ctx_init(rocke_moe_down_build_ctx_t* ctx,
     {
         rocke_value_t* batch_idx = rocke_b_block_id_z(b);
         ctx->batch_off_a = rocke_b_mul(b, batch_idx, ctx->stride_a);
-        ctx->batch_off_b = rocke_b_mul(b, batch_idx, ctx->stride_b);
+        {
+            /* Same i64 B-slab fold as the grouped branch (Python order:
+             * const, sext(batch), sext(stride_b), mul, mul). */
+            rocke_value_t* elem_bytes_b = rocke_b_const_i64(b, 2);
+            rocke_value_t* batch_i64 = rocke_b_sext(b, batch_idx, rocke_i64());
+            rocke_value_t* stride_b_i64 = rocke_b_sext(b, ctx->stride_b, rocke_i64());
+            rocke_value_t* b_base_bytes
+                = rocke_b_mul(b, rocke_b_mul(b, batch_i64, stride_b_i64), elem_bytes_b);
+            ctx->WDown = rocke_b_global_ptr_add(b, ctx->WDown, b_base_bytes);
+        }
+        ctx->batch_off_b = ctx->c0_dr;
         /* Offset into flattened padded bucket arrays; slot_size is tile-m
          * aligned M. */
         ctx->batch_bucket_off = rocke_b_mul(b, batch_idx, ctx->slot_size);
