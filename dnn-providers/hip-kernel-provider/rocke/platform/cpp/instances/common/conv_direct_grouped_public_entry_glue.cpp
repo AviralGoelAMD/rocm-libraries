@@ -214,7 +214,7 @@ rocke_kernel_def_t* rocke_build_direct_conv_4c_new(rocke_ir_builder_t* b,
 
 /* Copy `msg` into the (err, err_cap) buffer, NUL-terminated and truncated to
  * fit. No-op if err is NULL or err_cap is 0. */
-static void rocke_dconv_set_err(char* err, size_t err_cap, const char* msg)
+void rocke_dconv_set_err(char* err, size_t err_cap, const char* msg)
 {
     size_t n;
     if(err == NULL || err_cap == 0)
