@@ -31,7 +31,9 @@ Three arch families are supported, each with its own hard-coded tile config:
       tile 64×64×64, warp 2×2, atom 16×16×16, pipeline ``mem``
 * **gfx950** — wave64, MFMA 32×32×16 atom:
       tile 64×64×64, warp 2×2, atom 32×32×16, pipeline ``mem``; fwd and dgrad
-      move to a 128×128 tile on large problems (``_gfx950_*_big_tile``)
+      move to a 128×128 tile on large problems (``_gfx950_*_big_tile``), and
+      wgrad raises the auto split-K degree on thin grids
+      (``_gfx950_wgrad_min_split_k``)
 * **gfx1250** (wave32, WMMA) — WMMA 16×16×32 atom:
       tile 32×32×32, warp 2×2, atom 16×16×32, pipeline ``mem``
   (gfx1250 restricts WMMA conv to pipeline=``mem``, groups=1, no cshuffle
@@ -215,6 +217,22 @@ _GFX950_FWD_BIG_TILE_MIN_TILES = 1536
 # zero-fill records carry no reduction work).
 _GFX950_DGRAD_BIG_TILE_MIN_CTAS = 768
 
+# gfx950 wgrad split-K floor. The CK formula sizes split_k from the reduction
+# alone; on a thin grid (few dW tiles) it can leave most CUs idle. Raise the
+# degree until the grid reaches _GFX950_WGRAD_SPLIT_TARGET_CTAS, keeping every
+# K-slice at least _GFX950_WGRAD_MIN_SLICE long and the degree at most
+# _GFX950_WGRAD_MAX_RULE_SPLIT_K. Grids of _GFX950_WGRAD_SPLIT_MAX_TILES tiles
+# or more already fill the device, and the split-K epilogue only adds traffic.
+_GFX950_WGRAD_SPLIT_TARGET_CTAS = 4096
+_GFX950_WGRAD_MIN_SLICE = 1024
+_GFX950_WGRAD_MAX_RULE_SPLIT_K = 16
+_GFX950_WGRAD_SPLIT_MAX_TILES = 512
+
+
+def _pow2_floor(x: float) -> int:
+    """Largest power of two <= x (1 for x < 2)."""
+    return 1 << (int(x).bit_length() - 1) if x >= 2 else 1
+
 
 def _gfx950_fwd_big_tile(p: "ConvProblem") -> bool:
     """Whether the gfx950 fwd candidate takes the 128x128 tile for ``p``."""
@@ -263,6 +281,29 @@ def _gfx950_tile(big: bool) -> Tuple[int, int, int, int, int, int, int]:
         _GFX950_WARP_N,
         _GFX950_WARP_TILE_MN,
         _GFX950_WARP_TILE_K,
+    )
+
+
+def _gfx950_wgrad_min_split_k(spec: "ConvGroupedSpec", p: "ConvProblem") -> int:
+    """Split-K floor for an auto-resolved gfx950 wgrad (1 = no floor).
+
+    Only the dense default 64x64 geometry, the one the rule was fit on.
+    """
+    if (
+        spec.arch != "gfx950"
+        or p.groups != 1
+        or (spec.tile_m, spec.tile_n) != (_GFX950_TILE_M, _GFX950_TILE_N)
+    ):
+        return 1
+    spatial = (p.Z if p.is_3d else 1) * p.Y * p.X
+    tiles = -(-p.kpg // spec.tile_m) * -(-(spatial * p.cpg) // spec.tile_n)
+    if tiles >= _GFX950_WGRAD_SPLIT_MAX_TILES:
+        return 1
+    k_wg = p.N * p.Ho * p.Wo * (p.Do if p.is_3d else 1)
+    return min(
+        _GFX950_WGRAD_MAX_RULE_SPLIT_K,
+        _pow2_floor(k_wg / _GFX950_WGRAD_MIN_SLICE),
+        _pow2_floor(_GFX950_WGRAD_SPLIT_TARGET_CTAS / tiles),
     )
 
 
@@ -785,9 +826,10 @@ def _resolve_wgrad_split_k(
 
     Honors a concrete split-K fixed by the candidate (WMMA forces 1 -- it has
     no split-K path); otherwise auto-resolves via the CK formula on the
-    per-group GEMM dims (== full dims when groups==1). Grouped rides the group
-    on block_id_z alongside the K-slice (z = groups*split_k), so grouped
-    split-K is valid on MFMA.
+    per-group GEMM dims (== full dims when groups==1), raised on gfx950 to
+    :func:`_gfx950_wgrad_min_split_k` where the dW grid is thin. Grouped rides
+    the group on block_id_z alongside the K-slice (z = groups*split_k), so
+    grouped split-K is valid on MFMA.
 
     The result is then held under the scratch cap: when it bites, split_k
     falls back to 1 (a plain store, no scratch needed). Shared by
@@ -839,6 +881,7 @@ def _resolve_wgrad_split_k(
             groups=grid_groups,
             block_size=_block(spec)[0],
         ).split_k
+        requested = max(requested, _gfx950_wgrad_min_split_k(spec, p))
     # The helper already keeps groups*split_k inside the z limit on the auto
     # path; this clamp still has to run for an explicitly requested split_k.
     split_k = max(1, min(requested, _MAX_GRID_DIM_Z // grid_groups))
