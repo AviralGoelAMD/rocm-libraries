@@ -189,6 +189,14 @@ bool rocke_unified_attn_enable_softmax_mfma_interleave(const rocke_unified_attn_
 bool rocke_unified_attn_enable_v_double_buffer(const rocke_unified_attn_problem_t* p);
 /* Python: _enable_early_v_schedule(problem) -- long single-batch combo prefill. */
 bool rocke_unified_attn_enable_early_v_schedule(const rocke_unified_attn_problem_t* p);
+/* Python: _gfx950_prefill_pipeline_cohort(problem) -- d128 bs16 causal prefill
+ * on the transposed-32x32 half-local-PV body (single- or multi-seq), no SW /
+ * ALiBi / QQ-bias / sinks / softcap / FP8. */
+bool rocke_unified_attn_gfx950_prefill_pipeline_cohort(const rocke_unified_attn_problem_t* p);
+/* Python: _gfx950_prefill_pipeline(problem) -- the cohort on the LLVM-direct
+ * backend; the C problem has no compile_backend override, so == the cohort.
+ * Selects T=64 and the pipelined knob stack (see tiled_spec_from_problem). */
+bool rocke_unified_attn_gfx950_prefill_pipeline(const rocke_unified_attn_problem_t* p);
 
 /* Python: _tiled_spec_from_problem(problem) -> rocke_attention_tiled_2d_spec_t.
  * Assembles the full tiled-2D spec for gfx950 by running every selector and gate

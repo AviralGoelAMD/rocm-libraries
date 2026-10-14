@@ -53,6 +53,22 @@ static void pipe_d128_t64(rocke_attention_tiled_2d_spec_t* s)
     s->use_transposed_mask_limit = true;
 }
 
+/* Python _PIPE_ROUTED: the routed pipeline stack, every lever on. */
+static void pipe_routed(rocke_attention_tiled_2d_spec_t* s)
+{
+    pipe_d128_t64(s);
+    s->use_v_double_buffer = true;
+    s->use_mask_phase_split = true;
+    s->use_f32_denormal_flush = true;
+    s->use_fp_contract = true;
+    s->use_reverse_q_block_order = true;
+    s->use_k_lds_xor_swizzle = true;
+    s->use_v_lds_xor_swizzle = true;
+    s->use_lds_dma_overlap = true;
+    s->use_kv_block_id_prefetch = true;
+    s->use_softmax_scale_fold = true;
+}
+
 /* Fill `s` for config index `idx`. Returns 0 on success, -1 on unknown idx. */
 static int make_spec(int idx, rocke_attention_tiled_2d_spec_t* s)
 {
@@ -977,8 +993,9 @@ static int make_spec(int idx, rocke_attention_tiled_2d_spec_t* s)
         s->use_fp_contract = (idx != 57);
         break;
 
-    /* Pipeline stack, one lever per case on pipe_d128_t64. Lockstep with the
-     * Python _CONFIGS. */
+    /* Pipeline stack, one lever per case on pipe_d128_t64 (59-68), the routed
+     * specs (69 bf16 single-seq + interleave mode 1, 70 fp16, 71 multi-seq),
+     * then cross-path coverage (72-75). Lockstep with the Python _CONFIGS. */
     case 59:
         pipe_d128_t64(s);
         s->use_v_double_buffer = true;
@@ -1020,6 +1037,55 @@ static int make_spec(int idx, rocke_attention_tiled_2d_spec_t* s)
     case 68:
         pipe_d128_t64(s);
         s->use_softmax_scale_fold = true;
+        break;
+    case 69:
+    case 70:
+        pipe_routed(s);
+        s->dtype = (idx == 70) ? "fp16" : "bf16";
+        s->use_softmax_mfma_interleave = true;
+        s->softmax_interleave_mode = 1;
+        break;
+    case 71:
+        pipe_routed(s);
+        s->num_seqs = 4;
+        break;
+    case 72:
+        pipe_d128_t64(s);
+        s->use_transposed_half_local_pv = false;
+        s->use_lds_dma_overlap = true;
+        break;
+    case 73:
+        pipe_d128_t64(s);
+        s->use_kv_block_id_prefetch = true;
+        s->use_k_lds_xor_swizzle = true;
+        s->use_v_lds_xor_swizzle = true;
+        break;
+    case 74:
+        s->head_size = 128;
+        s->block_size = 16;
+        s->num_query_heads = 1;
+        s->num_kv_heads = 1;
+        s->dtype = "bf16";
+        s->use_sinks = false;
+        s->sliding_window = 0;
+        s->has_softcap = false;
+        s->use_v_double_buffer = true;
+        s->use_kv_block_id_prefetch = true;
+        break;
+    case 75:
+        s->head_size = 128;
+        s->block_size = 32;
+        s->num_query_heads = 32;
+        s->num_kv_heads = 32;
+        s->dtype = "fp16";
+        s->use_sinks = false;
+        s->sliding_window = 0;
+        s->has_softcap = false;
+        s->use_mfma_32x32 = true;
+        s->block_m_per_warp = 32;
+        s->has_tile_size = true;
+        s->tile_size = 64;
+        s->use_v_double_buffer = true;
         break;
 
     default:
