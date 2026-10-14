@@ -107,12 +107,10 @@ typedef struct rocke_attention_tiled_2d_spec
     bool use_register_pv; /* False */
 
     /* Deep K+V prefetch / V-double-buffer schedule controls (Python mirror).
-     * The gfx950 C emitter currently builds only the depth-2 single/early-V
-     * schedule; these fields are carried so the spec is byte-identical with the
-     * Python dataclass and the provider/dispatcher can pass them through. A
-     * builder that sees use_v_double_buffer / use_staggered_iter_wait / kv_ring
-     * _depth!=2 / use_q_reread it does not yet emit must reject in validate(),
-     * NOT silently ignore (mirrors the Python __post_init__). */
+     * The gfx950 C emitter builds the depth-2 schedule including the
+     * non-staggered V double-buffer (with or without early-V); it rejects
+     * use_staggered_iter_wait / kv_ring_depth!=2 / use_q_reread, which it does
+     * not emit (reject, never silently ignore). */
     bool use_v_double_buffer; /* False */
     int kv_ring_depth; /* 2 */
     bool use_staggered_iter_wait; /* False */

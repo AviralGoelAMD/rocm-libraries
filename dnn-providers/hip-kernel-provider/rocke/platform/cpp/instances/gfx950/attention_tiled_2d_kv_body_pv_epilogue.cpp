@@ -38,6 +38,8 @@
 #include "rocke/instance_gfx950_attention_tiled_2d_internal.h"
 
 #include <assert.h>
+#include <stdio.h>
+#include <string.h>
 
 /* ============================================================ *
  *  Local dtype-dispatch wrappers mirroring the Python module aliases
@@ -90,15 +92,18 @@ static rocke_value_t* rocke__attn2d_mfma_16x16x32(rocke_ir_builder_t* b,
  *  Every sub-expression is bound in Python source (left-to-right) order so C's
  *  unspecified arg-eval order does not shuffle the SSA value numbering.
  * ============================================================ */
-static rocke_value_t* rocke_pv32_v_load_paired(rocke_ir_builder_t* b,
+static rocke_value_t* rocke_pv32_v_load_paired(rocke_gfx950_attn2d_build_ctx_t* ctx,
                                                rocke_value_t* V_lds,
                                                rocke_value_t* v_buf,
                                                int n,
                                                int k,
                                                rocke_value_t* lane_half32,
                                                rocke_value_t* lane_col32,
-                                               const rocke_type_t* dtype)
+                                               const rocke_type_t* dtype,
+                                               bool swizzled,
+                                               const char* lds_dma_scope)
 {
+    rocke_ir_builder_t* b = ctx->b;
     /* col_group16 = (lane_col32 / 16) * 16. Python emits the div (with its const
      * 16) BEFORE the mul's const 16; bind the div first. */
     rocke_value_t* col_div16 = rocke_b_div(b, lane_col32, rocke_b_const_i32(b, 16));
@@ -107,25 +112,51 @@ static rocke_value_t* rocke_pv32_v_load_paired(rocke_ir_builder_t* b,
     rocke_value_t* tr_col_mod = rocke_b_mod(b, lane_col32, rocke_b_const_i32(b, 4));
     rocke_value_t* tr_col_rhs = rocke_b_mul(b, tr_col_mod, rocke_b_const_i32(b, 4));
     rocke_value_t* tr_col32 = rocke_b_add(b, col_group16, tr_col_rhs);
-    /* tr_row_base32 = (k*16 + lane_half32*4) + ((lane_col32 / 4) % 4). Python
-     * evaluates the inner add (const(k*16), mul(lane_half32,4)) BEFORE the mod. */
-    rocke_value_t* tr_row_k = rocke_b_const_i32(b, (int64_t)(k * 16));
-    rocke_value_t* tr_row_inner
-        = rocke_b_add(b, tr_row_k, rocke_b_mul(b, lane_half32, rocke_b_const_i32(b, 4)));
-    rocke_value_t* tr_row_div4 = rocke_b_div(b, lane_col32, rocke_b_const_i32(b, 4));
-    rocke_value_t* tr_row_mod = rocke_b_mod(b, tr_row_div4, rocke_b_const_i32(b, 4));
-    rocke_value_t* tr_row_base32 = rocke_b_add(b, tr_row_inner, tr_row_mod);
+    if(!swizzled)
+    {
+        /* Natural layout: the historical emission order (each read builds its
+         * own column add; the +8 row is built between the reads).
+         * tr_row_base32 = (k*16 + lane_half32*4) + ((lane_col32 / 4) % 4). Python
+         * evaluates the inner add (const(k*16), mul(lane_half32,4)) BEFORE the
+         * mod. */
+        rocke_value_t* tr_row_k = rocke_b_const_i32(b, (int64_t)(k * 16));
+        rocke_value_t* tr_row_inner
+            = rocke_b_add(b, tr_row_k, rocke_b_mul(b, lane_half32, rocke_b_const_i32(b, 4)));
+        rocke_value_t* tr_row_div4 = rocke_b_div(b, lane_col32, rocke_b_const_i32(b, 4));
+        rocke_value_t* tr_row_mod = rocke_b_mod(b, tr_row_div4, rocke_b_const_i32(b, 4));
+        rocke_value_t* tr_row_base32 = rocke_b_add(b, tr_row_inner, tr_row_mod);
 
-    /* Python computes col = add(const(n*32), tr_col32) INLINE inside EACH
-     * ds_read call (helpers/attention.py 844-846, 851-853), so it is emitted
-     * TWICE -- once per read. Mirror that (do NOT hoist) for value numbering. */
-    rocke_value_t* col0 = rocke_b_add(b, rocke_b_const_i32(b, (int64_t)(n * 32)), tr_col32);
-    rocke_value_t* idx0[3] = {v_buf, tr_row_base32, col0};
-    rocke_value_t* A_r0 = rocke_b_ds_read_tr16_b64(b, V_lds, idx0, 3, dtype);
-    rocke_value_t* row1 = rocke_b_add(b, tr_row_base32, rocke_b_const_i32(b, 8));
-    rocke_value_t* col1 = rocke_b_add(b, rocke_b_const_i32(b, (int64_t)(n * 32)), tr_col32);
-    rocke_value_t* idx1[3] = {v_buf, row1, col1};
-    rocke_value_t* A_r1 = rocke_b_ds_read_tr16_b64(b, V_lds, idx1, 3, dtype);
+        /* Python computes col = add(const(n*32), tr_col32) INLINE inside EACH
+         * ds_read call, so it is emitted TWICE -- once per read. Mirror that (do
+         * NOT hoist) for value numbering. */
+        rocke_value_t* col0 = rocke_b_add(b, rocke_b_const_i32(b, (int64_t)(n * 32)), tr_col32);
+        rocke_value_t* idx0[3] = {v_buf, tr_row_base32, col0};
+        rocke_value_t* A_r0
+            = rocke_b_ds_read_tr16_b64_scoped(b, V_lds, idx0, 3, dtype, lds_dma_scope);
+        rocke_value_t* row1 = rocke_b_add(b, tr_row_base32, rocke_b_const_i32(b, 8));
+        rocke_value_t* col1 = rocke_b_add(b, rocke_b_const_i32(b, (int64_t)(n * 32)), tr_col32);
+        rocke_value_t* idx1[3] = {v_buf, row1, col1};
+        rocke_value_t* A_r1
+            = rocke_b_ds_read_tr16_b64_scoped(b, V_lds, idx1, 3, dtype, lds_dma_scope);
+        return rocke_b_vec_concat(b, A_r0, A_r1);
+    }
+    /* Swizzled V (use_v_lds_xor_swizzle): the column XOR depends only on the
+     * lane part of the row, so it is evaluated once on lane_row and the k*16 /
+     * +8 row steps stay constant offsets. */
+    rocke_value_t* lr_hi = rocke_b_mul(b, lane_half32, rocke_b_const_i32(b, 4));
+    rocke_value_t* lr_div4 = rocke_b_div(b, lane_col32, rocke_b_const_i32(b, 4));
+    rocke_value_t* lr_lo = rocke_b_mod(b, lr_div4, rocke_b_const_i32(b, 4));
+    rocke_value_t* lane_row = rocke_b_add(b, lr_hi, lr_lo);
+    rocke_value_t* tr_row_base32
+        = rocke_b_add(b, rocke_b_const_i32(b, (int64_t)(k * 16)), lane_row);
+    rocke_value_t* tr_row_hi = rocke_b_add(b, tr_row_base32, rocke_b_const_i32(b, 8));
+    rocke_value_t* col = rocke_b_add(b, rocke_b_const_i32(b, (int64_t)(n * 32)), tr_col32);
+    rocke_value_t* col_x = rocke_gfx950_attn2d_v_swz_halves(ctx, lane_row);
+    rocke_value_t* col_swz = rocke_b_xor(b, col, col_x);
+    rocke_value_t* idx0[3] = {v_buf, tr_row_base32, col_swz};
+    rocke_value_t* A_r0 = rocke_b_ds_read_tr16_b64_scoped(b, V_lds, idx0, 3, dtype, lds_dma_scope);
+    rocke_value_t* idx1[3] = {v_buf, tr_row_hi, col_swz};
+    rocke_value_t* A_r1 = rocke_b_ds_read_tr16_b64_scoped(b, V_lds, idx1, 3, dtype, lds_dma_scope);
     return rocke_b_vec_concat(b, A_r0, A_r1);
 }
 
@@ -178,8 +209,16 @@ rocke_value_t* rocke_gfx950_attn2d_apply_transposed_pv_regs(rocke_gfx950_attn2d_
             /* Half-local PV (Python 3361-3391). Each 32-lane half consumes only
              * the P rows already local to that half via the paired transpose
              * V-read so V and P share the same permuted K order. */
-            A_v_t = rocke_pv32_v_load_paired(
-                b, ctx->V_lds, v_buf, n, k, ctx->lane_half32_v, ctx->lane_col32_v, dtype);
+            A_v_t = rocke_pv32_v_load_paired(ctx,
+                                             ctx->V_lds,
+                                             v_buf,
+                                             n,
+                                             k,
+                                             ctx->lane_half32_v,
+                                             ctx->lane_col32_v,
+                                             dtype,
+                                             ctx->V_LDS_SWZ,
+                                             ctx->LDS_READ_TAG);
             for(kk = 0; kk < 8; ++kk)
             {
                 int local_in_group = kk % 4;
@@ -207,7 +246,7 @@ rocke_value_t* rocke_gfx950_attn2d_apply_transposed_pv_regs(rocke_gfx950_attn2d_
             idx[0] = v_buf;
             idx[1] = v_row;
             idx[2] = v_dim32;
-            v1 = rocke_b_smem_load_vN(b, ctx->V_lds, idx, 3, dtype, 1);
+            v1 = rocke_b_smem_load_vN_scoped(b, ctx->V_lds, idx, 3, dtype, 1, ctx->LDS_READ_TAG);
             a_v_elems[kk] = rocke_b_vec_extract(b, v1, 0);
         }
         /* Assemble the P^T operand (Python 3286-3310). */
@@ -277,6 +316,18 @@ void rocke_gfx950_attn2d_emit_pv_bucket(rocke_gfx950_attn2d_build_ctx_t* ctx,
         rocke_b_s_waitcnt(b, 0, 0, -1);
         rocke_b_sync(b);
     }
+    else if(ctx->V_DOUBLE_BUF)
+    {
+        /* V[i] (cur_buf) is already visible from the iter-start sync; leave the
+         * two next-tile prefetches (V[i+1], K[i+1]) pending. Under
+         * use_lds_dma_overlap the wait + barrier is dropped: it publishes nothing
+         * and the next-tile writes target the other slot. */
+        if(!ctx->LDS_DMA_OVERLAP)
+        {
+            rocke_b_s_waitcnt(b, 2 * kv_calls_per_tile, 2 * kv_calls_per_tile, -1);
+            rocke_gfx950_attn2d_kv_publish_sync(ctx);
+        }
+    }
     else if(ctx->K_SINGLE_BUFFER)
     {
         /* single K slot. Only V[i] is in flight here (next-K was deferred).
@@ -285,13 +336,13 @@ void rocke_gfx950_attn2d_emit_pv_bucket(rocke_gfx950_attn2d_build_ctx_t* ctx,
          * single slot (overlaps PV[i]; the next iter-start full drain makes it
          * visible before QK[i+1]). No WAR race. */
         rocke_b_s_waitcnt(b, 0, 0, -1);
-        rocke_b_sync(b);
+        rocke_gfx950_attn2d_kv_publish_sync(ctx);
         rocke_gfx950_attn2d_issue_k(ctx, in->safe_next_tile, ctx->nxt_buf_v);
     }
     else
     {
         rocke_b_s_waitcnt(b, kv_calls_per_tile, kv_calls_per_tile, -1);
-        rocke_b_sync(b);
+        rocke_gfx950_attn2d_kv_publish_sync(ctx);
     }
 
     /* The fp8 PV scale (Python line 1149: v_scale_p / 240.0) is hoisted in the
@@ -307,7 +358,7 @@ void rocke_gfx950_attn2d_emit_pv_bucket(rocke_gfx950_attn2d_build_ctx_t* ctx,
             /* Transposed PV: O^T = V^T @ P^T via register P^T (Python 3221-3341).
              * v_buf and use_hi are emitted ONCE here (Python 3231-3232), before
              * the per-N acc-scale + apply loop, and reused by every apply call. */
-            ctx->pv_v_buf_v = rocke_b_const_i32(b, 0);
+            ctx->pv_v_buf_v = ctx->V_DOUBLE_BUF ? ctx->cur_buf : rocke_b_const_i32(b, 0);
             ctx->pv_use_hi_v = rocke_b_cmp_eq(b, ctx->lane_half32_v, rocke_b_const_i32(b, 1));
             for(n = 0; n < ctx->ACC_N_TILES; ++n)
             {
@@ -349,7 +400,7 @@ void rocke_gfx950_attn2d_emit_pv_bucket(rocke_gfx950_attn2d_build_ctx_t* ctx,
         else
         {
             /* Transitional 32x32 PV from the P_lds bridge (Python 3342-3412). */
-            rocke_value_t* v_buf = rocke_b_const_i32(b, 0);
+            rocke_value_t* v_buf = ctx->V_DOUBLE_BUF ? ctx->cur_buf : rocke_b_const_i32(b, 0);
             for(n = 0; n < ctx->ACC_N_TILES; ++n)
             {
                 rocke_value_t* scaled[ROCKE_GFX950_ATTN2D_MAX_REGS_PER_LANE];
@@ -459,7 +510,7 @@ void rocke_gfx950_attn2d_emit_pv_bucket(rocke_gfx950_attn2d_build_ctx_t* ctx,
                 rocke_value_t* ncb_16 = rocke_b_const_i32(b, 16);
                 n_col_base = rocke_b_add(b, rocke_b_mul(b, ncb_n, ncb_16), ctx->pv_tr_reader->col);
             }
-            v_buf = rocke_b_const_i32(b, 0);
+            v_buf = ctx->V_DOUBLE_BUF ? ctx->cur_buf : rocke_b_const_i32(b, 0);
 
             for(k = 0; k < ctx->PV_K_ITERS; ++k)
             {
@@ -656,6 +707,14 @@ void rocke_gfx950_attn2d_emit_pv_bucket(rocke_gfx950_attn2d_build_ctx_t* ctx,
         for(atom = 0; atom < ctx->ACC_M_ATOMS; ++atom)
             yields[yc++] = new_acc[n * ctx->ACC_M_ATOMS + atom];
     yields[yc++] = ctx->GROUPED_KV2 ? in->cur_buf : ctx->nxt_buf_v;
+    if(ctx->BLOCK_ID_PREFETCH)
+    {
+        /* Carry tile i+1's ids into bid_cur and tile i+2's into bid_nxt. */
+        for(i = 0; i < ctx->kv_calls_per_tile; ++i)
+            yields[yc++] = ctx->bid_nxt[i];
+        for(i = 0; i < ctx->kv_calls_per_tile; ++i)
+            yields[yc++] = ctx->bid_new[i];
+    }
 
     /* Record the rewritten carry for callers that thread phases (the driver's
      * single-phase path reads this back via the loop results). */
@@ -675,34 +734,29 @@ void rocke_gfx950_attn2d_emit_pv_bucket(rocke_gfx950_attn2d_build_ctx_t* ctx,
  *  emitter, then leave. Returns the loop handle; the epilogue reads the
  *  rewritten carry from kvloop.op->results.
  * ============================================================ */
-rocke_for_t rocke_gfx950_attn2d_drive_kv_loop(rocke_gfx950_attn2d_build_ctx_t* ctx)
+/* One KV-loop phase: scf_for_iter over [lo, hi) with the given named carry,
+ * the body unpacked into ctx and emitted with ``skip_mask``. */
+static rocke_for_t rocke__attn2d_kv_phase(rocke_gfx950_attn2d_build_ctx_t* ctx,
+                                          rocke_value_t* lo,
+                                          rocke_value_t* hi,
+                                          const rocke_iter_arg_t* iter_args,
+                                          const char* iv_name,
+                                          bool skip_mask)
 {
     rocke_ir_builder_t* b = ctx->b;
-    rocke_iter_arg_t iter_args[ROCKE_GFX950_ATTN2D_MAX_ITER_ARGS];
     rocke_for_t kvloop;
     int i;
     int ml = ctx->ml_count;
     int num_accs = ctx->ACC_N_TILES * ctx->ACC_M_ATOMS;
 
-    for(i = 0; i < ctx->iter_args_count; ++i)
-    {
-        iter_args[i].name = ctx->iter_args_names[i];
-        iter_args[i].init = ctx->iter_args[i];
-    }
-
-    kvloop = rocke_b_scf_for_iter(b,
-                                  ctx->tile_start,
-                                  ctx->tile_end,
-                                  ctx->kv_step,
-                                  iter_args,
-                                  ctx->iter_args_count,
-                                  "kv_tile",
-                                  false,
-                                  true);
+    kvloop = rocke_b_scf_for_iter(
+        b, lo, hi, ctx->kv_step, iter_args, ctx->iter_args_count, iv_name, false, true);
+    if(kvloop.op == NULL)
+        return kvloop;
 
     rocke_b_region_enter(b, kvloop.body);
     ctx->kv_tile_iv = kvloop.iv;
-    /* Unpack the carry the same way the Python body does (lines 2495-2508). */
+    /* Unpack the carry the same way the Python body does. */
     for(i = 0; i < ctx->SOFTMAX_STATE_SLOTS; ++i)
     {
         ctx->m_cur[i] = kvloop.iter_vars[2 * i];
@@ -711,12 +765,76 @@ rocke_for_t rocke_gfx950_attn2d_drive_kv_loop(rocke_gfx950_attn2d_build_ctx_t* c
     for(i = 0; i < num_accs; ++i)
         ctx->acc_cur[i] = kvloop.iter_vars[ml + i];
     ctx->cur_buf = kvloop.iter_vars[ml + num_accs];
-    ctx->skip_mask = false;
+    if(ctx->BLOCK_ID_PREFETCH)
+    {
+        int bid_base = ml + num_accs + 1;
+        for(i = 0; i < ctx->kv_calls_per_tile; ++i)
+        {
+            ctx->bid_cur[i] = kvloop.iter_vars[bid_base + i];
+            ctx->bid_nxt[i] = kvloop.iter_vars[bid_base + ctx->kv_calls_per_tile + i];
+        }
+    }
+    ctx->skip_mask = skip_mask;
 
     rocke_gfx950_attn2d_emit_kv_body(ctx);
 
     rocke_b_region_leave(b);
     return kvloop;
+}
+
+rocke_for_t rocke_gfx950_attn2d_drive_kv_loop(rocke_gfx950_attn2d_build_ctx_t* ctx)
+{
+    rocke_ir_builder_t* b = ctx->b;
+    rocke_iter_arg_t iter_args[ROCKE_GFX950_ATTN2D_MAX_ITER_ARGS];
+    int i;
+
+    for(i = 0; i < ctx->iter_args_count; ++i)
+    {
+        iter_args[i].name = ctx->iter_args_names[i];
+        iter_args[i].init = ctx->iter_args[i];
+    }
+
+    /* use_mask_phase_split (Python 4660-4698): a full-tile phase with the mask
+     * elided, then the masked boundary phase, threading the carry through. */
+    const bool MASK_PHASE_SPLIT = ctx->spec->use_mask_phase_split && ctx->TRANSPOSED_MASK_LIMIT
+                                  && ctx->SLIDING_WINDOW == 0;
+    if(!MASK_PHASE_SPLIT)
+        return rocke__attn2d_kv_phase(
+            ctx, ctx->tile_start, ctx->tile_end, iter_args, "kv_tile", false);
+
+    /* First masked tile: split = min((min_causal_lim+1)//T, max_seq_prefix_len//T)
+     * clamped to [tile_start, tile_end]. */
+    rocke_value_t* min_causal_lim = rocke_b_add(b, ctx->context_len, ctx->qb_start_pos);
+    rocke_value_t* fbc_num = rocke_b_add(b, min_causal_lim, rocke_b_const_i32(b, 1));
+    rocke_value_t* full_by_causal = rocke_b_div(b, fbc_num, rocke_b_const_i32(b, ctx->T));
+    rocke_value_t* full_by_prefix
+        = rocke_b_div(b, ctx->max_seq_prefix_len_v, rocke_b_const_i32(b, ctx->T));
+    rocke_value_t* fb_lt = rocke_b_cmp_lt(b, full_by_causal, full_by_prefix);
+    rocke_value_t* split_raw = rocke_b_select(b, fb_lt, full_by_causal, full_by_prefix);
+    rocke_value_t* lo_lt = rocke_b_cmp_lt(b, split_raw, ctx->tile_start);
+    rocke_value_t* split_lo = rocke_b_select(b, lo_lt, ctx->tile_start, split_raw);
+    rocke_value_t* hi_lt = rocke_b_cmp_lt(b, split_lo, ctx->tile_end);
+    rocke_value_t* split = rocke_b_select(b, hi_lt, split_lo, ctx->tile_end);
+
+    rocke_for_t loop1
+        = rocke__attn2d_kv_phase(ctx, ctx->tile_start, split, iter_args, "kv_tile_f", true);
+    if(loop1.op == NULL)
+        return loop1;
+
+    /* Thread loop1's results into loop2. The iter_arg names seed the minted SSA
+     * value names, so loop2 uses "<name>_b" to keep them distinct. */
+    rocke_iter_arg_t iter_args2[ROCKE_GFX950_ATTN2D_MAX_ITER_ARGS];
+    for(i = 0; i < ctx->iter_args_count; ++i)
+    {
+        size_t len = strlen(ctx->iter_args_names[i]) + 3;
+        char* nm = (char*)rocke_arena_alloc(&b->arena, len);
+        if(nm == NULL)
+            return loop1;
+        snprintf(nm, len, "%s_b", ctx->iter_args_names[i]);
+        iter_args2[i].name = nm;
+        iter_args2[i].init = loop1.op->results[i];
+    }
+    return rocke__attn2d_kv_phase(ctx, split, ctx->tile_end, iter_args2, "kv_tile_b", false);
 }
 
 /* ============================================================ *

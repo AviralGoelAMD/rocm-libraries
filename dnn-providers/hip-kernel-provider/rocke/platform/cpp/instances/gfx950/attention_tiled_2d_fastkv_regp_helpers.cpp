@@ -39,7 +39,7 @@ static rocke_status_t rocke__fastkv_gfx950_base_name(const rocke_attention_tiled
                                                      size_t out_cap)
 {
     char t_buf[32], hkv_buf[64], kv_buf[64], sw_buf[32], w_buf[32], mw_buf[32];
-    char d_buf[16], b_buf[16];
+    char d_buf[16], b_buf[16], ring_buf[32], schedb_buf[32], smxil_buf[32];
 
     if(s == NULL || out == NULL)
         return ROCKE_ERR_VALUE;
@@ -67,6 +67,24 @@ static rocke_status_t rocke__fastkv_gfx950_base_name(const rocke_attention_tiled
         snprintf(mw_buf, sizeof(mw_buf), "mw%d", s->block_m_per_warp);
     else
         mw_buf[0] = '\0';
+    if(s->kv_ring_depth != 2)
+        snprintf(ring_buf, sizeof(ring_buf), "ring%d", s->kv_ring_depth);
+    else
+        ring_buf[0] = '\0';
+    if(s->use_sched_barrier)
+        snprintf(schedb_buf, sizeof(schedb_buf), "schedb%d", s->sched_barrier_mask);
+    else
+        schedb_buf[0] = '\0';
+    if(s->use_softmax_mfma_interleave && s->softmax_interleave_mode == 2)
+        snprintf(smxil_buf,
+                 sizeof(smxil_buf),
+                 "smxil%dg%d",
+                 s->softmax_interleave_mode,
+                 s->softmax_interleave_groups);
+    else if(s->use_softmax_mfma_interleave)
+        snprintf(smxil_buf, sizeof(smxil_buf), "smxil%d", s->softmax_interleave_mode);
+    else
+        smxil_buf[0] = '\0';
 
     {
         const char* parts[] = {
@@ -94,12 +112,27 @@ static rocke_status_t rocke__fastkv_gfx950_base_name(const rocke_attention_tiled
             s->use_grouped_kv2_softmax ? "gkv2" : "",
             s->use_fast_paged_kv_desc ? "fastkvdesc" : "",
             s->use_early_v_schedule ? "earlyv" : "",
+            s->use_v_double_buffer ? "vdbuf" : "",
+            s->use_k_single_buffer ? "ksb" : "",
+            s->use_mask_phase_split ? "mphsplit" : "",
+            ring_buf,
+            s->use_staggered_iter_wait ? "stgw" : "",
+            schedb_buf,
+            smxil_buf,
+            s->use_q_reread ? "qrr" : "",
+            s->use_q_direct_reg ? "qdreg" : "",
             s->use_agpr_alloc_zero ? "agpr0" : "",
             s->use_fp8_mfma_qk ? "fp8mfma" : "",
             s->use_fp8_mfma_pv ? "fp8pv" : "",
             s->use_register_pv ? "regpv" : "",
             s->use_f32_denormal_flush ? "ftz" : "",
             s->use_fp_contract ? "fpc" : "",
+            s->use_reverse_q_block_order ? "rqb" : "",
+            s->use_k_lds_xor_swizzle ? "kswz" : "",
+            s->use_v_lds_xor_swizzle ? "vswz" : "",
+            s->use_softmax_scale_fold ? "smfold" : "",
+            s->use_lds_dma_overlap ? "dmaov" : "",
+            s->use_kv_block_id_prefetch ? "bidpf" : "",
         };
         size_t num_parts = sizeof(parts) / sizeof(parts[0]);
         return rocke_kernel_name_join(

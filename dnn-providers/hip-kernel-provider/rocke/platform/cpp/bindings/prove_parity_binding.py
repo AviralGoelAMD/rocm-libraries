@@ -1414,6 +1414,17 @@ def problems_gfx950_attention_tiled_2d():
         # ---- misc flag combinations ----
         p(64, 64, 32, 32, 64, 32, 1, 4096, use_sinks=True),
         p(512, 2, 64, 8, 64, 32, 512, 4096, use_sinks=True),  # combo + sinks
+        # ---- d128 bs16 GQA-4 paged prefill pipeline cohort (vdbuf + mph +
+        # rqb / kswz / vswz / dmaov / bidpf / smfold) ----
+        p(8192, 1, 32, 8, 128, 16, 8192, 8192),  # single-seq bf16
+        p(8192, 1, 32, 8, 128, 16, 8192, 8192, dtype="fp16"),  # single-seq fp16
+        p(2048, 1, 8, 1, 128, 16, 2048, 2048),  # single-seq GQA-8, 1 kv head
+        p(8192, 4, 32, 8, 128, 16, 2048, 2048),  # multi-seq bf16
+        p(8192, 4, 32, 8, 128, 16, 2048, 2048, dtype="fp16"),  # multi-seq fp16
+        p(8204, 7, 32, 8, 128, 16, 3000, 3000),  # ragged multi-seq
+        # exclusions: sliding window, block_size 32
+        p(8192, 1, 32, 8, 128, 16, 8192, 8192, sliding_window=256),
+        p(8192, 4, 32, 8, 128, 32, 2048, 2048),
     ]
 
 
@@ -1507,6 +1518,13 @@ def _selector_parity_row(problem_dict, arch):
                 "use_fp8_mfma_qk",
                 "use_f32_denormal_flush",
                 "use_fp_contract",
+                "use_mask_phase_split",
+                "use_reverse_q_block_order",
+                "use_k_lds_xor_swizzle",
+                "use_v_lds_xor_swizzle",
+                "use_lds_dma_overlap",
+                "use_kv_block_id_prefetch",
+                "use_softmax_scale_fold",
             }
         }
     except Exception as e:  # noqa: BLE001

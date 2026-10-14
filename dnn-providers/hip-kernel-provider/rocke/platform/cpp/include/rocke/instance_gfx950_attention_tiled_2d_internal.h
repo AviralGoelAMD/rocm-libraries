@@ -85,8 +85,11 @@ extern "C" {
  * (16 per-lane elems for the wide C dist) or HD=256 narrow (16 N-tiles * 2
  * atoms). 64 covers any buildable shape. */
 #define ROCKE_GFX950_ATTN2D_MAX_ACCS 64
-/* Online-softmax iter-args: 2*SOFTMAX_STATE_SLOTS (m,l per slot) + ACCS + cur_buf. */
-#define ROCKE_GFX950_ATTN2D_MAX_ITER_ARGS 96
+/* Online-softmax iter-args: 2*SOFTMAX_STATE_SLOTS (m,l per slot) + ACCS + cur_buf
+ * + 2 * kv_calls_per_tile block ids (use_kv_block_id_prefetch). */
+#define ROCKE_GFX950_ATTN2D_MAX_ITER_ARGS 256
+/* K/V async-DMA calls per tile: T*HD / (THREADS*8) <= 128*256/(64*8). */
+#define ROCKE_GFX950_ATTN2D_MAX_KV_CALLS 64
 /* Per-lane register slots (REGS_PER_LANE): 4 (M=16), 8 (M=32), 16 (32x32). */
 #define ROCKE_GFX950_ATTN2D_MAX_REGS_PER_LANE 16
 /* QK / PV K-iters (HD/QK_K_STEP or T/PV_K_STEP); HD<=256, T<=128 -> <=16. */
@@ -137,6 +140,14 @@ typedef struct rocke_gfx950_attn2d_build_ctx
      * modes 0/1 emit iglp_opt(mode); mutually exclusive with USE_SCHED_BARRIER. */
     bool USE_SOFTMAX_INTERLEAVE;
     int SOFTMAX_INTERLEAVE_MODE;
+    /* V double-buffer (V_lds[2]): V[i+1] is prefetched into the alternate slot
+     * during iteration i; PV reads V[i] from cur_buf. */
+    bool V_DOUBLE_BUF;
+    /* Pipeline levers (Python locals of the same names). */
+    bool K_LDS_SWZ, V_LDS_SWZ, LDS_DMA_OVERLAP, BLOCK_ID_PREFETCH, SOFTMAX_SCALE_FOLD;
+    int SWZ_CPR, SWZ_RPP_SHIFT, SWZ_HD_SHIFT;
+    const char* LDS_DMA_TAG; /* "dma" under LDS_DMA_OVERLAP, else NULL  */
+    const char* LDS_READ_TAG; /* "read" under LDS_DMA_OVERLAP, else NULL */
     /* fp8 K/V cache predicates */
     bool KV_FP8, FP8_MFMA_QK, FP8_MFMA_PV;
     bool REGISTER_PV, USE_MFMA_32X32, TRANSPOSED_QK_32X32;
@@ -300,6 +311,21 @@ typedef struct rocke_gfx950_attn2d_build_ctx
     rocke_value_t* max_seq_prefix_len_v;
     rocke_value_t* kv_step;
 
+    /* ---- paged block-id prefetch (use_kv_block_id_prefetch) ---- *
+     * Loop-invariant per-call coordinates (_dma_call_coords) and the carried
+     * block ids. pf_tile_cur / pf_tile_nxt are the tile-index SSA values whose
+     * loads take their soffset from pf ids (Python _prefetched_ids, keyed by
+     * value identity); NULL until the first loop iteration-start sets them. */
+    int kv_calls_per_tile;
+    rocke_value_t* dma_bwt[ROCKE_GFX950_ATTN2D_MAX_KV_CALLS];
+    rocke_value_t* k_dma_within[ROCKE_GFX950_ATTN2D_MAX_KV_CALLS];
+    rocke_value_t* v_dma_within[ROCKE_GFX950_ATTN2D_MAX_KV_CALLS];
+    rocke_value_t* bid_cur[ROCKE_GFX950_ATTN2D_MAX_KV_CALLS];
+    rocke_value_t* bid_nxt[ROCKE_GFX950_ATTN2D_MAX_KV_CALLS];
+    rocke_value_t* bid_new[ROCKE_GFX950_ATTN2D_MAX_KV_CALLS];
+    rocke_value_t* pf_tile_cur;
+    rocke_value_t* pf_tile_nxt;
+
     /* ---- online-softmax iter-args ---- *
      * The scf_for_iter carry: [m_0,l_0, ..., m_{S-1},l_{S-1}, acc_0..acc_{A-1},
      * cur_buf]. iter_args holds the initial carry. ACC indexing: acc lives at
@@ -445,6 +471,19 @@ rocke_value_t* rocke_gfx950_attn2d_read_k8_mfma_operand(rocke_gfx950_attn2d_buil
                                                         rocke_value_t* buf_idx,
                                                         rocke_value_t* k_row,
                                                         rocke_value_t* k_off);
+/* K / V LDS XOR swizzle: half-index XOR for an LDS row (_k_swz_halves /
+ * _v_swz_halves). */
+rocke_value_t* rocke_gfx950_attn2d_k_swz_halves(rocke_gfx950_attn2d_build_ctx_t* ctx,
+                                                rocke_value_t* row);
+rocke_value_t* rocke_gfx950_attn2d_v_swz_halves(rocke_gfx950_attn2d_build_ctx_t* ctx,
+                                                rocke_value_t* row);
+/* _kv_publish_sync: b.sync(), or sync_lds_only under use_lds_dma_overlap. */
+void rocke_gfx950_attn2d_kv_publish_sync(rocke_gfx950_attn2d_build_ctx_t* ctx);
+/* _load_block_ids: per-call physical block ids of tile_idx (kv_calls_per_tile
+ * values written to out_ids). Requires the preloop _dma_call_coords. */
+void rocke_gfx950_attn2d_load_block_ids(rocke_gfx950_attn2d_build_ctx_t* ctx,
+                                        rocke_value_t* tile_idx,
+                                        rocke_value_t** out_ids);
 
 /* ----- fp8 K/V cache loaders (lines 1798-2182) ----- */
 /* fp8 async-loader CTA-invariant scalars, emitted once in the preloop

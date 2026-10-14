@@ -628,6 +628,9 @@ void rocke_gfx950_attn2d_emit_preloop_prefetch(rocke_gfx950_attn2d_build_ctx_t* 
 
     /* Prefetch tile_start's K into buffer 0 BEFORE the loop (2384). */
     rocke_gfx950_attn2d_issue_k(ctx, ctx->tile_start, rocke_b_const_i32(B, 0));
+    /* V double-buffer: also prefetch tile_start's V into slot 0 (3213-3214). */
+    if(ctx->V_DOUBLE_BUF)
+        rocke_gfx950_attn2d_issue_v(ctx, ctx->tile_start, rocke_b_const_i32(B, 0));
 
     /* cur_buf_init = const_i32(0); iter_args.append(("cur_buf", cur_buf_init))
      * (2399-2400). */
@@ -636,6 +639,30 @@ void rocke_gfx950_attn2d_emit_preloop_prefetch(rocke_gfx950_attn2d_build_ctx_t* 
     ctx->iter_args_names[idx] = ctx->iter_args_name_buf[idx];
     ctx->iter_args[idx] = rocke_b_const_i32(B, 0);
     ctx->iter_args_count = idx + 1;
+
+    /* Paged block-id prefetch: carry the ids of tile i (bid_cur{c}) and tile
+     * i+1 (bid_nxt{c}); iteration i loads tile i+2's (3231-3239). */
+    if(ctx->BLOCK_ID_PREFETCH)
+    {
+        rocke_value_t* ids[ROCKE_GFX950_ATTN2D_MAX_KV_CALLS];
+        rocke_value_t* ts1_raw = rocke_b_add(B, ctx->tile_start, rocke_b_const_i32(B, 1));
+        rocke_value_t* ts1_ok = rocke_b_cmp_lt(B, ts1_raw, ctx->tile_end);
+        rocke_value_t* ts1 = rocke_b_select(B, ts1_ok, ts1_raw, ctx->tile_start);
+        for(int pass = 0; pass < 2; ++pass)
+        {
+            rocke_gfx950_attn2d_load_block_ids(ctx, pass == 0 ? ctx->tile_start : ts1, ids);
+            for(int c = 0; c < ctx->kv_calls_per_tile; ++c)
+            {
+                int j = ctx->iter_args_count++;
+                snprintf(ctx->iter_args_name_buf[j],
+                         sizeof(ctx->iter_args_name_buf[0]),
+                         pass == 0 ? "bid_cur%d" : "bid_nxt%d",
+                         c);
+                ctx->iter_args_names[j] = ctx->iter_args_name_buf[j];
+                ctx->iter_args[j] = ids[c];
+            }
+        }
+    }
 
     /* kv_step (2482) is emitted by the caller AFTER emit_licm_hoist to keep the
      * const in Python emission order; see rocke_gfx950_attn2d_emit_kv_step. */
