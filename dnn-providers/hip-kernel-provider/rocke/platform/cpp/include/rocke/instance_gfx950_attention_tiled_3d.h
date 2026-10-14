@@ -190,6 +190,10 @@ typedef struct rocke_unified_attention_3d_tiled_spec
      * kernel's use_i64_kv_addr. Default false => byte-identical small-cache
      * build. */
     bool use_i64_kv_addr; /* False */
+    /* f32 denormal flush (CodegenPolicy f32_denormal_mode=preserve-sign): the
+     * softmax exp2 lowers without the IEEE denormal fix-up. gfx950 only (the
+     * gfx942 builder rejects it). */
+    bool use_f32_denormal_flush; /* False */
 } rocke_unified_attention_3d_tiled_spec_t;
 
 rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_default(void);
@@ -205,6 +209,8 @@ typedef struct rocke_unified_attention_reduce_tiled_spec
 
     bool has_waves_per_eu; /* Optional[int] None */
     int waves_per_eu;
+    /* f32 denormal flush; the dispatcher sets it with the segment kernel's. */
+    bool use_f32_denormal_flush; /* False */
 } rocke_unified_attention_reduce_tiled_spec_t;
 
 rocke_unified_attention_reduce_tiled_spec_t rocke_unified_attention_reduce_tiled_spec_default(void);

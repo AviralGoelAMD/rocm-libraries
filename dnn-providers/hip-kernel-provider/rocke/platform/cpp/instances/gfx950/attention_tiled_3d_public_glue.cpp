@@ -201,6 +201,7 @@ rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_de
     s.use_invariant_hoist = false;
     s.use_wide_kv_load = false;
     s.use_i64_kv_addr = false;
+    s.use_f32_denormal_flush = false;
     return s;
 }
 
@@ -210,6 +211,7 @@ rocke_unified_attention_reduce_tiled_spec_t rocke_unified_attention_reduce_tiled
     memset(&s, 0, sizeof(s));
     s.has_waves_per_eu = false;
     s.waves_per_eu = 0;
+    s.use_f32_denormal_flush = false;
     return s;
 }
 
@@ -377,6 +379,10 @@ int rocke_gfx950_unified_attention_3d_tiled_spec_kernel_name(
     {
         parts[np++] = "qqb";
     }
+    if(s->use_f32_denormal_flush)
+    {
+        parts[np++] = "ftz";
+    }
 
     st = rocke_kernel_name_join("", parts, np, NULL, NULL, 0, buf, cap, &out_len);
     if(st != ROCKE_OK)
@@ -427,6 +433,10 @@ int rocke_gfx950_unified_attention_reduce_tiled_spec_kernel_name(
     parts[np++] = h_part;
     parts[np++] = seg_part;
     parts[np++] = (s->dtype != NULL) ? s->dtype : "";
+    if(s->use_f32_denormal_flush)
+    {
+        parts[np++] = "ftz";
+    }
 
     st = rocke_kernel_name_join("", parts, np, NULL, NULL, 0, buf, cap, &out_len);
     if(st != ROCKE_OK)
@@ -930,6 +940,11 @@ static rocke_kernel_def_t* build_segment_gfx950(rocke_ir_builder_t* b,
             {
                 rocke_attr_set_int(b, &b->kernel->attrs, "waves_per_eu", spec->waves_per_eu);
             }
+            /* Python: apply_codegen_policy(spec.codegen_policy). */
+            if(spec->use_f32_denormal_flush)
+            {
+                rocke_attr_set_str(b, &b->kernel->attrs, "f32_denormal_mode", "preserve-sign");
+            }
         }
 
         /* ---- phase functions in Python execution order ----
@@ -1023,6 +1038,11 @@ rocke_kernel_def_t* rocke_build_unified_attention_reduce_tiled_gfx950(
             if(spec->has_waves_per_eu)
             {
                 rocke_attr_set_int(b, &b->kernel->attrs, "waves_per_eu", spec->waves_per_eu);
+            }
+            /* Python: apply_codegen_policy(spec.codegen_policy). */
+            if(spec->use_f32_denormal_flush)
+            {
+                rocke_attr_set_str(b, &b->kernel->attrs, "f32_denormal_mode", "preserve-sign");
             }
         }
 

@@ -1590,6 +1590,8 @@ def _tiled_cache_key(problem: UnifiedAttentionProblem) -> Tuple:
         _enable_early_v_schedule(problem),
         _enable_register_pv(problem),
         _enable_i64_kv_addr(problem),
+        _enable_f32_denormal_flush(problem),
+        _enable_fp_contract(problem),
         _select_2d_compile_backend(problem),
         _enable_gfx942_fp16_flash(problem),
         _enable_gfx942_bf16_flash(problem),
@@ -2680,6 +2682,34 @@ def _enable_i64_kv_addr(problem: UnifiedAttentionProblem) -> bool:
     return cache_bytes > 0x8000_0000
 
 
+def _enable_f32_denormal_flush(problem: UnifiedAttentionProblem) -> bool:
+    """Flush f32 denormals in the gfx950 paged 2D and split-KV 3D kernels.
+
+    Sets ``use_f32_denormal_flush`` on the 2D spec, the 3D segment spec and the
+    3D reduce spec (``CodegenPolicy.f32_denormal_mode = preserve-sign``). The
+    softmax exp2 then lowers without the IEEE denormal range fix-up. Every
+    exp2 argument is a max-subtracted logit or a running-max delta (<= 0), so
+    only weights below the f32 normal range are flushed; they cannot move a sum
+    that contains the row maximum's unit term. gfx950 only: the other arches
+    have not been validated with the flag. The strided (non-paged) decode path
+    builds its own specs and keeps the flag off.
+    """
+    del problem  # arch-wide policy; the problem does not narrow it
+    return _resolve_attention_arch() == "gfx950"
+
+
+def _enable_fp_contract(problem: UnifiedAttentionProblem) -> bool:
+    """Allow FMA contraction in the gfx950 paged 2D kernel.
+
+    Sets ``use_fp_contract`` on the 2D spec (``CodegenPolicy.fp_contract``) so
+    the softmax scale and rescale ``fmul``/``fadd`` chains may fuse into FMA.
+    Rounding of a fused pair can differ from the unfused form by one ulp.
+    Not enabled on the 3D decode kernels, which are memory-bound.
+    """
+    del problem  # arch-wide policy; the problem does not narrow it
+    return _resolve_attention_arch() == "gfx950"
+
+
 # --- LDS-budget resolver ----------------------------------------------------
 # The 2D-tiled register-PV path stages the K/V tiles plus a small epilogue Acc_lds
 # buffer in LDS (Q, P^T and the running O accumulator are register-resident, so
@@ -3414,6 +3444,7 @@ def _tiled_3d_cache_key(problem: UnifiedAttentionProblem) -> Tuple:
         _enable_gfx942_3d_wide_kv_load(problem),
         _kv_storage_dtype(problem),
         _enable_i64_kv_addr(problem),
+        _enable_f32_denormal_flush(problem),
     )
     if _resolve_attention_arch() == "gfx1250":
         sp = _tiled_3d_spec_from_problem(problem)
@@ -4497,6 +4528,15 @@ def _get_3d_pipeline(
                 )
             else:
                 segment_spec = _tiled_3d_spec_from_problem(problem)
+                # The reduce kernel shares the segment kernel's f32 denormal
+                # policy; only the gfx950 reduce spec declares the field, and
+                # the predicate is gfx950-only, so the key is set value-
+                # conditionally.
+                reduce_policy = (
+                    {"use_f32_denormal_flush": True}
+                    if _enable_f32_denormal_flush(problem)
+                    else {}
+                )
                 reduce_spec = UnifiedAttentionReduceTiledSpec(
                     head_size=problem.head_size,
                     num_query_heads=problem.num_query_heads,
@@ -4504,6 +4544,7 @@ def _get_3d_pipeline(
                     dtype=problem.dtype,
                     num_segments=num_segments,
                     waves_per_eu=_select_3d_waves_per_eu(problem),
+                    **reduce_policy,
                 )
             seg_kernel = build_unified_attention_3d_tiled(segment_spec, arch=arch)
             red_kernel = build_unified_attention_reduce_tiled(reduce_spec, arch=arch)

@@ -34,6 +34,11 @@ from kernels.common._attention_strided_kv import (
     strided_kv_resource,
 )
 
+from rocke.core.codegen_policy import (
+    CodegenPolicy,
+    F32DenormalMode,
+    apply_codegen_policy,
+)
 from rocke.core.ir import (
     BF16,
     F16,
@@ -65,6 +70,13 @@ from rocke.helpers.transforms import TensorDescriptor, indirect, unmerge
 
 MFMA_M = 16
 MFMA_N = 16
+
+
+def _f32_flush_policy(flush: bool) -> CodegenPolicy:
+    """Codegen policy for the segment/reduce ``use_f32_denormal_flush`` knob."""
+    return CodegenPolicy(
+        f32_denormal_mode=F32DenormalMode.PRESERVE_SIGN if flush else None
+    )
 
 
 # CK-Tile C-accumulator warp distribution for the 16x16x16 MFMA atom. This
@@ -150,8 +162,18 @@ class UnifiedAttention3DTiledSpec:
     use_i64_kv_addr: bool = False
     # Direct non-paged [B,H,S,D] addressing; D remains contiguous.
     kv_layout: str = "paged"
+    # Flush f32 denormals (``CodegenPolicy.f32_denormal_mode=preserve-sign``):
+    # the softmax exp2 lowers without the IEEE denormal range fix-up. See
+    # ``UnifiedAttention2DTiledSpec.use_f32_denormal_flush``. Default OFF
+    # (golden-safe); the gfx950 dispatcher sets it (_enable_f32_denormal_flush).
+    use_f32_denormal_flush: bool = False
 
     def __post_init__(self):
+        if type(self.use_f32_denormal_flush) is not bool:
+            raise ValueError(
+                "use_f32_denormal_flush must be a bool "
+                f"(got {self.use_f32_denormal_flush!r})"
+            )
         if self.kv_layout not in ("paged", "strided"):
             raise ValueError("kv_layout must be 'paged' or 'strided'")
         if self.kv_layout == "strided" and (
@@ -193,6 +215,11 @@ class UnifiedAttention3DTiledSpec:
             return 32
         return max(1, int(math.ceil(math.log2(self.num_seqs + 1))))
 
+    @property
+    def codegen_policy(self) -> CodegenPolicy:
+        """Backend codegen policy selected by ``use_f32_denormal_flush``."""
+        return _f32_flush_policy(self.use_f32_denormal_flush)
+
     def kernel_name(self) -> str:
         from rocke.helpers.spec import kernel_name_join
 
@@ -210,6 +237,9 @@ class UnifiedAttention3DTiledSpec:
             "softcap" if self.has_softcap else "",
             "alibi" if self.use_alibi else "",
             "qqb" if self.use_qq_bias else "",
+            # The C++ twin appends "_stridedkv" after joining the other tags,
+            # so it stays the last tag.
+            "ftz" if self.use_f32_denormal_flush else "",
             "stridedkv" if self.kv_layout == "strided" else "",
         )
 
@@ -334,6 +364,7 @@ def build_unified_attention_3d_tiled(
     b.kernel.attrs["max_workgroup_size"] = THREADS
     if spec.waves_per_eu is not None:
         b.kernel.attrs["waves_per_eu"] = spec.waves_per_eu
+    apply_codegen_policy(b.kernel, spec.codegen_policy)
 
     # ---------------- parameter declarations ----------------
     # NOTE: the AITER 3D signature distinguishes between segm_* workspace
@@ -1072,10 +1103,25 @@ class UnifiedAttentionReduceTiledSpec:
     # AMDGPU occupancy hint (``"amdgpu-waves-per-eu"``). ``None`` keeps
     # the LLVM backend's heuristic.
     waves_per_eu: Optional[int] = None
+    # Same f32 denormal policy as the segment kernel (the cross-segment exp2
+    # rescale). Default OFF; the gfx950 dispatcher sets it with the segment's.
+    use_f32_denormal_flush: bool = False
+
+    def __post_init__(self):
+        if type(self.use_f32_denormal_flush) is not bool:
+            raise ValueError(
+                "use_f32_denormal_flush must be a bool "
+                f"(got {self.use_f32_denormal_flush!r})"
+            )
 
     @property
     def dtype_ir(self) -> Type:
         return F16 if self.dtype == "fp16" else BF16
+
+    @property
+    def codegen_policy(self) -> CodegenPolicy:
+        """Backend codegen policy selected by ``use_f32_denormal_flush``."""
+        return _f32_flush_policy(self.use_f32_denormal_flush)
 
     def kernel_name(self) -> str:
         from rocke.helpers.spec import kernel_name_join
@@ -1086,6 +1132,7 @@ class UnifiedAttentionReduceTiledSpec:
             f"h{self.num_query_heads}",
             f"seg{self.num_segments}",
             self.dtype,
+            "ftz" if self.use_f32_denormal_flush else "",
         )
 
 
@@ -1122,6 +1169,7 @@ def build_unified_attention_reduce_tiled(
     b.kernel.attrs["max_workgroup_size"] = THREADS
     if spec.waves_per_eu is not None:
         b.kernel.attrs["waves_per_eu"] = spec.waves_per_eu
+    apply_codegen_policy(b.kernel, spec.codegen_policy)
 
     out = b.param(
         "output_ptr", PtrType(dtype, "global"), noalias=True, writeonly=True, align=16

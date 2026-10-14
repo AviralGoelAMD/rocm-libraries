@@ -294,6 +294,13 @@ def make_explicit_attention_3d_specs(
     )
     if not ok:
         raise ValueError(f"unsupported explicit 3D attention config: {why}")
+    # The reduce kernel carries the segment kernel's f32 denormal policy (the
+    # field exists only on the gfx950 specs, so pass it only when set).
+    reduce_policy = (
+        {"use_f32_denormal_flush": True}
+        if knobs.get("use_f32_denormal_flush", False)
+        else {}
+    )
     reduce = reduce_type(
         head_size=problem.head_size,
         num_query_heads=problem.num_query_heads,
@@ -301,6 +308,7 @@ def make_explicit_attention_3d_specs(
         dtype=problem.dtype,
         num_segments=int(config.num_segments),
         waves_per_eu=config.waves_per_eu,
+        **reduce_policy,
     )
     return segment, reduce
 

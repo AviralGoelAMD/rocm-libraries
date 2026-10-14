@@ -111,7 +111,34 @@ _CONFIGS = {
         kv_storage_dtype=None,
         use_i64_kv_addr=True,
     ),
+    6: dict(
+        # f32 denormal flush on the dispatcher's gfx950 decode spec (GQA-4,
+        # 32 sequences); the reduce kernel inherits the flag.
+        head_size=128,
+        block_size=16,
+        num_query_heads=32,
+        num_kv_heads=8,
+        dtype="bf16",
+        num_segments=16,
+        num_seqs=32,
+        use_sinks=False,
+        sliding_window=0,
+        has_softcap=False,
+        use_f32_denormal_flush=True,
+    ),
 }
+
+
+def _reduce_spec(cfg: dict) -> UnifiedAttentionReduceTiledSpec:
+    """Reduce spec derived from the segment config (as the C twin does)."""
+    return UnifiedAttentionReduceTiledSpec(
+        head_size=cfg["head_size"],
+        num_query_heads=cfg["num_query_heads"],
+        num_kv_heads=cfg["num_kv_heads"],
+        dtype=cfg["dtype"],
+        num_segments=cfg["num_segments"],
+        use_f32_denormal_flush=cfg.get("use_f32_denormal_flush", False),
+    )
 
 
 def _emit(idx: int) -> str:
@@ -123,13 +150,7 @@ def _emit(idx: int) -> str:
     seg_kernel = build_unified_attention_3d_tiled(seg_spec, arch="gfx950")
     seg_ll = _native_lower(seg_kernel, arch="gfx950")
 
-    red_spec = UnifiedAttentionReduceTiledSpec(
-        head_size=cfg["head_size"],
-        num_query_heads=cfg["num_query_heads"],
-        num_kv_heads=cfg["num_kv_heads"],
-        dtype=cfg["dtype"],
-        num_segments=cfg["num_segments"],
-    )
+    red_spec = _reduce_spec(cfg)
     red_kernel = build_unified_attention_reduce_tiled(red_spec, arch="gfx950")
     red_ll = _native_lower(red_kernel, arch="gfx950")
 
@@ -150,13 +171,7 @@ def main() -> int:
             raise SystemExit(f"unknown config index {idx}")
         seg_spec = UnifiedAttention3DTiledSpec(**cfg)
         seg_kernel = build_unified_attention_3d_tiled(seg_spec, arch="gfx950")
-        red_spec = UnifiedAttentionReduceTiledSpec(
-            head_size=cfg["head_size"],
-            num_query_heads=cfg["num_query_heads"],
-            num_kv_heads=cfg["num_kv_heads"],
-            dtype=cfg["dtype"],
-            num_segments=cfg["num_segments"],
-        )
+        red_spec = _reduce_spec(cfg)
         red_kernel = build_unified_attention_reduce_tiled(red_spec, arch="gfx950")
         sys.stdout.write(serialize(seg_kernel))
         sys.stdout.write(serialize(red_kernel))
@@ -166,13 +181,7 @@ def main() -> int:
             raise SystemExit(f"unknown config index {idx}")
         seg_spec = UnifiedAttention3DTiledSpec(**cfg)
         seg_kernel = build_unified_attention_3d_tiled(seg_spec, arch="gfx950")
-        red_spec = UnifiedAttentionReduceTiledSpec(
-            head_size=cfg["head_size"],
-            num_query_heads=cfg["num_query_heads"],
-            num_kv_heads=cfg["num_kv_heads"],
-            dtype=cfg["dtype"],
-            num_segments=cfg["num_segments"],
-        )
+        red_spec = _reduce_spec(cfg)
         red_kernel = build_unified_attention_reduce_tiled(red_spec, arch="gfx950")
         sys.stdout.write("".join(str(d) + "\n" for d in verify(seg_kernel)))
         sys.stdout.write("".join(str(d) + "\n" for d in verify(red_kernel)))
