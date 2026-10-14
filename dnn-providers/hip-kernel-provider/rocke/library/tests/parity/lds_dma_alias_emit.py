@@ -101,7 +101,8 @@ def _build(spec, *, arch: str = "gfx950") -> KernelDef:
     read_tr = b.ds_read_tr16_b128 if wide_tr else b.ds_read_tr16_b64
     z0 = read_tr(b_lds, c0, row, col, dtype=BF16, lds_alias=read_tag(ring_b, 0))
     z1 = b.smem_load_vN(a_lds, c1, row, col, dtype=BF16, n=8, lds_alias=read_tag(ring_a, 1))
-    acc = b.fadd(acc, b.cast_to_f32(b.vec_extract(z0, 5)))
+    # b64 returns 4 lanes, b128 8: lane 5 only exists in the wide form.
+    acc = b.fadd(acc, b.cast_to_f32(b.vec_extract(z0, 5 if wide_tr else 1)))
     acc = b.fadd(acc, b.cast_to_f32(b.vec_extract(z1, 2)))
     b.global_store(dst, tid, acc, align=4)
     b.ret()

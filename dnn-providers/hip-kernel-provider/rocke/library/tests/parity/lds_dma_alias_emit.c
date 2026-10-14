@@ -139,7 +139,8 @@ static void build(rocke_ir_builder_t* b, const alias_config_t* c)
               ? rocke_b_ds_read_tr16_b128_alias(b, b_lds, idx0, 3, bf16, tag(&t, ring_b, rs0))
               : rocke_b_ds_read_tr16_b64_alias(b, b_lds, idx0, 3, bf16, tag(&t, ring_b, rs0));
     rocke_value_t* z1 = rocke_b_smem_load_vN_alias(b, a_lds, idx1, 3, bf16, 8, tag(&t, ring_a, rs1));
-    acc = rocke_b_fadd(b, acc, f32_lane(b, z0, 5));
+    /* b64 returns 4 lanes, b128 8: lane 5 only exists in the wide form. */
+    acc = rocke_b_fadd(b, acc, f32_lane(b, z0, c->wide_tr ? 5 : 1));
     acc = rocke_b_fadd(b, acc, f32_lane(b, z1, 2));
     rocke_b_global_store(b, dst, tid, acc, 4);
     rocke_b_ret(b);
