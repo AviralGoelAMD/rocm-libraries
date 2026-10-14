@@ -30,8 +30,8 @@ Three arch families are supported, each with its own hard-coded tile config:
 * **gfx942** — wave64, MFMA 16×16×16 atom (largest fp16/bf16 atom available):
       tile 64×64×64, warp 2×2, atom 16×16×16, pipeline ``mem``
 * **gfx950** — wave64, MFMA 32×32×16 atom:
-      tile 64×64×64, warp 2×2, atom 32×32×16, pipeline ``mem``; fwd moves
-      to a 128×128 tile on large problems (``_gfx950_fwd_big_tile``)
+      tile 64×64×64, warp 2×2, atom 32×32×16, pipeline ``mem``; fwd and dgrad
+      move to a 128×128 tile on large problems (``_gfx950_*_big_tile``)
 * **gfx1250** (wave32, WMMA) — WMMA 16×16×32 atom:
       tile 32×32×32, warp 2×2, atom 16×16×32, pipeline ``mem``
   (gfx1250 restricts WMMA conv to pipeline=``mem``, groups=1, no cshuffle
@@ -161,6 +161,8 @@ from kernels.common.conv_implicit_gemm_wgrad import (
 )
 from kernels.common.conv_implicit_gemm_dgrad import (
     DgradConvSpec,
+    compute_tilde,
+    enumerate_sub_gemms,
     is_valid_dgrad_spec as _dgrad_is_valid_spec,
 )
 from rocke.dispatch.core import (
@@ -198,7 +200,7 @@ _GFX950_WARP_N = 2
 _GFX950_WARP_TILE_MN = 32
 _GFX950_WARP_TILE_K = 16
 
-# gfx950 large-tile rule (fwd): same 2x2 warps and 32x32x16 atom, but a
+# gfx950 large-tile rule (fwd, dgrad): same 2x2 warps and 32x32x16 atom, but a
 # 128x128 CTA tile, i.e. 16 MFMA per wave per K tile instead of 4, so the
 # per-tile address/LDS work is amortised over four times the math. It needs a
 # grid that still fills the device at a quarter of the CTA count, a long enough
@@ -206,9 +208,12 @@ _GFX950_WARP_TILE_K = 16
 # columns (a 64-wide channel axis would leave half of every tile idle). Fit on
 # a cold A/B over ResNet-50 / SD-UNet / 3-D shapes and checked on held-out ones.
 _GFX950_BIG_TILE_MN = 128
-_GFX950_BIG_TILE_MIN_KRED = 1024  # reduction length Y*X*C (per group)
+_GFX950_BIG_TILE_MIN_KRED = 1024  # MAC-weighted reduction length per output
 # fwd: output tiles at the default 64x64 geometry.
 _GFX950_FWD_BIG_TILE_MIN_TILES = 1536
+# dgrad: CTAs at the 128x128 geometry, over the GEMM sub-problems only (the
+# zero-fill records carry no reduction work).
+_GFX950_DGRAD_BIG_TILE_MIN_CTAS = 768
 
 
 def _gfx950_fwd_big_tile(p: "ConvProblem") -> bool:
@@ -222,6 +227,29 @@ def _gfx950_fwd_big_tile(p: "ConvProblem") -> bool:
         and tiles >= _GFX950_FWD_BIG_TILE_MIN_TILES
         and k_red >= _GFX950_BIG_TILE_MIN_KRED
     )
+
+
+def _gfx950_dgrad_big_tile(p: "ConvProblem") -> bool:
+    """Whether the gfx950 dgrad candidate takes the 128x128 tile for ``p``.
+
+    The tilde decomposition splits a strided problem into sub-GEMMs with
+    different reductions, so both the CTA count and the reduction length are
+    taken over the GEMM records the 128x128 kernel would launch.
+    """
+    if p.groups != 1 or p.is_3d or p.cpg < _GFX950_BIG_TILE_MN:
+        return False
+    tile = _GFX950_BIG_TILE_MN
+    gemms = [
+        g
+        for g in enumerate_sub_gemms(p, compute_tilde(p), tile, tile)
+        if not g.is_zero_fill
+    ]
+    m_total = sum(g.gemm_m for g in gemms)
+    if not m_total:
+        return False
+    ctas = sum(-(-g.gemm_m // tile) * -(-p.cpg // tile) for g in gemms)
+    k_red = sum(g.gemm_m * g.gemm_k for g in gemms) / m_total
+    return ctas >= _GFX950_DGRAD_BIG_TILE_MIN_CTAS and k_red >= _GFX950_BIG_TILE_MIN_KRED
 
 
 def _gfx950_tile(big: bool) -> Tuple[int, int, int, int, int, int, int]:
@@ -1669,15 +1697,7 @@ def _make_gfx950_dgrad_candidate() -> KernelCandidate:
     algorithm = "implicit_gemm_dgrad"
 
     def _tile(req: ConvGroupedRequest):
-        return (
-            _GFX950_TILE_M,
-            _GFX950_TILE_N,
-            _GFX950_TILE_K,
-            _GFX950_WARP_M,
-            _GFX950_WARP_N,
-            _GFX950_WARP_TILE_MN,
-            _GFX950_WARP_TILE_K,
-        )
+        return _gfx950_tile(_gfx950_dgrad_big_tile(_problem(req)))
 
     def _build_instance_spec(req: ConvGroupedRequest) -> DgradConvSpec:
         tm, tn, tk, wm, wn, wtmn, wtk = _tile(req)
