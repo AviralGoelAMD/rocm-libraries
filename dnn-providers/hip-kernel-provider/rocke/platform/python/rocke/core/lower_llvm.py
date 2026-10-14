@@ -800,6 +800,12 @@ _INTRINSIC_DECLS: Dict[str, str] = {
     "amdgcn.cvt.scalef32.pk.f32.bf8": (
         "declare <2 x float> @llvm.amdgcn.cvt.scalef32.pk.f32.bf8(i32, float, i1)"
     ),
+    "amdgcn.cvt.scalef32.pk.bf16.fp8": (
+        "declare <2 x bfloat> @llvm.amdgcn.cvt.scalef32.pk.bf16.fp8(i32, float, i1)"
+    ),
+    "amdgcn.cvt.scalef32.pk.f16.fp8": (
+        "declare <2 x half> @llvm.amdgcn.cvt.scalef32.pk.f16.fp8(i32, float, i1)"
+    ),
     # gfx950 ``ds_swizzle_b32`` — single-instruction intra-32-lane
     # permute. We use it for the softmax XOR-butterfly reduction; the
     # FFT-mode offset is encoded as an immediate and the LDS unit
@@ -1599,6 +1605,8 @@ class _Lowerer:
         self._needs_av_scope_md: bool = False
         # ``!5 = !{i32 1}`` referenced by ``!nontemporal`` loads/stores.
         self._needs_nontemporal_md: bool = False
+        # ``!4 .. !9`` alias-scope nodes (see ``_lds_scope_md``).
+        self._needs_lds_scope_md: bool = False
         # Off unless the kernel was built with source-location capture (see
         # IRBuilder's ``capture_loc`` / ROCKE_DEBUG_LOC). When off, not one byte
         # of the emitted .ll changes, so the byte-identity gate and the IR
@@ -2608,6 +2616,43 @@ class _Lowerer:
             f"<4 x i32> <i32 0, i32 1, i32 2, i32 3>"
         )
 
+    def _op_arith_cvt_scalef32_pk_fp8x8_to(self, op: Op) -> None:
+        """Lower <8 x fp8e4m3> + f32 scale -> <8 x bf16|f16>: four gfx950
+        ``v_cvt_scalef32_pk_{bf16,f16}_fp8`` (2 elements each), one per
+        16-bit half of the two packed words."""
+        v, scale = op.operands
+        is_bf16 = op.attrs["dtype"] == "bf16"
+        key = "bf16" if is_bf16 else "f16"
+        ety = "bfloat" if is_bf16 else "half"
+        self._need(f"amdgcn.cvt.scalef32.pk.{key}.fp8")
+        base = op.result.name
+        words = f"{base}w"
+        self._current().emit(f"  {words} = bitcast <8 x i8> {self._operand(v)} to <2 x i32>")
+        parts = []
+        for w in range(2):
+            word = f"{base}w{w}"
+            self._current().emit(f"  {word} = extractelement <2 x i32> {words}, i32 {w}")
+            for hi in ("false", "true"):
+                part = f"{base}p{len(parts)}"
+                self._current().emit(
+                    f"  {part} = call <2 x {ety}> @llvm.amdgcn.cvt.scalef32.pk.{key}.fp8("
+                    f"i32 {word}, float {self._operand(scale)}, i1 {hi})"
+                )
+                parts.append(part)
+        lo4, hi4 = f"{base}lo", f"{base}hi"
+        self._current().emit(
+            f"  {lo4} = shufflevector <2 x {ety}> {parts[0]}, <2 x {ety}> {parts[1]}, "
+            f"<4 x i32> <i32 0, i32 1, i32 2, i32 3>"
+        )
+        self._current().emit(
+            f"  {hi4} = shufflevector <2 x {ety}> {parts[2]}, <2 x {ety}> {parts[3]}, "
+            f"<4 x i32> <i32 0, i32 1, i32 2, i32 3>"
+        )
+        self._current().emit(
+            f"  {base} = shufflevector <4 x {ety}> {lo4}, <4 x {ety}> {hi4}, "
+            f"<8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>"
+        )
+
     def _op_arith_cvt_scalef32_pk_f32_bf8(self, op: Op) -> None:
         """e5m2 sibling of :meth:`_op_arith_cvt_scalef32_pk_f32_fp8`."""
         v, scale = op.operands
@@ -3045,8 +3090,13 @@ class _Lowerer:
             f"  {gep} = getelementptr inbounds {elem_ty}, ptr addrspace(1) "
             f"{self._operand(ptr)}, i32 {self._operand(idx)}"
         )
+        md = ""
+        if op.attrs.get("invariant"):
+            # Shares the empty ``!1 = !{}`` node with the FP-atomic metadata.
+            self._needs_fp_atomic_md = True
+            md = ", !invariant.load !1"
         self._current().emit(
-            f"  {op.result.name} = load {elem_ty}, ptr addrspace(1) {gep}, align {align}"
+            f"  {op.result.name} = load {elem_ty}, ptr addrspace(1) {gep}, align {align}{md}"
         )
 
     def _op_memref_global_store(self, op: Op) -> None:
@@ -3258,6 +3308,22 @@ class _Lowerer:
         self._needs_nontemporal_md = True
         return ", !nontemporal !5"
 
+    def _lds_scope_md(self, dma: bool) -> str:
+        """Alias-scope tags that separate async global->LDS DMAs from LDS
+        loads/stores, for kernels built with ``lds_dma_alias_scopes``.
+
+        Without scope info the backend's waitcnt pass must assume any LDS
+        access may alias any in-flight LDS DMA and inserts ``vmcnt(0)``
+        before it, which drains a prefetched tile before the current one is
+        read. With the tags it only waits for DMAs whose scope may alias the
+        access, i.e. none: the kernel orders DMA-written data with explicit
+        ``s_waitcnt`` (the attribute is that promise). Empty otherwise.
+        """
+        if not self.kernel.attrs.get("lds_dma_alias_scopes"):
+            return ""
+        self._needs_lds_scope_md = True
+        return ", !alias.scope !9, !noalias !4" if dma else ", !alias.scope !4, !noalias !9"
+
     def _op_tile_smem_store(self, op: Op) -> None:
         smem = op.operands[0]
         indices = op.operands[1:-1]
@@ -3357,7 +3423,7 @@ class _Lowerer:
         align = int(op.attrs.get("align", vec * elem_bytes))
         self._current().emit(
             f"  store <{vec} x {elem_ty}> {self._operand(value)}, ptr addrspace(3) {gep}, "
-            f"align {align}"
+            f"align {align}{self._lds_scope_md(False)}"
         )
 
     def _op_tile_smem_load_v4(self, op: Op) -> None:
@@ -3465,7 +3531,7 @@ class _Lowerer:
         else:
             self._current().emit(
                 f"  {op.result.name} = load {volatile}<{vec} x {elem_ty}>, ptr addrspace(3) {base}, "
-                f"align {align}"
+                f"align {align}{self._lds_scope_md(False)}"
             )
 
     def _op_tile_wmma_f32_16x16x16_f16(self, op: Op) -> None:
@@ -4533,7 +4599,7 @@ class _Lowerer:
         raw = self._fresh("tr.raw")
         self._current().emit(
             f"  {raw} = call <4 x i16> @llvm.amdgcn.ds.read.tr16.b64("
-            f"ptr addrspace(3) {base})"
+            f"ptr addrspace(3) {base}){self._lds_scope_md(False)}"
         )
         elem_ty = _llvm_type(op.result.type.elem)  # type: ignore[attr-defined]
         self._current().emit(
@@ -4794,7 +4860,7 @@ class _Lowerer:
             f"i32 {size_bytes}, "
             f"i32 {self._operand(voff)}, "
             f"i32 {self._operand(soff)}, "
-            f"i32 0, i32 {aux})"
+            f"i32 0, i32 {aux}){self._lds_scope_md(True)}"
         )
 
     def _op_tile_s_wait_asynccnt(self, op: Op) -> None:
@@ -6613,6 +6679,13 @@ class _Lowerer:
             out.append("")
         if self._needs_nontemporal_md:
             out.append("!5 = !{i32 1}")
+            out.append("")
+        if self._needs_lds_scope_md:
+            out.append('!6 = distinct !{!6, !"rocke.lds"}')
+            out.append('!7 = distinct !{!7, !6, !"rocke.lds.dma"}')
+            out.append('!8 = distinct !{!8, !6, !"rocke.lds.access"}')
+            out.append("!9 = !{!7}")
+            out.append("!4 = !{!8}")
             out.append("")
         if self._debug is not None:
             out.extend(self._debug.render())
