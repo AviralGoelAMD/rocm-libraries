@@ -258,13 +258,22 @@ def make_explicit_attention_3d_specs(
         raise ValueError(f"waves_per_eu must be one of {WAVES_PER_EU}")
 
     tile = resolve_tile_policy(problem.block_size, config.tile_policy)
-    if arch == "gfx950" and tile != int(problem.block_size):
-        raise ValueError("gfx950 3D implements only tile_size == block_size")
-    if arch == "gfx942" and tile not in (
+    tile_fields: dict[str, object] = {}
+    if arch == "gfx950":
+        # The gfx950 segment kernel tiles whole pages: T = block_size * kv_tile_mult.
+        if tile % int(problem.block_size):
+            raise ValueError("gfx950 3D tiles must be a whole number of pages")
+        if tile != int(problem.block_size):
+            tile_fields["kv_tile_mult"] = tile // int(problem.block_size)
+    elif tile not in (
         int(problem.block_size),
         max(1, int(problem.block_size) // 2),
     ):
         raise ValueError("gfx942 3D implements only full- or half-block tiles")
+    else:
+        tile_fields["tile_size_override"] = (
+            None if tile == int(problem.block_size) else int(tile)
+        )
 
     spec_type, reduce_type, _, _, supports = _tiled_3d_impl(arch)
     knobs = _checked_knobs(config.knob_dict())
@@ -281,7 +290,7 @@ def make_explicit_attention_3d_specs(
         **_semantic_fields(problem),
         num_segments=int(config.num_segments),
         waves_per_eu=config.waves_per_eu,
-        tile_size_override=(None if tile == int(problem.block_size) else int(tile)),
+        **tile_fields,
         **knobs,
     )
     ok, why = supports(

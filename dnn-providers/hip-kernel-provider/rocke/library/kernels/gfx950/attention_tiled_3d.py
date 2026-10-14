@@ -175,6 +175,11 @@ class UnifiedAttention3DTiledSpec:
     # dropped. The launcher must size grid x to ``num_seqs`` when this is
     # set.
     decode_fast_path: bool = False
+    # KV tile = ``kv_tile_mult`` paged blocks (T = block_size * kv_tile_mult).
+    # Each async DMA call stays inside one page (the call's tokens never
+    # straddle a page boundary), and the page is looked up per call, so a
+    # tile may span several non-contiguous pages. 1 keeps T == block_size.
+    kv_tile_mult: int = 1
 
     def __post_init__(self):
         if type(self.use_f32_denormal_flush) is not bool:
@@ -196,6 +201,15 @@ class UnifiedAttention3DTiledSpec:
             raise ValueError(
                 f"kv_storage_dtype must be None or 'fp8e4m3' (got {self.kv_storage_dtype!r})"
             )
+        if self.kv_tile_mult not in (1, 2, 4, 8):
+            raise ValueError(f"kv_tile_mult must be 1, 2, 4 or 8 (got {self.kv_tile_mult})")
+        if self.kv_tile_mult > 1 and (
+            (self.block_size * self.head_size) % 512 != 0
+            or self.block_size * self.kv_tile_mult > 128
+        ):
+            raise ValueError(
+                "kv_tile_mult needs block_size*head_size % 512 == 0 and a tile <= 128"
+            )
 
     @property
     def num_queries_per_kv(self) -> int:
@@ -211,7 +225,7 @@ class UnifiedAttention3DTiledSpec:
 
     @property
     def tile_size(self) -> int:
-        return self.block_size
+        return self.block_size * self.kv_tile_mult
 
     @property
     def dtype_ir(self) -> Type:
@@ -250,6 +264,7 @@ class UnifiedAttention3DTiledSpec:
             "ftz" if self.use_f32_denormal_flush else "",
             "stridedkv" if self.kv_layout == "strided" else "",
             "dec" if self.decode_fast_path else "",
+            f"t{self.tile_size}" if self.kv_tile_mult > 1 else "",
         )
 
 
@@ -681,20 +696,51 @@ def build_unified_attention_3d_tiled(
     # half offset, plus the byte-stride 4D base. One ``.offset()`` call
     # produces the final byte address for one async DMA call.
     seq_base = b.mul(seq_idx, bt_stride_p) if spec.kv_layout == "paged" else None
+    # The descriptor addresses ONE page (``BS`` tokens); a tile of
+    # ``kv_tile_mult`` pages resolves each call's page through
+    # ``_paged_coords`` below (T == BS when kv_tile_mult == 1).
     paged_kv_desc = TensorDescriptor.naive(
         "paged_kv_bytes",
-        lengths=[1 << 24, T, NUM_KV, HD],
+        lengths=[1 << 24, BS, NUM_KV, HD],
         strides=[kv_stride_blk_b, kv_stride_tok_b, kv_stride_h_b, KV_BYTES],
         coord_names=("physical_block", "token", "kv_head", "dim"),
     ).transform(
         indirect("tile_idx", into="physical_block", table=block_tables, base=seq_base),
-        unmerge("linear_half", into=("token", "dim"), dims=(T, HD)),
+        unmerge("linear_half", into=("token", "dim"), dims=(BS, HD)),
     )
 
-    def _kv_offset(src, kv_tile_idx, linear_half):
-        """(buffer resource or None, voffset) of one paged K/V access."""
+    TILE_MULT = spec.kv_tile_mult if spec.kv_layout == "paged" else 1
+    PAGE_HALVES = BS * HD
+    if TILE_MULT > 1:
+        # Clamp page lookups of the (masked) tail tile to the sequence's last
+        # valid page so the block-table read never leaves the sequence's row.
+        last_page = b.sub(
+            b.div(b.add(seq_len, b.const_i32(BS - 1)), b.const_i32(BS)),
+            b.const_i32(1),
+        )
+
+    def _paged_coords(kv_tile_idx: Value, first_half: int, lane_half: Value):
+        """(block-table index, within-page half offset) of one DMA call.
+
+        ``first_half`` is the call's tile-relative half offset; a call never
+        straddles a page (``PAGE_HALVES % KV_HALVES_PER_CALL == 0``).
+        """
+        if TILE_MULT == 1:
+            return kv_tile_idx, b.add(b.const_i32(first_half), lane_half)
+        page = b.add(
+            b.mul(kv_tile_idx, b.const_i32(TILE_MULT)),
+            b.const_i32(first_half // PAGE_HALVES),
+        )
+        page = b.select(b.cmp_lt(page, last_page), page, last_page)
+        return page, b.add(b.const_i32(first_half % PAGE_HALVES), lane_half)
+
+    def _kv_offset(src, page_idx, linear_half):
+        """(buffer resource or None, voffset) of one paged K/V access.
+
+        ``linear_half`` is page-relative (``_paged_coords``).
+        """
         desc = paged_kv_desc
-        coords = dict(tile_idx=kv_tile_idx, linear_half=linear_half, kv_head=kv_head_idx)
+        coords = dict(tile_idx=page_idx, linear_half=linear_half, kv_head=kv_head_idx)
         if I64_KV_ADDR:
             base_i64, voff, _ = desc.offset_i64_split(b, "physical_block", **coords)
             return b.buffer_rsrc(b.global_ptr_add(src, base_i64), kv_block_bytes_c), voff
@@ -711,12 +757,13 @@ def build_unified_attention_3d_tiled(
         buf_off_i64 = b.zext(buf_off_i32, I64)
         buf_base = b.smem_ptr_add(lds_addr, buf_off_i64)
         for call in range(kv_calls_per_tile):
-            linear_half = b.add(b.const_i32(call * KV_HALVES_PER_CALL), lane_half_base)
+            first_half = call * KV_HALVES_PER_CALL
+            page_idx, linear_half = _paged_coords(kv_tile_idx, first_half, lane_half_base)
             call_rsrc = rsrc
             if spec.kv_layout == "strided":
                 voff = strided_kv_offset(b, strides, kv_tile_idx, linear_half, seq_len, HD, T)
             else:
-                own_rsrc, voff = _kv_offset(src, kv_tile_idx, linear_half)
+                own_rsrc, voff = _kv_offset(src, page_idx, linear_half)
                 if own_rsrc is not None:
                     call_rsrc = own_rsrc
             dst = b.smem_ptr_add(buf_base, b.const_i64(call * bytes_per_call))
@@ -789,8 +836,15 @@ def build_unified_attention_3d_tiled(
         src = key if lds_token == "K" else value
         row, col = _fp8_chunk_coords(call)
         linear_half_first = b.add(b.mul(row, b.const_i32(HD)), col)
+        page_idx = kv_tile_idx
+        first_half = call * THREADS * fp8_elems_per_chunk
+        if TILE_MULT > 1:
+            # chunk_id * 8 == call * 512 + tid * 8: one page per call.
+            page_idx, linear_half_first = _paged_coords(
+                kv_tile_idx, first_half, lane_half_base
+            )
         desc = paged_kv_desc
-        coords = dict(tile_idx=kv_tile_idx, linear_half=linear_half_first, kv_head=kv_head_idx)
+        coords = dict(tile_idx=page_idx, linear_half=linear_half_first, kv_head=kv_head_idx)
         if I64_KV_ADDR:
             # Flat per-lane global load: full i64 byte/element offset so
             # the per-thread physical_block * stride cannot overflow the
@@ -992,7 +1046,7 @@ def build_unified_attention_3d_tiled(
             b.sync()
 
         # Keys >= seq_len in the sequence's last tile hold whatever the cache
-        # has in the page slack. Their P is 0, but
+        # has in the page slack (or a clamped page). Their P is 0, but
         # 0 * NaN = NaN inside the PV MFMA, so zero those V rows in LDS before
         # PV. Uniform branch, taken only on the tile that crosses seq_len.
         with b.scf_if(b.cmp_gt(b.add(tile_off, b.const_i32(T)), seq_len)):

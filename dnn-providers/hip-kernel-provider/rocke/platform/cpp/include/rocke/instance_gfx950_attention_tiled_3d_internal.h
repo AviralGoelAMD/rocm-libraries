@@ -173,6 +173,8 @@ typedef struct rocke_gfx950_attn_tiled_3d_config
 
     /* ---- decode-path knobs (spec fields of the same lower-case name) ---- */
     bool DECODE_FAST_PATH; /* spec.decode_fast_path                 */
+    int TILE_MULT; /* kv_tile_mult if paged else 1 (build entry) */
+    int PAGE_HALVES; /* BS * HD                               */
 
     const rocke_type_t* dtype; /* F16 / BF16                                 */
     const rocke_type_t* kv_io_dtype; /* FP8E4M3 if KV_FP8 else dtype               */
@@ -305,6 +307,8 @@ typedef struct rocke_gfx950_attention_tiled_3d_build_ctx
     rocke_value_t* K_lds; /* [2, T, HD]                                */
     rocke_value_t* V_lds; /* [2, T, HD]                                */
     rocke_value_t* P_lds; /* [BLOCK_M, T]                              */
+    /* ---------- multi-page tiles ---------- */
+    rocke_value_t* last_page; /* last valid page of the sequence (clamp)    */
 
     /* ---------- async DMA infra (lines 565-585) ---------- */
     rocke_value_t* big_bytes; /* const_i32(0x7FFF0000)                     */

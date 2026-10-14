@@ -106,6 +106,7 @@ _GEOMETRY_FIELDS = frozenset(
         "waves_per_eu",
         "num_segments",
         "tile_size_override",
+        "kv_tile_mult",
     }
 )
 

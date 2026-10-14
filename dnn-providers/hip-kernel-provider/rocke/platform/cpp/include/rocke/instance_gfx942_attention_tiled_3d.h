@@ -166,6 +166,7 @@ typedef struct rocke_unified_attention_3d_tiled_spec
     /* gfx950 decode-path knobs (see the gfx950 header). The gfx942 builder
      * ignores them. Kept byte-identical with the gfx950 header. */
     bool decode_fast_path; /* False */
+    int kv_tile_mult; /* 1 */
 } rocke_unified_attention_3d_tiled_spec_t;
 
 /* Materialise every defaulted field. Required fields are zero/NULL-init; the
