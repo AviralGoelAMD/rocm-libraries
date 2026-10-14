@@ -332,6 +332,8 @@ def _reference_gfx950_generic(problem):
     )
     if _kau._d256_gfx950_fast(problem):
         spec = replace(spec, **_kau._d256_gfx950_spec_overrides())
+    if _kau._gfx950_prefill_pipeline(problem):
+        spec = replace(spec, **_kau._gfx950_prefill_pipeline_overrides())
     return spec
 
 

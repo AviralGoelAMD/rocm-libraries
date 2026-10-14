@@ -789,6 +789,54 @@ def _d256_gfx950_spec_overrides() -> dict:
     )
 
 
+def _gfx950_prefill_pipeline(problem: "UnifiedAttentionProblem") -> bool:
+    """gfx950 single-seq causal prefill on the pipelined transposed-32x32 stack.
+
+    The cohort of ``_enable_single_batch_combo`` without sliding window or
+    ALiBi / QQ-bias, paged ``block_size == 16``, LLVM-direct backend (the
+    scoped-noalias LDS metadata the stack relies on is LLVM-IR only, and the
+    heaviest-first block order measured slower under hipcc). Head sizes are
+    the measured ones. The knob constellation is
+    ``_gfx950_prefill_pipeline_overrides``; the tile is 64 tokens
+    (``_select_2d_tile_size``).
+    """
+    return (
+        _enable_single_batch_combo(problem)
+        and problem.sliding_window == 0
+        and not problem.use_alibi
+        and not problem.use_qq_bias
+        and problem.block_size == 16
+        and problem.head_size == 128
+        and _select_2d_compile_backend(problem) == "llvm"
+    )
+
+
+def _gfx950_prefill_pipeline_overrides() -> dict:
+    """Single source of truth for the gfx950 pipelined prefill knob stack.
+
+    Conflict-free (XOR-swizzled) K/V LDS, heaviest-first Q-block order, V
+    double buffer with the next-tile K/V DMA kept in flight across the
+    publish barrier (alias-scoped LDS), block ids prefetched a tile ahead, the
+    causal mask peeled to the boundary tiles, and the folded-scale softmax.
+    Applied by ``_spec_gfx950_generic`` on top of the combo geometry.
+    """
+    return dict(
+        use_k_lds_xor_swizzle=True,
+        use_v_lds_xor_swizzle=True,
+        use_kq_lds_pad=False,
+        use_reverse_q_block_order=True,
+        use_v_double_buffer=True,
+        use_staggered_iter_wait=False,
+        use_early_v_schedule=False,
+        use_k_single_buffer=False,
+        use_fast_paged_kv_desc=False,
+        use_lds_dma_overlap=True,
+        use_mask_phase_split=True,
+        use_kv_block_id_prefetch=True,
+        use_softmax_scale_fold=True,
+    )
+
+
 def _enable_softmax_mfma_interleave(problem: UnifiedAttentionProblem) -> bool:
     """gfx950 single-batch d128 prefill: interleave the softmax VALU into the
     MFMA window via ``iglp_opt(1)`` and widen to num_warps=4.
@@ -1111,6 +1159,10 @@ def _select_2d_tile_size(problem: UnifiedAttentionProblem) -> int:
     #   * d64  -> T = 128 (8 * block_size). Paired with num_warps=4 the wider
     #     tile feeds the d64 KV loop and was the winner for both MHA and
     #     GQA-8 d64 S2048 (1.19-2.68x over prod).
+    if _gfx950_prefill_pipeline(problem):
+        # The pipelined single-seq prefill stack (see
+        # ``_gfx950_prefill_pipeline``) is tuned at a 64-token tile.
+        return 64
     if _enable_single_batch_combo(problem):
         if problem.head_size == 64:
             # fast_paged_kv_desc (needs T=64) is a ~1.3-1.4x win for the bf16
@@ -1488,6 +1540,8 @@ def _tiled_cache_key(problem: UnifiedAttentionProblem) -> Tuple:
         # deliberately lives ABOVE the autotuner-regenerable `_enable_*` helpers
         # below; keying on the predicate (not the flags) keeps that layering.
         _d256_gfx950_fast(problem),
+        # Same layering for the gfx950 pipelined prefill override.
+        _gfx950_prefill_pipeline(problem),
         # Selects the distinct natural-QK 4-warp GQA builder (build_gfx942_4warp_gqa)
         # in `_get_2d_launcher`; keyed so its HSACO never shares a cache slot with
         # the default gfx942 builder for the same geometry.

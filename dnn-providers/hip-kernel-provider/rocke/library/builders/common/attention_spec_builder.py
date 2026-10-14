@@ -317,6 +317,11 @@ def _spec_gfx950_generic(problem: UnifiedAttentionProblem):
         # softmax<->MFMA-interleave codegen constellation on top of the gated
         # geometry above. Kept behind ``_kau.`` for test-steering (see docstring).
         _spec = replace(_spec, **_kau._d256_gfx950_spec_overrides())
+    if _kau._gfx950_prefill_pipeline(problem):
+        # gfx950 pipelined single-seq prefill stack (single source of truth:
+        # ``_gfx950_prefill_pipeline_overrides``); the 64-token tile comes from
+        # ``_select_2d_tile_size``.
+        _spec = replace(_spec, **_kau._gfx950_prefill_pipeline_overrides())
     return _spec
 
 
