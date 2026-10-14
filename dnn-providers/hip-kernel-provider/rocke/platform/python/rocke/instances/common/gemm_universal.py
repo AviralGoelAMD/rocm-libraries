@@ -1365,9 +1365,19 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
         # to LDS. Single workgroup writes share the LDS base.
         _dtl_pass_bytes = spec.block_size * _DTL_BYTES_PER_LANE
 
+        # The DTL voffset is i32 and the resource bound (num_records) is
+        # 0x7FFF0000, so fold the batch and tile-row origin into a 64-bit
+        # resource base; only the in-tile offset stays 32-bit.
         _dtl_big_bytes = b.const_i32(0x7FFF0000)
-        _dtl_a_rsrc = b.buffer_rsrc(A, _dtl_big_bytes)
-        _dtl_b_rsrc = b.buffer_rsrc(Bp, _dtl_big_bytes)
+
+        def _dtl_tile_rsrc(ptr: Value, batch_off: Value, row_off: Value) -> Value:
+            k64 = b.zext(K, _I64)
+            elems = b.add(b.zext(batch_off, _I64), b.mul(b.zext(row_off, _I64), k64))
+            base = b.global_ptr_add(ptr, b.mul(elems, b.const_i64(2)))
+            return b.buffer_rsrc(base, _dtl_big_bytes)
+
+        _dtl_a_rsrc = _dtl_tile_rsrc(A, batch_off_a, block_m_off)
+        _dtl_b_rsrc = _dtl_tile_rsrc(Bp, batch_off_b, block_n_off)
         _dtl_a_lds_base = b.smem_addr_of(A_smem)
         _dtl_b_lds_base = b.smem_addr_of(B_smem)
         _dtl_zero_soff = b.const_i32(0)
@@ -1463,11 +1473,8 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                 # the swizzled ds_read (col_base^f(row)) fetches it back (XOR is
                 # its own inverse) -- the LDS dest stays wave-contiguous.
                 off_elems = b.add(
-                    batch_off_a,
-                    b.add(
-                        b.mul(b.add(block_m_off, _a_src_row(row)), K),
-                        b.add(k_off, _swz_col(col, row)),
-                    ),
+                    b.mul(_a_src_row(row), K),
+                    b.add(k_off, _swz_col(col, row)),
                 )
                 off_bytes = b.mul(off_elems, c2)
                 b.async_buffer_load_lds_addr(
@@ -1493,11 +1500,8 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                 col_v = b.mod(chunk_idx, _dtl_c_chunks_per_row)
                 col = b.mul(col_v, _dtl_c_halves_per_chunk)
                 off_elems = b.add(
-                    batch_off_b,
-                    b.add(
-                        b.mul(b.add(block_n_off, _b_src_row(row)), K),
-                        b.add(k_off, _swz_col(col, row)),
-                    ),
+                    b.mul(_b_src_row(row), K),
+                    b.add(k_off, _swz_col(col, row)),
                 )
                 off_bytes = b.mul(off_elems, c2)
                 b.async_buffer_load_lds_addr(
