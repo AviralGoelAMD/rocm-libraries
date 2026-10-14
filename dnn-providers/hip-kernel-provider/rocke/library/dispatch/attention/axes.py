@@ -141,7 +141,6 @@ _GFX950_3D_AXES: Tuple[KnobAxis, ...] = (
     _flag("use_f32_denormal_flush"),
     _flag("kv_split_wait"),
     _flag("fold_kv_scale"),
-    _values("kv_load_aux", 0, (0, 1, 2, 3)),
 )
 
 # Dense-kernel spec fields the tuning space never varies. Problem fields come

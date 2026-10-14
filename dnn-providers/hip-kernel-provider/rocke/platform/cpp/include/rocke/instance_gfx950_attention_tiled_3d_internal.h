@@ -182,7 +182,6 @@ typedef struct rocke_gfx950_attn_tiled_3d_config
     bool FOLD_SCALE; /* spec.fold_kv_scale and KV_FP8         */
     int NR; /* softmax state rows per lane: 1 if TRANS else 4 */
     bool KV_SPLIT_WAIT; /* spec.kv_split_wait                    */
-    int KV_LOAD_AUX; /* spec.kv_load_aux (DMA aux bits)        */
 
     const rocke_type_t* dtype; /* F16 / BF16                                 */
     const rocke_type_t* kv_io_dtype; /* FP8E4M3 if KV_FP8 else dtype               */
