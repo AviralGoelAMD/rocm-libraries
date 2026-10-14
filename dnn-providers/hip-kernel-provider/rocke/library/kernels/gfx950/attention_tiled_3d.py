@@ -169,9 +169,43 @@ class UnifiedAttention3DTiledSpec:
     # raw fp8 chunks ride in registers for one iteration and are dequantized
     # into LDS at the top of the next.
     kv_prefetch: bool = False
-    # Correctness fix (prototype flag): keep the online-softmax running max
-    # monotone, m_new = max(m_old, tile_max). Should become the default.
-    stable_running_max: bool = False
+    # Transposed QK and PV (S^T = K Q^T, O^T = V^T P^T). Every lane owns one
+    # query row (lane % 16), so P stays in registers as the PV operand (no P
+    # LDS round trip), the running max needs a 2-stage cross-lane reduce per
+    # tile, and the row sum is reduced once after the loop. K rows are read
+    # in a permuted order so a lane's P values are consecutive keys, which is
+    # the V transpose-read order.
+    transposed_softmax: bool = False
+    # kv_prefetch only: wait for the current K before QK and for the current
+    # V before PV (two partial vmcnt waits) instead of draining both at the
+    # loop top, so the V DMA overlaps QK and softmax.
+    kv_split_wait: bool = False
+    # FP8 K/V: fold k_scale into the QK scale and v_scale into the segment
+    # output, so the dequant is a bare fp8 -> f32 -> bf16/fp16 convert.
+    fold_kv_scale: bool = False
+    # Buffer-load AUX cache-policy bits of the K/V DMAs (0 default, 1 GLC,
+    # 2 SLC, 3 GLC|SLC).
+    kv_load_aux: int = 0
+    # Tag the K/V LDS DMAs and the kernel's LDS accesses with disjoint alias
+    # scopes. Untagged, the backend must assume every LDS access may alias
+    # every in-flight LDS DMA and drains vmcnt to 0 before the first K read,
+    # so the prefetched tile never overlaps compute. The kernel's explicit
+    # s_waitcnt calls order every DMA-written read.
+    lds_dma_scopes: bool = False
+    # kv_prefetch block-table reads as invariant loads, so the uniform address
+    # selects a scalar s_load: the ids then never sit in the vmcnt queue ahead
+    # of (or behind) the K/V DMAs.
+    scalar_block_ids: bool = False
+    # Keep MFMA accumulators in VGPRs (no AGPRs): the per-tile alpha rescale
+    # then works in place instead of copying acc AGPR -> VGPR -> AGPR.
+    acc_in_vgpr: bool = False
+    # Flush f32 denormals (bare v_exp_f32, no IEEE denormal fix-up).
+    ftz_f32: bool = False
+    # transposed_softmax + decode_fast_path: mask only keys past the causal
+    # limit. Rows past the query group are never stored, and for one query
+    # token the causal limit already bounds the prefix, so the row and
+    # prefix masks are redundant.
+    decode_lean_mask: bool = False
 
     def __post_init__(self):
         if self.kv_layout not in ("paged", "strided"):
@@ -197,6 +231,16 @@ class UnifiedAttention3DTiledSpec:
             raise ValueError(
                 "kv_tile_mult needs block_size*head_size % 512 == 0 and a tile <= 128"
             )
+        if self.transposed_softmax and (self.use_alibi or self.use_qq_bias):
+            raise ValueError("transposed_softmax does not support ALiBi or QQ bias")
+        if self.kv_split_wait and (not self.kv_prefetch or self.kv_storage_dtype is not None):
+            raise ValueError("kv_split_wait needs kv_prefetch with a bf16/fp16 KV cache")
+        if self.fold_kv_scale and self.kv_storage_dtype is None:
+            raise ValueError("fold_kv_scale needs an fp8 KV cache")
+        if self.kv_load_aux not in (0, 1, 2, 3):
+            raise ValueError(f"kv_load_aux must be 0..3 (got {self.kv_load_aux})")
+        if self.decode_lean_mask and not (self.transposed_softmax and self.decode_fast_path):
+            raise ValueError("decode_lean_mask needs transposed_softmax and decode_fast_path")
 
     @property
     def num_queries_per_kv(self) -> int:
@@ -245,6 +289,15 @@ class UnifiedAttention3DTiledSpec:
             "dec" if self.decode_fast_path else "",
             f"t{self.tile_size}" if self.kv_tile_mult > 1 else "",
             "pf" if self.kv_prefetch else "",
+            "tsm" if self.transposed_softmax else "",
+            "kvsw" if self.kv_split_wait else "",
+            "fks" if self.fold_kv_scale else "",
+            f"aux{self.kv_load_aux}" if self.kv_load_aux else "",
+            "lsc" if self.lds_dma_scopes else "",
+            "sbt" if self.scalar_block_ids else "",
+            "accv" if self.acc_in_vgpr else "",
+            "ftz" if self.ftz_f32 else "",
+            "lean" if self.decode_lean_mask else "",
         )
 
 
@@ -361,6 +414,11 @@ def build_unified_attention_3d_tiled(
     QK_N_TILES = T // MFMA_N
     PV_K_ITERS = T // PV_K_STEP
     PV_N_TILES = HD // MFMA_N
+    # Transposed QK/PV: one query row per lane (see spec docstring).
+    TRANS = spec.transposed_softmax
+    FOLD_SCALE = spec.fold_kv_scale and KV_FP8
+    # Loop-carried softmax state per lane: 4 MFMA C rows, or 1 when transposed.
+    NR = 1 if TRANS else 4
 
     THREADS = 64
 
@@ -368,6 +426,12 @@ def build_unified_attention_3d_tiled(
     b.kernel.attrs["max_workgroup_size"] = THREADS
     if spec.waves_per_eu is not None:
         b.kernel.attrs["waves_per_eu"] = spec.waves_per_eu
+    if spec.lds_dma_scopes:
+        b.kernel.attrs["lds_dma_alias_scopes"] = True
+    if spec.acc_in_vgpr:
+        b.kernel.attrs["agpr_alloc"] = (0, 0)
+    if spec.ftz_f32:
+        b.kernel.attrs["f32_denormal_flush"] = True
 
     # ---------------- parameter declarations ----------------
     # NOTE: the AITER 3D signature distinguishes between segm_* workspace
@@ -538,10 +602,23 @@ def build_unified_attention_3d_tiled(
         b.ret()
 
     # ---------------- LDS layout ----------------
-    Q_lds = b.smem_alloc(dtype, [BLOCK_M, HD], name_hint="Qlds")
-    K_lds = b.smem_alloc(dtype, [2, T, HD], name_hint="Klds")
+    K_lds = b.smem_alloc(dtype, [2, T, HD], name_hint="Klds") if TRANS else None
+    # Transposed softmax reads Q into registers once before the loop, so Q is
+    # staged in K buffer 1 (first written by the tile_start+1 DMA, issued
+    # after those reads) instead of its own LDS slab.
+    Q_lds = None if TRANS else b.smem_alloc(dtype, [BLOCK_M, HD], name_hint="Qlds")
+    if not TRANS:
+        K_lds = b.smem_alloc(dtype, [2, T, HD], name_hint="Klds")
     V_lds = b.smem_alloc(dtype, [2, T, HD], name_hint="Vlds")
-    P_lds = b.smem_alloc(dtype, [BLOCK_M, T], name_hint="Plds")
+
+    def _q_lds_at(row: Value, col: Value):
+        """(smem, indices) of Q element (row, col) in its staging buffer."""
+        if TRANS:
+            return K_lds, [b.const_i32(1), row, col]
+        return Q_lds, [row, col]
+
+    # Transposed softmax keeps P in registers: no P staging buffer.
+    P_lds = None if TRANS else b.smem_alloc(dtype, [BLOCK_M, T], name_hint="Plds")
 
     # CK Tile ``TransposeLDSLayout<M=16, K=PV_K_STEP, B=1>`` lane formulas.
     # The 3D segment kernel is single-warp, so ``lane == tid``.
@@ -553,6 +630,9 @@ def build_unified_attention_3d_tiled(
     one_f = b.const_f32(1.0)
     rcp_ln2 = b.const_f32(1.4426950408889634)
     qk_scale = b.fmul(scale_p, rcp_ln2)
+    if FOLD_SCALE:
+        # K is dequantized without its scale; apply it to the logits instead.
+        qk_scale = b.fmul(qk_scale, k_scale_p)
     sw_const = b.const_i32(int(SLIDING_WINDOW))
     z8 = b.zero_vec(dtype, 8)
 
@@ -580,9 +660,10 @@ def build_unified_attention_3d_tiled(
             dim=b.const_i32(0),
         )
         v8 = b.global_load_vN(query, b.add(q_off_base, Q_col), dtype, 8, align=16)
+        q_smem, q_idx = _q_lds_at(Q_row, Q_col)
         b.smem_store_vN(
-            Q_lds,
-            [Q_row, Q_col],
+            q_smem,
+            q_idx,
             b.vector_select(b.vector_splat(qmask_t, 8), v8, z8),
             8,
         )
@@ -610,12 +691,26 @@ def build_unified_attention_3d_tiled(
     lane_rg = b.div(tid, b.const_i32(16))
     lane_col = b.mod(tid, b.const_i32(16))
 
+    if TRANS:
+        # Lane owns query row ``lane % 16``; Q is the loop-invariant B operand
+        # of the transposed QK MFMA, held in registers for the whole loop.
+        q_kits = []
+        for k in range(QK_K_ITERS):
+            q_smem, q_idx = _q_lds_at(
+                lane_col, b.add(b.const_i32(k * 32), b.mul(lane_rg, b.const_i32(8)))
+            )
+            q_kits.append(b.smem_load_vN(q_smem, *q_idx, dtype=dtype, n=8))
+
+    def _state_row(r: int) -> Value:
+        """Query row (within BLOCK_M) of softmax state slot ``r`` of this lane."""
+        return lane_col if TRANS else _mfma_16x16_c_row(b, tid, r)
+
     if USE_SINKS:
         # Triton's 3D applies sinks only when segm_idx == 0.
         seg0 = b.cmp_eq(seg_idx, b.const_i32(0))
         m_inits = []
-        for r in range(4):
-            row = _mfma_16x16_c_row(b, tid, r)
+        for r in range(NR):
+            row = _state_row(r)
             qh = b.add(
                 b.mul(kv_head_idx, b.const_i32(NQK)), b.mod(row, b.const_i32(NQK))
             )
@@ -625,14 +720,19 @@ def build_unified_attention_3d_tiled(
             sink_with_mask = b.select(qh_in, sink_f, neg_inf)
             m_inits.append(b.select(seg0, sink_with_mask, neg_inf))
     else:
-        m_inits = [neg_inf, neg_inf, neg_inf, neg_inf]
-    l_inits = [one_f, one_f, one_f, one_f]
+        m_inits = [neg_inf] * NR
+    if TRANS:
+        # The row sum is a per-lane partial over this lane's keys, reduced
+        # across the 4 lane groups after the loop: seed the 1 on group 0 only.
+        l_inits = [b.select(b.cmp_eq(lane_rg, b.const_i32(0)), one_f, zero_f)]
+    else:
+        l_inits = [one_f, one_f, one_f, one_f]
 
     acc_zero = b.zero_vec_f32(4)
     acc_inits = [acc_zero for _ in range(PV_N_TILES)]
 
     iter_args = []
-    for r in range(4):
+    for r in range(NR):
         iter_args.append((f"m{r}", m_inits[r]))
         iter_args.append((f"l{r}", l_inits[r]))
     for n in range(PV_N_TILES):
@@ -715,7 +815,11 @@ def build_unified_attention_3d_tiled(
         for p in range(TILE_MULT):
             page = b.add(b.mul(kv_tile_idx, b.const_i32(TILE_MULT)), b.const_i32(p))
             page = b.select(b.cmp_lt(page, last_page), page, last_page)
-            ids.append(b.global_load_i32(block_tables, b.add(seq_base, page)))
+            ids.append(
+                b.global_load_i32(
+                    block_tables, b.add(seq_base, page), invariant=spec.scalar_block_ids
+                )
+            )
         return ids
 
     def _paged_coords(kv_tile_idx: Value, first_half: int, lane_half: Value):
@@ -775,7 +879,9 @@ def build_unified_attention_3d_tiled(
                 if own_rsrc is not None:
                     call_rsrc = own_rsrc
             dst = b.smem_ptr_add(buf_base, b.const_i64(call * bytes_per_call))
-            b.async_buffer_load_lds_addr(call_rsrc, dst, voff, zero_soff, 4)
+            b.async_buffer_load_lds_addr(
+                call_rsrc, dst, voff, zero_soff, 4, coherency=spec.kv_load_aux
+            )
 
     def _issue_k_load(kv_tile_idx: Value, buf_idx: Value, block_ids=None) -> None:
         _issue_kv_async(kv_tile_idx, buf_idx, "K", block_ids)
@@ -883,7 +989,21 @@ def build_unified_attention_3d_tiled(
         # backend collapses the extract+pack chain back into a
         # bitcast-equivalent shuffle once it sees the
         # cvt.pk.f32.fp8 operand is whole-i32.
-        packed = dequant_fp8x8_to_dtype(b, fp8_vec, scale, dtype)
+        if FOLD_SCALE:
+            # Scales are applied to the logits / segment output instead.
+            lo_f32 = b.cvt_pk_f32_fp8x4(
+                b.vec_pack([b.vec_extract(fp8_vec, i) for i in range(4)], FP8E4M3)
+            )
+            hi_f32 = b.cvt_pk_f32_fp8x4(
+                b.vec_pack([b.vec_extract(fp8_vec, i) for i in range(4, 8)], FP8E4M3)
+            )
+            packed = b.vec_pack(
+                [b.cast_f32_to(b.vec_extract(lo_f32, i), dtype) for i in range(4)]
+                + [b.cast_f32_to(b.vec_extract(hi_f32, i), dtype) for i in range(4)],
+                dtype,
+            )
+        else:
+            packed = dequant_fp8x8_to_dtype(b, fp8_vec, scale, dtype)
         b.smem_store_vN(lds, [buf_idx, row, col], packed, fp8_elems_per_chunk)
 
     def _issue_k(tile_idx: Value, buf_idx: Value) -> None:
@@ -929,6 +1049,14 @@ def build_unified_attention_3d_tiled(
         prefetch_carry = _fp8_raw_tile(nxt0, _ids(nxt0)) + list(
             _ids(b.add(tile_start, b.const_i32(2)))
         )
+    elif PREFETCH and spec.kv_split_wait:
+        # Block ids ahead of the DMAs, so the partial vmcnt waits in the loop
+        # count K/V calls only (VMEM returns in issue order).
+        ids0 = _ids(tile_start)
+        ids1 = _ids(b.add(tile_start, b.const_i32(1)))
+        _issue_k_load(tile_start, b.const_i32(0), ids0)
+        _issue_v_load(tile_start, b.const_i32(0), ids0)
+        prefetch_carry = list(ids1) if ids1 is not None else []
     elif PREFETCH:
         ids0 = _ids(tile_start)
         _issue_k_load(tile_start, b.const_i32(0), ids0)
@@ -955,8 +1083,8 @@ def build_unified_attention_3d_tiled(
     hoist_qh_r = []
     hoist_row_ok = []
     hoist_causal_lim = []
-    for reg in range(4):
-        row = _mfma_16x16_c_row(b, tid, reg)
+    for reg in range(NR):
+        row = _state_row(reg)
         qp_r = b.add(qb_start_pos, b.div(row, b.const_i32(NQK)))
         qh_r = b.add(b.mul(kv_head_idx, b.const_i32(NQK)), b.mod(row, b.const_i32(NQK)))
         row_ok = b.land(
@@ -980,14 +1108,52 @@ def build_unified_attention_3d_tiled(
     else:
         hoist_alibi = None
 
+    if TRANS:
+        # Transposed QK: A = K rows, B = Q (q_kits), C[key_slot, query]. Lane
+        # (g = lane/16, c = lane%16) gets key slots g*4 + r of each 16-key
+        # n-tile. For 32-key PV steps, n-tile 2kk+t loads K row
+        # kk*32 + (c//4)*8 + t*4 + c%4 into A slot c, so slot g*4 + r holds key
+        # kk*32 + g*8 + t*4 + r: the lane's 8 P values over (t, r) are the 8
+        # consecutive keys the V transpose-read gives the lane.
+        if PV_K_STEP == 32:
+            k_row_lane = b.add(
+                b.mul(b.div(lane_col, b.const_i32(4)), b.const_i32(8)),
+                b.mod(lane_col, b.const_i32(4)),
+            )
+            key_lane = b.mul(lane_rg, b.const_i32(8))
+        else:
+            k_row_lane = lane_col
+            key_lane = b.mul(lane_rg, b.const_i32(4))
+
+        def _trans_key(n: int, r: int) -> int:
+            """Tile-relative key of S^T n-tile ``n`` slot ``r``, minus ``key_lane``."""
+            if PV_K_STEP == 32:
+                return (n // 2) * 32 + (n % 2) * 4 + r
+            return n * 16 + r
+
+        def _trans_k_row(n: int) -> Value:
+            if PV_K_STEP == 32:
+                return b.add(b.const_i32((n // 2) * 32 + (n % 2) * 4), k_row_lane)
+            return b.add(b.const_i32(n * 16), k_row_lane)
+
+    def _xor32_reduce(v: Value, combine) -> Value:
+        """Combine ``v`` with lane ``l ^ 32`` (one VALU permlane32 swap)."""
+        vi = b.bitcast(v, I32)
+        lo, hi = b.permlane32_swap(vi, vi)
+        return combine(b.bitcast(lo, F32), b.bitcast(hi, F32))
+
+    def _group_reduce(v: Value, combine) -> Value:
+        """Combine ``v`` across the 4 lane groups ``lane / 16`` (same lane % 16)."""
+        return _xor32_reduce(combine(v, b.warp_shuffle_xor(v, 16)), combine)
+
     kvloop = b.scf_for_iter(
         tile_start, tile_end, b.const_i32(1), iter_args, iv_name="kv_tile"
     )
     with kvloop as (kv_tile_iv, carry):
-        m_vals = [carry[2 * r] for r in range(4)]
-        l_vals = [carry[2 * r + 1] for r in range(4)]
-        acc_vals = [carry[8 + n] for n in range(PV_N_TILES)]
-        cur_buf = carry[8 + PV_N_TILES]
+        m_vals = [carry[2 * r] for r in range(NR)]
+        l_vals = [carry[2 * r + 1] for r in range(NR)]
+        acc_vals = [carry[2 * NR + n] for n in range(PV_N_TILES)]
+        cur_buf = carry[2 * NR + PV_N_TILES]
         nxt_buf = b.sub(b.const_i32(1), cur_buf)
         tile_off = b.mul(kv_tile_iv, b.const_i32(T))
 
@@ -995,7 +1161,7 @@ def build_unified_attention_3d_tiled(
         in_range_next = b.cmp_lt(next_tile_iv_raw, tile_end)
         safe_next_tile = b.select(in_range_next, next_tile_iv_raw, kv_tile_iv)
 
-        pf_base = 9 + PV_N_TILES
+        pf_base = 2 * NR + PV_N_TILES + 1
         new_pf = []
         if FP8_REG_PREFETCH:
             # LDS[cur] was staged last iteration; only LDS needs draining, the
@@ -1009,6 +1175,17 @@ def build_unified_attention_3d_tiled(
             new_pf = _fp8_raw_tile(nxt2, ids_n2) + list(
                 _ids(b.add(kv_tile_iv, b.const_i32(3)))
             )
+        elif spec.kv_split_wait:
+            # In flight here (issue order): ids[+1], K[cur], V[cur]. Wait for
+            # K[cur] only; V[cur] lands under QK + softmax.
+            b.s_waitcnt(vmcnt=kv_calls_per_tile, lgkmcnt=0)
+            b.s_barrier_bare()
+            ids_n1 = carry[pf_base : pf_base + TILE_MULT] if PREFETCH_IDS else None
+            if PREFETCH_IDS:
+                new_pf = list(_ids(b.add(kv_tile_iv, b.const_i32(2))))
+            with b.scf_if(in_range_next):
+                _issue_k_load(next_tile_iv_raw, nxt_buf, ids_n1)
+                _issue_v_load(next_tile_iv_raw, nxt_buf, ids_n1)
         else:
             b.s_waitcnt(vmcnt=0, lgkmcnt=0)
             b.sync()
@@ -1023,19 +1200,32 @@ def build_unified_attention_3d_tiled(
                     new_pf = list(_ids(b.add(kv_tile_iv, b.const_i32(2))))
 
         # QK
-        A_kits = []
-        for k in range(QK_K_ITERS):
-            q_col_off = b.add(b.const_i32(k * 32), b.mul(lane_rg, b.const_i32(8)))
-            A_kits.append(b.smem_load_vN(Q_lds, lane_col, q_col_off, dtype=dtype, n=8))
         S_n = []
-        for n in range(QK_N_TILES):
-            acc_v = b.zero_vec_f32(4)
+        if TRANS:
+            # S^T n-tile = K(permuted rows) x Q^T; Q operands live in q_kits.
+            for n in range(QK_N_TILES):
+                acc_v = b.zero_vec_f32(4)
+                k_row = _trans_k_row(n)
+                for k in range(QK_K_ITERS):
+                    kc_off = b.add(b.const_i32(k * 32), b.mul(lane_rg, b.const_i32(8)))
+                    K_v = b.smem_load_vN(K_lds, cur_buf, k_row, kc_off, dtype=dtype, n=8)
+                    acc_v = _mfma_16x16x32(b, dtype, K_v, q_kits[k], acc_v)
+                S_n.append(acc_v)
+        else:
+            A_kits = []
             for k in range(QK_K_ITERS):
-                kc_off = b.add(b.const_i32(k * 32), b.mul(lane_rg, b.const_i32(8)))
-                k_row = b.add(b.const_i32(n * 16), lane_col)
-                B_v = b.smem_load_vN(K_lds, cur_buf, k_row, kc_off, dtype=dtype, n=8)
-                acc_v = _mfma_16x16x32(b, dtype, A_kits[k], B_v, acc_v)
-            S_n.append(acc_v)
+                q_col_off = b.add(b.const_i32(k * 32), b.mul(lane_rg, b.const_i32(8)))
+                A_kits.append(
+                    b.smem_load_vN(Q_lds, lane_col, q_col_off, dtype=dtype, n=8)
+                )
+            for n in range(QK_N_TILES):
+                acc_v = b.zero_vec_f32(4)
+                for k in range(QK_K_ITERS):
+                    kc_off = b.add(b.const_i32(k * 32), b.mul(lane_rg, b.const_i32(8)))
+                    k_row = b.add(b.const_i32(n * 16), lane_col)
+                    B_v = b.smem_load_vN(K_lds, cur_buf, k_row, kc_off, dtype=dtype, n=8)
+                    acc_v = _mfma_16x16x32(b, dtype, A_kits[k], B_v, acc_v)
+                S_n.append(acc_v)
 
         if not PREFETCH:
             _issue_v(kv_tile_iv, cur_buf)
@@ -1047,7 +1237,28 @@ def build_unified_attention_3d_tiled(
         # better robustness against compiler reordering).
         alibi_per_row = hoist_alibi  # None when USE_ALIBI is False
         masked = {}
-        for reg in range(4):
+        if TRANS:
+            # One query row per lane; slot (n, r) is key tile_key + _trans_key.
+            row_ok = hoist_row_ok[0]
+            causal_lim = hoist_causal_lim[0]
+            tile_key = b.add(tile_off, key_lane)
+            for n in range(QK_N_TILES):
+                for r in range(4):
+                    col_abs = b.add(tile_key, b.const_i32(_trans_key(n, r)))
+                    causal_ok = b.cmp_le(col_abs, causal_lim)
+                    if spec.decode_lean_mask:
+                        m_ok = causal_ok
+                    else:
+                        in_prefix = b.cmp_lt(col_abs, max_seq_prefix_len)
+                        m_ok = b.land(b.land(row_ok, causal_ok), in_prefix)
+                    if SLIDING_WINDOW > 0:
+                        dist = b.sub(causal_lim, col_abs)
+                        m_ok = b.land(m_ok, b.cmp_lt(dist, sw_const))
+                    s_scaled = b.fmul(b.vec_extract(S_n[n], r), qk_scale)
+                    if USE_SOFTCAP:
+                        s_scaled = b.fmul(_apply_softcap(b, s_scaled, softcap_p), rcp_ln2)
+                    masked[(n, r)] = b.select(m_ok, s_scaled, neg_inf)
+        for reg in range(0 if TRANS else 4):
             qp_r = hoist_qp_r[reg]
             row_ok = hoist_row_ok[reg]
             causal_lim = hoist_causal_lim[reg]
@@ -1090,42 +1301,71 @@ def build_unified_attention_3d_tiled(
                     s_scaled = b.fadd(s_scaled, b.fmul(qq_v, rcp_ln2))
                 masked[(n, reg)] = b.select(m_ok, s_scaled, neg_inf)
 
-        m_new = []
-        s_local = {}
-        for reg in range(4):
+        if TRANS:
+            # Row max: in-lane over the tile, then across the 4 lane groups.
             local_max = neg_inf
             for n in range(QK_N_TILES):
-                v = masked[(n, reg)]
-                s_local[(reg, n)] = v
-                local_max = b.fmax(local_max, v)
-            full_max_raw = _warp_xor_reduce_max(b, local_max)
-            if spec.stable_running_max:
-                # Online-softmax running max: max(m_old, tile_max). Without it
-                # alpha = exp2(m_old - tile_max) exceeds 1 and overflows f32
-                # once logits spread more than 128 (log2 units) across tiles.
-                full_max_raw = b.fmax(m_vals[reg], full_max_raw)
+                for r in range(4):
+                    local_max = b.fmax(local_max, masked[(n, r)])
+            full_max_raw = b.fmax(m_vals[0], _group_reduce(local_max, b.fmax))
             ok = b.fcmp("ogt", full_max_raw, neg_inf)
-            m_new.append(b.select(ok, full_max_raw, zero_f))
-
-        l_local = []
-        for reg in range(4):
-            row = _mfma_16x16_c_row(b, tid, reg)
+            m_new = [b.select(ok, full_max_raw, zero_f)]
+            p_t = {}
             sum_p = zero_f
             for n in range(QK_N_TILES):
-                p = b.exp2(b.fsub(s_local[(reg, n)], m_new[reg]))
-                col = b.add(b.mul(b.const_i32(n), b.const_i32(16)), lane_col)
-                b.smem_store_vN(P_lds, [row, col], b.cast_f32_to(p, dtype), 1)
-                sum_p = b.fadd(sum_p, p)
-            l_local.append(_warp_xor_reduce_sum(b, sum_p))
+                for r in range(4):
+                    p_t[(n, r)] = b.exp2(b.fsub(masked[(n, r)], m_new[0]))
+                    sum_p = b.fadd(sum_p, p_t[(n, r)])
+            alpha_regs = [b.exp2(b.fsub(m_vals[0], m_new[0]))]
+            # Per-lane partial row sum; reduced across lane groups after the loop.
+            new_l_vals = [b.fadd(b.fmul(l_vals[0], alpha_regs[0]), sum_p)]
+        else:
+            m_new = []
+            s_local = {}
+            for reg in range(4):
+                local_max = neg_inf
+                for n in range(QK_N_TILES):
+                    v = masked[(n, reg)]
+                    s_local[(reg, n)] = v
+                    local_max = b.fmax(local_max, v)
+                full_max_raw = _warp_xor_reduce_max(b, local_max)
+                # Online-softmax running max: max(m_old, tile_max). A bare tile
+                # max lets alpha = exp2(m_old - tile_max) exceed 1 and overflow
+                # f32 once logits spread more than 128 (log2 units) across tiles.
+                full_max_raw = b.fmax(m_vals[reg], full_max_raw)
+                ok = b.fcmp("ogt", full_max_raw, neg_inf)
+                m_new.append(b.select(ok, full_max_raw, zero_f))
 
-        alpha_regs = [b.exp2(b.fsub(m_vals[r], m_new[r])) for r in range(4)]
-        new_l_vals = [
-            b.fadd(b.fmul(l_vals[r], alpha_regs[r]), l_local[r]) for r in range(4)
-        ]
+            l_local = []
+            for reg in range(4):
+                row = _mfma_16x16_c_row(b, tid, reg)
+                sum_p = zero_f
+                for n in range(QK_N_TILES):
+                    p = b.exp2(b.fsub(s_local[(reg, n)], m_new[reg]))
+                    col = b.add(b.mul(b.const_i32(n), b.const_i32(16)), lane_col)
+                    b.smem_store_vN(P_lds, [row, col], b.cast_f32_to(p, dtype), 1)
+                    sum_p = b.fadd(sum_p, p)
+                l_local.append(_warp_xor_reduce_sum(b, sum_p))
+
+            alpha_regs = [b.exp2(b.fsub(m_vals[r], m_new[r])) for r in range(4)]
+            new_l_vals = [
+                b.fadd(b.fmul(l_vals[r], alpha_regs[r]), l_local[r]) for r in range(4)
+            ]
         if PREFETCH:
-            # K/V[cur] already landed (top-of-loop drain); only the P tile
-            # written above must be visible. Next tile's loads stay in flight.
-            b.sync_lds_only()
+            if spec.kv_split_wait:
+                # In flight: V[cur], ids[+2], then K/V[next] when issued.
+                # Leave the younger loads outstanding; V[cur] must land.
+                n_ids = TILE_MULT if PREFETCH_IDS and not spec.scalar_block_ids else 0
+                with b.scf_if(in_range_next):
+                    b.s_waitcnt(vmcnt=2 * kv_calls_per_tile + n_ids)
+                with b.scf_if(b.cmp_ge(next_tile_iv_raw, tile_end)):
+                    b.s_waitcnt(vmcnt=n_ids)
+            if not TRANS:
+                # K/V[cur] already landed; only the P tile written above must
+                # be visible. Next tile's loads stay in flight.
+                b.sync_lds_only()
+            elif spec.kv_split_wait:
+                b.s_barrier_bare()
         elif KV_FP8:
             # FP8 sync loader has no in-flight async work.
             b.s_waitcnt(vmcnt=0, lgkmcnt=0)
@@ -1134,20 +1374,42 @@ def build_unified_attention_3d_tiled(
             b.s_waitcnt(vmcnt=kv_calls_per_tile, lgkmcnt=kv_calls_per_tile)
             b.sync()
 
+        if TRANS:
+            # P^T operands straight from registers: PV step k covers keys
+            # k*PV_K_STEP + key_lane + (t*4 + r), the lane's V transpose-read rows.
+            if PV_K_STEP == 32:
+                p_ops = [
+                    b.vec_pack(
+                        [
+                            b.cast_f32_to(p_t[(2 * k + t, r)], dtype)
+                            for t in range(2)
+                            for r in range(4)
+                        ],
+                        dtype,
+                    )
+                    for k in range(PV_K_ITERS)
+                ]
+            else:
+                p_ops = [
+                    b.vec_pack([b.cast_f32_to(p_t[(k, r)], dtype) for r in range(4)], dtype)
+                    for k in range(PV_K_ITERS)
+                ]
+
         new_acc = []
         for n in range(PV_N_TILES):
             scaled_comps = []
             for reg in range(4):
                 e = b.vec_extract(acc_vals[n], reg)
-                scaled_comps.append(b.fmul(e, alpha_regs[reg]))
+                scaled_comps.append(b.fmul(e, alpha_regs[0 if TRANS else reg]))
             acc_v = b.vec_pack(scaled_comps, F32)
 
             n_col_base = b.add(b.mul(b.const_i32(n), b.const_i32(16)), tr_col_lane)
 
             for k in range(PV_K_ITERS):
                 if PV_K_STEP == 32:
-                    p_off = b.add(b.const_i32(k * 32), b.mul(lane_rg, b.const_i32(8)))
-                    A_p = b.smem_load_vN(P_lds, lane_col, p_off, dtype=dtype, n=8)
+                    if not TRANS:
+                        p_off = b.add(b.const_i32(k * 32), b.mul(lane_rg, b.const_i32(8)))
+                        A_p = b.smem_load_vN(P_lds, lane_col, p_off, dtype=dtype, n=8)
                     row_r0 = pv_tr_reader.row(b, k_offset=k * 32, read=0)
                     row_r1 = pv_tr_reader.row(b, k_offset=k * 32, read=1)
                     B_r0 = b.ds_read_tr16_b64(
@@ -1157,19 +1419,27 @@ def build_unified_attention_3d_tiled(
                         V_lds, cur_buf, row_r1, n_col_base, dtype=dtype
                     )
                     B_v = b.vec_concat(B_r0, B_r1)
-                    acc_v = _mfma_16x16x32(b, dtype, A_p, B_v, acc_v)
+                    if TRANS:
+                        # O^T += V^T P^T: the V read is the A operand.
+                        acc_v = _mfma_16x16x32(b, dtype, B_v, p_ops[k], acc_v)
+                    else:
+                        acc_v = _mfma_16x16x32(b, dtype, A_p, B_v, acc_v)
                 else:
-                    p_off = b.add(b.const_i32(k * 16), b.mul(lane_rg, b.const_i32(4)))
-                    A_p = b.smem_load_vN(P_lds, lane_col, p_off, dtype=dtype, n=4)
+                    if not TRANS:
+                        p_off = b.add(b.const_i32(k * 16), b.mul(lane_rg, b.const_i32(4)))
+                        A_p = b.smem_load_vN(P_lds, lane_col, p_off, dtype=dtype, n=4)
                     row_lane = pv_tr_reader.row(b, k_offset=k * 16, read=0)
                     B_v = b.ds_read_tr16_b64(
                         V_lds, cur_buf, row_lane, n_col_base, dtype=dtype
                     )
-                    acc_v = _mfma_16x16x16(b, dtype, A_p, B_v, acc_v)
+                    if TRANS:
+                        acc_v = _mfma_16x16x16(b, dtype, B_v, p_ops[k], acc_v)
+                    else:
+                        acc_v = _mfma_16x16x16(b, dtype, A_p, B_v, acc_v)
             new_acc.append(acc_v)
 
         yields = []
-        for r in range(4):
+        for r in range(NR):
             yields.append(m_new[r])
             yields.append(new_l_vals[r])
         for n in range(PV_N_TILES):
@@ -1180,10 +1450,38 @@ def build_unified_attention_3d_tiled(
 
     # ---------------- write segment workspace ----------------
     final = kvloop.results
-    m_final = [final[2 * r] for r in range(4)]
-    l_final = [final[2 * r + 1] for r in range(4)]
-    acc_final = [final[8 + n] for n in range(PV_N_TILES)]
+    m_final = [final[2 * r] for r in range(NR)]
+    l_final = [final[2 * r + 1] for r in range(NR)]
+    acc_final = [final[2 * NR + n] for n in range(PV_N_TILES)]
+    if FOLD_SCALE:
+        acc_final = [
+            b.vec_pack([b.fmul(b.vec_extract(a, i), v_scale_p) for i in range(4)], F32)
+            for a in acc_final
+        ]
 
+    if TRANS:
+        # Lane holds O[row = lane % 16][d = n*16 + (lane/16)*4 + 0..3]: one
+        # 16-byte store per n-tile. Lane group 0 writes the row's m and the
+        # row sum reduced over the 4 lane groups.
+        row_ok = hoist_row_ok[0]
+        qtoken = b.add(cu_q_start, hoist_qp_r[0])
+        d_lane = b.mul(lane_rg, b.const_i32(4))
+        for n in range(PV_N_TILES):
+            seg_acc_idx, _ = seg_acc_desc.offset(
+                b,
+                token=qtoken,
+                head=hoist_qh_r[0],
+                seg=seg_idx,
+                dim=b.add(b.const_i32(n * 16), d_lane),
+            )
+            with b.scf_if(row_ok):
+                b.global_store_vN(segm_output_ptr, seg_acc_idx, acc_final[n], 4, align=16)
+        l_row = _group_reduce(l_final[0], b.fadd)
+        ml_idx, _ = ml_desc.offset(b, token=qtoken, head=hoist_qh_r[0], seg=seg_idx)
+        with b.scf_if(b.land(row_ok, b.cmp_eq(lane_rg, b.const_i32(0)))):
+            b.global_store(segm_max_ptr, ml_idx, m_final[0], align=4)
+            b.global_store(segm_expsum_ptr, ml_idx, l_row, align=4)
+        return b.kernel
     # Per-thread: write own (row, col) of acc; only the lane in each
     # 4-lane row group (lane%4 == 0) writes m and l. The workspace
     # layouts ``segm_output[token, head, seg, dim]`` and

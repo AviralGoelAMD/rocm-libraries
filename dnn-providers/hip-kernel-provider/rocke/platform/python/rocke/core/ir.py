@@ -1291,6 +1291,36 @@ class IRBuilder:
             result_name_hint="sdq8x4",
         ).result
 
+    def cvt_scalef32_pk_fp8x8_to(self, v: Value, scale_f32: Value, dtype: Type) -> Value:
+        """Convert ``<8 x fp8e4m3> -> <8 x bf16|f16>`` with gfx950
+        ``v_cvt_scalef32_pk_{bf16,f16}_fp8`` (2 elements per instruction,
+        straight to the 16-bit type; no f32 round trip).
+
+        The scale has the same **E8M0** semantics as
+        :meth:`cvt_scalef32_pk_f32_fp8x4`: only its exponent is used. Pass
+        ``1.0`` for an exact, unscaled convert and apply arbitrary per-tensor
+        scales elsewhere.
+        """
+        if (
+            not isinstance(v.type, VectorType)
+            or v.type.elem.name != "fp8e4m3"
+            or v.type.count != 8
+        ):
+            raise ValueError(
+                f"cvt_scalef32_pk_fp8x8_to expects vec<fp8e4m3x8>, got {v.type.name}"
+            )
+        if scale_f32.type.name != "f32":
+            raise ValueError("cvt_scalef32_pk_fp8x8_to scale must be f32")
+        if dtype.name not in ("bf16", "f16"):
+            raise ValueError(f"cvt_scalef32_pk_fp8x8_to dtype must be bf16/f16, got {dtype.name}")
+        return self._op(
+            "arith.cvt_scalef32_pk_fp8x8_to",
+            [v, scale_f32],
+            [VectorType(dtype, 8)],
+            attrs={"dtype": dtype.name},
+            result_name_hint="cvt8",
+        ).result
+
     def cvt_scalef32_pk_f32_bf8x4(self, v: Value, scale_f32: Value) -> Value:
         """e5m2 sibling of :meth:`cvt_scalef32_pk_f32_fp8x4`."""
         if (
@@ -1838,13 +1868,25 @@ class IRBuilder:
         ).result
 
     def global_load(
-        self, ptr: Value, idx: Value, dtype: Type, *, align: int = 1
+        self,
+        ptr: Value,
+        idx: Value,
+        dtype: Type,
+        *,
+        align: int = 1,
+        invariant: bool = False,
     ) -> Value:
+        """Scalar global load. ``invariant=True`` promises the location is not
+        written while the kernel runs (LLVM ``!invariant.load``), which lets
+        the backend use a scalar ``s_load`` when the address is uniform."""
+        attrs = {"elem_type": dtype.name, "align": int(align)}
+        if invariant:
+            attrs["invariant"] = True
         return self._op(
             "memref.global_load_typed",
             [ptr, idx],
             [dtype],
-            attrs={"elem_type": dtype.name, "align": int(align)},
+            attrs=attrs,
             result_name_hint="gl",
         ).result
 
@@ -1860,8 +1902,10 @@ class IRBuilder:
     def global_load_f32(self, ptr: Value, idx: Value, *, align: int = 4) -> Value:
         return self.global_load(ptr, idx, F32, align=align)
 
-    def global_load_i32(self, ptr: Value, idx: Value, *, align: int = 4) -> Value:
-        return self.global_load(ptr, idx, I32, align=align)
+    def global_load_i32(
+        self, ptr: Value, idx: Value, *, align: int = 4, invariant: bool = False
+    ) -> Value:
+        return self.global_load(ptr, idx, I32, align=align, invariant=invariant)
 
     def global_load_i64(self, ptr: Value, idx: Value, *, align: int = 8) -> Value:
         return self.global_load(ptr, idx, I64, align=align)
@@ -5296,6 +5340,7 @@ PURE_OP_NAMES = {
     "arith.cvt_pk_bf8_f32x4",
     "arith.cvt_scalef32_pk_f32_fp8",
     "arith.cvt_scalef32_pk_f32_bf8",
+    "arith.cvt_scalef32_pk_fp8x8_to",
     "arith.cvt_scalef32_pk_fp8_f32",
     "arith.cvt_scalef32_pk_bf8_f32",
     "tile.ds_read_tr_b8",
