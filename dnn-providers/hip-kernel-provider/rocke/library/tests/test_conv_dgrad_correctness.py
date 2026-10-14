@@ -820,8 +820,12 @@ class TestConvDgradGfx1250Emit(unittest.TestCase):
 # M-outer default for the identical problem and tiling.
 
 
-def _dgrad_run_inprocess(spec, dtype, seed=0):
-    """Launch one dgrad kernel and return dX as a torch tensor (NHWC)."""
+def _dgrad_run_inprocess(spec, dtype, seed=0, dx_fill_byte=0):
+    """Launch one dgrad kernel and return dX as a torch tensor (NHWC).
+
+    ``dx_fill_byte`` is the byte dX is memset to before launch; 0xFF makes
+    every fp16/bf16 element a NaN, so any position the kernel skips shows.
+    """
     import ctypes
 
     import torch
@@ -853,7 +857,8 @@ def _dgrad_run_inprocess(spec, dtype, seed=0):
     dY_d, W_d, dX_d = rt.alloc(dY.nbytes), rt.alloc(W.nbytes), rt.alloc(dX.nbytes)
     rt.memcpy_h2d(dY_d, _u8(dY), dY.nbytes)
     rt.memcpy_h2d(W_d, _u8(W), W.nbytes)
-    rt.memset(dX_d, 0, dX.nbytes)  # split-K atomic-add needs a zeroed dX
+    # split-K atomic-add needs a zeroed dX; a split_k=1 launch must not.
+    rt.memset(dX_d, dx_fill_byte, dX.nbytes)
 
     sub_gemms = spec.compute_sub_gemms()
     buf = pack_sub_gemm_buffer(sub_gemms, spec.tile_m, spec.tile_n)
@@ -1208,6 +1213,100 @@ class TestConvDgradUniformKDecode(unittest.TestCase):
         self.assertEqual(tuple(got.shape), tuple(ref.shape))
         delta = (got.float() - ref).abs().max().item()
         self.assertLess(delta / ref.abs().max().item(), 2e-2)
+
+
+@unittest.skipUnless(
+    ARCH in _MFMA_ARCHES and _HAS_TORCH, f"needs one of {_MFMA_ARCHES} + torch"
+)
+class TestConvDgradWritesEveryDx(unittest.TestCase):
+    """A split_k=1 dgrad must write every dX element, taps or not.
+
+    dX is pre-filled with NaN. Positions no filter tap reaches -- the odd rows
+    and columns of a 1x1 stride-2 downsample, the phases a dilated filter
+    skips -- must come back as zero, not as the fill. Covers each K-loop
+    variant, since a gemm_k = 0 zero-fill record runs none of their loops.
+    """
+
+    def _check(self, *, Y, stride, dil=1, pad=0, Hi=14, ukd=False, rpf=False):
+        import torch
+
+        sys.path.insert(0, os.path.abspath(_PYDIR))
+        from kernels.common.conv_implicit_gemm import ConvDataSpec, ConvProblem
+        from kernels.common.conv_implicit_gemm_dgrad import (
+            DgradConvSpec,
+            is_valid_dgrad_spec,
+        )
+
+        N, C, K, Wi = 2, 64, 128, Hi + 3
+        problem = ConvProblem(
+            N=N, Hi=Hi, Wi=Wi, C=C, K=K, Y=Y, X=Y, sH=stride, sW=stride,
+            pH=pad, pW=pad, dH=dil, dW=dil,
+        )  # fmt: skip
+        spec = DgradConvSpec(
+            problem=problem,
+            name="rocke_test_dgrad_cover",
+            data=ConvDataSpec(dtype_a="bf16", dtype_b="bf16", dtype_d="bf16"),
+            tile_m=64,
+            tile_n=64,
+            tile_k=64,
+            warp_m=2,
+            warp_n=2,
+            warp_tile_m=32,
+            warp_tile_n=32,
+            warp_tile_k=16,
+            wave_size=64,
+            pipeline="mem",
+            epilogue="cshuffle",
+            lds_k_outer=ARCH == "gfx950",
+            uniform_k_decode=ukd,
+            reg_prefetch=rpf,
+        )
+        ok, reason = is_valid_dgrad_spec(spec, ARCH)
+        if not ok:
+            self.skipTest(f"invalid spec: {reason}")
+        spec.validate()
+        got = _dgrad_run_inprocess(spec, "bf16", dx_fill_byte=0xFF)
+
+        torch.manual_seed(0)
+        dY = torch.empty(N, problem.Ho, problem.Wo, K).uniform_(-1.0, 1.0)
+        W = torch.empty(K, Y, Y, C).uniform_(-1.0, 1.0)
+        ref = torch.nn.grad.conv2d_input(
+            (N, C, Hi, Wi),
+            W.to(torch.bfloat16).float().permute(0, 3, 1, 2),
+            dY.to(torch.bfloat16).float().permute(0, 3, 1, 2),
+            stride=stride,
+            padding=pad,
+            dilation=dil,
+        ).permute(0, 2, 3, 1)
+        got = got.float()
+        self.assertFalse(torch.isnan(got).any(), "dX kept the NaN pre-fill")
+        untouched = ref == 0
+        self.assertTrue(untouched.any(), "case has no tap-free dX position")
+        self.assertTrue(torch.equal(got[untouched], ref[untouched]))
+        delta = (got - ref).abs().max().item()
+        self.assertLess(delta / ref.abs().max().item(), 2e-2)
+
+    def test_1x1_stride2_downsample(self):
+        self._check(Y=1, stride=2)
+
+    def test_1x1_stride2_uniform_k_decode(self):
+        self._check(Y=1, stride=2, ukd=True)
+
+    def test_1x1_stride2_reg_prefetch(self):
+        self._check(Y=1, stride=2, rpf=True)
+
+    def test_1x1_stride2_ukd_reg_prefetch(self):
+        self._check(Y=1, stride=2, ukd=True, rpf=True)
+
+    def test_1x1_stride3_padded(self):
+        self._check(Y=1, stride=3, pad=1, Hi=13)
+
+    def test_2x2_stride3(self):
+        self._check(Y=2, stride=3, Hi=13)
+
+    def test_3x3_stride2_dilation2(self):
+        # gcd(stride, dilation) = 2: odd phases have no tilde sub-GEMM at all.
+        self._check(Y=3, stride=2, dil=2, pad=2, ukd=True)
 
 
 if __name__ == "__main__":

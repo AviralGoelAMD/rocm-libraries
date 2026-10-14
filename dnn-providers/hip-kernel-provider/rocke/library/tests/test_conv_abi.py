@@ -20,6 +20,7 @@ This pins together:
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import replace as dc_replace
 
 import pytest
@@ -1112,6 +1113,41 @@ def test_cache_rejects_dgrad_beyond_max_sub_gemms():
         KernelIdentity(max_sub_gemms=2, **ident), strided
     )
     assert not ok and "sub-GEMMs" in reason
+
+
+@pytest.mark.parametrize("stride", [1, 2, 3])
+@pytest.mark.parametrize("dil", [1, 2, 3])
+@pytest.mark.parametrize("Y,pad", [(1, 0), (1, 1), (2, 0), (3, 1), (3, 2), (5, 2)])
+def test_dgrad_records_write_every_dx_once(stride, dil, Y, pad):
+    """The tilde records, zero-fill records included, write every dX (hi, wi)
+    exactly once, so a split_k=1 dgrad never leaves an element unwritten
+    (1x1 stride 2 reaches only even positions) and never races two stores."""
+    from kernels.common.conv_implicit_gemm_dgrad import (
+        compute_tilde,
+        enumerate_sub_gemms,
+        pack_sub_gemm_buffer,
+    )
+
+    p = ConvProblem(
+        N=1, Hi=13, Wi=10, C=8, K=8, Y=Y, X=max(1, Y - 1),
+        sH=stride, sW=max(1, stride - 1), pH=pad, pW=pad // 2, dH=dil, dW=dil,
+    )  # fmt: skip
+    sgs = enumerate_sub_gemms(p, compute_tilde(p), 64, 64)
+    pack_sub_gemm_buffer(sgs, 64, 64)  # zero-fill records must pack
+    writes = Counter()
+    for sg in sgs:
+        for htl in range(sg.h_tilde_slice):
+            hi = sg.d_h_offset + sg.d_h_stride * htl
+            for wtl in range(sg.w_tilde_slice):
+                wi = sg.d_w_offset + sg.d_w_stride * wtl
+                if 0 <= hi < p.Hi and 0 <= wi < p.Wi:
+                    writes[hi, wi] += 1
+    assert len(writes) == p.Hi * p.Wi
+    assert set(writes.values()) == {1}
+    assert [sg.block_start for sg in sgs[1:]] == [sg.block_end for sg in sgs[:-1]]
+    if stride == 1 and dil == 1:
+        assert not any(sg.is_zero_fill for sg in sgs)
+
 
 
 def test_aot_dgrad_builds_one_tilde_binary_for_every_stride(monkeypatch):

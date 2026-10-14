@@ -268,14 +268,18 @@ typedef struct rocke_sub_gemm_params
     int d_w_stride;
     int d_w_offset;
     int gemm_k_padded;
+    /* K per group: the K-decode divisor of the magic table (Python
+     * SubGemmParams.kpg). Not a packed record field. */
+    int kpg;
 } rocke_sub_gemm_params_t;
 
 /* Compute tilde decomposition parameters from a ConvProblem. */
 rocke_tilde_decomposition_t rocke_compute_tilde(const rocke_conv_problem_t* p);
 
-/* Enumerate all non-empty sub-GEMMs. Writes up to out_cap entries into out[].
- * Returns the number written (may be less than y_tilde * x_tilde if some
- * phases are empty). */
+/* Enumerate the non-empty sub-GEMMs, then the zero-fill records (gemm_k = 0)
+ * for dX positions no filter tap reaches (Python enumerate_sub_gemms /
+ * _uncovered_dx_rects). Writes up to out_cap entries into out[]; returns the
+ * total count, which may exceed out_cap. */
 int rocke_enumerate_sub_gemms(const rocke_conv_problem_t* p,
                               const rocke_tilde_decomposition_t* tilde,
                               int tile_m,

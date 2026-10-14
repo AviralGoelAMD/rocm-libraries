@@ -1619,10 +1619,11 @@ def _dgrad_lds_k_outer(req: "ConvGroupedRequest", warp_tile_mn: int) -> bool:
 def _make_gfx950_dgrad_candidate() -> KernelCandidate:
     """Backward-data conv for gfx950: 64x64x64, 2x2, 32x32x16 MFMA.
 
-    Pins ``epilogue="default"`` and ``split_k=1``. dgrad already dispatches its
-    epilogue internally on ``needs_atomic`` (stride > 1 gives more than one
-    sub-GEMM, which forces the atomic store regardless of split-K), so the
-    epilogue knob does not carry the same meaning it does for wgrad. Split-K is
+    Pins ``epilogue="default"`` and ``split_k=1``. dgrad dispatches its store
+    internally on ``split_k`` (1 gives plain stores: the tilde records,
+    zero-fill records included, write every dX element exactly once, so dX
+    needs no pre-zeroing), so the epilogue knob does not carry the same
+    meaning it does for wgrad. Split-K is
     left at 1 rather than auto-resolved: the CK formula wgrad uses keys on its
     lopsided ``N*Ho*Wo`` reduction, and dgrad's ``Y*X*K`` is not that shape.
 

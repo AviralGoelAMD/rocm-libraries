@@ -208,8 +208,16 @@ class SubGemmParams:
     d_w_stride: int
     d_w_offset: int
     gemm_k_padded: int
+    # Output channels per group; the K-decode divisor of the magic table. Not a
+    # packed record field (the kernel reads kpg from its kernargs).
+    kpg: int
 
     RECORD_NUM_FIELDS: int = 22
+
+    @property
+    def is_zero_fill(self) -> bool:
+        """A record with no filter tap: it only stores zeros to its dX rows."""
+        return self.gemm_k == 0
 
     def pack_i32(self) -> List[int]:
         """Pack this record as a list of 22 signed i32 values."""
@@ -247,11 +255,13 @@ def enumerate_sub_gemms(
     tile_k: int = 32,
     split_k: int = 1,
 ) -> List[SubGemmParams]:
-    """Enumerate all non-empty sub-GEMMs for the tilde decomposition.
+    """Enumerate the sub-GEMMs for the tilde decomposition.
 
-    Returns a list of :class:`SubGemmParams` sorted by ``(i_ytilde, i_xtilde)``,
-    with cumulative ``block_start`` / ``block_end`` ranges suitable for a
-    binary search dispatch inside the kernel.
+    Returns one :class:`SubGemmParams` per non-empty ``(i_ytilde, i_xtilde)``
+    pair, then the zero-fill records of :func:`_uncovered_dx_rects`, with
+    cumulative ``block_start`` / ``block_end`` ranges suitable for a binary
+    search dispatch inside the kernel. Together the records write every dX
+    element exactly once, so a split_k=1 launch needs no pre-zeroed dX.
     """
     sub_gemms: List[SubGemmParams] = []
     cumulative_tiles = 0
@@ -320,10 +330,102 @@ def enumerate_sub_gemms(
                 d_w_stride=p.sW,
                 d_w_offset=p.dW * i_xt + p.sW * w_tilde_slice_begin - p.pW,
                 gemm_k_padded=_ceil_div(gemm_k, tile_k * split_k) * (tile_k * split_k),
+                kpg=p.kpg,
             )
             sub_gemms.append(sg)
 
+    # Zero-fill records: dX positions that no filter tap reaches (stride larger
+    # than the dilated filter footprint, e.g. a 1x1 stride-2 downsample, or a
+    # phase the slice bounds above leave out). gemm_k = 0 runs no K iteration,
+    # so the epilogue stores the zero accumulator. The unit dot slices keep the
+    # record's runtime divisors non-zero, and b_y/x_offset = Y/X puts every tap
+    # out of range.
+    for h_off, h_n, w_off, w_n in _uncovered_dx_rects(p, sub_gemms):
+        gemm_m = p.N * h_n * w_n
+        num_tiles = _ceil_div(gemm_m, tile_m) * _ceil_div(p.cpg, tile_n)
+        block_start = cumulative_tiles
+        cumulative_tiles += num_tiles
+        sub_gemms.append(
+            SubGemmParams(
+                i_ytilde=-1,
+                i_xtilde=-1,
+                y_dot_slice=1,
+                x_dot_slice=1,
+                h_tilde_slice_begin=0,
+                h_tilde_slice=h_n,
+                w_tilde_slice_begin=0,
+                w_tilde_slice=w_n,
+                gemm_m=gemm_m,
+                gemm_n=p.cpg,
+                gemm_k=0,
+                block_start=block_start,
+                block_end=cumulative_tiles,
+                a_embed_h_coeff=-(p.dH // tilde.gcd_h),
+                a_embed_w_coeff=-(p.dW // tilde.gcd_w),
+                b_y_stride=tilde.y_tilde,
+                b_y_offset=p.Y,
+                b_x_stride=tilde.x_tilde,
+                b_x_offset=p.X,
+                d_h_stride=p.sH,
+                d_h_offset=h_off,
+                d_w_stride=p.sW,
+                d_w_offset=w_off,
+                gemm_k_padded=0,
+                kpg=p.kpg,
+            )
+        )
+
     return sub_gemms
+
+
+def _uncovered_dx_rects(
+    p: ConvProblem, sub_gemms: List[SubGemmParams]
+) -> List[Tuple[int, int, int, int]]:
+    """dX rectangles no record of ``sub_gemms`` writes, as zero-fill extents.
+
+    A record writes ``hi = d_h_offset + d_h_stride * htl`` for ``htl`` in
+    ``[0, h_tilde_slice)`` (same for ``wi``), clipped to ``[0, Hi)``. Every
+    record strides by ``sH``/``sW``, so dX splits into ``sH * sW`` phase
+    classes ``(hi % sH, wi % sW)``; each GEMM record owns one class (distinct
+    ``i_ytilde`` give distinct ``dH * i_ytilde mod sH``) and may write only a
+    sub-rectangle of it. Returns ``(d_h_offset, h_tilde_slice, d_w_offset,
+    w_tilde_slice)`` for the rest: a whole class with no record, else up to
+    four strips around the record's rectangle. Empty for stride 1, dilation 1.
+    C++ twin: ``_uncovered_dx_rects`` in conv_implicit_gemm_dgrad.cpp.
+    """
+
+    def _span(off: int, n: int, phase: int, stride: int, n_cls: int):
+        r0 = (off - phase) // stride  # exact: off == phase (mod stride)
+        return max(0, r0), min(n_cls, r0 + n)
+
+    owner = {(sg.d_h_offset % p.sH, sg.d_w_offset % p.sW): sg for sg in sub_gemms}
+    rects: List[Tuple[int, int, int, int]] = []
+    for ph in range(p.sH):
+        nh = _ceil_div(p.Hi - ph, p.sH)
+        if nh <= 0:
+            continue
+        for pw in range(p.sW):
+            nw = _ceil_div(p.Wi - pw, p.sW)
+            if nw <= 0:
+                continue
+            sg = owner.get((ph, pw))
+            ha = hb = wa = wb = 0
+            if sg is not None:
+                ha, hb = _span(sg.d_h_offset, sg.h_tilde_slice, ph, p.sH, nh)
+                wa, wb = _span(sg.d_w_offset, sg.w_tilde_slice, pw, p.sW, nw)
+            if ha >= hb or wa >= wb:
+                ha = hb = wa = wb = 0  # the record writes nothing in range
+            # (row0, rows, col0, cols) in class-local indices.
+            strips = (
+                (0, ha, 0, nw),
+                (hb, nh - hb, 0, nw),
+                (ha, hb - ha, 0, wa),
+                (ha, hb - ha, wb, nw - wb),
+            )
+            for r0, nr, c0, nc in strips:
+                if nr > 0 and nc > 0:
+                    rects.append((ph + p.sH * r0, nr, pw + p.sW * c0, nc))
+    return rects
 
 
 def _magic_i32_pair(divisor: int) -> List[int]:
@@ -346,10 +448,9 @@ def sub_gemm_magic_pairs(sg: SubGemmParams) -> List[int]:
     pair per divisor, in :data:`_MAGIC_FIELDS` order: kpg, x_dot_slice,
     h_tilde_slice*w_tilde_slice, w_tilde_slice.
     """
-    kpg = sg.gemm_k // (sg.y_dot_slice * sg.x_dot_slice)
     out: List[int] = []
     for d in (
-        kpg,
+        sg.kpg,
         sg.x_dot_slice,
         sg.h_tilde_slice * sg.w_tilde_slice,
         sg.w_tilde_slice,

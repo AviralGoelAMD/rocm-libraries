@@ -59,10 +59,17 @@ All convolutions — stride=1 and strided — use a **single unified tiled kerne
 - Each CTA binary-searches the buffer to find its sub-GEMM and loads record fields.
 - The K-loop uses runtime descriptor closures that compute `dY` and `W` offsets
   from the record's coefficients.
-- **Epilogue dispatch** based on `needs_atomic`:
-  - `False` (1 sub-GEMM, split_k=1): direct `buffer_store` into `dX`.
-  - `True` (stride > 1 or split_k > 1): `global_atomic_fadd` into `dX`
-    (caller must zero-initialise `dX` before launch).
+- **Epilogue dispatch** based on `split_k`:
+  - `split_k = 1`: plain stores into `dX`. The records write disjoint `dX`
+    positions, and together they write every position exactly once, so the
+    caller does not need to zero `dX`.
+  - `split_k > 1`: `global_atomic_fadd` into `dX` (caller must zero-initialise
+    `dX` before launch).
+- **Zero-fill records.** Some `dX` positions get no filter tap: a 1x1 stride-2
+  downsample reaches only even `(hi, wi)`, and dilation can leave edge rows
+  out. `enumerate_sub_gemms` appends a record with `gemm_k = 0` for each such
+  rectangle (`_uncovered_dx_rects`). It runs no K iteration and its epilogue
+  stores the zero accumulator. C++ twin: `rocke_enumerate_sub_gemms`.
 
 ### Sub-GEMM record layout (22 × i32)
 

@@ -53,6 +53,16 @@ static int _floor_div(int a, int b)
 {
     return a / b;
 }
+/* Python's floor // and non-negative % for a possibly negative a (b > 0). */
+static int _floor_div_signed(int a, int b)
+{
+    int q = a / b;
+    return (a % b != 0 && a < 0) ? q - 1 : q;
+}
+static int _pos_mod(int a, int b)
+{
+    return a - b * _floor_div_signed(a, b);
+}
 static int _gcd(int a, int b)
 {
     while(b)
@@ -796,8 +806,103 @@ int rocke_enumerate_sub_gemms(const rocke_conv_problem_t* p,
                 sg->d_w_stride = sW;
                 sg->d_w_offset = dW * i_xt + sW * w_tsb - p->pW;
                 sg->gemm_k_padded = gemm_k_padded;
+                sg->kpg = kpg;
             }
             count++;
+        }
+    }
+
+    /* Zero-fill records (Python _uncovered_dx_rects): dX splits into sH*sW
+     * phase classes (hi % sH, wi % sW); a GEMM record above owns at most one
+     * class and may write only a sub-rectangle of it. Each class without a
+     * record, and the up-to-four strips around a record's rectangle, gets a
+     * gemm_k = 0 record whose epilogue stores zeros. Unit dot slices keep the
+     * runtime divisors non-zero; b_y/x_offset = Y/X puts every tap out of
+     * range. */
+    int h_tsb = _floor_div(_max(0, p->pH - dH * (tilde->y_tilde - 1)), sH);
+    int h_ts = _min(tilde->h_tilde, _ceil_div(p->pH + p->Hi - 1, sH) + 1) - h_tsb;
+    int w_tsb = _floor_div(_max(0, p->pW - dW * (tilde->x_tilde - 1)), sW);
+    int w_ts = _min(tilde->w_tilde, _ceil_div(p->pW + p->Wi - 1, sW) + 1) - w_tsb;
+    for(int ph = 0; ph < sH; ph++)
+    {
+        int nh = _ceil_div(p->Hi - ph, sH);
+        if(nh <= 0)
+            continue;
+        for(int pw = 0; pw < sW; pw++)
+        {
+            int nw = _ceil_div(p->Wi - pw, sW);
+            if(nw <= 0)
+                continue;
+            int ha = 0, hb = 0, wa = 0, wb = 0;
+            for(int i_yt = 0; i_yt < tilde->y_tilde; i_yt++)
+            {
+                for(int i_xt = 0; i_xt < tilde->x_tilde; i_xt++)
+                {
+                    if(_ceil_div(p->Y - i_yt, tilde->y_tilde) <= 0
+                       || _ceil_div(p->X - i_xt, tilde->x_tilde) <= 0 || h_ts <= 0
+                       || w_ts <= 0)
+                        continue;
+                    int h_off = dH * i_yt + sH * h_tsb - p->pH;
+                    int w_off = dW * i_xt + sW * w_tsb - p->pW;
+                    if(_pos_mod(h_off, sH) != ph || _pos_mod(w_off, sW) != pw)
+                        continue;
+                    int r0 = _floor_div(h_off - ph, sH);
+                    int c0 = _floor_div(w_off - pw, sW);
+                    ha = _max(0, r0);
+                    hb = _min(nh, r0 + h_ts);
+                    wa = _max(0, c0);
+                    wb = _min(nw, c0 + w_ts);
+                }
+            }
+            if(ha >= hb || wa >= wb)
+                ha = hb = wa = wb = 0;
+            /* (row0, rows, col0, cols) in class-local indices. */
+            int strips[4][4] = {{0, ha, 0, nw},
+                                {hb, nh - hb, 0, nw},
+                                {ha, hb - ha, 0, wa},
+                                {ha, hb - ha, wb, nw - wb}};
+            for(int s = 0; s < 4; s++)
+            {
+                int nr = strips[s][1];
+                int nc = strips[s][3];
+                if(nr <= 0 || nc <= 0)
+                    continue;
+                int gemm_m = p->N * nr * nc;
+                int num_tiles = _ceil_div(gemm_m, tile_m) * _ceil_div(cpg, tile_n);
+                int block_start = cumulative_tiles;
+                cumulative_tiles += num_tiles;
+                if(count < out_cap)
+                {
+                    rocke_sub_gemm_params_t* sg = &out[count];
+                    memset(sg, 0, sizeof(*sg));
+                    sg->i_ytilde = -1;
+                    sg->i_xtilde = -1;
+                    sg->y_dot_slice = 1;
+                    sg->x_dot_slice = 1;
+                    sg->h_tilde_slice_begin = 0;
+                    sg->h_tilde_slice = nr;
+                    sg->w_tilde_slice_begin = 0;
+                    sg->w_tilde_slice = nc;
+                    sg->gemm_m = gemm_m;
+                    sg->gemm_n = cpg;
+                    sg->gemm_k = 0;
+                    sg->block_start = block_start;
+                    sg->block_end = cumulative_tiles;
+                    sg->a_embed_h_coeff = -(dH / tilde->gcd_h);
+                    sg->a_embed_w_coeff = -(dW / tilde->gcd_w);
+                    sg->b_y_stride = tilde->y_tilde;
+                    sg->b_y_offset = p->Y;
+                    sg->b_x_stride = tilde->x_tilde;
+                    sg->b_x_offset = p->X;
+                    sg->d_h_stride = sH;
+                    sg->d_h_offset = ph + sH * strips[s][0];
+                    sg->d_w_stride = sW;
+                    sg->d_w_offset = pw + sW * strips[s][2];
+                    sg->gemm_k_padded = 0;
+                    sg->kpg = kpg;
+                }
+                count++;
+            }
         }
     }
     return count;
@@ -853,7 +958,7 @@ int rocke_pack_sub_gemm_buffer(const rocke_sub_gemm_params_t* sgs,
             return 0;
         int* mag = &out_buf[count * ROCKE_DGRAD_SUB_GEMM_RECORD_FIELDS
                             + i * ROCKE_DGRAD_SUB_GEMM_MAGIC_FIELDS];
-        int divisors[4] = {sg->gemm_k / (sg->y_dot_slice * sg->x_dot_slice),
+        int divisors[4] = {sg->kpg,
                            sg->x_dot_slice,
                            sg->h_tilde_slice * sg->w_tilde_slice,
                            sg->w_tilde_slice};
