@@ -814,7 +814,14 @@ def build_moe_gate_up_silu_gemm(
     else:
         batch_idx = b.block_id_z()
         batch_off_a = b.mul(batch_idx, stride_a)
-        batch_off_b = b.mul(batch_idx, stride_b)
+        # Same i64 B-slab fold as the grouped branch: ``batch * stride_b``
+        # in i32 elements wraps once the expert weights pass 2^31 elements.
+        elem_bytes_b = b.const_i64(2)  # f16 / bf16
+        batch_i64 = b.sext(batch_idx, I64)
+        b_base_bytes = b.mul(b.mul(batch_i64, b.sext(stride_b, I64)), elem_bytes_b)
+        WGate = b.global_ptr_add(WGate, b_base_bytes)
+        WUp = b.global_ptr_add(WUp, b_base_bytes)
+        batch_off_b = c0
         batch_off_c = b.mul(batch_idx, stride_c)
         block_m_off = b.mul(b.block_id_y(), c_block_m)
     block_n_off = b.mul(b.block_id_x(), c_block_n)
@@ -1260,7 +1267,12 @@ def build_moe_interleaved_gate_up_silu_gemm(
     else:
         batch_idx = b.block_id_z()
         batch_off_a = b.mul(batch_idx, stride_a)
-        batch_off_b = b.mul(batch_idx, stride_b)
+        # i64 B-slab fold (see the grouped branch above).
+        elem_bytes_b = b.const_i64(2)  # f16 / bf16
+        batch_i64 = b.sext(batch_idx, I64)
+        b_base_bytes = b.mul(b.mul(batch_i64, b.sext(stride_b, I64)), elem_bytes_b)
+        WGateUp = b.global_ptr_add(WGateUp, b_base_bytes)
+        batch_off_b = c0
         batch_off_c = b.mul(batch_idx, stride_c)
         block_m_off = b.mul(b.block_id_y(), c_block_m)
     block_n_off = b.mul(b.block_id_x(), c_block_n)
@@ -1724,7 +1736,12 @@ def build_moe_down_reduce_gemm(
     else:
         batch_idx = b.block_id_z()
         batch_off_a = b.mul(batch_idx, stride_a)
-        batch_off_b = b.mul(batch_idx, stride_b)
+        # i64 B-slab fold (see the grouped branch above).
+        elem_bytes_b = b.const_i64(2)  # f16 / bf16
+        batch_i64 = b.sext(batch_idx, I64)
+        b_base_bytes = b.mul(b.mul(batch_i64, b.sext(stride_b, I64)), elem_bytes_b)
+        WDown = b.global_ptr_add(WDown, b_base_bytes)
+        batch_off_b = c0_dr
         # Offset into flattened padded bucket arrays (SortedTokenIds /
         # SortedWeights). ``slot_size`` is M and is tile-m aligned.
         batch_bucket_off = b.mul(batch_idx, slot_size)
