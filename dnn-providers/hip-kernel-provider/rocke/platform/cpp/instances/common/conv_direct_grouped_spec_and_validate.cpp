@@ -30,6 +30,7 @@
  */
 
 #include "rocke/instance_conv_direct_grouped.h"
+#include "rocke/instance_conv_direct_grouped_internal.h" /* rocke_direct_dilation_reason */
 
 #include <stdio.h>
 #include <string.h>
@@ -212,8 +213,7 @@ rocke_status_t rocke_direct_conv_16c_kernel_name(const rocke_direct_conv_16c_spe
  * compute p. Only the non-grouped forward kernel computes a dilated conv. Any
  * dilation other than 1 -- zero and negatives included -- is refused, as in
  * Python's is_dilated. */
-static bool
-    rocke_direct_dilation_reason(const rocke_direct_conv_problem_t* p, char* why, size_t why_cap)
+bool rocke_direct_dilation_reason(const rocke_direct_conv_problem_t* p, char* why, size_t why_cap)
 {
     if(p->dil_h != 1 || p->dil_w != 1)
     {
