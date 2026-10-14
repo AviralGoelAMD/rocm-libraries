@@ -1175,6 +1175,26 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
         block_m_off = b.to_sgpr_u32(b.mul(b.block_id_y(), c_block_m))
         block_n_off = b.to_sgpr_u32(b.mul(b.block_id_x(), c_block_n))
 
+    # pad_m / pad_n: the last M / N tile overhangs the operand. Clamp the
+    # overhanging rows' global *load* row to the last valid row so no A/B
+    # access leaves the allocation (a raw or 0x7FFF0000-record buffer load
+    # past row M-1 / N-1 faults when the operand ends at a page boundary).
+    # Those rows' results are never stored (the epilogue masks them), so
+    # the duplicated data is harmless. LDS placement keeps the unclamped
+    # row. Unpadded specs emit nothing here.
+    _a_row_lim = (
+        b.sub(b.sub(M, b.const_i32(1)), block_m_off) if spec.trait.pad_m else None
+    )
+    _b_row_lim = (
+        b.sub(b.sub(N, b.const_i32(1)), block_n_off) if spec.trait.pad_n else None
+    )
+
+    def _a_src_row(row: Value) -> Value:
+        return row if _a_row_lim is None else b.smin(row, _a_row_lim)
+
+    def _b_src_row(row: Value) -> Value:
+        return row if _b_row_lim is None else b.smin(row, _b_row_lim)
+
     # LDS allocation. compv4 (non-DTL, direct epilogue) double-buffers AB
     # so the next K-tile's global->LDS copy overlaps the current tile's
     # MFMA/ds_read work (real software pipelining; see ``_emit_kloop_db``).
@@ -1445,7 +1465,7 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                 off_elems = b.add(
                     batch_off_a,
                     b.add(
-                        b.mul(b.add(block_m_off, row), K),
+                        b.mul(b.add(block_m_off, _a_src_row(row)), K),
                         b.add(k_off, _swz_col(col, row)),
                     ),
                 )
@@ -1475,7 +1495,7 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                 off_elems = b.add(
                     batch_off_b,
                     b.add(
-                        b.mul(b.add(block_n_off, row), K),
+                        b.mul(b.add(block_n_off, _b_src_row(row)), K),
                         b.add(k_off, _swz_col(col, row)),
                     ),
                 )
@@ -1562,7 +1582,9 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                 elem_col = b.add(col, b.const_i32(i)) if i else col
                 valid = _pad_k_valid(elem_col)
                 safe_col = b.select(valid, elem_col, b.const_i32(0))
-                raw = a_global_tile.load_scalar(b, b.const_i32(0), row, safe_col)
+                raw = a_global_tile.load_scalar(
+                    b, b.const_i32(0), _a_src_row(row), safe_col
+                )
                 vals.append(_mask_storage_scalar(raw, valid))
             return vals[0] if n == 1 else b.vec_pack(vals, storage_dtype)
 
@@ -1572,7 +1594,9 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                 elem_col = b.add(col, b.const_i32(i)) if i else col
                 valid = _pad_k_valid(elem_col)
                 safe_col = b.select(valid, elem_col, b.const_i32(0))
-                raw = b_global_tile.load_scalar(b, b.const_i32(0), row, safe_col)
+                raw = b_global_tile.load_scalar(
+                    b, b.const_i32(0), _b_src_row(row), safe_col
+                )
                 vals.append(_mask_storage_scalar(raw, valid))
             return vals[0] if n == 1 else b.vec_pack(vals, storage_dtype)
 
@@ -1598,7 +1622,9 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                 a_val = (
                     _load_a_pad_k(row, col, 1)
                     if spec.trait.pad_k
-                    else a_global_tile.load_scalar(b, b.const_i32(0), row, col)
+                    else a_global_tile.load_scalar(
+                        b, b.const_i32(0), _a_src_row(row), col
+                    )
                 )
                 a_lds_tile.store_scalar(
                     b, _ld_a_row(row), _swz_col(col, row), value=a_val
@@ -1607,7 +1633,9 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                 a_val = (
                     _load_a_pad_k(row, col, load_vec)
                     if spec.trait.pad_k
-                    else a_global_tile.load_vec(b, b.const_i32(0), row, col, n=load_vec)
+                    else a_global_tile.load_vec(
+                        b, b.const_i32(0), _a_src_row(row), col, n=load_vec
+                    )
                 )
                 a_lds_tile.store_vec(
                     b, _ld_a_row(row), _swz_col(col, row), value=a_val, n=load_vec
@@ -1670,7 +1698,9 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                     b_val = (
                         _load_b_pad_k(row, col, 1)
                         if spec.trait.pad_k
-                        else b_global_tile.load_scalar(b, b.const_i32(0), row, col)
+                        else b_global_tile.load_scalar(
+                            b, b.const_i32(0), _b_src_row(row), col
+                        )
                     )
                     b_lds_tile.store_scalar(
                         b, _ld_b_row(row), _swz_col(col, row), value=b_val
@@ -1680,7 +1710,7 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                         _load_b_pad_k(row, col, load_vec)
                         if spec.trait.pad_k
                         else b_global_tile.load_vec(
-                            b, b.const_i32(0), row, col, n=load_vec
+                            b, b.const_i32(0), _b_src_row(row), col, n=load_vec
                         )
                     )
                     b_lds_tile.store_vec(
