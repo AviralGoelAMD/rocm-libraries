@@ -3004,6 +3004,60 @@ def cases():
         ("grid_widedma_sq512", {"wide_lds_dma": True}),
         ("grid_widedma_noncausal_sq512", {"wide_lds_dma": True, "causal": False}),
         ("grid_widedma_bm128_sq512", {"wide_lds_dma": True, "block_m": 128}),
+        # Grid qk_lookahead loop on the LDS-DMA alias rings: the 128-row tile
+        # and the 256-row mfma_windows body (window_fence; non-causal also
+        # pv_window_exp).
+        (
+            "grid_lookahead_ring_bm128_sq512",
+            {
+                "wide_lds_dma": True,
+                "lds_dma_alias_ring": True,
+                "qk_lookahead": True,
+                "qk_lookahead_unroll": 2,
+                "permlane32_reduce": True,
+                "pv_priority": 0,
+                "o_store_width": 8,
+                "block_m": 128,
+            },
+        ),
+        (
+            "grid_windows_fence_sq512",
+            {
+                "wide_lds_dma": True,
+                "lds_dma_alias_ring": True,
+                "qk_lookahead": True,
+                "qk_lookahead_unroll": 2,
+                "permlane32_reduce": True,
+                "pv_priority": 0,
+                "o_store_width": 8,
+                "block_m": 256,
+                "lds_read_base": True,
+                "scalar_uniforms": True,
+                "wave_group_pingpong": True,
+                "mfma_windows": 4,
+                "window_fence": True,
+            },
+        ),
+        (
+            "grid_windows_fence_pvexp1_noncausal_sq512",
+            {
+                "causal": False,
+                "wide_lds_dma": True,
+                "lds_dma_alias_ring": True,
+                "qk_lookahead": True,
+                "qk_lookahead_unroll": 2,
+                "permlane32_reduce": True,
+                "pv_priority": 0,
+                "o_store_width": 8,
+                "block_m": 256,
+                "lds_read_base": True,
+                "scalar_uniforms": True,
+                "wave_group_pingpong": True,
+                "mfma_windows": 4,
+                "window_fence": True,
+                "pv_window_exp": 1,
+            },
+        ),
         # --- bottom-right diagonal. Four cases pin the aligned and arbitrary
         # shifted-diagonal routes, the sink composition, and the BM128 geometry.
         (
