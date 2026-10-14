@@ -2023,20 +2023,46 @@ def _direct_grid(spec: ConvGroupedSpec, req: OperatorRequest) -> Tuple[int, int,
     return direct_launch_geometry(spec.to_direct_spec(req))[0]
 
 
+# Depthwise tiled forward: CTAs (one wave each) the launch should reach before
+# a taller row tile is worth its longer per-CTA filter-row chain.
+_DW_TILED_MIN_CTAS = 1024
+
+
 def _dw_tiled_tile(p: DirectConvProblem) -> Tuple[int, int, int]:
     """(block_w, block_h, block_waves) for the output-stationary depthwise
-    forward kernel. One wave per CTA; a 7-wide output strip when the width
-    tiles by 7 (the 56/28/14/7 maps of the common backbones); a 7-row tile for
-    the larger filters and the large stride-1 maps, where amortising the input
-    halo over more rows pays, else 4 rows."""
+    forward kernel. One wave per CTA and a 7-wide output strip when the width
+    tiles by 7 (the 56/28/14/7 maps of the common backbones), else 8.
+
+    Rows per CTA: a tall tile amortises the input halo over more output rows,
+    but each CTA walks its rows one after another, so on a small grid the
+    launch is as slow as one CTA's row chain. The row tile is the tallest of
+    7 (larger filters and large stride-1 maps) or 4, then 2, then 1, that
+    still launches :data:`_DW_TILED_MIN_CTAS` CTAs; 1 when none does.
+    """
     block_w = 7 if p.Wo % 7 == 0 else 8
-    block_h = 7 if (p.KH >= 5 or (p.stride == 1 and p.Ho >= 56)) else 4
-    return (block_w, block_h, 1)
+    tallest = 7 if (p.KH >= 5 or (p.stride == 1 and p.Ho >= 56)) else 4
+    strips = -(-p.Wo // block_w) * -(-p.groups // 64) * p.N
+    for block_h in sorted({tallest, 4, 2}, reverse=True):
+        if strips * -(-p.Ho // block_h) >= _DW_TILED_MIN_CTAS:
+            return (block_w, block_h, 1)
+    return (block_w, 1, 1)
 
 
 def _grouped_direct_tile(p: DirectConvProblem) -> Tuple[int, int, int]:
     """(block_q, block_groups, double_buffer) for the generic grouped kernel."""
     return (16, 4 if p.cpg <= 8 else 2, 1)
+
+
+# The grouped direct routes (and grouped dgrad's extra weight-transpose launch)
+# carry a per-call floor the implicit GEMM does not, so they only pay once the
+# implicit GEMM would launch this many 64-row output tiles across its groups.
+_GROUPED_DIRECT_MIN_IGEMM_TILES = 2048
+
+
+def _grouped_igemm_tiles(p: DirectConvProblem) -> int:
+    """Output tiles the implicit GEMM launches for ``p``: one per 64 output
+    pixels per group (its N tile covers cpg <= 16 in one)."""
+    return -(-(p.N * p.Ho * p.Wo) // 64) * p.groups
 
 
 # Depthwise dgrad CTA-count thresholds (CTAs at the default 4-wide strip).
@@ -2144,6 +2170,13 @@ def _make_gfx950_direct_candidate(kind: str) -> KernelCandidate:
             return False, f"{kind} needs cpg == kpg in 4..16 (multiple of 4)"
         if kind == "grouped_dgrad" and (p.stride != 1 or p.PAD > p.KH - 1):
             return False, "grouped_dgrad needs stride 1 and pad <= KH - 1"
+        if kind in ("grouped", "grouped_dgrad"):
+            tiles = _grouped_igemm_tiles(p)
+            if tiles < _GROUPED_DIRECT_MIN_IGEMM_TILES:
+                return False, (
+                    f"{kind} needs at least {_GROUPED_DIRECT_MIN_IGEMM_TILES} "
+                    f"implicit-GEMM output tiles to pay off (got {tiles})"
+                )
         inst = _spec(req, p).to_direct_spec(req)
         if kind == "dw_tiled":
             return is_valid_depthwise_tiled_spec(inst, arch=req.arch)

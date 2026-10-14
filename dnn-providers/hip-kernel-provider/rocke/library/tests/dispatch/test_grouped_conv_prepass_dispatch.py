@@ -93,7 +93,7 @@ class TestStemChannelPad(unittest.TestCase):
 
 class TestGroupedDgradTranspose(unittest.TestCase):
     def _dg(self, **kw):
-        d = dict(N=4, C=128, K=128, Hi=28, Wi=28, G=32, direction="dgrad")
+        d = dict(N=32, C=128, K=128, Hi=28, Wi=28, G=32, direction="dgrad")
         d.update(kw)
         return _req(**d)
 
@@ -111,6 +111,27 @@ class TestGroupedDgradTranspose(unittest.TestCase):
         for kw in (dict(stride_h=2, stride_w=2), dict(C=1024, K=1024)):
             spec = dispatch_conv_grouped(self._dg(**kw)).spec
             self.assertEqual(spec.direct_kind, "", kw)
+
+    def test_small_work_stays_on_the_igemm(self):
+        """Below _GROUPED_DIRECT_MIN_IGEMM_TILES implicit-GEMM tiles both
+        grouped direct routes decline; at or above it they take the request."""
+        from dispatch.grouped_convolution import (
+            _GROUPED_DIRECT_MIN_IGEMM_TILES,
+            dispatch_conv_grouped,
+        )
+
+        def tiles(n):  # 64-pixel output tiles over 32 groups of 28x28
+            return -(-(n * 28 * 28) // 64) * 32
+
+        for direction, kind in (("dgrad", "grouped_dgrad"), ("fwd", "grouped")):
+            for n in (1, 2, 4, 5, 8, 32):
+                want = kind if tiles(n) >= _GROUPED_DIRECT_MIN_IGEMM_TILES else ""
+                spec = dispatch_conv_grouped(self._dg(N=n, direction=direction)).spec
+                self.assertEqual(spec.direct_kind, want, (direction, n))
+            self.assertEqual(
+                dispatch_conv_grouped(self._dg(N=1, direction=direction)).spec.direct_kind,
+                "",
+            )
 
     def test_values_read_the_transposed_filter(self):
         from dispatch.grouped_convolution import (
