@@ -146,7 +146,9 @@ def apply_split_k_decode(req: GemmRequest, spec: UniversalGemmSpec) -> Universal
     return replace(spec, trait=replace(spec.trait, split_k=decision.split_k))
 
 
-def apply_split_k_fill(req: GemmRequest, spec: UniversalGemmSpec) -> UniversalGemmSpec:
+def apply_split_k_fill(
+    req: GemmRequest, spec: UniversalGemmSpec, *, ctas_per_cu: int = 1
+) -> UniversalGemmSpec:
     """:func:`apply_split_k` with the device-fill degree (:func:`select_split_k_fill`).
 
     For compute-bound skinny shapes whose K slices stay deep. CDNA only, like
@@ -163,6 +165,7 @@ def apply_split_k_fill(req: GemmRequest, spec: UniversalGemmSpec) -> UniversalGe
         tile_m=t.tile_m,
         tile_n=t.tile_n,
         tile_k=t.tile_k,
+        ctas_per_cu=ctas_per_cu,
     )
     if decision.split_k <= 1:
         return spec
