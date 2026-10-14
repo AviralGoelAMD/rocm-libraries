@@ -483,6 +483,21 @@ class UnifiedAttention2DTiledSpec:
     # ABI change. Pure index permutation: every output row is computed by the
     # same code, so results are bit-identical.
     use_reverse_q_block_order: bool = False
+    # Conflict-free K_lds / V_lds layout for the transposed 32x32 body. The
+    # natural [T, HD] row-major tile puts every row at a multiple of the
+    # 256-byte LDS bank period (HD=128), so the QK K read (32 rows, same
+    # 16-byte column chunk per lane group) and the PV V transpose read (8 rows
+    # per instruction) serialise on the same banks. The swizzle stores logical
+    # 16-byte chunk ``c`` of row ``r`` at physical chunk ``c ^ s(r)``. The
+    # async DMA still writes lane-contiguous LDS; each lane instead *fetches*
+    # the global chunk that belongs at its LDS slot, so no ABI or LDS-size
+    # change. K uses ``s(r) = (r / RPP) % CPR`` (16 consecutive rows spread over
+    # all 64 banks); V uses ``s(r) = ((r / RPP) % 8 << 1) % CPR`` (matches the
+    # 8-row x 4-chunk footprint of one ``ds_read_b64_tr_b16``). RPP = rows per
+    # 256-byte period, CPR = 16-byte chunks per row. Same data, permuted
+    # addresses: numerics are bit-identical.
+    use_k_lds_xor_swizzle: bool = False
+    use_v_lds_xor_swizzle: bool = False
 
     def __post_init__(self):
         if self.num_warps not in (1, 2, 4, 8):
@@ -788,6 +803,22 @@ class UnifiedAttention2DTiledSpec:
                     f"tile_size must be a positive multiple of block_size "
                     f"(got tile_size={self.tile_size}, block_size={self.block_size})"
                 )
+        if self.use_k_lds_xor_swizzle or self.use_v_lds_xor_swizzle:
+            # Only the transposed 32x32 body reads K through
+            # ``_read_k8_mfma_operand`` and V through ``pv32_v_load_paired``;
+            # the other bodies index K_lds / V_lds directly.
+            if not (self.use_mfma_32x32 and self.use_transposed_qk_32x32):
+                raise ValueError("LDS XOR swizzle requires the transposed 32x32 path")
+            if self.kv_storage_dtype is not None:
+                raise ValueError("LDS XOR swizzle does not support FP8 KV")
+            if self.use_fast_paged_kv_desc:
+                raise ValueError("LDS XOR swizzle does not support fast_paged_kv_desc")
+            if self.head_size not in (64, 128, 256):
+                raise ValueError("LDS XOR swizzle needs a power-of-two head_size >= 64")
+        if self.use_k_lds_xor_swizzle and self.use_kq_lds_pad:
+            raise ValueError("use_k_lds_xor_swizzle replaces use_kq_lds_pad")
+        if self.use_v_lds_xor_swizzle and not self.use_transposed_half_local_pv:
+            raise ValueError("use_v_lds_xor_swizzle requires use_transposed_half_local_pv")
 
     @property
     def num_queries_per_kv(self) -> int:
@@ -900,6 +931,8 @@ class UnifiedAttention2DTiledSpec:
             "fp8pv" if self.use_fp8_mfma_pv else "",
             "regpv" if self.use_register_pv else "",
             "rqb" if self.use_reverse_q_block_order else "",
+            "kswz" if self.use_k_lds_xor_swizzle else "",
+            "vswz" if self.use_v_lds_xor_swizzle else "",
         )
 
 
@@ -1908,6 +1941,39 @@ def build_unified_attention_2d_tiled(
 
     lane_half_base = b.mul(tid, b.const_i32(8))
 
+    # ---- K/V LDS XOR swizzle (see ``use_k_lds_xor_swizzle``) ----
+    # Chunk = 8 halves (16 bytes). CPR chunks per row; RPP rows per 256-byte
+    # bank period. ``_*_swz_halves(row)`` returns the XOR to apply to a
+    # half-index column (chunk XOR << 3), so the 8-half offset is preserved.
+    K_LDS_SWZ = bool(spec.use_k_lds_xor_swizzle)
+    V_LDS_SWZ = bool(spec.use_v_lds_xor_swizzle)
+    SWZ_CPR = HD // 8
+    SWZ_RPP_SHIFT = max(0, (128 // HD).bit_length() - 1)
+    SWZ_HD_SHIFT = HD.bit_length() - 1
+
+    def _k_swz_halves(row: Value) -> Value:
+        chunk = b.land(
+            b.lshr(row, b.const_i32(SWZ_RPP_SHIFT)), b.const_i32(SWZ_CPR - 1)
+        )
+        return b.shl(chunk, b.const_i32(3))
+
+    def _v_swz_halves(row: Value) -> Value:
+        chunk = b.land(
+            b.shl(
+                b.land(b.lshr(row, b.const_i32(SWZ_RPP_SHIFT)), b.const_i32(7)),
+                b.const_i32(1),
+            ),
+            b.const_i32(SWZ_CPR - 1),
+        )
+        return b.shl(chunk, b.const_i32(3))
+
+    def _swizzle_dma_linear_half(linear_half: Value, swz_halves) -> Value:
+        # The DMA lane owns LDS slot (row, chunk p) of the natural layout; it
+        # fetches the global chunk c = p ^ s(row) that the swizzled layout
+        # stores there. XOR only touches the chunk bits of the half index.
+        row = b.lshr(linear_half, b.const_i32(SWZ_HD_SHIFT))
+        return b.xor(linear_half, swz_halves(row))
+
     K_lds_addr = b.smem_addr_of(K_lds)
     V_lds_addr = b.smem_addr_of(V_lds)
     bytes_per_buf = T * HD * 2  # one [T, HD] *working-dtype* (bf16) slab
@@ -2131,6 +2197,8 @@ def build_unified_attention_2d_tiled(
                 linear_half = b.add(
                     b.const_i32(call * KV_HALVES_PER_CALL), lane_half_base
                 )
+                if K_LDS_SWZ:
+                    linear_half = _swizzle_dma_linear_half(linear_half, _k_swz_halves)
                 if I64_KV_ADDR:
                     base_i64, voff, _ = paged_kv_desc.offset_i64_split(
                         b,
@@ -2189,6 +2257,8 @@ def build_unified_attention_2d_tiled(
                 linear_half = b.add(
                     b.const_i32(call * KV_HALVES_PER_CALL), lane_half_base
                 )
+                if V_LDS_SWZ:
+                    linear_half = _swizzle_dma_linear_half(linear_half, _v_swz_halves)
                 if I64_KV_ADDR:
                     base_i64, voff, _ = paged_kv_desc.offset_i64_split(
                         b,
@@ -2716,6 +2786,9 @@ def build_unified_attention_2d_tiled(
         Otherwise read bf16 directly. Shared by the 16x16 and 32x32 QK
         paths so both get the fp8 LDS-footprint win.
         """
+        if K_LDS_SWZ:
+            # Logical chunk c of row r lives at physical chunk c ^ s_K(r).
+            k_off = b.xor(k_off, _k_swz_halves(k_row))
         if KQ_XOR_SWIZZLE:
             # Measurement-only vanilla XOR swizzle: permute the read column by
             # the low 3 bits of the row so 8 consecutive rows land on distinct
@@ -3993,6 +4066,7 @@ def build_unified_attention_2d_tiled(
                                 lane_half32=lane_half32,
                                 lane_col32=lane_col32,
                                 dtype=dtype,
+                                col_xor_of_row=_v_swz_halves if V_LDS_SWZ else None,
                             )
                             b_p_elems = []
                             for kk in range(8):
