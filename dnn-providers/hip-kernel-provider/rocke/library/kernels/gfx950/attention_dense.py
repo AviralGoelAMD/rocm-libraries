@@ -124,6 +124,9 @@ _DEFAULT_LDS_K_ROW_PAD = 8
 _DEFAULT_LAZY_RESCALE_THRESHOLD = 8.0
 # sched_barrier mask: 11 instruction-class bits (__builtin_amdgcn_sched_barrier).
 _SCHED_BARRIER_MASK_MAX = 0x7FF
+# sched_barrier mask letting only VALU (0x2), SALU (0x4) and TRANS (0x400)
+# cross: MFMAs and LDS reads keep their program order around it.
+_SCHED_ALU_ONLY = 0x406
 _PV_LOOP_ORDERS = frozenset({"d_major", "k_major"})
 _IGLP_OFF = -1
 # Accepted softmax-scale range, a chosen safety margin (not a hardware limit).
@@ -253,6 +256,11 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
     # readfirstlane, so wave-uniform LDS-DMA destinations and the exp2 scale
     # do not each hold a vector register across the KV loop.
     scalar_uniforms: bool = field(default=False, kw_only=True)
+    # qk_lookahead + lds_read_base only: issue each K (QK) and V (PV) operand
+    # read this many MFMAs before its use (0 = leave placement to the backend
+    # scheduler). Holds that many operands in registers; a fence per MFMA
+    # keeps the distance.
+    operand_read_ahead: int = field(default=0, kw_only=True)
 
     def resolved_exp_per_pv_step(self) -> int:
         if self.exp_per_pv_step is not None:
@@ -476,6 +484,18 @@ class Gfx950AttentionDenseSpec(_AttentionDenseSpecBase):
             raise ValueError("lds_read_base requires wide_lds_dma on the grid body")
         if self.scalar_uniforms and self.persistent:
             raise ValueError("scalar_uniforms is implemented on the grid body only")
+        if not 0 <= self.operand_read_ahead <= 16 or (
+            self.operand_read_ahead
+            and (
+                not (self.qk_lookahead and self.lds_read_base)
+                or self.bulk_operand_reads
+            )
+        ):
+            raise ValueError(
+                "operand_read_ahead must be 0..16, needs qk_lookahead and "
+                "lds_read_base, and excludes bulk_operand_reads; got "
+                f"{self.operand_read_ahead}"
+            )
 
     @property
     def resolved_persist_decode(self) -> str:
@@ -622,6 +642,7 @@ _CODEGEN_KNOB_DEFAULTS = MappingProxyType(
             "bulk_operand_reads",
             "lds_read_base",
             "scalar_uniforms",
+            "operand_read_ahead",
         )
     }
 )
@@ -757,6 +778,7 @@ def build_attention_dense(
     BULK_K = bool(spec.bulk_operand_reads & 1)
     BULK_V = bool(spec.bulk_operand_reads & 2)
     LDS_READ_BASE = spec.lds_read_base
+    READ_AHEAD = int(spec.operand_read_ahead)
     IGLP = spec.resolved_iglp_mode()
     gqa = Hq // Hkv
     stride_q_tok = Hq * D
@@ -1216,7 +1238,36 @@ def build_attention_dense(
             K_lds, _z, _z, _z, b.add(kt, b.const_i32(off)), dtype=dtype, n=8
         )
 
-    def do_qk(kbuf, after_mfma=None, accs=None):
+    def _do_qk_read_ahead(kbuf, after_mfma, accs, tail_read=None):
+        """``operand_read_ahead``: each K operand read runs READ_AHEAD MFMAs
+        ahead of its use, fenced like the PV run (see ``do_pv``). Once the K
+        reads run out, ``tail_read`` (optional) fills the same slots, so the
+        next phase's first operands are in flight before this run ends."""
+        kt = k_tile_base(kbuf)
+        steps = [(nsub, ks) for nsub in range(N_SUB) for ks in range(K_STEPS)]
+        packs = [None] * len(steps)
+        for k in range(min(READ_AHEAD, len(steps))):
+            packs[k] = read_k_at(kt, *steps[k])
+        s_reg = []
+        acc = None
+        for idx, (nsub, ks) in enumerate(steps):
+            if ks == 0:
+                acc = b.zero_vec_f32(16)
+            acc = mfma_32x32x16_for_dtype(b, dtype, packs[idx], q_packs[ks], acc)
+            if idx + READ_AHEAD < len(steps):
+                packs[idx + READ_AHEAD] = read_k_at(kt, *steps[idx + READ_AHEAD])
+            elif tail_read is not None:
+                tail_read()
+            b.sched_barrier(_SCHED_ALU_ONLY)
+            if after_mfma is not None:
+                after_mfma()
+            if ks == K_STEPS - 1:
+                if accs is not None:
+                    accs.append(acc)
+                s_reg.append([b.vec_extract(acc, i) for i in range(16)])
+        return s_reg
+
+    def do_qk(kbuf, after_mfma=None, accs=None, tail_read=None):
         """QK MFMA: S^T = K@Q^T. mfma(a=K, bv=Q) => key on the 16 per-lane accumulator
         regs (+lane^32), query on lane%32 -- the layout that keeps softmax a cheap
         in-lane reduce + one lane^32 exchange, and lets CK-1's transposed PV consume P
@@ -1227,6 +1278,8 @@ def build_attention_dense(
         list) receives each nsub's raw accumulator vector."""
         if BULK_K:
             return _do_qk_bulk(kbuf, after_mfma, accs)
+        if READ_AHEAD:
+            return _do_qk_read_ahead(kbuf, after_mfma, accs, tail_read)
         s_reg = []
         kt = k_tile_base(kbuf) if LDS_READ_BASE else None
         for nsub in range(N_SUB):
@@ -1494,16 +1547,46 @@ def build_attention_dense(
             dtype=dtype,
         )
 
-    def do_pv(o_acc_in, p_packs, vbuf, after_mfma=None, bulk=False):
+    def v_prefetch(vbuf):
+        """operand_read_ahead: lets an earlier MFMA run (do_qk's ``tail_read``)
+        start this tile's first PV operand reads. Returns (read_one, state);
+        pass ``state`` to do_pv as ``pre``."""
+        st = {"base": v_operand_base(vbuf), "ops": []}
+
+        def read_one():
+            k = len(st["ops"])
+            if k < min(READ_AHEAD, len(PV_STEPS)):
+                st["ops"].append(read_v(*PV_STEPS[k], st["base"]))
+
+        return read_one, st
+
+    def do_pv(o_acc_in, p_packs, vbuf, after_mfma=None, bulk=False, pre=None):
         out = list(o_acc_in)
-        vbuf = v_operand_base(vbuf)
+        vbuf = pre["base"] if pre is not None else v_operand_base(vbuf)
+        n_steps = len(PV_STEPS)
         if bulk:
             # bulk_operand_reads: all V operand reads ahead of the PV MFMA run.
             vops = [read_v(dt, kk_step, vbuf) for dt, kk_step in PV_STEPS]
             b.sched_barrier(0)
+        elif READ_AHEAD:
+            # operand_read_ahead: V operand reads run READ_AHEAD MFMAs ahead of
+            # their use; each fence keeps MFMAs and LDS reads in this order
+            # while VALU, SALU and transcendental work may still move across.
+            vops = [None] * n_steps
+            done = list(pre["ops"]) if pre is not None else []
+            vops[: len(done)] = done
+            for k in range(len(done), min(READ_AHEAD, n_steps)):
+                vops[k] = read_v(*PV_STEPS[k], vbuf)
         for idx, (dt, kk_step) in enumerate(PV_STEPS):
-            vop = vops[idx] if bulk else read_v(dt, kk_step, vbuf)
+            if bulk or READ_AHEAD:
+                vop = vops[idx]
+            else:
+                vop = read_v(dt, kk_step, vbuf)
             out[dt] = mfma_32x32x16_for_dtype(b, dtype, vop, p_packs[kk_step], out[dt])
+            if READ_AHEAD and not bulk:
+                if idx + READ_AHEAD < n_steps:
+                    vops[idx + READ_AHEAD] = read_v(*PV_STEPS[idx + READ_AHEAD], vbuf)
+                b.sched_barrier(_SCHED_ALU_ONLY)
             if after_mfma is not None:
                 after_mfma()
         return out
@@ -1709,7 +1792,10 @@ def build_attention_dense(
                         return
                     emit_exp(*slot)
 
-            s_next = do_qk(buf_j1, after_mfma=exp_hook)
+            # V(j) landed before this iteration's top barrier, so the first PV
+            # operand reads may already run in the QK MFMA shadow.
+            pv_read, pv_pre = v_prefetch(buf_j) if READ_AHEAD else (None, None)
+            s_next = do_qk(buf_j1, after_mfma=exp_hook, tail_read=pv_read)
             for slot in slots:
                 emit_exp(*slot)
             l_local = b.fadd(lsum[0], lsum[1])
@@ -1740,7 +1826,9 @@ def build_attention_dense(
 
             if PV_PRIORITY and not PINGPONG:
                 b.s_setprio(PV_PRIORITY)
-            o_acc = do_pv(o_acc, p_packs, buf_j, after_mfma=max_hook, bulk=BULK_V)
+            o_acc = do_pv(
+                o_acc, p_packs, buf_j, after_mfma=max_hook, bulk=BULK_V, pre=pv_pre
+            )
             if PV_PRIORITY and not PINGPONG:
                 b.s_setprio(0)
             for n, i in mslots:
