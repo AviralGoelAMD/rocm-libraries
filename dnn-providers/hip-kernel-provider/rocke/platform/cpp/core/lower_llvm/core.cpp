@@ -1807,6 +1807,35 @@ static const char* rocke_ll_scheduler_strategy(rocke_lower_t* L, const rocke_att
     return strategy;
 }
 
+/* Python codegen_policy.normalize_f32_denormal_mode: "ieee" is the LLVM
+ * default and emits nothing; "preserve-sign" is the only other mode. */
+static const char* rocke_ll_f32_denormal_mode(rocke_lower_t* L, const rocke_attr_value_t* v)
+{
+    if(!v)
+    {
+        return NULL;
+    }
+    if(v->kind != ROCKE_ATTR_STR || !v->u.s)
+    {
+        rocke_ll_fail(L, ROCKE_ERR_VALUE, "f32_denormal_mode must be a string");
+        return NULL;
+    }
+    if(strcmp(v->u.s, "ieee") == 0)
+    {
+        return NULL;
+    }
+    if(strcmp(v->u.s, "preserve-sign") != 0)
+    {
+        rocke_ll_fail(L,
+                      ROCKE_ERR_VALUE,
+                      "unsupported f32_denormal_mode '%s'; expected one of: ieee, "
+                      "preserve-sign, or None",
+                      v->u.s);
+        return NULL;
+    }
+    return v->u.s;
+}
+
 /* ====================================================================== */
 /* finalize (Python finalize)                                             */
 /* ====================================================================== */
@@ -1955,6 +1984,13 @@ void rocke_ll_finalize(rocke_lower_t* L, rocke_strbuf_t* out)
             rocke_strbuf_appendf(out,
                                  " \"amdgpu-sched-strategy\"=\"%s\"",
                                  rocke_ll_scheduler_strategy(L, scheduler));
+        }
+        const char* f32_denorm
+            = rocke_ll_f32_denormal_mode(L, rocke_attr_get(&L->kernel->attrs, "f32_denormal_mode"));
+        if(f32_denorm)
+        {
+            rocke_strbuf_appendf(
+                out, " \"denormal-fp-math-f32\"=\"%s,%s\"", f32_denorm, f32_denorm);
         }
         /* waves_per_eu mirrors the Python lowerer: a bare int N emits "N,N",
          * a 2-element tuple (lo,hi) -- serialized as the INT_LIST l:[ i:lo, i:hi ]

@@ -354,6 +354,9 @@ def compile_kernel_via_hipcc(
     hip_src = lower_kernel_to_hip(kernel, arch=lower_arch)
     t2 = time.perf_counter()
     flags = ["-O3"]
+    if policy.f32_denormal_mode == "preserve-sign":
+        # clang's spelling of ``"denormal-fp-math-f32"="preserve-sign"``.
+        flags.append("-fgpu-flush-denormals-to-zero")
     if extra_flags:
         flags.extend(extra_flags)
     with tempfile.TemporaryDirectory() as td:

@@ -43,6 +43,7 @@ from dataclasses import dataclass
 import math
 from typing import Optional, Tuple
 
+from rocke.core.codegen_policy import F32_DENORMAL_MODE_ATTR, F32DenormalMode
 from rocke.core.ir import (
     BF16,
     CACHE_STREAM,
@@ -1186,6 +1187,12 @@ def build_unified_attention_2d_tiled(
         b.kernel.attrs["waves_per_eu"] = spec.waves_per_eu
     if spec.use_agpr_alloc_zero:
         b.kernel.attrs["agpr_alloc"] = (0, 0)
+    # Flush f32 denormals: the precise softmax exp2 then lowers to a bare
+    # v_exp_f32 (no denormal range fix-up), and the subtract feeding it stays
+    # SLP-vectorizable (v_pk_add_f32), which exp2_fast would block. Every
+    # softmax input is <= 0, and results below 2^-126 are invisible in the
+    # bf16/fp16 P operand.
+    b.kernel.attrs[F32_DENORMAL_MODE_ATTR] = F32DenormalMode.PRESERVE_SIGN.value
 
     # ---------------- parameter declarations ----------------
     output = b.param(
