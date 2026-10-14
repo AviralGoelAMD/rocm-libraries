@@ -214,16 +214,6 @@ class UnifiedAttention3DTiledSpec:
     # selects a scalar s_load: the ids then never sit in the vmcnt queue ahead
     # of (or behind) the K/V DMAs.
     scalar_block_ids: bool = False
-    # Keep MFMA accumulators in VGPRs (no AGPRs): the per-tile alpha rescale
-    # then works in place instead of copying acc AGPR -> VGPR -> AGPR.
-    acc_in_vgpr: bool = False
-    # Flush f32 denormals (bare v_exp_f32, no IEEE denormal fix-up).
-    ftz_f32: bool = False
-    # transposed_softmax + decode_fast_path: mask only keys past the causal
-    # limit. Rows past the query group are never stored, and for one query
-    # token the causal limit already bounds the prefix, so the row and
-    # prefix masks are redundant.
-    decode_lean_mask: bool = False
     # Hand out CTAs segment-fastest: the linear launch id (x fastest, which is
     # how the dispatcher deals CTAs round-robin across XCDs) is re-split into
     # (segment, kv head, query block), so one sequence's segments land on
@@ -268,8 +258,6 @@ class UnifiedAttention3DTiledSpec:
             raise ValueError("fold_kv_scale needs an fp8 KV cache")
         if self.kv_load_aux not in (0, 1, 2, 3):
             raise ValueError(f"kv_load_aux must be 0..3 (got {self.kv_load_aux})")
-        if self.decode_lean_mask and not (self.transposed_softmax and self.decode_fast_path):
-            raise ValueError("decode_lean_mask needs transposed_softmax and decode_fast_path")
 
     @property
     def num_queries_per_kv(self) -> int:
@@ -332,9 +320,6 @@ class UnifiedAttention3DTiledSpec:
             f"aux{self.kv_load_aux}" if self.kv_load_aux else "",
             "lsc" if self.lds_dma_scopes else "",
             "sbt" if self.scalar_block_ids else "",
-            "accv" if self.acc_in_vgpr else "",
-            "ftz" if self.ftz_f32 else "",
-            "lean" if self.decode_lean_mask else "",
             "smo" if self.seg_major_order else "",
         )
 
@@ -467,10 +452,6 @@ def build_unified_attention_3d_tiled(
     apply_codegen_policy(b.kernel, spec.codegen_policy)
     if spec.lds_dma_scopes:
         b.kernel.attrs["lds_dma_alias_scopes"] = True
-    if spec.acc_in_vgpr:
-        b.kernel.attrs["agpr_alloc"] = (0, 0)
-    if spec.ftz_f32:
-        b.kernel.attrs["f32_denormal_flush"] = True
 
     # ---------------- parameter declarations ----------------
     # NOTE: the AITER 3D signature distinguishes between segm_* workspace
@@ -1302,11 +1283,8 @@ def build_unified_attention_3d_tiled(
                 for r in range(4):
                     col_abs = b.add(tile_key, b.const_i32(_trans_key(n, r)))
                     causal_ok = b.cmp_le(col_abs, causal_lim)
-                    if spec.decode_lean_mask:
-                        m_ok = causal_ok
-                    else:
-                        in_prefix = b.cmp_lt(col_abs, max_seq_prefix_len)
-                        m_ok = b.land(b.land(row_ok, causal_ok), in_prefix)
+                    in_prefix = b.cmp_lt(col_abs, max_seq_prefix_len)
+                    m_ok = b.land(b.land(row_ok, causal_ok), in_prefix)
                     if SLIDING_WINDOW > 0:
                         dist = b.sub(causal_lim, col_abs)
                         m_ok = b.land(m_ok, b.cmp_lt(dist, sw_const))

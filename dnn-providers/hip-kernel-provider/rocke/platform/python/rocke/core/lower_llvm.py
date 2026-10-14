@@ -800,12 +800,6 @@ _INTRINSIC_DECLS: Dict[str, str] = {
     "amdgcn.cvt.scalef32.pk.f32.bf8": (
         "declare <2 x float> @llvm.amdgcn.cvt.scalef32.pk.f32.bf8(i32, float, i1)"
     ),
-    "amdgcn.cvt.scalef32.pk.bf16.fp8": (
-        "declare <2 x bfloat> @llvm.amdgcn.cvt.scalef32.pk.bf16.fp8(i32, float, i1)"
-    ),
-    "amdgcn.cvt.scalef32.pk.f16.fp8": (
-        "declare <2 x half> @llvm.amdgcn.cvt.scalef32.pk.f16.fp8(i32, float, i1)"
-    ),
     # gfx950 ``ds_swizzle_b32`` — single-instruction intra-32-lane
     # permute. We use it for the softmax XOR-butterfly reduction; the
     # FFT-mode offset is encoded as an immediate and the LDS unit
@@ -2614,43 +2608,6 @@ class _Lowerer:
         self._current().emit(
             f"  {op.result.name} = shufflevector <2 x float> {lo}, <2 x float> {hi}, "
             f"<4 x i32> <i32 0, i32 1, i32 2, i32 3>"
-        )
-
-    def _op_arith_cvt_scalef32_pk_fp8x8_to(self, op: Op) -> None:
-        """Lower <8 x fp8e4m3> + f32 scale -> <8 x bf16|f16>: four gfx950
-        ``v_cvt_scalef32_pk_{bf16,f16}_fp8`` (2 elements each), one per
-        16-bit half of the two packed words."""
-        v, scale = op.operands
-        is_bf16 = op.attrs["dtype"] == "bf16"
-        key = "bf16" if is_bf16 else "f16"
-        ety = "bfloat" if is_bf16 else "half"
-        self._need(f"amdgcn.cvt.scalef32.pk.{key}.fp8")
-        base = op.result.name
-        words = f"{base}w"
-        self._current().emit(f"  {words} = bitcast <8 x i8> {self._operand(v)} to <2 x i32>")
-        parts = []
-        for w in range(2):
-            word = f"{base}w{w}"
-            self._current().emit(f"  {word} = extractelement <2 x i32> {words}, i32 {w}")
-            for hi in ("false", "true"):
-                part = f"{base}p{len(parts)}"
-                self._current().emit(
-                    f"  {part} = call <2 x {ety}> @llvm.amdgcn.cvt.scalef32.pk.{key}.fp8("
-                    f"i32 {word}, float {self._operand(scale)}, i1 {hi})"
-                )
-                parts.append(part)
-        lo4, hi4 = f"{base}lo", f"{base}hi"
-        self._current().emit(
-            f"  {lo4} = shufflevector <2 x {ety}> {parts[0]}, <2 x {ety}> {parts[1]}, "
-            f"<4 x i32> <i32 0, i32 1, i32 2, i32 3>"
-        )
-        self._current().emit(
-            f"  {hi4} = shufflevector <2 x {ety}> {parts[2]}, <2 x {ety}> {parts[3]}, "
-            f"<4 x i32> <i32 0, i32 1, i32 2, i32 3>"
-        )
-        self._current().emit(
-            f"  {base} = shufflevector <4 x {ety}> {lo4}, <4 x {ety}> {hi4}, "
-            f"<8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>"
         )
 
     def _op_arith_cvt_scalef32_pk_f32_bf8(self, op: Op) -> None:
