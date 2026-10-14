@@ -2072,6 +2072,7 @@ CONV_DGRAD_REGISTRY = CandidateRegistry(
     _FAMILY_DGRAD, dim_vocabulary=_CONV_DIM_VOCABULARY
 )
 CONV_DGRAD_REGISTRY.register(_make_gfx950_dgrad_candidate())
+CONV_DGRAD_REGISTRY.register(_make_gfx950_direct_candidate("dw_dgrad_stream"))
 
 CONV_FWD_REGISTRY = CandidateRegistry(_FAMILY_FWD, dim_vocabulary=_CONV_DIM_VOCABULARY)
 CONV_FWD_REGISTRY.register(_make_gfx942_fwd_candidate())
