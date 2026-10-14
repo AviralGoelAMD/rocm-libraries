@@ -1838,25 +1838,13 @@ class IRBuilder:
         ).result
 
     def global_load(
-        self,
-        ptr: Value,
-        idx: Value,
-        dtype: Type,
-        *,
-        align: int = 1,
-        invariant: bool = False,
+        self, ptr: Value, idx: Value, dtype: Type, *, align: int = 1
     ) -> Value:
-        """Scalar global load. ``invariant=True`` promises the location is not
-        written while the kernel runs (LLVM ``!invariant.load``), which lets
-        the backend use a scalar ``s_load`` when the address is uniform."""
-        attrs = {"elem_type": dtype.name, "align": int(align)}
-        if invariant:
-            attrs["invariant"] = True
         return self._op(
             "memref.global_load_typed",
             [ptr, idx],
             [dtype],
-            attrs=attrs,
+            attrs={"elem_type": dtype.name, "align": int(align)},
             result_name_hint="gl",
         ).result
 
@@ -1872,10 +1860,8 @@ class IRBuilder:
     def global_load_f32(self, ptr: Value, idx: Value, *, align: int = 4) -> Value:
         return self.global_load(ptr, idx, F32, align=align)
 
-    def global_load_i32(
-        self, ptr: Value, idx: Value, *, align: int = 4, invariant: bool = False
-    ) -> Value:
-        return self.global_load(ptr, idx, I32, align=align, invariant=invariant)
+    def global_load_i32(self, ptr: Value, idx: Value, *, align: int = 4) -> Value:
+        return self.global_load(ptr, idx, I32, align=align)
 
     def global_load_i64(self, ptr: Value, idx: Value, *, align: int = 8) -> Value:
         return self.global_load(ptr, idx, I64, align=align)

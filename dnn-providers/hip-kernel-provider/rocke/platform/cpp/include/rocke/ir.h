@@ -934,16 +934,6 @@ rocke_value_t* rocke_b_global_load(rocke_ir_builder_t* b,
                                    rocke_value_t* idx,
                                    const rocke_type_t* dtype,
                                    int align /* <=0 => 1 */);
-/* Like rocke_b_global_load; invariant=true records the `invariant` attr
- * (Python global_load(invariant=True)), lowered to `!invariant.load !1`: the
- * location is not written while the kernel runs, so a uniform address may
- * select a scalar s_load. */
-rocke_value_t* rocke_b_global_load_ex(rocke_ir_builder_t* b,
-                                      rocke_value_t* ptr,
-                                      rocke_value_t* idx,
-                                      const rocke_type_t* dtype,
-                                      int align,
-                                      bool invariant);
 rocke_value_t* rocke_b_global_load_f16(rocke_ir_builder_t* b,
                                        rocke_value_t* ptr,
                                        rocke_value_t* idx,

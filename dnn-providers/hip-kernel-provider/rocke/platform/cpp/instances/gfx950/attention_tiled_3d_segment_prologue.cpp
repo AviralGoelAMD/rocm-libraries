@@ -931,12 +931,8 @@ rocke_value_t**
         rocke_value_t* page = rocke_b_mul(B, kv_tile_idx, rocke_b_const_i32(B, CFG.TILE_MULT));
         page = rocke_b_add(B, page, rocke_b_const_i32(B, p));
         page = rocke_b_select(B, rocke_b_cmp_lt(B, page, ctx->last_page), page, ctx->last_page);
-        ids[p] = rocke_b_global_load_ex(B,
-                                        ctx->block_tables,
-                                        rocke_b_add(B, ctx->seq_base, page),
-                                        rocke_i32(),
-                                        4,
-                                        CFG.SCALAR_BLOCK_IDS);
+        ids[p] = rocke_b_global_load(
+            B, ctx->block_tables, rocke_b_add(B, ctx->seq_base, page), rocke_i32(), 4);
     }
     return ids;
 }

@@ -182,7 +182,6 @@ typedef struct rocke_gfx950_attn_tiled_3d_config
     bool FOLD_SCALE; /* spec.fold_kv_scale and KV_FP8         */
     int NR; /* softmax state rows per lane: 1 if TRANS else 4 */
     bool KV_SPLIT_WAIT; /* spec.kv_split_wait                    */
-    bool SCALAR_BLOCK_IDS; /* spec.scalar_block_ids                 */
     int KV_LOAD_AUX; /* spec.kv_load_aux (DMA aux bits)        */
 
     const rocke_type_t* dtype; /* F16 / BF16                                 */
@@ -437,7 +436,7 @@ void rocke_gfx950_attention_tiled_3d_issue_v_load(rocke_gfx950_attention_tiled_3
                                                   rocke_value_t* buf_idx,
                                                   rocke_value_t* const* block_ids);
 /* _tile_block_ids(kv_tile_idx): the TILE_MULT physical block ids of a tile
- * (clamped to the last valid page; invariant loads when SCALAR_BLOCK_IDS).
+ * (clamped to the last valid page).
  * Returns an arena array of TILE_MULT values, or NULL when not PREFETCH_IDS
  * (Python _ids()). */
 rocke_value_t**

@@ -3045,13 +3045,8 @@ class _Lowerer:
             f"  {gep} = getelementptr inbounds {elem_ty}, ptr addrspace(1) "
             f"{self._operand(ptr)}, i32 {self._operand(idx)}"
         )
-        md = ""
-        if op.attrs.get("invariant"):
-            # Shares the empty ``!1 = !{}`` node with the FP-atomic metadata.
-            self._needs_fp_atomic_md = True
-            md = ", !invariant.load !1"
         self._current().emit(
-            f"  {op.result.name} = load {elem_ty}, ptr addrspace(1) {gep}, align {align}{md}"
+            f"  {op.result.name} = load {elem_ty}, ptr addrspace(1) {gep}, align {align}"
         )
 
     def _op_memref_global_store(self, op: Op) -> None:

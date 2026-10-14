@@ -391,35 +391,6 @@ _CONFIGS = {
         kv_load_aux=2,
         kv_prefetch=True,
     ),
-    26: dict(
-        # kv_prefetch + scalar_block_ids
-        head_size=128,
-        block_size=16,
-        num_query_heads=32,
-        num_kv_heads=8,
-        dtype="bf16",
-        num_segments=16,
-        use_sinks=False,
-        sliding_window=0,
-        has_softcap=False,
-        kv_prefetch=True,
-        scalar_block_ids=True,
-    ),
-    27: dict(
-        # kv_prefetch + kv_split_wait + scalar_block_ids
-        head_size=128,
-        block_size=16,
-        num_query_heads=32,
-        num_kv_heads=8,
-        dtype="bf16",
-        num_segments=16,
-        use_sinks=False,
-        sliding_window=0,
-        has_softcap=False,
-        kv_prefetch=True,
-        kv_split_wait=True,
-        scalar_block_ids=True,
-    ),
 }
 
 

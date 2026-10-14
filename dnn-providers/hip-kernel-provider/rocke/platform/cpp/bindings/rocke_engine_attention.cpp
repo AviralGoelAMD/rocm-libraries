@@ -1074,7 +1074,6 @@ rocke_unified_attention_3d_tiled_spec_t t3d_build(const py::dict& d, Store& st)
     s.kv_split_wait = a_bool(d, "kv_split_wait", s.kv_split_wait);
     s.fold_kv_scale = a_bool(d, "fold_kv_scale", s.fold_kv_scale);
     s.kv_load_aux = a_int(d, "kv_load_aux", s.kv_load_aux);
-    s.scalar_block_ids = a_bool(d, "scalar_block_ids", s.scalar_block_ids);
     if(d.contains("waves_per_eu") && !d["waves_per_eu"].is_none())
     {
         s.has_waves_per_eu = true;

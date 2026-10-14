@@ -129,12 +129,10 @@ _FAST = {"decode_fast_path": True, "kv_prefetch": True, "kv_tile_mult": 2}
 _KNOBS = [
     ({}, False),
     (_FAST, False),
-    ({**_FAST, "transposed_softmax": True, "scalar_block_ids": True,
-      "kv_split_wait": True, "kv_load_aux": 3}, False),
-    ({**_FAST, "transposed_softmax": True, "scalar_block_ids": True}, False),
+    ({**_FAST, "transposed_softmax": True, "kv_split_wait": True, "kv_load_aux": 3}, False),
+    ({**_FAST, "transposed_softmax": True}, False),
     (_FAST, True),
-    ({**_FAST, "transposed_softmax": True, "scalar_block_ids": True,
-      "fold_kv_scale": True}, True),
+    ({**_FAST, "transposed_softmax": True, "fold_kv_scale": True}, True),
 ]
 
 

@@ -120,16 +120,6 @@ rocke_value_t* rocke_b_global_load(rocke_ir_builder_t* b,
                                    const rocke_type_t* dtype,
                                    int align)
 {
-    return rocke_b_global_load_ex(b, ptr, idx, dtype, align, false);
-}
-
-rocke_value_t* rocke_b_global_load_ex(rocke_ir_builder_t* b,
-                                      rocke_value_t* ptr,
-                                      rocke_value_t* idx,
-                                      const rocke_type_t* dtype,
-                                      int align,
-                                      bool invariant)
-{
     rocke_value_t* ops[2];
     rocke_attr_map_t a;
     if(!rocke_i_live(b))
@@ -144,8 +134,6 @@ rocke_value_t* rocke_b_global_load_ex(rocke_ir_builder_t* b,
     a = rocke_i_attrs(b);
     rocke_attr_set_str(b, &a, "elem_type", dtype->name);
     rocke_attr_set_int(b, &a, "align", (int64_t)align);
-    if(invariant)
-        rocke_attr_set_bool(b, &a, "invariant", true);
     return rocke_i_op1(b, ROCKE_OP_MEMREF_GLOBAL_LOAD_TYPED, ops, 2, dtype, &a, "gl");
 }
 
