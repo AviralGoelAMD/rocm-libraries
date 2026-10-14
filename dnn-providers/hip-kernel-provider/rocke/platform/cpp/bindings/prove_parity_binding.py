@@ -1782,19 +1782,6 @@ def cfgs_gfx950_attention_tiled_3d():
             use_sinks=False,
             sliding_window=0,
             has_softcap=False,
-            kv_prefetch=True,
-            scalar_block_ids=True,
-        ),
-        dict(
-            head_size=128,
-            block_size=16,
-            num_query_heads=32,
-            num_kv_heads=8,
-            dtype="bf16",
-            num_segments=16,
-            use_sinks=False,
-            sliding_window=0,
-            has_softcap=False,
             transposed_softmax=True,
         ),
         dict(
@@ -1900,9 +1887,8 @@ def cfgs_gfx950_attention_tiled_3d():
             use_sinks=False,
             sliding_window=0,
             has_softcap=False,
-            kv_prefetch=True,
-            kv_split_wait=True,
-            scalar_block_ids=True,
+            kv_storage_dtype="fp8e4m3",
+            fold_kv_scale=True,
         ),
         dict(
             head_size=128,
@@ -1939,8 +1925,22 @@ def cfgs_gfx950_attention_tiled_3d():
             use_sinks=False,
             sliding_window=0,
             has_softcap=False,
-            kv_storage_dtype="fp8e4m3",
-            fold_kv_scale=True,
+            kv_prefetch=True,
+            scalar_block_ids=True,
+        ),
+        dict(
+            head_size=128,
+            block_size=16,
+            num_query_heads=32,
+            num_kv_heads=8,
+            dtype="bf16",
+            num_segments=16,
+            use_sinks=False,
+            sliding_window=0,
+            has_softcap=False,
+            kv_prefetch=True,
+            kv_split_wait=True,
+            scalar_block_ids=True,
         ),
         dict(
             head_size=128,
@@ -1980,317 +1980,6 @@ def cfgs_gfx950_attention_tiled_3d():
             use_qq_bias=True,
             kv_prefetch=True,
             seg_major_order=True,
-        ),
-        dict(
-            head_size=128,
-            block_size=16,
-            num_query_heads=32,
-            num_kv_heads=8,
-            dtype="bf16",
-            num_segments=2,
-            use_sinks=False,
-            sliding_window=0,
-            has_softcap=False,
-            num_seqs=32,
-            decode_fast_path=True,
-            kv_tile_mult=2,
-            kv_prefetch=True,
-            transposed_softmax=True,
-            kv_load_aux=3,
-            seg_major_order=True,
-            scalar_block_ids=True,
-            kv_split_wait=True,
-            use_f32_denormal_flush=True,
-        ),
-        dict(
-            head_size=128,
-            block_size=16,
-            num_query_heads=32,
-            num_kv_heads=8,
-            dtype="bf16",
-            num_segments=8,
-            use_sinks=False,
-            sliding_window=0,
-            has_softcap=False,
-            num_seqs=32,
-            decode_fast_path=True,
-            kv_tile_mult=2,
-            kv_prefetch=True,
-            transposed_softmax=True,
-            kv_load_aux=3,
-            seg_major_order=True,
-            scalar_block_ids=True,
-            kv_split_wait=True,
-            use_f32_denormal_flush=True,
-        ),
-        dict(
-            head_size=128,
-            block_size=16,
-            num_query_heads=32,
-            num_kv_heads=8,
-            dtype="bf16",
-            num_segments=32,
-            use_sinks=False,
-            sliding_window=0,
-            has_softcap=False,
-            num_seqs=32,
-            decode_fast_path=True,
-            kv_tile_mult=2,
-            kv_prefetch=True,
-            transposed_softmax=True,
-            kv_load_aux=3,
-            seg_major_order=True,
-            scalar_block_ids=True,
-            kv_split_wait=True,
-            use_f32_denormal_flush=True,
-        ),
-        dict(
-            head_size=128,
-            block_size=16,
-            num_query_heads=32,
-            num_kv_heads=8,
-            dtype="bf16",
-            num_segments=128,
-            use_sinks=False,
-            sliding_window=0,
-            has_softcap=False,
-            num_seqs=32,
-            decode_fast_path=True,
-            kv_tile_mult=2,
-            kv_prefetch=True,
-            transposed_softmax=True,
-            kv_load_aux=3,
-            seg_major_order=True,
-            scalar_block_ids=True,
-            kv_split_wait=True,
-            use_f32_denormal_flush=True,
-        ),
-        dict(
-            head_size=128,
-            block_size=16,
-            num_query_heads=8,
-            num_kv_heads=1,
-            dtype="bf16",
-            num_segments=2,
-            use_sinks=False,
-            sliding_window=0,
-            has_softcap=False,
-            num_seqs=32,
-            decode_fast_path=True,
-            kv_tile_mult=2,
-            kv_prefetch=True,
-            transposed_softmax=True,
-            kv_load_aux=3,
-            seg_major_order=True,
-            scalar_block_ids=True,
-            kv_split_wait=True,
-            use_f32_denormal_flush=True,
-        ),
-        dict(
-            head_size=128,
-            block_size=16,
-            num_query_heads=8,
-            num_kv_heads=1,
-            dtype="bf16",
-            num_segments=8,
-            use_sinks=False,
-            sliding_window=0,
-            has_softcap=False,
-            num_seqs=32,
-            decode_fast_path=True,
-            kv_tile_mult=2,
-            kv_prefetch=True,
-            transposed_softmax=True,
-            kv_load_aux=3,
-            seg_major_order=True,
-            scalar_block_ids=True,
-            kv_split_wait=True,
-            use_f32_denormal_flush=True,
-        ),
-        dict(
-            head_size=128,
-            block_size=16,
-            num_query_heads=8,
-            num_kv_heads=1,
-            dtype="bf16",
-            num_segments=32,
-            use_sinks=False,
-            sliding_window=0,
-            has_softcap=False,
-            num_seqs=32,
-            decode_fast_path=True,
-            kv_tile_mult=2,
-            kv_prefetch=True,
-            transposed_softmax=True,
-            kv_load_aux=3,
-            seg_major_order=True,
-            scalar_block_ids=True,
-            kv_split_wait=True,
-            use_f32_denormal_flush=True,
-        ),
-        dict(
-            head_size=128,
-            block_size=16,
-            num_query_heads=8,
-            num_kv_heads=1,
-            dtype="bf16",
-            num_segments=128,
-            use_sinks=False,
-            sliding_window=0,
-            has_softcap=False,
-            num_seqs=32,
-            decode_fast_path=True,
-            kv_tile_mult=2,
-            kv_prefetch=True,
-            transposed_softmax=True,
-            kv_load_aux=3,
-            seg_major_order=True,
-            scalar_block_ids=True,
-            kv_split_wait=True,
-            use_f32_denormal_flush=True,
-        ),
-        dict(
-            head_size=128,
-            block_size=16,
-            num_query_heads=32,
-            num_kv_heads=8,
-            dtype="bf16",
-            num_segments=32,
-            use_sinks=False,
-            sliding_window=0,
-            has_softcap=False,
-            num_seqs=32,
-            kv_storage_dtype="fp8e4m3",
-            decode_fast_path=True,
-            kv_tile_mult=2,
-            kv_prefetch=True,
-            transposed_softmax=True,
-            fold_kv_scale=True,
-            seg_major_order=True,
-            scalar_block_ids=True,
-            use_f32_denormal_flush=True,
-        ),
-        dict(
-            head_size=128,
-            block_size=16,
-            num_query_heads=8,
-            num_kv_heads=1,
-            dtype="bf16",
-            num_segments=8,
-            use_sinks=False,
-            sliding_window=0,
-            has_softcap=False,
-            kv_storage_dtype="fp8e4m3",
-            decode_fast_path=True,
-            kv_tile_mult=2,
-            kv_prefetch=True,
-            transposed_softmax=True,
-            fold_kv_scale=True,
-            seg_major_order=True,
-            scalar_block_ids=True,
-            use_f32_denormal_flush=False,
-        ),
-        dict(
-            head_size=128,
-            block_size=16,
-            num_query_heads=8,
-            num_kv_heads=1,
-            dtype="bf16",
-            num_segments=128,
-            use_sinks=False,
-            sliding_window=0,
-            has_softcap=False,
-            num_seqs=32,
-            kv_storage_dtype="fp8e4m3",
-            decode_fast_path=True,
-            kv_tile_mult=2,
-            kv_prefetch=True,
-            transposed_softmax=True,
-            fold_kv_scale=True,
-            seg_major_order=True,
-            scalar_block_ids=True,
-            use_f32_denormal_flush=True,
-        ),
-        dict(
-            head_size=64,
-            block_size=16,
-            num_query_heads=16,
-            num_kv_heads=4,
-            dtype="fp16",
-            num_segments=16,
-            use_sinks=False,
-            sliding_window=0,
-            has_softcap=False,
-            decode_fast_path=True,
-            kv_tile_mult=2,
-            kv_prefetch=True,
-            transposed_softmax=True,
-            kv_load_aux=3,
-            seg_major_order=True,
-            scalar_block_ids=True,
-            kv_split_wait=True,
-            use_f32_denormal_flush=True,
-        ),
-        dict(
-            head_size=128,
-            block_size=16,
-            num_query_heads=32,
-            num_kv_heads=8,
-            dtype="bf16",
-            num_segments=16,
-            use_sinks=False,
-            sliding_window=0,
-            has_softcap=False,
-            use_i64_kv_addr=True,
-            decode_fast_path=True,
-            kv_tile_mult=2,
-            kv_prefetch=True,
-            transposed_softmax=True,
-            kv_load_aux=3,
-            seg_major_order=True,
-            scalar_block_ids=True,
-            kv_split_wait=True,
-            use_f32_denormal_flush=True,
-        ),
-        dict(
-            head_size=128,
-            block_size=16,
-            num_query_heads=32,
-            num_kv_heads=8,
-            dtype="bf16",
-            num_segments=16,
-            use_sinks=True,
-            sliding_window=0,
-            has_softcap=True,
-            kv_storage_dtype="fp8e4m3",
-            decode_fast_path=True,
-            kv_tile_mult=2,
-            kv_prefetch=True,
-            transposed_softmax=True,
-            fold_kv_scale=True,
-            seg_major_order=True,
-            scalar_block_ids=True,
-            use_f32_denormal_flush=True,
-        ),
-        dict(
-            head_size=128,
-            block_size=16,
-            num_query_heads=32,
-            num_kv_heads=8,
-            dtype="bf16",
-            num_segments=16,
-            use_sinks=False,
-            sliding_window=0,
-            has_softcap=False,
-            decode_fast_path=True,
-            kv_tile_mult=8,
-            kv_prefetch=True,
-            transposed_softmax=True,
-            kv_load_aux=3,
-            seg_major_order=True,
-            scalar_block_ids=True,
-            kv_split_wait=True,
-            use_f32_denormal_flush=True,
         ),
     ]
 
@@ -2486,94 +2175,6 @@ FAMILIES = [
 ]
 
 
-def problems_gfx950_decode_3d():
-    """(problem dict, running arch) matrix for the gfx950 paged decode 3D
-    selector: the cohort's batch / context / GQA / dtype corners, the segment
-    rule's clamps (CTA fill, >=128 keys per segment, 128 cap), the
-    ``target_ctas`` / ``num_cus`` inputs, and every field that leaves the cohort."""
-    base = dict(
-        num_query_heads=32,
-        num_kv_heads=8,
-        head_size=128,
-        block_size=16,
-        max_seqlen_q=1,
-        dtype="bf16",
-        num_cus=256,
-    )
-    out = []
-    for b in (1, 3, 4, 16, 64, 256):
-        for kv in (100, 1000, 8192, 32768, 131072):
-            for nq, nk in ((32, 8), (8, 1), (64, 8)):
-                for fp8 in (False, True):
-                    p = dict(base, num_seqs=b, total_q=b, max_seqlen_k=kv)
-                    p.update(num_query_heads=nq, num_kv_heads=nk, use_fp8=fp8)
-                    out.append((p, "gfx950"))
-    d = dict(base, num_seqs=4, total_q=4, max_seqlen_k=32768)
-    for over in (
-        dict(num_cus=120),
-        dict(num_cus=304),
-        dict(target_ctas=256),
-        dict(clamp_arch="gfx950"),
-        dict(clamp_arch="gfx942"),
-        dict(dtype="fp16"),
-        dict(q_dtype="bf16"),
-        dict(q_dtype="fp8"),
-        dict(fp8_fnuz=True, use_fp8=True),
-        dict(head_size=64),
-        dict(block_size=32),
-        dict(num_query_heads=8, num_kv_heads=8),
-        dict(num_query_heads=128, num_kv_heads=8),
-        dict(max_seqlen_q=2, total_q=8),
-        dict(sliding_window=128),
-        dict(use_sinks=True),
-        dict(softcap=30.0),
-        dict(use_alibi=True),
-        dict(use_qq_bias=True),
-    ):
-        out.append((dict(d, **over), "gfx950"))
-    out.append((d, "gfx942"))
-    return out
-
-
-def run_decode_3d_selector_parity():
-    """Compare the C++ gfx950 decode 3D selector with the Python one.
-    Returns (n_match, mismatch detail lines)."""
-    from dataclasses import fields
-    from unittest.mock import patch
-
-    import kernels.common.attention_unified as au
-    from kernels.gfx950.attention_tiled_3d import UnifiedAttention3DTiledSpec
-
-    defaults = {f.name: f.default for f in fields(UnifiedAttention3DTiledSpec)}
-    knob_names = (
-        "decode_fast_path",
-        "seg_major_order",
-        "kv_tile_mult",
-        "kv_prefetch",
-        "scalar_block_ids",
-        "transposed_softmax",
-        "kv_split_wait",
-        "kv_load_aux",
-        "fold_kv_scale",
-    )
-    n_match, details = 0, []
-    for problem, arch in problems_gfx950_decode_3d():
-        prob = au.UnifiedAttentionProblem(**problem)
-        with patch.object(au, "_resolve_attention_arch", return_value=arch):
-            cohort = au._gfx950_decode_3d_cohort(prob)
-            knobs = au._gfx950_decode_3d_knobs(prob)
-            segs = au._gfx950_decode_3d_segments(prob) if cohort else 0
-        want = {"cohort": cohort, "num_segments": segs}
-        want.update({k: knobs.get(k, defaults[k]) for k in knob_names})
-        got = dict(rocke_engine.gfx950_attn_decode_3d_config(problem, arch=arch))
-        if got == want:
-            n_match += 1
-        else:
-            diff = {k: (want[k], got.get(k)) for k in want if got.get(k) != want[k]}
-            details.append(f"  MISMATCH {arch} {problem}: {diff}")
-    return n_match, details
-
-
 def main():
     so_id, so_ver = _assert_build_id_match()
     print(f"engine build-id: {so_id}  version: {so_ver}  (matches emit dir)")
@@ -2662,27 +2263,7 @@ def main():
         for line in sel_details:
             print(line)
 
-    # ---- Problem-driven selector parity (gfx950 paged decode 3D config) ----
-    print()
-    print("--- problem-driven selector parity: gfx950 paged decode 3D ---")
-    if not hasattr(rocke_engine, "gfx950_attn_decode_3d_config"):
-        print(
-            "WARNING: rocke_engine.gfx950_attn_decode_3d_config not found -- "
-            "rebuild the engine with the selector binding. Skipping."
-        )
-        dec_failed = False
-    else:
-        dec_match, dec_details = run_decode_3d_selector_parity()
-        dec_failed = bool(dec_details)
-        print(
-            f"problems checked: {dec_match + len(dec_details)}  match: {dec_match}  "
-            f"mismatch: {len(dec_details)}  "
-            f"{'SELECTOR PARITY FAILED' if dec_failed else 'SELECTOR PARITY OK'}"
-        )
-        for line in dec_details:
-            print(line)
-
-    return 0 if (fam_failed == 0 and not selector_failed and not dec_failed) else 1
+    return 0 if (fam_failed == 0 and not selector_failed) else 1
 
 
 if __name__ == "__main__":

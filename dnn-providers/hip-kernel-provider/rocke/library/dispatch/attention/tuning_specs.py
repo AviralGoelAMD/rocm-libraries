@@ -31,7 +31,7 @@ TILE_POLICIES: Tuple[str, ...] = (
 NUM_WARPS: Tuple[int, ...] = (1, 2, 4, 8)
 BLOCK_M_PER_WARP: Tuple[int, ...] = (16, 32)
 WAVES_PER_EU: Tuple[Optional[int], ...] = (None, 1, 2, 3, 4)
-NUM_SEGMENTS: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+NUM_SEGMENTS: Tuple[int, ...] = (8, 16, 32, 64, 128)
 
 
 def validate_explicit_fp8_encoding(*, arch: str, use_fp8: bool, fp8_fnuz: bool) -> None:

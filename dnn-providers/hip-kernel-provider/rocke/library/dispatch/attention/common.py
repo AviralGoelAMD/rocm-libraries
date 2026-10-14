@@ -519,12 +519,8 @@ class AttentionTuningSpec:
             # The dense spec bakes (or declares) its whole problem shape.
             return tuple(_dense_kernel_module(self.arch).attention_dense_grid(ks))
         if self.path == "3d":
-            if getattr(ks, "decode_fast_path", False):
-                # All-decode kernel contract: CTA x owns sequence x.
-                qblocks = problem.num_seqs
-            else:
-                block_q = max(1, 16 // problem.num_queries_per_kv)
-                qblocks = problem.total_q // block_q + problem.num_seqs
+            block_q = max(1, 16 // problem.num_queries_per_kv)
+            qblocks = problem.total_q // block_q + problem.num_seqs
             return (int(qblocks), int(problem.num_kv_heads), int(ks.num_segments))
         if self.builder_kind == "gfx942_4warp_gqa":
             from kernels.common.attention_unified import gfx942_4warp_launch_grid

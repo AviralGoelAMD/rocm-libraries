@@ -82,9 +82,6 @@ typedef struct rocke_unified_attn_problem
     int num_cus; /* default 120 */
     /* waves_per_eu / compile_backend are not read by the ported selectors. */
     int num_kv_blocks; /* default 0 ("unknown") */
-    int target_ctas; /* default 0 (=> num_cus * 4) */
-    bool fp8_fnuz; /* default false */
-    const char* clamp_arch; /* default NULL (=> running-box arch) */
 } rocke_unified_attn_problem_t;
 
 /* Python: UnifiedAttentionProblem.num_queries_per_kv property.
@@ -204,34 +201,6 @@ bool rocke_unified_attn_enable_early_v_schedule(const rocke_unified_attn_problem
  * state is restored on return). Pass "gfx950" for the primary production path. */
 rocke_attention_tiled_2d_spec_t
     rocke_unified_attn_tiled_spec_from_problem(const rocke_unified_attn_problem_t* p,
-                                               const char* arch);
-
-/* gfx950 paged split-KV decode config (Python _gfx950_decode_3d_knobs). Field
- * names match UnifiedAttention3DTiledSpec; values are the spec defaults when
- * the problem is outside the cohort. */
-typedef struct rocke_unified_attn_decode_3d_config
-{
-    bool cohort; /* _gfx950_decode_3d_cohort(problem)            */
-    int num_segments; /* _gfx950_decode_3d_segments; 0 off-cohort   */
-    bool decode_fast_path;
-    bool seg_major_order;
-    int kv_tile_mult; /* 1 off-cohort */
-    bool kv_prefetch;
-    bool scalar_block_ids;
-    bool transposed_softmax;
-    bool kv_split_wait;
-    int kv_load_aux;
-    bool fold_kv_scale;
-} rocke_unified_attn_decode_3d_config_t;
-
-/* Python: _gfx950_decode_3d_cohort / _gfx950_decode_3d_segments /
- * _gfx950_decode_3d_knobs. ``arch`` is the running-box arch (the spec class);
- * ``p->clamp_arch`` (NULL == unset) must be NULL or "gfx950". The segment rule
- * fills ``target_ctas`` (or ``num_cus * 4``) CTAs over num_seqs * num_kv_heads
- * pairs, rounded up to a power of two, keeps >= 128 keys per segment
- * (max_seqlen_k / 128 rounded down to a power of two), caps at 128. */
-rocke_unified_attn_decode_3d_config_t
-    rocke_unified_attn_gfx950_decode_3d_config(const rocke_unified_attn_problem_t* p,
                                                const char* arch);
 
 /* ----------------------------------------------------------- magic div */
