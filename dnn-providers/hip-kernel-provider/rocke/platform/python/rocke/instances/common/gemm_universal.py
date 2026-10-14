@@ -196,6 +196,12 @@ class TraitSpec:
     # ordering stays with the explicit ``s_waitcnt`` + barrier at the top of
     # each K-tile. Requires ``dtl_prefetch``; default off (byte-identical).
     dtl_lds_alias: bool = False
+    # compv4 double-buffer (non-DTL) register prefetch: issue the next
+    # K-tile's global loads, run the current tile's MFMAs, and only then
+    # write the staged registers to the other LDS half. The default emits
+    # each ds_write right behind its load, so the VMEM latency stalls every
+    # K-tile before its MFMAs start. Default off (byte-identical).
+    db_defer_lds_store: bool = False
     # MoE active-tile early-exit. When True (only honored in
     # ``batched=True`` mode), the kernel takes two extra args
     # (``SortedTokenIds: ptr<i32>``, ``slot_size: i32``) and at CTA
@@ -330,6 +336,7 @@ class UniversalGemmSpec(WarpTileBlockSizeMixin):
                 "dtl": tr.direct_to_lds,
                 "pref": tr.dtl_prefetch,
                 "lalias": tr.dtl_lds_alias,
+                "dfst": tr.db_defer_lds_store,
                 "actt": tr.active_tile_skip,
                 f"spk{tr.split_k}": tr.split_k > 1,
                 "noalc": tr.cshuffle_no_alias,
@@ -1299,7 +1306,13 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
         _dtl_c_halves_per_chunk = b.const_i32(_DTL_HALVES)
         _dtl_c_block_size = b.const_i32(spec.block_size)
 
-    def emit_load_phase(A_dst: Value, B_dst: Value, k_off: Value, lds_parity=0) -> None:
+    def emit_load_phase(
+        A_dst: Value,
+        B_dst: Value,
+        k_off: Value,
+        lds_parity=0,
+        defer: Optional[List] = None,
+    ) -> None:
         """Coalesced global -> LDS copy for one K tile.
 
         Driven by :class:`TileWindow`: the A/B global views carry the
@@ -1533,6 +1546,15 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                 vals.append(_mask_storage_scalar(raw, valid))
             return vals[0] if n == 1 else b.vec_pack(vals, storage_dtype)
 
+        # ``defer`` (compv4 DB register prefetch): issue the global loads now
+        # but queue the LDS stores as closures for the caller to emit after
+        # the current tile's MFMAs, so the load latency overlaps them.
+        def _st(store) -> None:
+            if defer is None:
+                store()
+            else:
+                defer.append(store)
+
         for e in range(a_vecs_per_thread):
             vec_idx = b.add(b.mul(b.const_i32(e), c_threads), tid)
             row, col_v, col = _vec_rc(vec_idx)
@@ -1542,8 +1564,10 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                     if spec.trait.pad_k
                     else a_global_tile.load_scalar(b, b.const_i32(0), row, col)
                 )
-                a_lds_tile.store_scalar(
-                    b, _ld_a_row(row), _swz_col(col, row), value=a_val
+                _st(
+                    lambda row=row, col=col, a_val=a_val: a_lds_tile.store_scalar(
+                        b, _ld_a_row(row), _swz_col(col, row), value=a_val
+                    )
                 )
             else:
                 a_val = (
@@ -1551,8 +1575,10 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                     if spec.trait.pad_k
                     else a_global_tile.load_vec(b, b.const_i32(0), row, col, n=load_vec)
                 )
-                a_lds_tile.store_vec(
-                    b, _ld_a_row(row), _swz_col(col, row), value=a_val, n=load_vec
+                _st(
+                    lambda row=row, col=col, a_val=a_val: a_lds_tile.store_vec(
+                        b, _ld_a_row(row), _swz_col(col, row), value=a_val, n=load_vec
+                    )
                 )
         # B-load branch.
         #
@@ -1592,8 +1618,10 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                         if spec.trait.pad_k
                         else b.global_load(Bp, glob_off, storage_dtype)
                     )
-                    b_lds_tile.store_scalar(
-                        b, _ld_b_row(row), _swz_col(col, row), value=b_val
+                    _st(
+                        lambda row=row, col=col, b_val=b_val: b_lds_tile.store_scalar(
+                            b, _ld_b_row(row), _swz_col(col, row), value=b_val
+                        )
                     )
                 else:
                     b_val = (
@@ -1601,8 +1629,10 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                         if spec.trait.pad_k
                         else b.global_load_vN(Bp, glob_off, storage_dtype, load_vec)
                     )
-                    b_lds_tile.store_vec(
-                        b, _ld_b_row(row), _swz_col(col, row), value=b_val, n=load_vec
+                    _st(
+                        lambda row=row, col=col, b_val=b_val: b_lds_tile.store_vec(
+                            b, _ld_b_row(row), _swz_col(col, row), value=b_val, n=load_vec
+                        )
                     )
         else:
             for e in range(b_vecs_per_thread):
@@ -1614,8 +1644,10 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                         if spec.trait.pad_k
                         else b_global_tile.load_scalar(b, b.const_i32(0), row, col)
                     )
-                    b_lds_tile.store_scalar(
-                        b, _ld_b_row(row), _swz_col(col, row), value=b_val
+                    _st(
+                        lambda row=row, col=col, b_val=b_val: b_lds_tile.store_scalar(
+                            b, _ld_b_row(row), _swz_col(col, row), value=b_val
+                        )
                     )
                 else:
                     b_val = (
@@ -1625,8 +1657,10 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
                             b, b.const_i32(0), row, col, n=load_vec
                         )
                     )
-                    b_lds_tile.store_vec(
-                        b, _ld_b_row(row), _swz_col(col, row), value=b_val, n=load_vec
+                    _st(
+                        lambda row=row, col=col, b_val=b_val: b_lds_tile.store_vec(
+                            b, _ld_b_row(row), _swz_col(col, row), value=b_val, n=load_vec
+                        )
                     )
 
     def _emit_frag_smem_load(
@@ -1976,8 +2010,20 @@ def build_universal_gemm(spec: UniversalGemmSpec, arch: str = "gfx950") -> Kerne
             b.sync()
             # Issue next-tile global->VGPR->LDS copy into the other half;
             # this VMEM + ds_write stream overlaps the MFMAs below.
-            emit_load_phase(A_smem, B_smem, k_next, lds_parity=next_parity)
-            new_accs = emit_mfma_phase(A_smem, B_smem, acc_iter, lds_parity=parity)
+            if spec.trait.db_defer_lds_store:
+                # Register prefetch: global loads now, MFMAs on half(parity),
+                # then the queued ds_writes into half(next) -- the VMEM
+                # latency hides under the MFMAs instead of stalling them.
+                pending: List = []
+                emit_load_phase(
+                    A_smem, B_smem, k_next, lds_parity=next_parity, defer=pending
+                )
+                new_accs = emit_mfma_phase(A_smem, B_smem, acc_iter, lds_parity=parity)
+                for store in pending:
+                    store()
+            else:
+                emit_load_phase(A_smem, B_smem, k_next, lds_parity=next_parity)
+                new_accs = emit_mfma_phase(A_smem, B_smem, acc_iter, lds_parity=parity)
             b.scf_yield(next_parity, *new_accs)
 
         # Epilogue: drain the last in-loop load (it wrote the K-1 tile
