@@ -70,7 +70,11 @@ from ..core.arch import (
     known_arches,
     target_id_from_isa,
 )
-from ..core.codegen_policy import codegen_policy_for_kernel
+from ..core.codegen_policy import (
+    CodegenPolicy,
+    F32DenormalMode,
+    codegen_policy_for_kernel,
+)
 from ..core.ir import KernelDef
 from ..core.ir_print import print_ir
 from ..core.lower_hip import lower_kernel_to_hip
@@ -318,6 +322,14 @@ def _is_zero_agpr_alloc(value: object) -> bool:
         return False
 
 
+def _hipcc_policy_flags(policy: CodegenPolicy) -> List[str]:
+    """hipcc spelling of the policy fields the HIP path honors."""
+    if policy.f32_denormal_mode == F32DenormalMode.PRESERVE_SIGN.value:
+        # clang's spelling of ``"denormal-fp-math-f32"="preserve-sign"``.
+        return ["-fgpu-flush-denormals-to-zero"]
+    return []
+
+
 def compile_kernel_via_hipcc(
     kernel: KernelDef,
     *,
@@ -333,7 +345,9 @@ def compile_kernel_via_hipcc(
 
     Requires hipcc on ``PATH`` and a kernel supported by the HIP lowerer.
     An explicit scheduler policy is rejected because this path does not emit
-    the LLVM function attribute used by the COMGR path.
+    the LLVM function attribute used by the COMGR path. The f32 denormal
+    policy maps to its clang flag (:func:`_hipcc_policy_flags`); FMA
+    contraction is clang's HIP default, so ``fp_contract`` needs no flag.
 
     Returns a :class:`KernelArtifact` with hipcc's output in ``hsaco``, an
     empty ``llvm_text``, and timings for HIP lowering and compilation.
@@ -353,7 +367,7 @@ def compile_kernel_via_hipcc(
     compiler_target = compiler_target_from_target_id(arch)
     hip_src = lower_kernel_to_hip(kernel, arch=lower_arch)
     t2 = time.perf_counter()
-    flags = ["-O3"]
+    flags = ["-O3", *_hipcc_policy_flags(policy)]
     if extra_flags:
         flags.extend(extra_flags)
     with tempfile.TemporaryDirectory() as td:

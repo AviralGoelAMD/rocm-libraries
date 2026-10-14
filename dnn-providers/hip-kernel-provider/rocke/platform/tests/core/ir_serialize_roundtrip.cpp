@@ -138,6 +138,8 @@ static int run_one(int idx)
     if(idx == 0)
     {
         rocke_attr_set_str(&b0, &k0->attrs, "scheduler_strategy", "iterative-ilp");
+        rocke_attr_set_str(&b0, &k0->attrs, "f32_denormal_mode", "preserve-sign");
+        rocke_attr_set_bool(&b0, &k0->attrs, "fp_contract", true);
     }
 
     /* serialize(k0) */
@@ -158,9 +160,12 @@ static int run_one(int idx)
         rocke_ir_builder_free(&b0);
         return 1;
     }
-    if(idx == 0 && strstr(ll0, "\"amdgpu-sched-strategy\"=\"iterative-ilp\"") == NULL)
+    if(idx == 0
+       && (strstr(ll0, "\"amdgpu-sched-strategy\"=\"iterative-ilp\"") == NULL
+           || strstr(ll0, "\"denormal-fp-math-f32\"=\"preserve-sign,preserve-sign\"") == NULL
+           || strstr(ll0, " = fadd float ") != NULL || strstr(ll0, " = fmul float ") != NULL))
     {
-        fprintf(stderr, "[%d] scheduler strategy attribute missing\n", idx);
+        fprintf(stderr, "[%d] codegen policy not honored by the lowerer\n", idx);
         free(s0);
         free(ll0);
         rocke_ir_builder_free(&b0);
