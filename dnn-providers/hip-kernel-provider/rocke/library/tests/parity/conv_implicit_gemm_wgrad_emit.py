@@ -49,10 +49,17 @@
 #         gfx942 and chiplet swizzle; 45-47 pair it with async_dma, unroll_k
 #         and WMMA, which both engines must reject; 48 is a scalar-load
 #         128x128 tile (more carried offsets than accumulators)
-#   (Grouped wgrad reaches the C++ engine only through stream-K, and its tile
-#    loader has no elem_dtype, so no case loads bf16 operands. The stream-K
-#    partition and CTA pool are kernargs, so no case varies them. async_dma is
-#    rejected with stream-K, and so is prefetch_addr.)
+#   49-61 -- group_merge > 1 on depthwise shapes (see _GM_CFGS): 49-56 are the
+#         gfx950 dispatcher's specs verbatim (MBv2 dw3 s2 56^2 C144, EffB0 dw3
+#         14^2 C480, ConvNeXt dw7 56^2 C96, EffB0 dw5 s2 28^2 C240; fp16 and
+#         bf16; K-outer, two-stage split-K, R=8); 57-60 cover split_k=1 with the
+#         default and cshuffle epilogues, the M-outer tile, two-stage with R=1,
+#         and Gm 2/4/16; 61 has Gm not dividing groups, which both engines must
+#         reject
+#   (Unmerged grouped wgrad reaches the C++ engine only through stream-K, and
+#    its tile loader has no elem_dtype, so no unmerged case loads bf16
+#    operands. The stream-K partition and CTA pool are kernargs, so no case
+#    varies them. async_dma is rejected with stream-K, and so is prefetch_addr.)
 #
 # Negative cases (configs 100+) verify that invalid specs are rejected:
 #   100 -- odd C with fp16 split-K (must raise ValueError)
@@ -595,6 +602,8 @@ def _spec(idx: int):
 
     if 21 <= idx <= 29:
         return _streamk_spec(idx)
+    if idx in _GM_CFGS:
+        return _gm_spec(idx)
     if idx == 30:
         from dataclasses import replace
 
@@ -779,6 +788,77 @@ _STREAMK_CFGS = {
         "gfx942",
     ),
 }
+
+
+_MBV2 = dict(
+    N=32, Hi=56, Wi=56, C=144, K=144, Y=3, X=3, sH=2, sW=2, pH=1, pW=1, groups=144
+)
+_EFF3 = dict(N=32, Hi=14, Wi=14, C=480, K=480, Y=3, X=3, pH=1, pW=1, groups=480)
+_CNXT = dict(N=1, Hi=56, Wi=56, C=96, K=96, Y=7, X=7, pH=3, pW=3, groups=96)
+_EFF5 = dict(
+    N=32, Hi=28, Wi=28, C=240, K=240, Y=5, X=5, sH=2, sW=2, pH=2, pW=2, groups=240
+)
+
+# Group-merged depthwise configs; mirrored field-for-field by the C emitter.
+# (problem kwargs, dtype, tile_n, group_merge, split_k, two_stage, epilogue,
+#  lds_k_outer, ws_replicas). 49-56 are what the gfx950 dispatcher hands
+# to_wgrad_spec for those requests (split_k resolved, name pinned).
+_GM_CFGS = {
+    49: (_MBV2, "fp16", 128, 8, 56, True, "default", True, 8),
+    50: (_EFF3, "fp16", 128, 8, 16, True, "default", True, 8),
+    51: (_CNXT, "fp16", 256, 4, 40, True, "default", True, 8),
+    52: (_EFF5, "fp16", 256, 8, 32, True, "default", True, 8),
+    53: (_MBV2, "bf16", 128, 8, 56, True, "default", True, 8),
+    54: (_EFF3, "bf16", 128, 8, 16, True, "default", True, 8),
+    55: (_CNXT, "bf16", 256, 4, 40, True, "default", True, 8),
+    56: (_EFF5, "bf16", 256, 8, 32, True, "default", True, 8),
+    57: (_MBV2, "fp16", 64, 2, 1, False, "default", False, 8),
+    58: (_EFF3, "bf16", 256, 16, 1, False, "cshuffle", True, 8),
+    59: (_EFF5, "fp16", 128, 4, 4, True, "default", False, 1),
+    60: (_MBV2, "fp16", 128, 8, 1, False, "cshuffle", False, 8),
+    # Gm 8 does not divide groups 12: both engines must reject.
+    61: (
+        dict(N=8, Hi=28, Wi=28, C=12, K=12, Y=3, X=3, pH=1, pW=1, groups=12),
+        "fp16",
+        128,
+        8,
+        1,
+        False,
+        "default",
+        True,
+        8,
+    ),
+}
+
+
+def _gm_spec(idx: int):
+    """Group-merged configs; mirrored field-for-field by the C emitter."""
+    from kernels.common._conv_implicit_gemm_common import ConvDataSpec
+
+    prob, dt, tile_n, gm, split_k, two_stage, epilogue, k_outer, reps = _GM_CFGS[idx]
+    return (
+        WgradConvSpec(
+            problem=ConvProblem(**prob),
+            name="implicit_gemm_conv_wgrad",
+            data=ConvDataSpec(dtype_a=dt, dtype_b=dt, dtype_d=dt),
+            tile_m=64,
+            tile_n=tile_n,
+            tile_k=64,
+            warp_m=2,
+            warp_n=2,
+            warp_tile_m=32,
+            warp_tile_n=32,
+            warp_tile_k=16,
+            pipeline="mem",
+            epilogue=epilogue,
+            lds_k_outer=k_outer,
+            group_merge=gm,
+            split_k=split_k,
+            two_stage=two_stage,
+            ws_replicas=reps,
+        ),
+        "gfx950",
+    )
 
 
 def _streamk_spec(idx: int):

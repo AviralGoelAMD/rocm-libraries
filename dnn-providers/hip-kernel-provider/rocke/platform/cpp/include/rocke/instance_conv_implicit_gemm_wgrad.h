@@ -195,8 +195,12 @@ typedef struct rocke_implicit_gemm_conv_wgrad_spec
     const char* streamk_reduction; /* default "linear" */
     int streamk_ctas; /* default -1 */
 
-    /* WgradConvSpec.group_merge.  Only 1 is ported: stream-K folds the
-     * groups into GEMM-M itself, and the grid-per-group path is Python-only. */
+    /* WgradConvSpec.group_merge: Gm depthwise groups per workgroup on the
+     * grid-per-group path (gridDim.z = groups/Gm * ks_count), at split_k 1 or
+     * two-stage split-K; gated by the same rules as Python
+     * wgrad_group_merge_available. Stream-K requires 1 (it folds the groups
+     * into GEMM-M itself). Unmerged grid-per-group grouped wgrad (groups > 1,
+     * group_merge 1) is still Python-only. */
     int group_merge; /* default 1 */
     /* prefetch_addr: carry each A/B chunk's global byte offset across K
      * iterations, so every iteration issues its buffer loads first and derives

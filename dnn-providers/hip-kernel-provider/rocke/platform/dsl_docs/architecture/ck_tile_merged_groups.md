@@ -477,13 +477,13 @@ and spends the diagonal on the **B load** rather than the C store. The store is
 therefore dense and `vec_c` is free to widen — see
 `examples/gfx950/conv_fwd/fwd_merged_groups_case_study.md`.
 
-Engine coverage differs by direction. **Forward** is implemented in both the
-Python and the C++ engine (`group_merge` is a field on
-`rocke_implicit_gemm_conv_spec`) and the fwd parity emitters build merged
-configs, so byte-identity gates merged emission directly. **wgrad** is
-Python-engine only and its knob is additive at its default of 1 — which is how
-it keeps the gate green without merged coverage. That wgrad gap predates the
-forward port.
+Engine coverage. **Forward** is implemented in both the Python and the C++
+engine (`group_merge` is a field on `rocke_implicit_gemm_conv_spec`) and the
+fwd parity emitters build merged configs, so byte-identity gates merged
+emission directly. **wgrad** is likewise implemented in both engines
+(`group_merge` on `rocke_implicit_gemm_conv_wgrad_spec`), and the wgrad parity
+emitters build merged depthwise configs covering the direct, cshuffle and
+two-stage epilogues, so its merged emission is gated the same way.
 
 ---
 
