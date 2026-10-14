@@ -1303,6 +1303,22 @@ def build_row_kernel(module, spec_cls, build_fn, arch=None, **spec_kw):
     return _build
 
 
+def build_pooling(arch, problem_kw, **spec_kw):
+    """One NHWC ``Pooling2DSpec`` kernel (``problem_kw`` -> PoolingProblem)."""
+
+    def _build():
+        from rocke.instances.common.pooling import (
+            Pooling2DSpec,
+            PoolingProblem,
+            build_pooling2d,
+        )
+
+        spec = Pooling2DSpec(problem=PoolingProblem(**problem_kw), **spec_kw)
+        return build_pooling2d(spec, arch=arch)
+
+    return _build
+
+
 def cases():
     out = []
 
@@ -3978,6 +3994,20 @@ def cases():
                 "build_smoothquant",
                 arch="gfx950",
                 n_per_block=8192,
+                **_over,
+            ),
+        )
+
+    # ResNet-style 3x3/s2 max pool, C=256: the spec default and vec=0 (the
+    # widest C pack dividing C).
+    for _case_id, _over in (("default_c256", {}), ("vec_auto_c256", {"vec": 0})):
+        add(
+            "pooling",
+            f"pooling/gfx950/{_case_id}",
+            "gfx950",
+            build_pooling(
+                "gfx950",
+                dict(N=32, H=56, W=56, C=256, Y=3, X=3, sH=2, sW=2, pH=1, pW=1),
                 **_over,
             ),
         )

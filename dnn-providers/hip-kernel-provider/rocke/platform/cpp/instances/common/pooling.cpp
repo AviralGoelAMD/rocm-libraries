@@ -238,6 +238,23 @@ rocke_pooling2d_spec_t rocke_pooling2d_spec_default(void)
     return s;
 }
 
+int rocke_pooling_default_vec(int c)
+{
+    /* for v in (4, 2): if c % v == 0: return v
+     * return 1 */
+    if(c % 4 == 0)
+        return 4;
+    if(c % 2 == 0)
+        return 2;
+    return 1;
+}
+
+int rocke_pooling2d_spec_vec(const rocke_pooling2d_spec_t* spec)
+{
+    /* Pooling2DSpec.__post_init__: vec == 0 -> default_pooling_vec(problem.C). */
+    return spec->vec == 0 ? rocke_pooling_default_vec(spec->problem.C) : spec->vec;
+}
+
 rocke_status_t
     rocke_pooling2d_kernel_name(const rocke_pooling2d_spec_t* spec, char* out, size_t out_cap)
 {
@@ -257,7 +274,7 @@ rocke_status_t
         return st;
     }
     snprintf(bbuf, sizeof(bbuf), "b%d", spec->block_size);
-    snprintf(vbuf, sizeof(vbuf), "v%d", spec->vec);
+    snprintf(vbuf, sizeof(vbuf), "v%d", rocke_pooling2d_spec_vec(spec));
 
     /* kernel_name_join(name, problem.short(), dtype, op, f"b{bs}", f"v{vec}") */
     parts[0] = shortbuf;
@@ -289,6 +306,7 @@ bool rocke_pooling2d_is_valid_spec(const rocke_pooling2d_spec_t* spec,
     int ok;
     const rocke_pooling_problem_t* p;
     int Ho, Wo;
+    int vec;
 
 #define POOL_REASON(...)                               \
     do                                                 \
@@ -317,10 +335,13 @@ bool rocke_pooling2d_is_valid_spec(const rocke_pooling2d_spec_t* spec,
         return false;
     }
 
+    /* vec as resolved by Pooling2DSpec.__post_init__ (0 -> widest C pack). */
+    vec = rocke_pooling2d_spec_vec(spec);
+
     /* if spec.vec not in (1, 2, 4, 8): reject. */
-    if(spec->vec != 1 && spec->vec != 2 && spec->vec != 4 && spec->vec != 8)
+    if(vec != 1 && vec != 2 && vec != 4 && vec != 8)
     {
-        POOL_REASON("unsupported vec %d; expected one of {1, 2, 4, 8}", spec->vec);
+        POOL_REASON("unsupported vec %d; expected one of {1, 2, 4, 8}", vec);
         return false;
     }
 
@@ -337,7 +358,7 @@ bool rocke_pooling2d_is_valid_spec(const rocke_pooling2d_spec_t* spec,
 
     /* validate_io(IOSpecRule(dtype, block_size, vec=vec if vec>=2 else 2,
      *                        allowed_block_sizes=_legal_bs)). */
-    rocke_io_spec_rule_init(&rule, spec->dtype, spec->block_size, spec->vec >= 2 ? spec->vec : 2);
+    rocke_io_spec_rule_init(&rule, spec->dtype, spec->block_size, vec >= 2 ? vec : 2);
     rule.allowed_block_sizes = legal_bs;
     rule.num_allowed_block_sizes = n_legal;
 
@@ -383,11 +404,11 @@ bool rocke_pooling2d_is_valid_spec(const rocke_pooling2d_spec_t* spec,
         return false;
     }
     /* if spec.vec >= 2 and p.C % spec.vec != 0: reject. */
-    if(spec->vec >= 2 && (p->C % spec->vec) != 0)
+    if(vec >= 2 && (p->C % vec) != 0)
     {
         POOL_REASON("vec=%d requires C (%d) divisible by vec; fall back to vec=1 "
                     "for partial-C cases",
-                    spec->vec,
+                    vec,
                     p->C);
         return false;
     }
@@ -908,7 +929,7 @@ rocke_kernel_def_t* rocke_build_pooling2d(rocke_ir_builder_t* b,
         }
 
         p = &spec->problem;
-        VEC = spec->vec;
+        VEC = rocke_pooling2d_spec_vec(spec);
 
         /* io_ty = io_ir_type(spec.dtype) */
         io_ty = rocke_b_io_ir_type(b, spec->dtype);
@@ -1284,7 +1305,8 @@ rocke_status_t rocke_pooling2d_grid(const rocke_pooling2d_spec_t* spec, int out[
         return ROCKE_ERR_VALUE;
     }
     /* total_v = total_out // max(vec, 1) */
-    vec = spec->vec > 1 ? spec->vec : 1; /* max(vec, 1) */
+    vec = rocke_pooling2d_spec_vec(spec);
+    vec = vec > 1 ? vec : 1; /* max(vec, 1) */
     total_v = rocke_pooling_problem_total_out(&spec->problem) / vec;
     /* ceil_div_grid((total_v, block_size)) */
     totals[0] = total_v;

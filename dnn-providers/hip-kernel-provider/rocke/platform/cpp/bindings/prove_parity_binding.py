@@ -286,6 +286,28 @@ def cfgs_pooling():
             512,
             4,
         ),
+        # vec=0: the engine resolves the widest of {4, 2, 1} dividing C.
+        (
+            dict(N=32, H=56, W=56, C=256, Y=3, X=3, sH=2, sW=2, pH=1, pW=1, dH=1, dW=1),
+            "f16",
+            "max",
+            256,
+            0,
+        ),
+        (
+            dict(N=8, H=28, W=28, C=6, Y=2, X=2, sH=2, sW=2, pH=0, pW=0, dH=1, dW=1),
+            "f16",
+            "avg",
+            256,
+            0,
+        ),
+        (
+            dict(N=2, H=16, W=16, C=3, Y=3, X=3, sH=1, sW=1, pH=1, pW=1, dH=1, dW=1),
+            "f16",
+            "sum",
+            256,
+            0,
+        ),
     ]
     return [
         dict(problem=p, dtype=d, op=o, block_size=b, vec=v) for (p, d, o, b, v) in rows

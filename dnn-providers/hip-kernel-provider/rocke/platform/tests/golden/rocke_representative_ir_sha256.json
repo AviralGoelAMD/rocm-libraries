@@ -1562,6 +1562,22 @@
           "sha256": "a5decd14eda561f53e16f1a59a6ded1af6c2c61296c79ddd307ef718d8d1131e",
           "status": "ok"
         },
+        "pooling/gfx950/default_c256": {
+          "arch": "gfx950",
+          "bytes": 12863,
+          "family": "pooling",
+          "kernel_name": "rocke_pooling2d_N32H56W56C256_Y3X3_s2x2_p1x1_f16_max_b256_v1",
+          "sha256": "f233544f561aece90c92c580ef1ce4b3badb4f6ae6cd1f3a8cf135a3f731b4c5",
+          "status": "ok"
+        },
+        "pooling/gfx950/vec_auto_c256": {
+          "arch": "gfx950",
+          "bytes": 20248,
+          "family": "pooling",
+          "kernel_name": "rocke_pooling2d_N32H56W56C256_Y3X3_s2x2_p1x1_f16_max_b256_v4",
+          "sha256": "4895743b2f79d471f20be9d30b63dd3a26764a3a3574d0b4c87fdb913969b957",
+          "status": "ok"
+        },
         "rmsnorm2d/gfx950/default_n8192": {
           "arch": "gfx950",
           "bytes": 26998,
@@ -1629,7 +1645,7 @@
           "gfx1250": 4,
           "gfx90a": 5,
           "gfx942": 40,
-          "gfx950": 133
+          "gfx950": 135
         },
         "expected_failures": 4,
         "families": {
@@ -1654,10 +1670,11 @@
           "kda_chunkwise": 13,
           "moe": 9,
           "nontemporal": 2,
+          "pooling": 2,
           "rmsnorm2d": 3,
           "smoothquant": 2
         },
-        "ok_cases": 200
+        "ok_cases": 202
       }
     },
     "llvm22": {
@@ -3222,6 +3239,22 @@
           "sha256": "6f72ea631a752d64195a2e64a3dbc39b1c6764ad3fa190b8ea49e2346379dca2",
           "status": "ok"
         },
+        "pooling/gfx950/default_c256": {
+          "arch": "gfx950",
+          "bytes": 12955,
+          "family": "pooling",
+          "kernel_name": "rocke_pooling2d_N32H56W56C256_Y3X3_s2x2_p1x1_f16_max_b256_v1",
+          "sha256": "a73c5210c7bd9b2c4a5943c969e5465e88134746e831eded7ff63789ce0723b1",
+          "status": "ok"
+        },
+        "pooling/gfx950/vec_auto_c256": {
+          "arch": "gfx950",
+          "bytes": 20340,
+          "family": "pooling",
+          "kernel_name": "rocke_pooling2d_N32H56W56C256_Y3X3_s2x2_p1x1_f16_max_b256_v4",
+          "sha256": "ef63521b02c68d7af1ad5bdbab75834995200907c5546b4bc08bdd28714f371c",
+          "status": "ok"
+        },
         "rmsnorm2d/gfx950/default_n8192": {
           "arch": "gfx950",
           "bytes": 27005,
@@ -3289,7 +3322,7 @@
           "gfx1250": 4,
           "gfx90a": 5,
           "gfx942": 40,
-          "gfx950": 133
+          "gfx950": 135
         },
         "expected_failures": 4,
         "families": {
@@ -3314,10 +3347,11 @@
           "kda_chunkwise": 13,
           "moe": 9,
           "nontemporal": 2,
+          "pooling": 2,
           "rmsnorm2d": 3,
           "smoothquant": 2
         },
-        "ok_cases": 200
+        "ok_cases": 202
       }
     },
     "llvm23": {
@@ -4914,6 +4948,22 @@
           "sha256": "84b0fb5a8a92a0abec1e550febe86cbefe306b413ecdef02f3f04a6883d5a4fb",
           "status": "ok"
         },
+        "pooling/gfx950/default_c256": {
+          "arch": "gfx950",
+          "bytes": 13019,
+          "family": "pooling",
+          "kernel_name": "rocke_pooling2d_N32H56W56C256_Y3X3_s2x2_p1x1_f16_max_b256_v1",
+          "sha256": "b42ae6473c5971706edc98c2bd3a18e30328672317e694bdacefcd1d712e40d5",
+          "status": "ok"
+        },
+        "pooling/gfx950/vec_auto_c256": {
+          "arch": "gfx950",
+          "bytes": 20404,
+          "family": "pooling",
+          "kernel_name": "rocke_pooling2d_N32H56W56C256_Y3X3_s2x2_p1x1_f16_max_b256_v4",
+          "sha256": "d7c30c18a49c1e75a417b10ae6a4736872206ae9feaab3cffc78585d3abadefe",
+          "status": "ok"
+        },
         "rmsnorm2d/gfx950/default_n8192": {
           "arch": "gfx950",
           "bytes": 27069,
@@ -4964,7 +5014,7 @@
           "gfx1250": 8,
           "gfx90a": 5,
           "gfx942": 40,
-          "gfx950": 133
+          "gfx950": 135
         },
         "expected_failures": 0,
         "families": {
@@ -4989,10 +5039,11 @@
           "kda_chunkwise": 13,
           "moe": 9,
           "nontemporal": 2,
+          "pooling": 2,
           "rmsnorm2d": 3,
           "smoothquant": 2
         },
-        "ok_cases": 204
+        "ok_cases": 206
       }
     }
   },

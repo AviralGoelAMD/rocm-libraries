@@ -135,6 +135,60 @@ static int make_spec(int idx, rocke_pooling2d_spec_t* spec)
         spec->block_size = 512;
         spec->vec = 4;
         break;
+    case 6: /* vec=0 auto: C=256 -> vec 4 */
+        p->N = 32;
+        p->H = 56;
+        p->W = 56;
+        p->C = 256;
+        p->Y = 3;
+        p->X = 3;
+        p->sH = 2;
+        p->sW = 2;
+        p->pH = 1;
+        p->pW = 1;
+        p->dH = 1;
+        p->dW = 1;
+        spec->dtype = "f16";
+        spec->op = "max";
+        spec->block_size = 256;
+        spec->vec = 0;
+        break;
+    case 7: /* vec=0 auto: C=6 -> vec 2 */
+        p->N = 8;
+        p->H = 28;
+        p->W = 28;
+        p->C = 6;
+        p->Y = 2;
+        p->X = 2;
+        p->sH = 2;
+        p->sW = 2;
+        p->pH = 0;
+        p->pW = 0;
+        p->dH = 1;
+        p->dW = 1;
+        spec->dtype = "f16";
+        spec->op = "avg";
+        spec->block_size = 256;
+        spec->vec = 0;
+        break;
+    case 8: /* vec=0 auto: C=3 -> vec 1 */
+        p->N = 2;
+        p->H = 16;
+        p->W = 16;
+        p->C = 3;
+        p->Y = 3;
+        p->X = 3;
+        p->sH = 1;
+        p->sW = 1;
+        p->pH = 1;
+        p->pW = 1;
+        p->dH = 1;
+        p->dW = 1;
+        spec->dtype = "f16";
+        spec->op = "sum";
+        spec->block_size = 256;
+        spec->vec = 0;
+        break;
     default:
         return -1;
     }
@@ -145,7 +199,7 @@ int main(int argc, char** argv)
 {
     if(argc < 2)
     {
-        fprintf(stderr, "usage: %s <config_index 0..5> [mode]\n", argv[0]);
+        fprintf(stderr, "usage: %s <config_index 0..8> [mode]\n", argv[0]);
         return 2;
     }
     int idx = atoi(argv[1]);

@@ -112,10 +112,14 @@ rocke_status_t
  *     dtype: DType = "f16"            # "f16" | "bf16"
  *     op: PoolOp = "max"             # "max" | "avg" | "sum"
  *     block_size: int = 256
- *     vec: int = 1
+ *     vec: int = 1                   # 0 -> default_pooling_vec(problem.C)
  *     name: str = "rocke_pooling2d"
  *     tile_n: int = 1                # P81 (unused by v1 build path)
  *     use_warp_xor_reduce: bool = False  # P82 (unused by v1 build path)
+ *
+ * Python resolves vec == 0 once in __post_init__; the C struct keeps the 0 and
+ * every reader goes through rocke_pooling2d_spec_vec(), which resolves it the
+ * same way, so names, validation, grid and IR agree with Python.
  */
 typedef struct rocke_pooling2d_spec
 {
@@ -123,7 +127,7 @@ typedef struct rocke_pooling2d_spec
     const char* dtype; /* "f16" | "bf16"; default "f16"        */
     const char* op; /* "max" | "avg" | "sum"; default "max" */
     int block_size; /* default 256                          */
-    int vec; /* default 1                            */
+    int vec; /* default 1; 0 = widest of {4, 2, 1} dividing C */
     const char* name; /* default "rocke_pooling2d"           */
     int tile_n; /* default 1                            */
     bool use_warp_xor_reduce; /* default false                 */
@@ -134,6 +138,13 @@ typedef struct rocke_pooling2d_spec
  * rocke_pooling_problem_default()). The caller fills problem's six required
  * dims and overrides any field. */
 rocke_pooling2d_spec_t rocke_pooling2d_spec_default(void);
+
+/* default_pooling_vec(c): the widest C-axis pack in {4, 2, 1} that divides c. */
+int rocke_pooling_default_vec(int c);
+
+/* The spec's effective vec: spec->vec, or rocke_pooling_default_vec(problem.C)
+ * when spec->vec == 0 (Pooling2DSpec.__post_init__). */
+int rocke_pooling2d_spec_vec(const rocke_pooling2d_spec_t* spec);
 
 /* Pooling2DSpec.kernel_name():
  *   kernel_name_join(name, problem.short(), dtype, op, f"b{block_size}",

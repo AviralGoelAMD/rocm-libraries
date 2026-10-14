@@ -76,6 +76,37 @@ def _spec(idx: int) -> Pooling2DSpec:
             block_size=512,
             vec=4,
         )
+    # vec=0 resolves to the widest of {4, 2, 1} dividing C.
+    if idx == 6:
+        return Pooling2DSpec(
+            problem=PoolingProblem(
+                N=32, H=56, W=56, C=256, Y=3, X=3, sH=2, sW=2, pH=1, pW=1, dH=1, dW=1
+            ),
+            dtype="f16",
+            op="max",
+            block_size=256,
+            vec=0,
+        )
+    if idx == 7:
+        return Pooling2DSpec(
+            problem=PoolingProblem(
+                N=8, H=28, W=28, C=6, Y=2, X=2, sH=2, sW=2, pH=0, pW=0, dH=1, dW=1
+            ),
+            dtype="f16",
+            op="avg",
+            block_size=256,
+            vec=0,
+        )
+    if idx == 8:
+        return Pooling2DSpec(
+            problem=PoolingProblem(
+                N=2, H=16, W=16, C=3, Y=3, X=3, sH=1, sW=1, pH=1, pW=1, dH=1, dW=1
+            ),
+            dtype="f16",
+            op="sum",
+            block_size=256,
+            vec=0,
+        )
     raise SystemExit(f"unknown config index {idx}")
 
 
@@ -87,7 +118,7 @@ def main() -> int:
     return run_emit(
         _spec,
         _build,
-        usage="usage: pooling_emit.py <config_index 0..5> [mode]\n",
+        usage="usage: pooling_emit.py <config_index 0..8> [mode]\n",
     )
 
 
