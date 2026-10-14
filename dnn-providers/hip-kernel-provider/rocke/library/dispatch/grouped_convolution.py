@@ -651,13 +651,13 @@ class ConvGroupedSpec:
         )
 
 
-# gfx950 dgrad K-loop routing thresholds on the per-group reduction length
-# Y*X*kpg (the K loop trip count times tile_k). Below the first the loop is
-# short and the prologue/epilogue dominate; the per-tile decode
-# (uniform_k_decode) only pays once the loop is long, and is a loss on the
-# pointwise problems whose plain loop already uses the flat-offset fast path.
-_DGRAD_REG_PREFETCH_MIN_KRED = 2048
-_DGRAD_UNIFORM_K_DECODE_MIN_KRED = 4096
+# gfx950 dgrad K-loop routing. uniform_k_decode follows its existing selection
+# policy (the sweep and the AOT cache already build with it) on every
+# non-pointwise problem; the pointwise plain loop already takes the
+# flat-offset fast path, so there it buys nothing. reg_prefetch is added only
+# for the longest per-group reductions Y*X*kpg, where the global-read latency
+# per K tile is still exposed after the decode is gone.
+_DGRAD_REG_PREFETCH_MIN_KRED = 8192
 
 
 def _dgrad_kloop_flags(arch: str, wave_size: int, pipeline: str, p: "ConvProblem") -> dict:
@@ -670,8 +670,7 @@ def _dgrad_kloop_flags(arch: str, wave_size: int, pipeline: str, p: "ConvProblem
         return {"uniform_k_decode": False, "reg_prefetch": False}
     k_red = (p.Z if p.is_3d else 1) * p.Y * p.X * p.kpg
     return {
-        "uniform_k_decode": k_red >= _DGRAD_UNIFORM_K_DECODE_MIN_KRED
-        and DgradConvSpec.default_uniform_k_decode(
+        "uniform_k_decode": DgradConvSpec.default_uniform_k_decode(
             arch=arch, wave_size=wave_size, pipeline=pipeline
         ),
         "reg_prefetch": k_red >= _DGRAD_REG_PREFETCH_MIN_KRED,
