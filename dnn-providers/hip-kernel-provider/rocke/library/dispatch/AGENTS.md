@@ -58,7 +58,8 @@ The priority-30 tuning candidates are generated from
 `GFX942_TUNING_VARIANTS` and `GFX950_TUNING_VARIANTS` (geometry: codepath,
 tile, warps, rows per warp, segments, compile backend). Every other tuning
 field on the tiled kernel specs is a declared `KnobAxis` in `axes.py`
-(`_GFX950_2D_AXES`, `_GFX942_2D_AXES`, `_3D_AXES`); `test_tuning_space.py`
+(`_GFX950_2D_AXES` + `_GFX950_FP_POLICY_AXES`, `_GFX942_2D_AXES`, `_3D_AXES`,
+`_GFX950_3D_AXES`); `test_tuning_space.py`
 fails if a kernel field is on no axis. Axes are ordered prerequisites-first,
 and the space is walked depth-first with the kernel's own spec validator
 pruning illegal prefixes, plus `UnifiedSpace.validate` on gfx950 2D (the LDS

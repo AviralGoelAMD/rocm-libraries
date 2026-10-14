@@ -812,6 +812,8 @@ rocke_attention_tiled_2d_spec_t t2d_build(const py::dict& d, Store& st)
     s.use_fp8_mfma_pv = a_bool(d, "use_fp8_mfma_pv", s.use_fp8_mfma_pv);
     s.use_fp8_mfma_qk = a_bool(d, "use_fp8_mfma_qk", s.use_fp8_mfma_qk);
     s.use_i64_kv_addr = a_bool(d, "use_i64_kv_addr", s.use_i64_kv_addr);
+    s.use_f32_denormal_flush = a_bool(d, "use_f32_denormal_flush", s.use_f32_denormal_flush);
+    s.use_fp_contract = a_bool(d, "use_fp_contract", s.use_fp_contract);
     s.use_register_pv = a_bool(d, "use_register_pv", s.use_register_pv);
     s.use_mfma_32x32 = a_bool(d, "use_mfma_32x32", s.use_mfma_32x32);
     s.use_transposed_qk_32x32 = a_bool(d, "use_transposed_qk_32x32", s.use_transposed_qk_32x32);
@@ -1064,6 +1066,7 @@ rocke_unified_attention_3d_tiled_spec_t t3d_build(const py::dict& d, Store& st)
     s.use_invariant_hoist = a_bool(d, "use_invariant_hoist", s.use_invariant_hoist);
     s.use_wide_kv_load = a_bool(d, "use_wide_kv_load", s.use_wide_kv_load);
     s.use_i64_kv_addr = a_bool(d, "use_i64_kv_addr", s.use_i64_kv_addr);
+    s.use_f32_denormal_flush = a_bool(d, "use_f32_denormal_flush", s.use_f32_denormal_flush);
     if(d.contains("waves_per_eu") && !d["waves_per_eu"].is_none())
     {
         s.has_waves_per_eu = true;
@@ -1205,6 +1208,7 @@ std::string t3d950_lower(const py::dict& d, const std::string& arch)
         r.dtype = s.dtype;
         r.num_segments = s.num_segments;
         r.has_waves_per_eu = s.has_waves_per_eu;
+        r.use_f32_denormal_flush = s.use_f32_denormal_flush;
         r.waves_per_eu = s.waves_per_eu;
         rocke_ir_builder_t b;
         rocke_ir_builder_init(&b, "attention_tiled_3d_reduce");
@@ -1361,6 +1365,8 @@ static py::dict spec_to_dict(const rocke_attention_tiled_2d_spec_t& s)
     d["use_i64_kv_addr"] = s.use_i64_kv_addr;
     d["use_k_single_buffer"] = s.use_k_single_buffer;
     d["use_fp8_mfma_qk"] = s.use_fp8_mfma_qk;
+    d["use_f32_denormal_flush"] = s.use_f32_denormal_flush;
+    d["use_fp_contract"] = s.use_fp_contract;
     return d;
 }
 

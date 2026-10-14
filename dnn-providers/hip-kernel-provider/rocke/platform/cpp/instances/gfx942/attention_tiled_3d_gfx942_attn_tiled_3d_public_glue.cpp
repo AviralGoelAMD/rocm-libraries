@@ -135,6 +135,7 @@ rocke_unified_attention_3d_tiled_spec_t rocke_unified_attention_3d_tiled_spec_de
     s.tile_size_override = 0;
     s.use_invariant_hoist = false;
     s.use_wide_kv_load = false;
+    s.use_f32_denormal_flush = false;
     return s;
 }
 
@@ -325,6 +326,7 @@ rocke_unified_attention_reduce_tiled_spec_t rocke_unified_attention_reduce_tiled
     memset(&s, 0, sizeof(s));
     s.has_waves_per_eu = false;
     s.waves_per_eu = 0;
+    s.use_f32_denormal_flush = false;
     return s;
 }
 
@@ -883,6 +885,14 @@ static rocke_kernel_def_t* build_segment_gfx942(rocke_ir_builder_t* b,
                 "strided KV requires fp16/bf16 async loads without paged i64 addressing");
             return NULL;
         }
+        if(spec->use_f32_denormal_flush)
+        {
+            /* Python: the gfx942 UnifiedAttention3DTiledSpec has no such field. */
+            rocke_i_set_err(b,
+                            ROCKE_ERR_VALUE,
+                            "use_f32_denormal_flush is a gfx950-only knob (gfx942 segment)");
+            return NULL;
+        }
 
         /* Name the kernel from spec.kernel_name() (Python b = IRBuilder(
          * spec.kernel_name())). The C entry reuses a caller-supplied builder. */
@@ -991,6 +1001,14 @@ rocke_kernel_def_t* rocke_build_unified_attention_reduce_tiled_gfx942(
     {
         rocke_i_set_err(
             b, ROCKE_ERR_VALUE, "build_unified_attention_reduce_tiled_gfx942: NULL spec");
+        return NULL;
+    }
+    if(spec->use_f32_denormal_flush)
+    {
+        /* Python: the gfx942 UnifiedAttentionReduceTiledSpec has no such field. */
+        rocke_i_set_err(b,
+                        ROCKE_ERR_VALUE,
+                        "use_f32_denormal_flush is a gfx950-only knob (gfx942 reduce)");
         return NULL;
     }
 

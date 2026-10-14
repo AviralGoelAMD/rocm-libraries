@@ -131,3 +131,21 @@ is issued *after* the PV-wait barrier to avoid the WAR race that single-buffer
 naively introduces.  Gfx950 only; see the gfx950 attention
 [README](../gfx950/attention/README.md) "Single-batch d128" section for measured
 results.
+
+**`use_f32_denormal_flush`** — Applies `CodegenPolicy(f32_denormal_mode=
+"preserve-sign")`: the kernel carries `"denormal-fp-math-f32"="preserve-sign,
+preserve-sign"`, so the precise softmax `exp2` lowers to a bare `v_exp_f32`
+without the IEEE denormal range fix-up.  Correctness: every `exp2` argument is
+a max-subtracted logit or a running-max delta (<= 0), so only weights below the
+f32 normal range are flushed, and a softmax row sum always contains the unit
+term of its maximum.  Declared on the gfx950 2D spec and on both gfx950 3D
+specs (segment + reduce; the reduce kernel takes the segment's value).
+Selector-on for every gfx950 paged 2D / 3D problem (`_enable_f32_denormal_flush`);
+the strided non-paged decode path and every other arch keep it off.  Name tag
+`ftz`.
+
+**`use_fp_contract`** — Applies `CodegenPolicy(fp_contract=True)`: IR
+`fadd`/`fsub`/`fmul` carry `contract`, so the backend may fuse the softmax
+scale and rescale chains into `v_fma`/`v_pk_fma`.  A fused pair may round one
+ulp differently from the unfused form.  gfx950 2D spec only; selector-on for
+every gfx950 paged 2D problem (`_enable_fp_contract`).  Name tag `fpc`.

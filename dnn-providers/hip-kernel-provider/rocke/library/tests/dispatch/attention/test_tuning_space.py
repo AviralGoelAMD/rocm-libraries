@@ -153,7 +153,8 @@ class TestTuningSpace(unittest.TestCase):
             seqlen_q=1,
             seqlen_k=4096,
         )
-        self.assertEqual(len(specs), 5)
+        # waves_per_eu choices x the use_f32_denormal_flush axis.
+        self.assertEqual(len(specs), 10)
 
     def test_tuning_ids_are_unique_and_hashed(self):
         _candidate, _req, specs = _specs_for(

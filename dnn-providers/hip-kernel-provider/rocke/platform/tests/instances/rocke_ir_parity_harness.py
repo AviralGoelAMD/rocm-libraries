@@ -400,6 +400,7 @@ def build_attention_3d(
     num_segments,
     sliding_window=0,
     has_softcap=False,
+    **kw,
 ):
     def _build():
         from kernels import (
@@ -417,6 +418,7 @@ def build_attention_3d(
             sliding_window=sliding_window,
             has_softcap=has_softcap,
             num_segments=num_segments,
+            **kw,
         )
         return build_unified_attention_3d_tiled(spec)
 
@@ -424,7 +426,7 @@ def build_attention_3d(
 
 
 def build_attention_reduce(
-    name, arch, *, head_size, num_query_heads, num_kv_heads, dtype, num_segments
+    name, arch, *, head_size, num_query_heads, num_kv_heads, dtype, num_segments, **kw
 ):
     def _build():
         from kernels import (
@@ -438,6 +440,7 @@ def build_attention_reduce(
             num_kv_heads=num_kv_heads,
             dtype=dtype,
             num_segments=num_segments,
+            **kw,
         )
         return build_unified_attention_reduce_tiled(spec)
 
@@ -2889,6 +2892,69 @@ def cases():
             num_kv_heads=2,
             dtype="bf16",
             num_segments=4,
+        ),
+    )
+    # Backend floating-point policy, flag-on: the dispatcher's gfx950 D128
+    # GQA-4 paged prefill spec with f32 denormal flush + FMA contraction, and
+    # the decode segment + reduce pair with the flush.
+    add(
+        "attention",
+        "attention/gfx950/2d_bf16_d128_b16_gqa4_ftz_fpc",
+        "gfx950",
+        build_attention_2d(
+            "irhash_attn_950_2d_bf16_ftz_fpc",
+            "gfx950",
+            head_size=128,
+            block_size=16,
+            num_query_heads=32,
+            num_kv_heads=8,
+            dtype="bf16",
+            num_seqs=1,
+            num_warps=4,
+            waves_per_eu=2,
+            tile_size=32,
+            block_m_per_warp=32,
+            use_mfma_32x32=True,
+            use_transposed_qk_32x32=True,
+            use_transposed_scalar_state=True,
+            use_transposed_mask_once=True,
+            use_transposed_half_local_pv=True,
+            use_mfma32_skip_legacy_qreg=True,
+            use_transposed_mask_limit=True,
+            use_softmax_mfma_interleave=True,
+            use_f32_denormal_flush=True,
+            use_fp_contract=True,
+        ),
+    )
+    add(
+        "attention",
+        "attention/gfx950/3d_bf16_d128_b16_gqa4_ftz",
+        "gfx950",
+        build_attention_3d(
+            "irhash_attn_950_3d_bf16_ftz",
+            "gfx950",
+            head_size=128,
+            block_size=16,
+            num_query_heads=32,
+            num_kv_heads=8,
+            dtype="bf16",
+            num_segments=16,
+            use_f32_denormal_flush=True,
+        ),
+    )
+    add(
+        "attention",
+        "attention/gfx950/reduce_bf16_d128_ftz",
+        "gfx950",
+        build_attention_reduce(
+            "irhash_attn_950_reduce_bf16_ftz",
+            "gfx950",
+            head_size=128,
+            num_query_heads=32,
+            num_kv_heads=8,
+            dtype="bf16",
+            num_segments=16,
+            use_f32_denormal_flush=True,
         ),
     )
     add(
