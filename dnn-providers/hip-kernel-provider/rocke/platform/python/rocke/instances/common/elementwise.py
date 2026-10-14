@@ -100,6 +100,11 @@ class ElementwiseSpec:
     dtype: DType = "f16"
     block_size: int = 256
     vec: int = 8
+    # Block tiles (``block_size * vec`` elements each) one CTA owns. With
+    # ``> 1`` a full CTA span issues every tile's loads before any compute /
+    # store, putting ``tiles_per_block`` vector loads per operand in flight per
+    # thread; the grid shrinks by the same factor.
+    tiles_per_block: int = 1
     name: str = "rocke_elementwise"
 
     def is_unary(self) -> bool:
@@ -136,10 +141,11 @@ class ElementwiseSpec:
             self.dtype,
             f"b{self.block_size}",
             f"v{self.vec}",
+            f"t{self.tiles_per_block}" if self.tiles_per_block > 1 else "",
         )
 
     def elems_per_block(self) -> int:
-        return self.block_size * self.vec
+        return self.block_size * self.vec * self.tiles_per_block
 
 
 def is_valid_spec(spec: ElementwiseSpec) -> Tuple[bool, str]:
@@ -156,6 +162,8 @@ def is_valid_spec(spec: ElementwiseSpec) -> Tuple[bool, str]:
             return False, f"vec {spec.vec} not in {{2}} for f64"
     elif spec.vec not in (2, 4, 8):
         return False, f"vec {spec.vec} not in {{2, 4, 8}}"
+    if spec.tiles_per_block not in (1, 2, 4, 8):
+        return False, f"tiles_per_block {spec.tiles_per_block} not in {{1, 2, 4, 8}}"
     return True, "ok"
 
 
@@ -330,36 +338,25 @@ def build_elementwise(spec: ElementwiseSpec) -> KernelDef:
     tid = b.thread_id_x()
     bid = b.block_id_x()
     c_vec = b.const_i32(spec.vec)
-    c_chunk = b.const_i32(tile_elems)
-
-    block_base = b.mul(bid, c_chunk)
-    thread_base = b.add(block_base, b.mul(tid, c_vec))
-
-    fast_lim = b.add(thread_base, c_vec)
-    in_fast = b.cmp_le(fast_lim, N)
-
-    # Per-block tile windows anchored at this CTA's slab origin. The
-    # distribution P-coordinate is just the lane id; it feeds level 0 of
-    # the H decomposition.
-    a_tile = make_tile_window(a_view, lengths=(tile_elems,), origin=(block_base,))
-    c_tile = make_tile_window(c_view, lengths=(tile_elems,), origin=(block_base,))
-    b_tile = (
-        make_tile_window(b_view, lengths=(tile_elems,), origin=(block_base,))
-        if spec.is_binary()
-        else None
-    )
+    T = spec.tiles_per_block
     ps = [[tid]]
 
-    def emit_vec_path() -> None:
-        # Tile-shaped fast path, CK Tile idiom: ``load_tile`` ingests the
-        # per-thread Y span (f32-promoted) into a StaticDistributedTensor,
-        # we sweep Y applying the per-element f32 op, and ``store_tile``
-        # packs + writes the result. Mirrors CK Tile's
-        # ``store_tile(y_window, cast_tile<YDataType>(y_tile))``.
-        a_dt = a_tile.load(b, distribution=distribution, ps=ps)
+    def tile_windows(block_base):
+        # Per-tile windows anchored at this tile's slab origin. The
+        # distribution P-coordinate is just the lane id; it feeds level 0 of
+        # the H decomposition.
+        a_tile = make_tile_window(a_view, lengths=(tile_elems,), origin=(block_base,))
+        c_tile = make_tile_window(c_view, lengths=(tile_elems,), origin=(block_base,))
+        b_tile = (
+            make_tile_window(b_view, lengths=(tile_elems,), origin=(block_base,))
+            if spec.is_binary()
+            else None
+        )
+        return a_tile, b_tile, c_tile
+
+    def emit_compute_store(c_tile, a_dt, b_dt) -> None:
         out_dt = make_static_distributed_tensor(distribution, dtype=io_ty)
         if spec.is_binary():
-            b_dt = b_tile.load(b, distribution=distribution, ps=ps)
             for y in distribution.iterate_ys():
                 out_dt.set(y, _apply_binary(b, a_dt.get(y), b_dt.get(y), spec.op))
         else:
@@ -367,7 +364,22 @@ def build_elementwise(spec: ElementwiseSpec) -> KernelDef:
                 out_dt.set(y, _apply_unary(b, a_dt.get(y), spec.op))
         c_tile.store(b, out_dt, ps=ps)
 
-    def emit_scalar_path() -> None:
+    def emit_vec_path(block_base) -> None:
+        # Tile-shaped fast path, CK Tile idiom: ``load_tile`` ingests the
+        # per-thread Y span (f32-promoted) into a StaticDistributedTensor,
+        # we sweep Y applying the per-element f32 op, and ``store_tile``
+        # packs + writes the result. Mirrors CK Tile's
+        # ``store_tile(y_window, cast_tile<YDataType>(y_tile))``.
+        a_tile, b_tile, c_tile = tile_windows(block_base)
+        a_dt = a_tile.load(b, distribution=distribution, ps=ps)
+        b_dt = (
+            b_tile.load(b, distribution=distribution, ps=ps)
+            if spec.is_binary()
+            else None
+        )
+        emit_compute_store(c_tile, a_dt, b_dt)
+
+    def emit_scalar_path(thread_base) -> None:
         # Trailing-tail scalar fallback. The fast path's
         # ``thread_base + vec <= N`` predicate is false here, so each
         # of the up-to-``vec`` lanes individually probes ``idx < N``
@@ -387,10 +399,41 @@ def build_elementwise(spec: ElementwiseSpec) -> KernelDef:
                     r = _apply_unary(b, a, spec.op)
                 c_view.store_scalar(b, [idx], _from_compute(b, r, io_ty))
 
-    with b.scf_if(in_fast):
-        emit_vec_path()
-    with b.scf_if(b.lnot(in_fast)):
-        emit_scalar_path()
+    def emit_tile(block_base) -> None:
+        thread_base = b.add(block_base, b.mul(tid, c_vec))
+        in_fast = b.cmp_le(b.add(thread_base, c_vec), N)
+        with b.scf_if(in_fast):
+            emit_vec_path(block_base)
+        with b.scf_if(b.lnot(in_fast)):
+            emit_scalar_path(thread_base)
+
+    if T == 1:
+        emit_tile(b.mul(bid, b.const_i32(tile_elems)))
+        return b.kernel
+
+    # Multi-tile CTA: when the whole ``T * tile`` span is in bounds, issue all
+    # T tiles' loads first, then compute + store each, so every thread keeps T
+    # independent vector loads per operand in flight. A partial trailing span
+    # falls back to the per-tile guarded path.
+    cta_base = b.mul(bid, b.const_i32(T * tile_elems))
+    tile_bases = [b.add(cta_base, b.const_i32(t * tile_elems)) for t in range(T)]
+    span_full = b.cmp_le(b.add(cta_base, b.const_i32(T * tile_elems)), N)
+    with b.scf_if(span_full):
+        windows = [tile_windows(base) for base in tile_bases]
+        loaded = []
+        for a_tile, b_tile, _c in windows:
+            a_dt = a_tile.load(b, distribution=distribution, ps=ps)
+            b_dt = (
+                b_tile.load(b, distribution=distribution, ps=ps)
+                if spec.is_binary()
+                else None
+            )
+            loaded.append((a_dt, b_dt))
+        for (_a, _b, c_tile), (a_dt, b_dt) in zip(windows, loaded):
+            emit_compute_store(c_tile, a_dt, b_dt)
+    with b.scf_if(b.lnot(span_full)):
+        for base in tile_bases:
+            emit_tile(base)
 
     return b.kernel
 
