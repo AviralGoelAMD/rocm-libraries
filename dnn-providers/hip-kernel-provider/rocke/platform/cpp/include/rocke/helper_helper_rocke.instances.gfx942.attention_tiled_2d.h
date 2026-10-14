@@ -182,6 +182,20 @@ typedef struct rocke_attention_tiled_2d_spec
      * fp_contract). Rejected on gfx942. */
     bool use_f32_denormal_flush; /* False */
     bool use_fp_contract; /* False */
+    /* gfx950 transposed-32x32 prefill pipeline knobs (Python dataclass
+     * fields of the same names; see attention_tiled_2d.py). All default False
+     * (golden-safe) and rejected on gfx942. use_mask_phase_split peels the
+     * causal-full KV tiles into a no-mask loop phase; the rest are the
+     * heaviest-first Q-block order, the K / V LDS XOR swizzles, the LDS-DMA
+     * overlap (scoped-noalias K/V DMA vs operand reads + LDS-only publish
+     * barriers), the paged block-id prefetch and the softmax scale fold. */
+    bool use_mask_phase_split; /* False */
+    bool use_reverse_q_block_order; /* False */
+    bool use_k_lds_xor_swizzle; /* False */
+    bool use_v_lds_xor_swizzle; /* False */
+    bool use_lds_dma_overlap; /* False */
+    bool use_kv_block_id_prefetch; /* False */
+    bool use_softmax_scale_fold; /* False */
 } rocke_attention_tiled_2d_spec_t;
 
 /* Materialise every defaulted field (the dataclass defaults). The required
