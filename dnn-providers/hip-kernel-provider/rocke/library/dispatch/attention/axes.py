@@ -66,6 +66,7 @@ _GFX950_2D_AXES: Tuple[KnobAxis, ...] = (
     _flag("use_lds_dma_overlap"),
     _flag("use_kv_block_id_prefetch"),
     _flag("use_softmax_scale_fold"),
+    _flag("use_permlane32_row_reduce"),
     _gated("use_kq_lds_pad", {"kq_lds_pad_halves": _KQ_LDS_PAD_HALVES}),
     _gated("use_sched_barrier", {"sched_barrier_mask": _SCHED_BARRIER_MASKS}),
     KnobAxis(
