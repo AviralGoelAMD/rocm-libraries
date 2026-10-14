@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 SCHEDULER_STRATEGY_ATTR = "scheduler_strategy"
 F32_DENORMAL_MODE_ATTR = "f32_denormal_mode"
+FP_CONTRACT_ATTR = "fp_contract"
 
 
 class SchedulerStrategy(str, Enum):
@@ -86,6 +87,7 @@ class CodegenPolicy:
 
     scheduler_strategy: str | SchedulerStrategy | None = None
     f32_denormal_mode: str | F32DenormalMode | None = None
+    fp_contract: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -98,6 +100,8 @@ class CodegenPolicy:
             "f32_denormal_mode",
             normalize_f32_denormal_mode(self.f32_denormal_mode),
         )
+        if not isinstance(self.fp_contract, bool):
+            raise ValueError(f"fp_contract must be a bool, got {self.fp_contract!r}")
 
 
 def codegen_policy_from_attrs(attrs: Mapping[str, Any]) -> CodegenPolicy:
@@ -106,6 +110,7 @@ def codegen_policy_from_attrs(attrs: Mapping[str, Any]) -> CodegenPolicy:
     return CodegenPolicy(
         scheduler_strategy=attrs.get(SCHEDULER_STRATEGY_ATTR),
         f32_denormal_mode=attrs.get(F32_DENORMAL_MODE_ATTR),
+        fp_contract=attrs.get(FP_CONTRACT_ATTR, False),
     )
 
 
@@ -123,6 +128,7 @@ def apply_codegen_policy(kernel: KernelDef, policy: CodegenPolicy) -> None:
     for attr, value in (
         (SCHEDULER_STRATEGY_ATTR, policy.scheduler_strategy),
         (F32_DENORMAL_MODE_ATTR, policy.f32_denormal_mode),
+        (FP_CONTRACT_ATTR, policy.fp_contract or None),
     ):
         if value is None:
             kernel.attrs.pop(attr, None)
@@ -134,6 +140,7 @@ __all__ = [
     "CodegenPolicy",
     "F32_DENORMAL_MODE_ATTR",
     "F32DenormalMode",
+    "FP_CONTRACT_ATTR",
     "SCHEDULER_STRATEGY_ATTR",
     "SchedulerStrategy",
     "apply_codegen_policy",
