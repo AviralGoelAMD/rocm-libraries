@@ -493,9 +493,9 @@ class TestWgradMergeDegree(unittest.TestCase):
     load is scalar. Merging Gm groups into one tile is what restores a
     vectorisable run, and the degree is bounded by ``spatial * Gm <= tile_n``.
 
-    The tile is *not* a free variable: the selector keeps the shipped tile and
-    chooses only the degree, so these tests assert ``tile_n == 64`` everywhere
-    alongside the degree.
+    The tile is widened (64 -> 128 -> 256) only for depthwise, and only as far
+    as it takes to reach a useful degree (see ``_wgrad_dw_tile_n``); these
+    tests pin the tile alongside the degree.
 
     The sharp edge: at ``split_k == -1`` the gate's split-K clause is vacuous,
     so ``support()`` validates little more than that tile bound. A degree the
@@ -564,29 +564,28 @@ class TestWgradMergeDegree(unittest.TestCase):
 
     def test_degree_table(self):
         # Group count is a power of two well above every ladder rung, so these
-        # cases isolate the tile bound (spatial * Gm <= 64) from divisibility.
-        # The degree falls as the filter grows and reaches 1 once a single pair
-        # of groups no longer fits the tile -- which is also the point where
-        # merging stops being offered at all.
+        # cases isolate the tile bound (spatial * Gm <= tile_n) from
+        # divisibility. The tile widens until it fits 8 groups, or 4 on the
+        # widest rung; past that the shipped tile and its degree stand, which
+        # for the largest filters means no merging at all.
         from dispatch.grouped_convolution import _wgrad_merge_degree
 
         cases = {
-            (1, 3): 16,  # spatial 3: 3*16 = 48 <= 64, 3*32 > 64
-            (1, 7): 8,  # spatial 7: 7*8 = 56 <= 64
-            (3, 3): 4,  # spatial 9: 9*4 = 36 <= 64, 9*8 > 64
-            (3, 5): 4,  # spatial 15: 15*4 = 60 <= 64
-            (5, 5): 2,  # spatial 25: 25*2 = 50 <= 64
-            (7, 7): 1,  # spatial 49: 49*2 > 64, nothing merges
-            (11, 11): 1,  # spatial 121
-            (13, 13): 1,  # spatial 169
+            (1, 3): (16, 64),  # spatial 3: 3*16 = 48 <= 64, 3*32 > 64
+            (1, 7): (8, 64),  # spatial 7: 7*8 = 56 <= 64
+            (3, 3): (8, 128),  # spatial 9: 9*8 = 72 > 64, <= 128
+            (3, 5): (8, 128),  # spatial 15: 15*8 = 120 <= 128
+            (5, 5): (8, 256),  # spatial 25: 25*8 = 200 <= 256
+            (7, 7): (4, 256),  # spatial 49: 49*4 = 196 <= 256, 49*8 > 256
+            (11, 11): (1, 64),  # spatial 121: only 2 fit 256, below the floor
+            (13, 13): (1, 64),  # spatial 169
         }
-        for (Y, X), want in cases.items():
+        for (Y, X), (want, tile_n) in cases.items():
             req = self._dw(2048, Y, X)
             self.assertEqual(_wgrad_merge_degree(req), want, f"{Y}x{X}")
             spec = dispatch_conv_grouped(req).spec
             self.assertEqual(spec.group_merge, want, f"{Y}x{X}")
-            # The tile is never spent on merging -- that was fitted and lost.
-            self.assertEqual(spec.tile_n, 64, f"{Y}x{X}")
+            self.assertEqual(spec.tile_n, tile_n, f"{Y}x{X}")
 
     def test_degree_is_ladder_capped_not_only_tile_capped(self):
         # A 1x1 filter would fit 64 groups in the 64-wide tile and still have
