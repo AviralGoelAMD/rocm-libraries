@@ -68,10 +68,32 @@ class FmhaMfmaSpec:
     seqlen_q: int
     seqlen_k: int
     name: str = "rocke_fmha_fwd_mfma"
+    # Body levers (default off; the classic body is emitted unchanged).
+    # ``reg_p``: transposed-score body with register-resident P (no LDS P
+    # round trip). ``qk_k32`` / ``pv_k32``: gfx950 K-packed 16x16x32 atom for
+    # the QK / PV chain (``pv_k32`` widens the K-tile to 32 keys).
+    # ``v_lds_tr``: stage V in LDS, read V^T with ds_read_b64_tr_b16.
+    reg_p: bool = False
+    qk_k32: bool = False
+    pv_k32: bool = False
+    v_lds_tr: bool = False
+    v_lds_pad: int = 0
+
+    def body_tag(self) -> str:
+        if not self.reg_p:
+            return ""
+        tag = "rp"
+        if self.qk_k32:
+            tag += "_qk32"
+        if self.pv_k32:
+            tag += "_pv32"
+        if self.v_lds_tr:
+            tag += f"_vtr{self.v_lds_pad}"
+        return tag
 
     def kernel_name(self) -> str:
         s = self.common.shape
-        return kernel_name_join(
+        parts = [
             self.name,
             f"H{s.head_size}",
             f"HQ{s.num_query_heads}",
@@ -80,7 +102,10 @@ class FmhaMfmaSpec:
             f"Q{self.seqlen_q}",
             f"K{self.seqlen_k}",
             self.common.mask_mode,
-        )
+        ]
+        if self.body_tag():
+            parts.append(self.body_tag())
+        return kernel_name_join(*parts)
 
 
 def _mma_family(arch: str) -> str:
@@ -172,6 +197,19 @@ def is_valid_spec(spec: FmhaMfmaSpec, arch: str = "gfx950") -> Tuple[bool, str]:
         return False, (
             f"LDS budget {bytes_lds} > {target.lds_capacity_bytes} cap on {arch}"
         )
+    if (spec.qk_k32 or spec.pv_k32 or spec.v_lds_tr) and not spec.reg_p:
+        return False, "qk_k32 / pv_k32 / v_lds_tr require reg_p"
+    if spec.reg_p:
+        if family != "mma":
+            return False, "reg_p is the wave64 MFMA body only"
+        if spec.pv_k32 and spec.seqlen_k % 32 != 0:
+            return False, f"pv_k32 needs seqlen_k % 32 == 0 (got {spec.seqlen_k})"
+        if (spec.qk_k32 or spec.pv_k32) and not target.mma.has_shape(
+            family=family, a_dtype="f16", b_dtype="f16", c_dtype="fp32", m=16, n=16, k=32
+        ):
+            return False, f"16x16x32 f16 MFMA not available on {arch}"
+        if spec.v_lds_tr and not target.memory.has_ds_read_tr:
+            return False, f"v_lds_tr needs ds_read_b64_tr_b16 (absent on {arch})"
     return True, "ok"
 
 
@@ -310,6 +348,11 @@ def build_fmha_fwd_mfma(spec: FmhaMfmaSpec, arch: str = "gfx950") -> KernelDef:
         causal_ctx_offset=causal_ctx,
         k_token_offset_elems=k_batch_offset,
         v_token_offset_elems=v_batch_offset,
+        reg_p=spec.reg_p,
+        qk_k32=spec.qk_k32,
+        pv_k32=spec.pv_k32,
+        v_lds_tr=spec.v_lds_tr,
+        v_lds_pad=spec.v_lds_pad,
         arch=arch,
     )
     b.ret()
