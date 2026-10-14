@@ -418,6 +418,14 @@ struct rocke_lower
     const char* smem_pool_name; /* "@smem_pool.<kernel>" */
     ROCKE_VEC(rocke_ll_smem_base_cache_t) smem_base_cache; /* per-(block,alloc) base ptr */
 
+    /* LDS alias rings (Python _lds_alias_ring_map / _lds_alias_rings): filled
+     * by rocke_ll_collect_smem from the smem_alloc lds_ring attrs, validated
+     * and counted by rocke_ll_check_lds_alias_rings. */
+    bool lds_ring_declared[ROCKE_LDS_ALIAS_MAX_RINGS];
+    int lds_ring_slots[ROCKE_LDS_ALIAS_MAX_RINGS];
+    int lds_ring_global[ROCKE_LDS_ALIAS_MAX_RINGS]; /* index into smem_globals */
+    int num_lds_alias_rings;
+
     /* scf.for yield recording stack (Python _yield_stack: list of list[str]).
      * Each frame is a vector of operand strings. */
     ROCKE_VEC(ROCKE_VEC(const char*) *) yield_stack;
@@ -598,6 +606,17 @@ const char* rocke_ll_smem_global_name(rocke_lower_t* L,
  * and before rocke_ll_lower_region. Populates L->smem_offsets,
  * L->smem_pool_size, and L->smem_pool_name. */
 void rocke_ll_compute_smem_layout(rocke_lower_t* L);
+
+/* Order the collected LDS alias rings by id (ids must be 0..n-1) and check
+ * their pool byte ranges are disjoint (Python _check_lds_alias_rings). Call
+ * after rocke_ll_compute_smem_layout. */
+void rocke_ll_check_lds_alias_rings(rocke_lower_t* L);
+
+/* Python _lds_alias_md / _lds_dma_md: the `, !alias.scope ... , !noalias ...`
+ * suffix for an lds_alias-tagged op ("" when untagged). The DMA form raises
+ * for an untagged LDS-DMA write in a kernel that declares rings. */
+const char* rocke_ll_lds_alias_md(rocke_lower_t* L, const rocke_op_t* op);
+const char* rocke_ll_lds_dma_md(rocke_lower_t* L, const rocke_op_t* op);
 
 /* Emit a byte-level GEP to the start of the smem segment for `gname` inside
  * the unified pool. Returns the pool name directly when offset == 0;

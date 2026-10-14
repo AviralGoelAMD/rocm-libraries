@@ -48,6 +48,9 @@ from .ir import (
     I1,
     I16,
     I32,
+    LDS_ALIAS_ANY_SLOT,
+    LDS_ALIAS_MAX_RINGS,
+    LDS_ALIAS_MAX_SLOTS,
     KernelDef,
     Op,
     Param,
@@ -1610,6 +1613,11 @@ class _Lowerer:
         # accessed several times in the same block reuse a single byte-level
         # GEP instead of re-emitting it per access.
         self._smem_base_cache: Dict[Tuple[str, str], str] = {}
+        # LDS alias rings (IRBuilder.lds_alias_ring), indexed by ring id:
+        # (slot count, @global name). _collect_smem gathers them from the
+        # smem_alloc attrs; _check_lds_alias_rings orders and validates them.
+        self._lds_alias_ring_map: Dict[int, Tuple[int, str]] = {}
+        self._lds_alias_rings: List[Tuple[int, str]] = []
         self._blocks: List[_Block] = [_Block("entry")]
         self._block_counter = 0
         self._tmp_counter = 0
@@ -1816,8 +1824,92 @@ class _Lowerer:
                 gname = f"@{short}.{self.kernel.name}"
                 self._smem_globals.append((gname, op.result.type))
                 self._smem_storage_name[op.result.name] = gname
+                if "lds_ring" in op.attrs:
+                    self._add_lds_alias_ring(op, gname)
             for r in op.regions:
                 self._collect_smem(r)
+
+    def _add_lds_alias_ring(self, op: Op, gname: str) -> None:
+        ring = int(op.attrs["lds_ring"])
+        slots = int(op.attrs.get("lds_ring_slots", 0))
+        if not 0 <= ring < LDS_ALIAS_MAX_RINGS:
+            raise ValueError(f"LDS alias ring id {ring} out of range 0..{LDS_ALIAS_MAX_RINGS - 1}")
+        if ring in self._lds_alias_ring_map:
+            raise ValueError(f"LDS alias ring {ring} is declared twice")
+        if not 1 <= slots <= LDS_ALIAS_MAX_SLOTS:
+            raise ValueError(
+                f"LDS alias ring {ring} has {slots} slots (1..{LDS_ALIAS_MAX_SLOTS})"
+            )
+        self._lds_alias_ring_map[ring] = (slots, gname)
+
+    def _check_lds_alias_rings(self) -> None:
+        """Order the collected rings by id (ids must be 0..n-1) and check that
+        their pool byte ranges, after liveness packing, are disjoint: rings
+        claim no-alias with each other."""
+        n = len(self._lds_alias_ring_map)
+        if sorted(self._lds_alias_ring_map) != list(range(n)):
+            raise ValueError(
+                f"LDS alias ring ids must be 0..{n - 1}, got "
+                f"{sorted(self._lds_alias_ring_map)}"
+            )
+        self._lds_alias_rings = [self._lds_alias_ring_map[r] for r in range(n)]
+        types = dict(self._smem_globals)
+        spans = []
+        for ring, (_slots, gname) in enumerate(self._lds_alias_rings):
+            lo = self._smem_offsets.get(gname, 0)
+            spans.append((ring, lo, lo + _smem_seg_bytes(types[gname])))
+        for i, (ra, lo_a, hi_a) in enumerate(spans):
+            for rb, lo_b, hi_b in spans[i + 1 :]:
+                if lo_a < hi_b and lo_b < hi_a:
+                    raise ValueError(
+                        f"LDS alias rings {ra} and {rb} share smem pool bytes; "
+                        "rings must not overlap"
+                    )
+
+    def _lds_alias_md(self, op: Op) -> str:
+        """``!alias.scope`` / ``!noalias`` suffix for an ``lds_alias``-tagged op.
+
+        Ring ``r`` is domain ``rocke.lds.ring<r>`` with one scope per slot.
+        The access is in its slot's scope (every slot of the ring for
+        ``LDS_ALIAS_ANY_SLOT``) and no-alias with every other scope of every
+        ring. Inline string-named nodes keep the numbered metadata space
+        untouched. Untagged ops get no suffix."""
+        if "lds_ring" not in op.attrs:
+            return ""
+        ring = int(op.attrs["lds_ring"])
+        slot = int(op.attrs.get("lds_slot", LDS_ALIAS_ANY_SLOT))
+        if not 0 <= ring < len(self._lds_alias_rings):
+            raise ValueError(f"{op.name}: unknown LDS alias ring {ring}")
+        nslots = self._lds_alias_rings[ring][0]
+        if slot != LDS_ALIAS_ANY_SLOT and not 0 <= slot < nslots:
+            raise ValueError(f"{op.name}: LDS alias ring {ring} has no slot {slot}")
+        own = range(nslots) if slot == LDS_ALIAS_ANY_SLOT else (slot,)
+
+        def scope(r: int, s: int) -> str:
+            return f'!{{!"rocke.lds.ring{r}.slot{s}", !{{!"rocke.lds.ring{r}"}}}}'
+
+        mine = ", ".join(scope(ring, s) for s in own)
+        others = ", ".join(
+            scope(r, s)
+            for r, (n, _g) in enumerate(self._lds_alias_rings)
+            for s in range(n)
+            if r != ring or s not in own
+        )
+        text = f", !alias.scope !{{{mine}}}"
+        if others:
+            text += f", !noalias !{{{others}}}"
+        return text
+
+    def _lds_dma_md(self, op: Op) -> str:
+        """``_lds_alias_md`` for an LDS-DMA write. In a kernel with rings an
+        untagged DMA is an error: the backend checks a tagged read only
+        against tagged DMA, so an untagged one would go unwaited."""
+        if self._lds_alias_rings and "lds_ring" not in op.attrs:
+            raise ValueError(
+                f"{op.name}: this kernel declares LDS alias rings, so every "
+                "LDS-DMA write must name its ring slot (lds_alias=...)"
+            )
+        return self._lds_alias_md(op)
 
     def _collect_smem_liveness(
         self, region: Region
@@ -1926,19 +2018,6 @@ class _Lowerer:
         Falls back to the original sequential packing when liveness analysis
         yields no intervals (e.g. zero smem allocations).
         """
-        _elem_bytes = {
-            "i8": 1,
-            "fp8e4m3": 1,
-            "bf8e5m2": 1,
-            "f16": 2,
-            "bf16": 2,
-            "i32": 4,
-            "tf32": 4,
-            "f32": 4,
-            "i64": 8,
-            "f64": 8,
-        }
-
         pool_name = f"@smem_pool.{self.kernel.name}"
         self._smem_pool_name = pool_name
 
@@ -1947,12 +2026,7 @@ class _Lowerer:
             return
 
         # ---- compute per-allocation sizes and alignments ----
-        def _seg_size(stype: "SmemType") -> int:
-            eb = _elem_bytes.get(stype.elem.name, 2)
-            seg = eb
-            for d in stype.shape:
-                seg *= d
-            return seg
+        _seg_size = _smem_seg_bytes
 
         def _align(stype: "SmemType") -> int:
             if stype.elem.name == "f64":
@@ -3447,10 +3521,12 @@ class _Lowerer:
             if vec == 8 and getattr(self._backend, "blocks_ds_load_tr16", False)
             else ""
         )
+        md = self._lds_alias_md(op)
         if vec == 1:
             scalar = self._fresh("smem.s")
             self._current().emit(
-                f"  {scalar} = load {volatile}{elem_ty}, ptr addrspace(3) {base}, align {align}"
+                f"  {scalar} = load {volatile}{elem_ty}, ptr addrspace(3) {base}, "
+                f"align {align}{md}"
             )
             self._current().emit(
                 f"  {op.result.name} = insertelement <1 x {elem_ty}> undef, {elem_ty} {scalar}, i32 0"
@@ -3458,7 +3534,7 @@ class _Lowerer:
         else:
             self._current().emit(
                 f"  {op.result.name} = load {volatile}<{vec} x {elem_ty}>, ptr addrspace(3) {base}, "
-                f"align {align}"
+                f"align {align}{md}"
             )
 
     def _op_tile_wmma_f32_16x16x16_f16(self, op: Op) -> None:
@@ -4526,7 +4602,7 @@ class _Lowerer:
         raw = self._fresh("tr.raw")
         self._current().emit(
             f"  {raw} = call <4 x i16> @llvm.amdgcn.ds.read.tr16.b64("
-            f"ptr addrspace(3) {base})"
+            f"ptr addrspace(3) {base}){self._lds_alias_md(op)}"
         )
         elem_ty = _llvm_type(op.result.type.elem)  # type: ignore[attr-defined]
         self._current().emit(
@@ -4562,6 +4638,7 @@ class _Lowerer:
             # ``.v8bf16`` to match the op): no reinterpret needed.
             self._current().emit(
                 f"  {op.result.name} = call {ret_ty} @{intrinsic}(ptr addrspace(3) {base})"
+                f"{self._lds_alias_md(op)}"
             )
         else:
             # gfx950 returns a type-agnostic ``<8 x i16>``; reinterpret the raw
@@ -4569,6 +4646,7 @@ class _Lowerer:
             raw = self._fresh("trw.raw")
             self._current().emit(
                 f"  {raw} = call {ret_ty} @{intrinsic}(ptr addrspace(3) {base})"
+                f"{self._lds_alias_md(op)}"
             )
             self._current().emit(
                 f"  {op.result.name} = bitcast {ret_ty} {raw} to {want_ty}"
@@ -4787,7 +4865,7 @@ class _Lowerer:
             f"i32 {size_bytes}, "
             f"i32 {self._operand(voff)}, "
             f"i32 {self._operand(soff)}, "
-            f"i32 0, i32 {aux})"
+            f"i32 0, i32 {aux}){self._lds_dma_md(op)}"
         )
 
     def _op_tile_s_wait_asynccnt(self, op: Op) -> None:
@@ -5665,7 +5743,7 @@ class _Lowerer:
             f"i32 {self._operand(voffset)}, "
             f"i32 {self._operand(soffset)}, "
             f"i32 0, "
-            f"i32 {aux})"
+            f"i32 {aux}){self._lds_dma_md(op)}"
         )
 
     def _op_tile_buffer_load_lds_async(self, op: Op) -> None:
@@ -5713,7 +5791,7 @@ class _Lowerer:
             f"ptr addrspace(3) {ptr_name}, "
             f"i32 {size_bytes}, "
             f"i32 0, "
-            f"i32 {aux})"
+            f"i32 {aux}){self._lds_dma_md(op)}"
         )
 
     # ----- f32 LDS ops (cshuffle epilogue) -----
@@ -6602,6 +6680,28 @@ class _Lowerer:
         return "\n".join(out)
 
 
+_SMEM_ELEM_BYTES = {
+    "i8": 1,
+    "fp8e4m3": 1,
+    "bf8e5m2": 1,
+    "f16": 2,
+    "bf16": 2,
+    "i32": 4,
+    "tf32": 4,
+    "f32": 4,
+    "i64": 8,
+    "f64": 8,
+}
+
+
+def _smem_seg_bytes(stype: SmemType) -> int:
+    """Byte size of one smem allocation in the pool (unknown elements count 2)."""
+    seg = _SMEM_ELEM_BYTES.get(stype.elem.name, 2)
+    for d in stype.shape:
+        seg *= d
+    return seg
+
+
 def _format_agpr_alloc(value: object) -> str:
     """Format a kernel ``agpr_alloc`` attr for LLVM's AMDGPU backend."""
 
@@ -6758,6 +6858,7 @@ def _lower_kernel_to_llvm_python(
     lowerer = _Lowerer(kernel, llvm_flavor=llvm_flavor, arch=arch)
     lowerer._collect_smem(kernel.body)
     lowerer._compute_smem_layout()
+    lowerer._check_lds_alias_rings()
     lowerer.lower_region(kernel.body)
     return lowerer.finalize()
 

@@ -150,6 +150,16 @@ rocke_attr_map_t rocke_i_attrs(rocke_ir_builder_t* b);
  * attrs pointer; Op.attrs is dict(attrs or {}) in Python). */
 void rocke_i_attrs_copy(rocke_ir_builder_t* b, rocke_attr_map_t* dst, const rocke_attr_map_t* src);
 
+/* Python IRBuilder._lds_alias_attrs: validate an lds_alias tag on an access to
+ * `smem` and append lds_ring / lds_slot to `attrs` (no-op for a NULL tag).
+ * Raises the sticky error on an unknown ring, a bad slot, or an access to a
+ * different allocation than the ring's. Defined in ir_flow.cpp. */
+void rocke_i_lds_alias_attrs(rocke_ir_builder_t* b,
+                             const char* what,
+                             const rocke_lds_alias_t* tag,
+                             const rocke_value_t* smem,
+                             rocke_attr_map_t* attrs);
+
 #ifdef __cplusplus
 }
 #endif

@@ -523,6 +523,13 @@ typedef struct rocke_kernel_def
 
 #define ROCKE_REGION_STACK_MAX 64
 
+/* LDS-DMA alias rings (Python IRBuilder.lds_alias_ring). Caps shared with
+ * rocke.core.ir.LDS_ALIAS_MAX_RINGS / LDS_ALIAS_MAX_SLOTS. */
+#define ROCKE_LDS_ALIAS_MAX_RINGS 8
+#define ROCKE_LDS_ALIAS_MAX_SLOTS 8
+/* Slot of an access whose ring slot is chosen at run time (LDS_ALIAS_ANY_SLOT). */
+#define ROCKE_LDS_ALIAS_ANY_SLOT (-1)
+
 typedef struct rocke_ir_builder
 {
     rocke_arena_t arena; /* owns every node below               */
@@ -536,6 +543,11 @@ typedef struct rocke_ir_builder
     rocke_value_t** param_values;
     int num_param_lookup;
     int cap_param_lookup;
+
+    /* LDS-DMA alias rings declared so far (ring id = index). */
+    rocke_value_t* lds_alias_ring_smem[ROCKE_LDS_ALIAS_MAX_RINGS];
+    int lds_alias_ring_slots[ROCKE_LDS_ALIAS_MAX_RINGS];
+    int num_lds_alias_rings;
 
     /* Sticky error state. */
     rocke_status_t status;
@@ -1380,6 +1392,65 @@ void rocke_b_global_load_lds(rocke_ir_builder_t* b,
                              int size_bytes,
                              int coherency);
 
+/* ----- LDS-DMA alias rings (Python IRBuilder.lds_alias_ring / LdsAliasTag) -----
+ *
+ * rocke_b_lds_alias_ring declares an smem_alloc result a ring of `slots`
+ * disjoint slots and returns its ring id (-1 + sticky error on failure). The
+ * _alias variants below take an optional tag (NULL = untagged, byte-identical
+ * to the plain call): {ring, slot} with slot = ROCKE_LDS_ALIAS_ANY_SLOT for a
+ * slot chosen at run time. A tagged raw-address DMA must derive its address
+ * from rocke_b_smem_addr_of / rocke_b_smem_ptr_add of the ring's allocation.
+ * See the Python docstring for the full contract. */
+typedef struct rocke_lds_alias
+{
+    int ring;
+    int slot;
+} rocke_lds_alias_t;
+
+int rocke_b_lds_alias_ring(rocke_ir_builder_t* b, rocke_value_t* smem, int slots);
+rocke_value_t* rocke_b_smem_load_vN_alias(rocke_ir_builder_t* b,
+                                          rocke_value_t* smem,
+                                          rocke_value_t* const* indices,
+                                          int num_indices,
+                                          const rocke_type_t* dtype,
+                                          int n,
+                                          const rocke_lds_alias_t* alias);
+rocke_value_t* rocke_b_ds_read_tr16_b64_alias(rocke_ir_builder_t* b,
+                                              rocke_value_t* smem,
+                                              rocke_value_t* const* indices,
+                                              int num_indices,
+                                              const rocke_type_t* dtype /* NULL=>f16 */,
+                                              const rocke_lds_alias_t* alias);
+rocke_value_t* rocke_b_ds_read_tr16_b128_alias(rocke_ir_builder_t* b,
+                                               rocke_value_t* smem,
+                                               rocke_value_t* const* indices,
+                                               int num_indices,
+                                               const rocke_type_t* dtype /* NULL=>f16 */,
+                                               const rocke_lds_alias_t* alias);
+void rocke_b_async_buffer_load_lds_addr_alias(rocke_ir_builder_t* b,
+                                              rocke_value_t* rsrc,
+                                              rocke_value_t* lds_addr,
+                                              rocke_value_t* voffset,
+                                              rocke_value_t* soffset,
+                                              int dwords,
+                                              int coherency,
+                                              const rocke_lds_alias_t* alias);
+void rocke_b_async_buffer_load_lds_alias(rocke_ir_builder_t* b,
+                                         rocke_value_t* rsrc,
+                                         rocke_value_t* lds_ptr,
+                                         rocke_value_t* voffset,
+                                         rocke_value_t* soffset,
+                                         int dwords,
+                                         int coherency,
+                                         const rocke_lds_alias_t* alias);
+void rocke_b_global_load_lds_alias(rocke_ir_builder_t* b,
+                                   rocke_value_t* src_ptr,
+                                   rocke_value_t* byte_off,
+                                   rocke_value_t* lds_addr,
+                                   int size_bytes,
+                                   int coherency,
+                                   const rocke_lds_alias_t* alias);
+
 /* ----- global pointer arithmetic + buffer resource descriptors ----- */
 rocke_value_t*
     rocke_b_global_ptr_add(rocke_ir_builder_t* b, rocke_value_t* ptr, rocke_value_t* byte_off);
@@ -1491,6 +1562,10 @@ rocke_value_t* rocke_b_zero_vec_f16(rocke_ir_builder_t* b, int n);
 
 /* ----- barriers / scheduling ----- */
 void rocke_b_sync(rocke_ir_builder_t* b);
+/* Python b.sync(keep_lds_dma=n): s_waitcnt vmcnt(n) lgkmcnt(0) + bare barrier,
+ * so the n most recently issued LDS-DMA writes stay in flight (n == 0 is
+ * rocke_b_sync). Count only LDS-DMA ops issued after the guarded ones. */
+void rocke_b_sync_keep_lds_dma(rocke_ir_builder_t* b, int keep_lds_dma);
 void rocke_b_s_barrier_bare(rocke_ir_builder_t* b);
 void rocke_b_sync_half_block(rocke_ir_builder_t* b, rocke_value_t* half_selector);
 void rocke_b_sync_lds_only(rocke_ir_builder_t* b);

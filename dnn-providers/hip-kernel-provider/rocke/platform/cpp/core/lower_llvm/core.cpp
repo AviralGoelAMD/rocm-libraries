@@ -1020,6 +1020,38 @@ void rocke_ll_collect_smem(rocke_lower_t* L, const rocke_region_t* region)
             {
                 rocke_ll_fail(L, ROCKE_ERR_OOM, "smem_names push");
             }
+            int64_t ring;
+            if(rocke_attr_get_int(&op->attrs, "lds_ring", &ring))
+            {
+                /* Python _add_lds_alias_ring. */
+                int64_t slots = 0;
+                (void)rocke_attr_get_int(&op->attrs, "lds_ring_slots", &slots);
+                if(ring < 0 || ring >= ROCKE_LDS_ALIAS_MAX_RINGS)
+                {
+                    rocke_ll_fail(L,
+                                  ROCKE_ERR_VALUE,
+                                  "LDS alias ring id %lld out of range 0..%d",
+                                  (long long)ring,
+                                  ROCKE_LDS_ALIAS_MAX_RINGS - 1);
+                }
+                if(L->lds_ring_declared[ring])
+                {
+                    rocke_ll_fail(
+                        L, ROCKE_ERR_VALUE, "LDS alias ring %lld is declared twice", (long long)ring);
+                }
+                if(slots < 1 || slots > ROCKE_LDS_ALIAS_MAX_SLOTS)
+                {
+                    rocke_ll_fail(L,
+                                  ROCKE_ERR_VALUE,
+                                  "LDS alias ring %lld has %lld slots (1..%d)",
+                                  (long long)ring,
+                                  (long long)slots,
+                                  ROCKE_LDS_ALIAS_MAX_SLOTS);
+                }
+                L->lds_ring_declared[ring] = true;
+                L->lds_ring_slots[ring] = (int)slots;
+                L->lds_ring_global[ring] = (int)L->smem_globals.len - 1;
+            }
         }
         for(int r = 0; r < op->num_regions; r++)
         {
@@ -1240,6 +1272,113 @@ static int ll_smem_align(const rocke_type_t* stype)
     if(strcmp(n, "i8") == 0 || strcmp(n, "fp8e4m3") == 0 || strcmp(n, "bf8e5m2") == 0)
         return 16;
     return 4;
+}
+
+/* Python _check_lds_alias_rings. */
+void rocke_ll_check_lds_alias_rings(rocke_lower_t* L)
+{
+    int n = 0;
+    for(int r = 0; r < ROCKE_LDS_ALIAS_MAX_RINGS; r++)
+    {
+        if(L->lds_ring_declared[r])
+            n++;
+    }
+    for(int r = 0; r < ROCKE_LDS_ALIAS_MAX_RINGS; r++)
+    {
+        if(L->lds_ring_declared[r] != (r < n))
+            rocke_ll_fail(L, ROCKE_ERR_VALUE, "LDS alias ring ids must be 0..%d", n - 1);
+    }
+    L->num_lds_alias_rings = n;
+    for(int a = 0; a < n; a++)
+    {
+        int ga = L->lds_ring_global[a];
+        int lo_a = (size_t)ga < L->smem_offsets.len ? L->smem_offsets.data[ga] : 0;
+        int hi_a = lo_a + ll_smem_seg_size(L->smem_globals.data[ga].stype);
+        for(int c = a + 1; c < n; c++)
+        {
+            int gc = L->lds_ring_global[c];
+            int lo_c = (size_t)gc < L->smem_offsets.len ? L->smem_offsets.data[gc] : 0;
+            int hi_c = lo_c + ll_smem_seg_size(L->smem_globals.data[gc].stype);
+            if(lo_a < hi_c && lo_c < hi_a)
+                rocke_ll_fail(L,
+                              ROCKE_ERR_VALUE,
+                              "LDS alias rings %d and %d share smem pool bytes; "
+                              "rings must not overlap",
+                              a,
+                              c);
+        }
+    }
+}
+
+static void ll_lds_scope(rocke_strbuf_t* sb, int ring, int slot)
+{
+    rocke_strbuf_appendf(
+        sb, "!{!\"rocke.lds.ring%d.slot%d\", !{!\"rocke.lds.ring%d\"}}", ring, slot, ring);
+}
+
+/* Python _lds_alias_md. */
+const char* rocke_ll_lds_alias_md(rocke_lower_t* L, const rocke_op_t* op)
+{
+    int64_t ring, slot = ROCKE_LDS_ALIAS_ANY_SLOT;
+    if(!rocke_attr_get_int(&op->attrs, "lds_ring", &ring))
+        return "";
+    (void)rocke_attr_get_int(&op->attrs, "lds_slot", &slot);
+    if(ring < 0 || ring >= L->num_lds_alias_rings)
+        rocke_ll_fail(L, ROCKE_ERR_VALUE, "%s: unknown LDS alias ring %lld", op->name, (long long)ring);
+    int nslots = L->lds_ring_slots[ring];
+    if(slot != ROCKE_LDS_ALIAS_ANY_SLOT && (slot < 0 || slot >= nslots))
+        rocke_ll_fail(L,
+                      ROCKE_ERR_VALUE,
+                      "%s: LDS alias ring %lld has no slot %lld",
+                      op->name,
+                      (long long)ring,
+                      (long long)slot);
+    rocke_strbuf_t sb;
+    if(rocke_strbuf_init(&sb, 256) != 0)
+        rocke_ll_fail(L, ROCKE_ERR_OOM, "lds alias md");
+    rocke_strbuf_append(&sb, ", !alias.scope !{");
+    bool first = true;
+    for(int s = 0; s < nslots; s++)
+    {
+        if(slot != ROCKE_LDS_ALIAS_ANY_SLOT && s != slot)
+            continue;
+        if(!first)
+            rocke_strbuf_append(&sb, ", ");
+        ll_lds_scope(&sb, (int)ring, s);
+        first = false;
+    }
+    rocke_strbuf_append(&sb, "}");
+    first = true;
+    for(int r = 0; r < L->num_lds_alias_rings; r++)
+    {
+        for(int s = 0; s < L->lds_ring_slots[r]; s++)
+        {
+            if(r == ring && (slot == ROCKE_LDS_ALIAS_ANY_SLOT || s == slot))
+                continue;
+            rocke_strbuf_append(&sb, first ? ", !noalias !{" : ", ");
+            ll_lds_scope(&sb, r, s);
+            first = false;
+        }
+    }
+    if(!first)
+        rocke_strbuf_append(&sb, "}");
+    const char* text = sb.oom ? NULL : rocke_arena_strdup(&L->arena, sb.data);
+    rocke_strbuf_free(&sb);
+    if(!text)
+        rocke_ll_fail(L, ROCKE_ERR_OOM, "lds alias md");
+    return text;
+}
+
+/* Python _lds_dma_md. */
+const char* rocke_ll_lds_dma_md(rocke_lower_t* L, const rocke_op_t* op)
+{
+    if(L->num_lds_alias_rings > 0 && !rocke_attr_get(&op->attrs, "lds_ring"))
+        rocke_ll_fail(L,
+                      ROCKE_ERR_VALUE,
+                      "%s: this kernel declares LDS alias rings, so every LDS-DMA write "
+                      "must name its ring slot (lds_alias=...)",
+                      op->name);
+    return rocke_ll_lds_alias_md(L, op);
 }
 
 void rocke_ll_compute_smem_layout(rocke_lower_t* L)
@@ -2064,6 +2203,7 @@ static void ll_lower_into(rocke_lower_t* L,
     /* Pre-pass + lowering. */
     rocke_ll_collect_smem(L, kernel->body);
     rocke_ll_compute_smem_layout(L);
+    rocke_ll_check_lds_alias_rings(L);
     rocke_ll_lower_region(L, kernel->body);
 
     rocke_strbuf_t sb;
