@@ -69,6 +69,12 @@ from ...helpers.mfma_gemm_inner import (
 )
 from ...helpers.quant import quant_ir_type
 from ...helpers.spec import SignatureBuilder, kernel_name_join
+from ._scaled_gemm_tiled import (
+    TiledScaledGemmConfig,
+    emit_tiled_scaled_gemm,
+    tiled_grid,
+    validate_tiled,
+)
 
 
 QuantMode = Literal["aquant", "bquant", "abquant"]
@@ -101,6 +107,53 @@ class BlockScaleGemmSpec:
     # Defaults to True for backwards compat; flip on per-row
     # varying-scale workloads.
     per_input_row: bool = True
+    # Tiled body knobs (see ``_scaled_gemm_tiled``). Any non-default value
+    # (or ``per_input_row=False``) selects the register-tiled body, which
+    # applies scales per output cell. ``b_layout="nk"`` takes B as (N, K)
+    # with BScale (N/gn, K/gk); ``k_atom=128`` selects the fp8 16x16x128
+    # atom; ``split_k`` atomically accumulates into a zeroed C.
+    b_layout: str = "kn"
+    mfma_m: int = 1
+    mfma_n: int = 1
+    warp_m: int = 1
+    warp_n: int = 1
+    k_atom: int = 32
+    split_k: int = 1
+    prefetch: bool = False
+    k_unroll: int = 1
+    lds: bool = False
+
+    @property
+    def tiled(self) -> bool:
+        return (
+            not self.per_input_row
+            or self.b_layout != "kn"
+            or (self.mfma_m, self.mfma_n, self.warp_m, self.warp_n) != (1, 1, 1, 1)
+            or self.k_atom != 32
+            or self.split_k != 1
+            or self.prefetch
+            or self.k_unroll != 1
+            or self.lds
+        )
+
+    def tiled_config(self) -> TiledScaledGemmConfig:
+        return TiledScaledGemmConfig(
+            M=self.M,
+            N=self.N,
+            K=self.K,
+            atom=self.atom,
+            scale_mode="block",
+            group_mnk=tuple(self.group_size_mnk),
+            b_layout=self.b_layout,
+            mfma_m=self.mfma_m,
+            mfma_n=self.mfma_n,
+            warp_m=self.warp_m,
+            warp_n=self.warp_n,
+            split_k=self.split_k,
+            prefetch=self.prefetch,
+            k_unroll=self.k_unroll,
+            lds=self.lds,
+        )
 
     @property
     def atom(self) -> MfmaAtom:
@@ -115,6 +168,8 @@ class BlockScaleGemmSpec:
                 f"(got {self.block_tile_m}x{self.block_tile_n})"
             )
         if self.mantissa_dtype == "fp8e4m3":
+            if self.k_atom == 128:
+                return MfmaAtom.fp8_16x16x128()
             return MfmaAtom.fp8_16x16x32()
         if self.mantissa_dtype == "bf8e5m2":
             return MfmaAtom.bf8_16x16x32()
@@ -130,19 +185,24 @@ class BlockScaleGemmSpec:
     def block_size(self) -> int:
         # MFMA path: one wave64 warp per CTA -- the MFMA atom is
         # per-wave and each output tile is one atom invocation chain.
-        return 64
+        return 64 * self.warp_m * self.warp_n
 
     def kernel_name(self) -> str:
         gm, gn, gk = self.group_size_mnk
-        return kernel_name_join(
-            self.name,
+        parts = [
             f"M{self.M}N{self.N}K{self.K}",
             self.quant_mode,
             self.mantissa_dtype,
             f"g{gm}x{gn}x{gk}",
             f"t{self.block_tile_m}x{self.block_tile_n}",
-            flags={"psb": self.preshuffle_b},
-        )
+        ]
+        if self.tiled:
+            parts.append(
+                f"tl{self.b_layout}m{self.mfma_m}n{self.mfma_n}w{self.warp_m}x{self.warp_n}"
+                f"k{self.k_atom}s{self.split_k}{'pf' if self.prefetch else ''}u{self.k_unroll}"
+                f"{'lds' if self.lds else ''}"
+            )
+        return kernel_name_join(self.name, *parts, flags={"psb": self.preshuffle_b})
 
 
 def is_valid_spec(spec: BlockScaleGemmSpec, arch: str = "gfx950") -> Tuple[bool, str]:
@@ -199,6 +259,12 @@ def is_valid_spec(spec: BlockScaleGemmSpec, arch: str = "gfx950") -> Tuple[bool,
             "M / N must be divisible by their tile sizes "
             "(v1 doesn't handle partial tiles)"
         )
+    if spec.tiled:
+        if spec.k_atom not in (32, 128) or (
+            spec.k_atom == 128 and spec.mantissa_dtype != "fp8e4m3"
+        ):
+            return False, "k_atom must be 32, or 128 with fp8e4m3"
+        return validate_tiled(spec.tiled_config())
     return True, "ok"
 
 
@@ -249,7 +315,10 @@ def build_block_scale_gemm(spec: BlockScaleGemmSpec, arch: str = "gfx950") -> Ke
     ok, why = is_valid_spec(spec, arch=arch)
     if not ok:
         raise ValueError(f"invalid block_scale_gemm spec for {arch}: {why}")
-    validate_mfma_atom_in_catalog(spec.atom, arch, where="block_scale_gemm")
+    if spec.k_atom != 128:
+        # The fp8 16x16x128 atom lowers through the gfx950 scaled f8f6f4
+        # instruction, which the MMA catalog does not model.
+        validate_mfma_atom_in_catalog(spec.atom, arch, where="block_scale_gemm")
 
     mantissa_store = _mantissa_storage_dtype(spec)
     BS = spec.block_size
@@ -284,10 +353,29 @@ def build_block_scale_gemm(spec: BlockScaleGemmSpec, arch: str = "gfx950") -> Ke
         AScale = b.param("AScale", PtrType(F32, "global"), readonly=True, align=4)
     if spec.quant_mode in ("bquant", "abquant"):
         BScale = b.param("BScale", PtrType(F32, "global"), readonly=True, align=4)
-    C = b.param("C", PtrType(F32, "global"), writeonly=True, align=4)
+    if spec.split_k > 1:
+        C = b.param("C", PtrType(F32, "global"), align=4)
+    else:
+        C = b.param("C", PtrType(F32, "global"), writeonly=True, align=4)
     M = b.param("M", I32)  # noqa: F841 -- ABI; equals spec.M
     N = b.param("N", I32)  # noqa: F841 -- ABI; equals spec.N
     Kp = b.param("K", I32)  # noqa: F841 -- ABI
+
+    if spec.tiled:
+        if spec.quant_mode != "abquant" or a_store != b_store:
+            raise NotImplementedError("tiled block_scale_gemm body ships abquant fp8/bf8 only")
+        emit_tiled_scaled_gemm(
+            b,
+            spec.tiled_config(),
+            A=A,
+            AScale=AScale,
+            Bp=Bp,
+            BScale=BScale,
+            C=C,
+            decode_mx=None,
+        )
+        b.ret()
+        return b.kernel
 
     lane = b.thread_id_x()
     bid_n = b.block_id_x()
@@ -441,6 +529,8 @@ def _storage_ir_type(store: str):
 
 
 def block_scale_gemm_grid(spec: BlockScaleGemmSpec) -> Tuple[int, int, int]:
+    if spec.tiled:
+        return tiled_grid(spec.tiled_config())
     n_tiles = (spec.N + spec.block_tile_n - 1) // spec.block_tile_n
     m_tiles = (spec.M + spec.block_tile_m - 1) // spec.block_tile_m
     return (n_tiles, m_tiles, 1)

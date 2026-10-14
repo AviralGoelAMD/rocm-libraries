@@ -1,0 +1,459 @@
+# Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+"""Register-tiled fp8 scaled-GEMM body shared by block_scale_gemm and mx_gemm.
+
+Opt-in body selected by the non-default tiling knobs of
+:class:`~rocke.instances.common.block_scale_gemm.BlockScaleGemmSpec` and
+:class:`~rocke.instances.common.mx_gemm.MxGemmSpec`. The default specs keep
+the original one-atom-per-CTA body byte-for-byte.
+
+Structure (per CTA of ``warp_m * warp_n`` wave64 warps):
+
+* each warp owns ``mfma_m x mfma_n`` 16x16 MFMA atoms (register tile), so
+  one A fragment feeds ``mfma_n`` MFMAs and one B fragment feeds ``mfma_m``;
+* ``b_layout="nk"`` takes B as (N, K) row-major (the weight layout), so the
+  per-lane B fragment is K-contiguous and loads with one vector load, like A;
+* scales are applied per *output* cell: a lane's accumulator slot ``i`` is
+  output row ``(lane // 16) * 4 + i``, so the A scale is gathered for those
+  four rows (not for the lane's A-operand row);
+* MX with the 16x16x128 atom uses the in-instruction E8M0 scaled MFMA: lane
+  ``l`` carries the K-chunk ``(l // 16) * 32 .. +32`` of row/col ``l % 16``,
+  which is exactly one MX block, so the lane's scale byte is that block's;
+* ``split_k > 1`` splits the K-groups over ``block_id_z`` and atomically
+  adds f32 partials into C (caller zero-fills C).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Tuple
+
+from ...core.ir import F32, I32, IRBuilder, Value
+from ...helpers.atoms import MfmaAtom
+
+
+@dataclass(frozen=True)
+class TiledScaledGemmConfig:
+    M: int
+    N: int
+    K: int
+    atom: MfmaAtom
+    # "block": f32 scales, A (M/gm, K/gk), B (K/gk, N/gn) [kn] or (N/gn, K/gk) [nk]
+    # "mx":    e8m0 bytes,  A (M, K/32),     B (K/32, N)   [kn] or (N, K/32)   [nk]
+    scale_mode: str
+    group_mnk: Tuple[int, int, int]
+    b_layout: str = "nk"
+    mfma_m: int = 1
+    mfma_n: int = 1
+    warp_m: int = 1
+    warp_n: int = 1
+    split_k: int = 1
+    scaled_mfma: bool = False
+    prefetch: bool = False
+    k_unroll: int = 1
+    lds: bool = False
+
+    @property
+    def tile_m(self) -> int:
+        return 16 * self.mfma_m * self.warp_m
+
+    @property
+    def tile_n(self) -> int:
+        return 16 * self.mfma_n * self.warp_n
+
+    @property
+    def block_size(self) -> int:
+        return 64 * self.warp_m * self.warp_n
+
+
+def _loop_k(cfg: TiledScaledGemmConfig) -> int:
+    """K consumed per main-loop trip: one scale group, or 128 when the whole K
+    is a single group (per-token x per-channel), whose scale is applied once
+    in the epilogue."""
+    gk = cfg.group_mnk[2]
+    if cfg.scale_mode != "mx" and cfg.K // gk == 1:
+        return max(128, cfg.atom.k)
+    return gk
+
+
+def tiled_grid(cfg: TiledScaledGemmConfig) -> Tuple[int, int, int]:
+    return (cfg.N // cfg.tile_n, cfg.M // cfg.tile_m, cfg.split_k)
+
+
+def validate_tiled(cfg: TiledScaledGemmConfig) -> Tuple[bool, str]:
+    if cfg.b_layout not in ("kn", "nk"):
+        return False, f"b_layout must be 'kn' or 'nk' (got {cfg.b_layout!r})"
+    if cfg.atom.m != 16 or cfg.atom.n != 16:
+        return False, "tiled body supports 16x16 atoms only"
+    if min(cfg.mfma_m, cfg.mfma_n, cfg.warp_m, cfg.warp_n, cfg.split_k) < 1:
+        return False, "tile knobs must be >= 1"
+    if cfg.block_size > 1024:
+        return False, f"block_size {cfg.block_size} > 1024"
+    if cfg.M % cfg.tile_m or cfg.N % cfg.tile_n:
+        return False, f"M/N must divide the CTA tile {cfg.tile_m}x{cfg.tile_n}"
+    gm, gn, gk = cfg.group_mnk
+    if gk % cfg.atom.k:
+        return False, f"group_k ({gk}) must be a multiple of atom.k ({cfg.atom.k})"
+    loop_k = _loop_k(cfg)
+    if cfg.K % loop_k:
+        return False, f"K ({cfg.K}) must be a multiple of the K step ({loop_k})"
+    n_iters = cfg.K // loop_k
+    if n_iters % cfg.split_k:
+        return False, f"K steps ({n_iters}) must divide split_k ({cfg.split_k})"
+    if cfg.k_unroll < 1 or (n_iters // cfg.split_k) % cfg.k_unroll:
+        return False, f"K steps per split ({n_iters // cfg.split_k}) must divide k_unroll ({cfg.k_unroll})"
+    if cfg.lds:
+        if cfg.b_layout != "nk" or cfg.k_unroll != 1:
+            return False, "lds staging needs b_layout='nk' and k_unroll=1"
+        lk = _loop_k(cfg)
+        for rows in (cfg.tile_m, cfg.tile_n):
+            if (rows * (lk // 16)) % cfg.block_size:
+                return False, f"lds copy: {rows}x{lk} panel must split evenly over {cfg.block_size} threads"
+    if cfg.scaled_mfma:
+        if cfg.scale_mode != "mx" or cfg.atom.k != 128:
+            return False, "scaled_mfma needs MX scales and the 16x16x128 atom"
+    if cfg.b_layout == "kn" and cfg.atom.k == 128:
+        return False, "the 16x16x128 atom needs b_layout='nk' (K-contiguous B)"
+    if cfg.scale_mode == "block" and gn % 16 and gn != 1:
+        return False, "group_n must be 1 or a multiple of 16"
+    return True, "ok"
+
+
+def _load_fp8_frag(b: IRBuilder, ptr: Value, addr: Value, n: int, dtype) -> Value:
+    """Per-lane fp8 operand fragment starting at ``addr``.
+
+    For the 32-byte (16x16x128) fragment the hardware K order is NOT one
+    contiguous 32-byte run: lane group ``g = lane // 16`` holds K
+    ``[16g, 16g+16)`` in its first four VGPRs and ``[64+16g, 64+16g+16)`` in
+    the last four (measured on gfx950 through the per-32-block E8M0 scale the
+    scaled MFMA applies). ``addr`` is then the ``16g`` start; the second
+    half is 64 bytes further on. Matching that order keeps every 32-element
+    MX block on the lane group whose scale byte the instruction applies.
+    """
+    if n <= 16:
+        return b.global_load_vN(ptr, addr, dtype, n)
+    lo = b.global_load_vN(ptr, addr, dtype, 16)
+    hi = b.global_load_vN(ptr, b.add(addr, b.const_i32(64)), dtype, 16)
+    return b.vec_concat(lo, hi)
+
+
+def _load_b_kn_frag(b, Bp, k_base, n_col, n_per_lane, N, dtype):
+    out = b.zero_vec(dtype, n_per_lane)
+    for j in range(n_per_lane):
+        addr = b.add(b.mul(b.add(k_base, b.const_i32(j)), b.const_i32(N)), n_col)
+        out = b.vec_insert(out, b.global_load(Bp, addr, dtype, align=1), j)
+    return out
+
+
+def emit_tiled_scaled_gemm(
+    b: IRBuilder,
+    cfg: TiledScaledGemmConfig,
+    *,
+    A: Value,
+    AScale: Value,
+    Bp: Value,
+    BScale: Value,
+    C: Value,
+    decode_mx,
+) -> None:
+    """Emit the whole tiled kernel body into ``b`` (params already declared)."""
+    atom = cfg.atom
+    mx = cfg.scale_mode == "mx"
+    M, N, K = cfg.M, cfg.N, cfg.K
+    gm, gn, gk = cfg.group_mnk
+    dtype = A.type.pointee
+    # pt-style single K group: scale once in the epilogue, MFMA straight into acc.
+    scale_in_epilogue = (not mx) and K // gk == 1
+    loop_k = _loop_k(cfg)
+    iters_per_split = (K // loop_k) // cfg.split_k
+    atoms_per_iter = loop_k // atom.k
+    c16 = b.const_i32(16)
+
+    tid = b.thread_id_x()
+    lane = b.mod(tid, b.const_i32(64))
+    warp = b.div(tid, b.const_i32(64))
+    wm = b.mod(warp, b.const_i32(cfg.warp_m))
+    wn = b.div(warp, b.const_i32(cfg.warp_m))
+    lane16 = b.mod(lane, c16)
+    k_blk = b.div(lane, c16)
+    m_wave = b.add(
+        b.mul(b.block_id_y(), b.const_i32(cfg.tile_m)),
+        b.mul(wm, b.const_i32(16 * cfg.mfma_m)),
+    )
+    n_wave = b.add(
+        b.mul(b.block_id_x(), b.const_i32(cfg.tile_n)),
+        b.mul(wn, b.const_i32(16 * cfg.mfma_n)),
+    )
+    # Per-lane loop-invariant fragment bases (row * K + lane-group K start).
+    # 16x16x32: 8 contiguous K per lane group; 16x16x128: see _load_fp8_frag.
+    k_lane = b.mul(k_blk, b.const_i32(16 if atom.k == 128 else atom.a_per_lane))
+    a_rows = [b.add(m_wave, b.add(b.const_i32(16 * mi), lane16)) for mi in range(cfg.mfma_m)]
+    b_cols = [b.add(n_wave, b.add(b.const_i32(16 * ni), lane16)) for ni in range(cfg.mfma_n)]
+    a_base = [b.add(b.mul(r, b.const_i32(K)), k_lane) for r in a_rows]
+    b_base = [b.add(b.mul(c, b.const_i32(K)), k_lane) for c in b_cols] if cfg.b_layout == "nk" else None
+    # Output rows of accumulator slot i: m_atom + k_blk*4 + i.
+    out_row0 = [b.add(b.add(m_wave, b.const_i32(16 * mi)), b.mul(k_blk, b.const_i32(4))) for mi in range(cfg.mfma_m)]
+
+    U = cfg.k_unroll
+    trips_per_split = iters_per_split // U
+    tr_lo = b.mul(b.block_id_z(), b.const_i32(trips_per_split)) if cfg.split_k > 1 else b.const_i32(0)
+    tr_hi = b.add(tr_lo, b.const_i32(trips_per_split))
+
+    def zero_accs():
+        return [atom.zero_acc(b) for _ in range(cfg.mfma_m * cfg.mfma_n)]
+
+    def load_iter(kidx):
+        """All operand fragments (and scaled-MFMA scale bytes) of one K step,
+        flattened: per atom t -> [a_frags..., b_frags..., a_sc..., b_sc...]."""
+        k_group = b.mul(kidx, b.const_i32(loop_k))
+        flat = []
+        for t in range(atoms_per_iter):
+            k0 = b.add(k_group, b.const_i32(t * atom.k)) if t else k_group
+            flat += [_load_fp8_frag(b, A, b.add(base, k0), atom.a_per_lane, dtype) for base in a_base]
+            if cfg.b_layout == "nk":
+                flat += [_load_fp8_frag(b, Bp, b.add(base, k0), atom.b_per_lane, dtype) for base in b_base]
+            else:
+                kb = b.add(k0, k_lane)
+                flat += [_load_b_kn_frag(b, Bp, kb, c, atom.b_per_lane, N, dtype) for c in b_cols]
+            if cfg.scaled_mfma:
+                # One E8M0 byte per lane per operand: block (k0 / 32 + k_blk).
+                kgrp = b.add(b.div(k0, b.const_i32(32)), k_blk)
+                flat += [
+                    b.zext(b.global_load_i8(AScale, b.add(b.mul(r, b.const_i32(K // 32)), kgrp)), I32)
+                    for r in a_rows
+                ]
+                flat += [
+                    b.zext(b.global_load_i8(BScale, b.add(b.mul(c, b.const_i32(K // 32)), kgrp)), I32)
+                    for c in b_cols
+                ]
+        return flat
+
+    per_atom = cfg.mfma_m + cfg.mfma_n + (cfg.mfma_m + cfg.mfma_n if cfg.scaled_mfma else 0)
+    per_step = per_atom * atoms_per_iter
+    n_acc = cfg.mfma_m * cfg.mfma_n
+
+    def load_trip(tr):
+        """Fragments of the U consecutive K steps of trip ``tr``."""
+        base = b.mul(tr, b.const_i32(U)) if U > 1 else tr
+        flat = []
+        for u in range(U):
+            flat += load_iter(b.add(base, b.const_i32(u)) if u else base)
+        return flat
+
+    def compute_step(frags, kg, accs):
+        """MFMAs (+ per-group scale fold) of one K step on its fragments."""
+        ab_scale = None
+        if not cfg.scaled_mfma and not scale_in_epilogue:
+            ab_scale = _group_scales(b, cfg, AScale, BScale, kg, out_row0, b_cols, decode_mx)
+        work = list(accs) if (cfg.scaled_mfma or scale_in_epilogue) else zero_accs()
+        for t in range(atoms_per_iter):
+            f = frags[t * per_atom : (t + 1) * per_atom]
+            a_frags = f[: cfg.mfma_m]
+            b_frags = f[cfg.mfma_m : cfg.mfma_m + cfg.mfma_n]
+            a_sc = f[cfg.mfma_m + cfg.mfma_n : 2 * cfg.mfma_m + cfg.mfma_n]
+            b_sc = f[2 * cfg.mfma_m + cfg.mfma_n :]
+            for mi in range(cfg.mfma_m):
+                for ni in range(cfg.mfma_n):
+                    i = mi * cfg.mfma_n + ni
+                    if cfg.scaled_mfma:
+                        work[i] = b.mfma_scale_f32_16x16x128_f8f6f4(
+                            a_frags[mi], b_frags[ni], work[i], a_sc[mi], b_sc[ni]
+                        )
+                    else:
+                        work[i] = atom.emit(b, a_frags[mi], b_frags[ni], work[i])
+        if cfg.scaled_mfma or scale_in_epilogue:
+            return work
+        return [
+            b.vector_fma(work[mi * cfg.mfma_n + ni], ab_scale[mi][ni], accs[mi * cfg.mfma_n + ni])
+            for mi in range(cfg.mfma_m)
+            for ni in range(cfg.mfma_n)
+        ]
+
+    init = [(f"acc_{i // cfg.mfma_n}_{i % cfg.mfma_n}", z) for i, z in enumerate(zero_accs())]
+    if cfg.lds:
+        results = _lds_mainloop(
+            b, cfg, A=A, Bp=Bp, AScale=AScale, BScale=BScale, dtype=dtype, loop_k=loop_k,
+            atoms_per_iter=atoms_per_iter, init=init, tr_lo=tr_lo, tr_hi=tr_hi, tid=tid,
+            wm=wm, wn=wn, lane16=lane16, k_blk=k_blk, a_rows=a_rows, b_cols=b_cols,
+            compute_step=compute_step,
+        )
+    else:
+        if cfg.prefetch:
+            init += [(f"pf_{j}", v) for j, v in enumerate(load_trip(tr_lo))]
+        loop = b.scf_for_iter(tr_lo, tr_hi, b.const_i32(1), init, iv_name="kt")
+        with loop as (tr, carried):
+            carried = list(carried)
+            accs = carried[:n_acc]
+            if cfg.prefetch:
+                frags_all = carried[n_acc:]
+                tn = b.add(tr, b.const_i32(1))
+                nxt = load_trip(b.select(b.cmp_lt(tn, tr_hi), tn, tr))
+            else:
+                frags_all = load_trip(tr)
+                nxt = []
+            for u in range(U):
+                kg = b.mul(tr, b.const_i32(U)) if U > 1 else tr
+                kg = b.add(kg, b.const_i32(u)) if u else kg
+                accs = compute_step(frags_all[u * per_step : (u + 1) * per_step], kg, accs)
+            b.scf_yield(*accs, *nxt)
+        results = list(loop.results)[:n_acc]
+
+    # ---- epilogue
+    for mi in range(cfg.mfma_m):
+        for ni in range(cfg.mfma_n):
+            acc = results[mi * cfg.mfma_n + ni]
+            if scale_in_epilogue:
+                sc = _group_scales(b, cfg, AScale, BScale, b.const_i32(0), [out_row0[mi]], [b_cols[ni]], decode_mx)
+                acc = b.vector_mul(acc, sc[0][0])
+            for i in range(atom.c_per_lane):
+                row = b.add(out_row0[mi], b.const_i32(i)) if i else out_row0[mi]
+                addr = b.add(b.mul(row, b.const_i32(N)), b_cols[ni])
+                v = b.vec_extract(acc, i)
+                if cfg.split_k > 1:
+                    b.global_atomic_add(C, addr, v)
+                else:
+                    b.global_store(C, addr, v, align=4)
+
+
+_LDS_PAD = 16  # bytes of row padding: 144-byte rows keep 16 lanes' ds_read_b128 conflict-free
+
+
+def _lds_mainloop(
+    b, cfg, *, A, Bp, AScale, BScale, dtype, loop_k, atoms_per_iter, init, tr_lo, tr_hi,
+    tid, wm, wn, lane16, k_blk, a_rows, b_cols, compute_step,
+):
+    """CTA-shared operand staging: every K step the whole CTA copies its
+    ``tile_m x loop_k`` A panel and ``tile_n x loop_k`` B panel into LDS with
+    coalesced 16-byte loads (8 lanes per 128-byte row), then each warp reads
+    its MFMA fragments from LDS. Warps that share rows (columns) of the CTA
+    tile thereby share one global read instead of each issuing its own.
+    With ``prefetch`` the next step's global loads are issued right after the
+    LDS store so they overlap the current step's MFMAs."""
+    atom = cfg.atom
+    K = cfg.K
+    TM, TN, BS = cfg.tile_m, cfg.tile_n, cfg.block_size
+    row_bytes = loop_k + _LDS_PAD
+    chunks = loop_k // 16
+    A_s = b.smem_alloc(dtype, [TM, row_bytes], name_hint="A_s")
+    B_s = b.smem_alloc(dtype, [TN, row_bytes], name_hint="B_s")
+    m_cta = b.mul(b.block_id_y(), b.const_i32(TM))
+    n_cta = b.mul(b.block_id_x(), b.const_i32(TN))
+
+    def copy_slots(rows, base_row):
+        slots = []
+        for i in range(rows * chunks // BS):
+            c = b.add(tid, b.const_i32(i * BS)) if i else tid
+            r = b.div(c, b.const_i32(chunks))
+            col = b.mul(b.mod(c, b.const_i32(chunks)), b.const_i32(16))
+            g = b.add(b.mul(b.add(base_row, r), b.const_i32(K)), col)
+            slots.append((r, col, g))
+        return slots
+
+    a_slots = copy_slots(TM, m_cta)
+    b_slots = copy_slots(TN, n_cta)
+
+    def gload(tr):
+        k0 = b.mul(tr, b.const_i32(loop_k))
+        out = [b.global_load_vN(A, b.add(g, k0), dtype, 16) for _, _, g in a_slots]
+        out += [b.global_load_vN(Bp, b.add(g, k0), dtype, 16) for _, _, g in b_slots]
+        return out
+
+    def sstore(vals):
+        na = len(a_slots)
+        for (r, col, _), v in zip(a_slots, vals[:na]):
+            b.smem_store_vN(A_s, [r, col], v, 16)
+        for (r, col, _), v in zip(b_slots, vals[na:]):
+            b.smem_store_vN(B_s, [r, col], v, 16)
+
+    a_lrow = [b.add(b.mul(wm, b.const_i32(16 * cfg.mfma_m)), b.add(b.const_i32(16 * mi), lane16))
+              for mi in range(cfg.mfma_m)]
+    b_lrow = [b.add(b.mul(wn, b.const_i32(16 * cfg.mfma_n)), b.add(b.const_i32(16 * ni), lane16))
+              for ni in range(cfg.mfma_n)]
+
+    def read_frag(smem, row, t):
+        if atom.k == 128:
+            c0 = b.mul(k_blk, b.const_i32(16))
+            lo = b.smem_load_vN(smem, row, c0, dtype=dtype, n=16)
+            hi = b.smem_load_vN(smem, row, b.add(c0, b.const_i32(64)), dtype=dtype, n=16)
+            return b.vec_concat(lo, hi)
+        c0 = b.add(b.const_i32(t * atom.k), b.mul(k_blk, b.const_i32(atom.a_per_lane)))
+        return b.smem_load_vN(smem, row, c0, dtype=dtype, n=atom.a_per_lane)
+
+    def frags_from_lds(tr):
+        flat = []
+        k_step = b.mul(tr, b.const_i32(loop_k))
+        for t in range(atoms_per_iter):
+            flat += [read_frag(A_s, r, t) for r in a_lrow]
+            flat += [read_frag(B_s, r, t) for r in b_lrow]
+            if cfg.scaled_mfma:
+                k0 = b.add(k_step, b.const_i32(t * atom.k)) if t else k_step
+                kgrp = b.add(b.div(k0, b.const_i32(32)), k_blk)
+                flat += [
+                    b.zext(b.global_load_i8(AScale, b.add(b.mul(r, b.const_i32(K // 32)), kgrp)), I32)
+                    for r in a_rows
+                ]
+                flat += [
+                    b.zext(b.global_load_i8(BScale, b.add(b.mul(c, b.const_i32(K // 32)), kgrp)), I32)
+                    for c in b_cols
+                ]
+        return flat
+
+    n_acc = cfg.mfma_m * cfg.mfma_n
+    init = list(init)
+    if cfg.prefetch:
+        init += [(f"st_{j}", v) for j, v in enumerate(gload(tr_lo))]
+    loop = b.scf_for_iter(
+        tr_lo, tr_hi, b.const_i32(1), init, iv_name="kt", elide_trailing_barrier=False
+    )
+    with loop as (tr, carried):
+        carried = list(carried)
+        accs = carried[:n_acc]
+        regs = carried[n_acc:] if cfg.prefetch else gload(tr)
+        b.sync()  # previous step's LDS reads are done before overwriting
+        sstore(regs)
+        b.sync()
+        nxt = []
+        if cfg.prefetch:
+            tn = b.add(tr, b.const_i32(1))
+            nxt = gload(b.select(b.cmp_lt(tn, tr_hi), tn, tr))
+        accs = compute_step(frags_from_lds(tr), tr, accs)
+        b.scf_yield(*accs, *nxt)
+    return list(loop.results)[:n_acc]
+
+
+def _group_scales(b, cfg, AScale, BScale, kg, out_row0, b_cols, decode_mx) -> List[List[Value]]:
+    """Per-(mi, ni) ``<4 x f32>`` combined scale for the lane's 4 output cells."""
+    gm, gn, gk = cfg.group_mnk
+    K, N = cfg.K, cfg.N
+    n_kg = K // gk
+    mx = cfg.scale_mode == "mx"
+    a_vecs = []
+    for r0 in out_row0:
+        vals = []
+        for i in range(4):
+            row = b.add(r0, b.const_i32(i)) if i else r0
+            if mx:
+                off = b.add(b.mul(row, b.const_i32(K // 32)), kg)
+                vals.append(decode_mx(b, b.global_load_i8(AScale, off)))
+            else:
+                r = b.div(row, b.const_i32(gm)) if gm != 1 else row
+                vals.append(b.global_load_f32(AScale, b.add(b.mul(r, b.const_i32(n_kg)), kg)))
+        a_vecs.append(b.vec_pack(vals, F32))
+    b_vals = []
+    for c in b_cols:
+        if mx:
+            if cfg.b_layout == "nk":
+                off = b.add(b.mul(c, b.const_i32(K // 32)), kg)
+            else:
+                off = b.add(b.mul(kg, b.const_i32(N)), c)
+            b_vals.append(decode_mx(b, b.global_load_i8(BScale, off)))
+        else:
+            n_ng = (N + gn - 1) // gn
+            cb = b.div(c, b.const_i32(gn)) if gn != 1 else c
+            if cfg.b_layout == "nk":
+                off = b.add(b.mul(cb, b.const_i32(n_kg)), kg)
+            else:
+                off = b.add(b.mul(kg, b.const_i32(n_ng)), cb)
+            b_vals.append(b.global_load_f32(BScale, off))
+    return [[b.vector_mul(av, b.vector_splat(bv, 4)) for bv in b_vals] for av in a_vecs]
