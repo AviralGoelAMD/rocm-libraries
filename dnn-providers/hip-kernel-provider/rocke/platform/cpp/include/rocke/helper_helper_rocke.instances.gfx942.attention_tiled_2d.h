@@ -185,6 +185,7 @@ typedef struct rocke_attention_tiled_2d_spec
      * (golden-safe) and rejected on gfx942. use_mask_phase_split peels the
      * causal-full KV tiles into a no-mask loop phase. */
     bool use_mask_phase_split; /* False */
+    bool use_reverse_q_block_order; /* False */
 } rocke_attention_tiled_2d_spec_t;
 
 /* Materialise every defaulted field (the dataclass defaults). The required

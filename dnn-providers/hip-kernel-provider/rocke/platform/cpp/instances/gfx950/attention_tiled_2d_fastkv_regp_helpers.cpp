@@ -127,6 +127,7 @@ static rocke_status_t rocke__fastkv_gfx950_base_name(const rocke_attention_tiled
             s->use_register_pv ? "regpv" : "",
             s->use_f32_denormal_flush ? "ftz" : "",
             s->use_fp_contract ? "fpc" : "",
+            s->use_reverse_q_block_order ? "rqb" : "",
         };
         size_t num_parts = sizeof(parts) / sizeof(parts[0]);
         return rocke_kernel_name_join(

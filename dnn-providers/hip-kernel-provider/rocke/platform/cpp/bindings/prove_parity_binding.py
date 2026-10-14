@@ -1508,6 +1508,7 @@ def _selector_parity_row(problem_dict, arch):
                 "use_f32_denormal_flush",
                 "use_fp_contract",
                 "use_mask_phase_split",
+                "use_reverse_q_block_order",
             }
         }
     except Exception as e:  # noqa: BLE001

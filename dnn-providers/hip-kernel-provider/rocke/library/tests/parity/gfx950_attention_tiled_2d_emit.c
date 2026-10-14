@@ -992,6 +992,10 @@ static int make_spec(int idx, rocke_attention_tiled_2d_spec_t* s)
         s->use_v_double_buffer = true;
         s->use_early_v_schedule = true;
         break;
+    case 62:
+        pipe_d128_t64(s);
+        s->use_reverse_q_block_order = true;
+        break;
 
     default:
         return -1;

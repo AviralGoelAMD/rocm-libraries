@@ -765,7 +765,22 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
 
     /* ---- grid ids + wave decomposition (Py891-904) ---- */
     ctx->kv_head_idx = rocke_b_block_id_x(b);
-    ctx->q_block_global_idx = rocke_b_block_id_y(b);
+    if(spec->use_reverse_q_block_order)
+    {
+        /* Heaviest-first Q-block order: grid.y == cu_q[num_seqs] // BLOCK_Q +
+         * num_seqs (the launch formula), walked from the last block down. */
+        rocke_value_t* total_q_tok = rocke_b_global_load_i32(b, ctx->cu_q, ctx->num_seqs_p, 0);
+        rocke_value_t* q_blocks
+            = rocke_b_add(b,
+                          rocke_b_div(b, total_q_tok, rocke_b_const_i32(b, BLOCK_Q)),
+                          ctx->num_seqs_p);
+        rocke_value_t* last_q_block = rocke_b_sub(b, q_blocks, rocke_b_const_i32(b, 1));
+        ctx->q_block_global_idx = rocke_b_sub(b, last_q_block, rocke_b_block_id_y(b));
+    }
+    else
+    {
+        ctx->q_block_global_idx = rocke_b_block_id_y(b);
+    }
     ctx->tid = rocke_b_thread_id_x(b);
 
     if(NUM_WARPS == 1)
@@ -1143,6 +1158,7 @@ static rocke_status_t rocke_g950_attn2d_kernel_name(const rocke_attention_tiled_
             s->use_register_pv ? "regpv" : "",
             s->use_f32_denormal_flush ? "ftz" : "",
             s->use_fp_contract ? "fpc" : "",
+            s->use_reverse_q_block_order ? "rqb" : "",
         };
         size_t num_parts = sizeof(parts) / sizeof(parts[0]);
         return rocke_kernel_name_join(
