@@ -134,6 +134,7 @@ rocke_attention_tiled_2d_spec_t rocke_attention_tiled_2d_spec_default(void)
     s.use_reverse_q_block_order = false;
     s.use_k_lds_xor_swizzle = false;
     s.use_v_lds_xor_swizzle = false;
+    s.use_lds_dma_overlap = false;
     return s;
 }
 
@@ -261,7 +262,8 @@ bool rocke_attention_tiled_2d_spec_validate(rocke_ir_builder_t* b,
     if(s->use_mfma_32x32 || s->use_transposed_half_local_pv || s->use_mfma32_skip_legacy_qreg
        || s->use_grouped_kv2_softmax || s->use_fp8_mfma_qk || s->use_fp8_mfma_pv
        || s->use_f32_denormal_flush || s->use_fp_contract || s->use_mask_phase_split
-       || s->use_reverse_q_block_order || s->use_k_lds_xor_swizzle || s->use_v_lds_xor_swizzle)
+       || s->use_reverse_q_block_order || s->use_k_lds_xor_swizzle || s->use_v_lds_xor_swizzle
+       || s->use_lds_dma_overlap)
     {
         rocke_attn2d_set_err(b,
                              ROCKE_ERR_VALUE,

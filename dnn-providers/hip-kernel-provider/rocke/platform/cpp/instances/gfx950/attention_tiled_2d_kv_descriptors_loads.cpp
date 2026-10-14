@@ -216,6 +216,17 @@ static rocke_value_t* rocke__swizzle_dma_linear_half(rocke_gfx950_attn2d_build_c
     return rocke_b_xor(b, linear_half, x);
 }
 
+/* Barrier after an explicit s_waitcnt in the KV loop (_kv_publish_sync): under
+ * use_lds_dma_overlap the counted vmcnt is the only VMEM wait, so the barrier
+ * drains LDS ops only. */
+void rocke_gfx950_attn2d_kv_publish_sync(rocke_gfx950_attn2d_build_ctx_t* ctx)
+{
+    if(ctx->LDS_DMA_OVERLAP)
+        rocke_b_sync_lds_only(ctx->b);
+    else
+        rocke_b_sync(ctx->b);
+}
+
 /* ==========================================================================
  * Pre-loop: K/V buffer resources, byte derivation, paged-KV descriptor
  * (Python lines 1163-1630, the K/V-descriptor parts).
@@ -504,8 +515,8 @@ void rocke_gfx950_attn2d_issue_k_load_runtime(rocke_gfx950_attn2d_build_ctx_t* c
         rocke_value_t* k_dst = rocke_b_smem_ptr_add(
             b, K_wave_base, rocke_b_const_i64(b, (int64_t)call * bytes_per_call));
         /* CACHE_STREAM (SLC): one-shot streaming load; dwords=4 (1687-1689). */
-        rocke_b_async_buffer_load_lds_addr(
-            b, k_rsrc, k_dst, voff, zero_soff, 4, ROCKE_CACHE_STREAM);
+        rocke_b_async_buffer_load_lds_addr_scoped(
+            b, k_rsrc, k_dst, voff, zero_soff, 4, ROCKE_CACHE_STREAM, ctx->LDS_DMA_TAG);
     }
 }
 
@@ -597,8 +608,8 @@ void rocke_gfx950_attn2d_issue_v_load_runtime(rocke_gfx950_attn2d_build_ctx_t* c
         rocke_value_t* v_dst = rocke_b_smem_ptr_add(
             b, V_wave_base, rocke_b_const_i64(b, (int64_t)call * bytes_per_call));
         /* CACHE_STREAM (SLC): V consumed once per iter; dwords=4 (1737-1739). */
-        rocke_b_async_buffer_load_lds_addr(
-            b, v_rsrc, v_dst, voff, zero_soff, 4, ROCKE_CACHE_STREAM);
+        rocke_b_async_buffer_load_lds_addr_scoped(
+            b, v_rsrc, v_dst, voff, zero_soff, 4, ROCKE_CACHE_STREAM, ctx->LDS_DMA_TAG);
     }
 }
 
@@ -666,7 +677,7 @@ rocke_value_t* rocke_gfx950_attn2d_read_k8_mfma_operand(rocke_gfx950_attn2d_buil
 
     /* not K_FP8_MFMA: plain bf16 read (Python 2241-2242). */
     if(!ctx->FP8_MFMA_QK)
-        return rocke_b_smem_load_vN(b, ctx->K_lds, idx, 3, ctx->dtype, 8);
+        return rocke_b_smem_load_vN_scoped(b, ctx->K_lds, idx, 3, ctx->dtype, 8, ctx->LDS_READ_TAG);
 
     /* FP8_NATIVE_QK is always False on gfx950 (Python 793 / 2243-2246): the
      * native-fp8 raw read is dead, but emit it to mirror the source structure. */

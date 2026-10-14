@@ -719,6 +719,29 @@ const char* rocke_ll_smem_storage_type(rocke_lower_t* L, const rocke_type_t* sme
     return out;
 }
 
+const char* rocke_ll_lds_dma_scope_md(rocke_lower_t* L, const rocke_op_t* op)
+{
+    const rocke_attr_value_t* v = rocke_attr_get(&op->attrs, "lds_dma_scope");
+    if(!v)
+    {
+        return "";
+    }
+    L->needs_lds_dma_scope_md = true;
+    if(v->kind == ROCKE_ATTR_STR && v->u.s && strcmp(v->u.s, "dma") == 0)
+    {
+        return ", !alias.scope !9003, !noalias !9004";
+    }
+    if(v->kind == ROCKE_ATTR_STR && v->u.s && strcmp(v->u.s, "read") == 0)
+    {
+        return ", !alias.scope !9004, !noalias !9003";
+    }
+    rocke_ll_fail(L,
+                  ROCKE_ERR_VALUE,
+                  "unknown lds_dma_scope tag '%s'",
+                  (v->kind == ROCKE_ATTR_STR && v->u.s) ? v->u.s : "<non-string>");
+    return "";
+}
+
 /* ====================================================================== */
 /* FP hex constants (Python _fp64_hex / _fp32_hex / _fp16_hex)            */
 /* ====================================================================== */
@@ -2061,6 +2084,15 @@ void rocke_ll_finalize(rocke_lower_t* L, rocke_strbuf_t* out)
     {
         rocke_strbuf_append(out, "\n!5 = !{i32 1}\n");
     }
+    if(L->needs_lds_dma_scope_md)
+    {
+        rocke_strbuf_append(out,
+                            "\n!9000 = distinct !{!9000, !\"rocke.lds\"}\n"
+                            "!9001 = distinct !{!9001, !9000, !\"rocke.lds.dma\"}\n"
+                            "!9002 = distinct !{!9002, !9000, !\"rocke.lds.read\"}\n"
+                            "!9003 = !{!9001}\n"
+                            "!9004 = !{!9002}\n");
+    }
     if(L->debug)
     {
         rocke_ll_debug_render(L, L->debug, out);
@@ -2197,6 +2229,7 @@ static rocke_status_t ll_lower_kernel_to_llvm_ex_impl(const rocke_kernel_def_t* 
     L.needs_fp_atomic_md = false;
     L.needs_av_scope_md = false;
     L.needs_nontemporal_md = false;
+    L.needs_lds_dma_scope_md = false;
     rocke_vec_init(&L.blocks);
     rocke_vec_init(&L.needs);
     rocke_vec_init(&L.dyn_decls);

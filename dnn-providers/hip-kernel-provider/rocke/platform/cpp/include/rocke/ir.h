@@ -1058,6 +1058,17 @@ rocke_value_t* rocke_b_smem_load_vN(rocke_ir_builder_t* b,
                                     int num_indices,
                                     const rocke_type_t* dtype,
                                     int n);
+/* Python smem_load_vN(..., lds_dma_scope=...). `lds_dma_scope` is NULL
+ * (untagged; identical to rocke_b_smem_load_vN), "dma" or "read"; anything
+ * else puts the builder in its error state. See
+ * rocke_b_async_buffer_load_lds_addr_scoped for the claim it makes. */
+rocke_value_t* rocke_b_smem_load_vN_scoped(rocke_ir_builder_t* b,
+                                           rocke_value_t* smem,
+                                           rocke_value_t* const* indices,
+                                           int num_indices,
+                                           const rocke_type_t* dtype,
+                                           int n,
+                                           const char* lds_dma_scope);
 rocke_value_t* rocke_b_smem_load_vN_f16(rocke_ir_builder_t* b,
                                         rocke_value_t* smem,
                                         rocke_value_t* const* indices,
@@ -1297,6 +1308,13 @@ rocke_value_t* rocke_b_ds_read_tr16_b64(rocke_ir_builder_t* b,
                                         rocke_value_t* const* indices,
                                         int num_indices,
                                         const rocke_type_t* dtype /* NULL=>f16 */);
+/* Python ds_read_tr16_b64(..., lds_dma_scope=...); NULL = untagged. */
+rocke_value_t* rocke_b_ds_read_tr16_b64_scoped(rocke_ir_builder_t* b,
+                                               rocke_value_t* smem,
+                                               rocke_value_t* const* indices,
+                                               int num_indices,
+                                               const rocke_type_t* dtype /* NULL=>f16 */,
+                                               const char* lds_dma_scope);
 rocke_value_t* rocke_b_ds_read_tr16_b128(rocke_ir_builder_t* b,
                                          rocke_value_t* smem,
                                          rocke_value_t* const* indices,
@@ -1327,6 +1345,21 @@ void rocke_b_async_buffer_load_lds_addr(rocke_ir_builder_t* b,
                                         rocke_value_t* soffset,
                                         int dwords,
                                         int coherency);
+/* Python async_buffer_load_lds_addr(..., lds_dma_scope=...). "dma" on the
+ * LDS-DMA write and "read" on LDS reads declares the two disjoint (one
+ * scoped-noalias domain), so the backend need not drain the DMA (vmcnt)
+ * before those reads. The claim is static -- every tagged read vs every
+ * tagged write, across loop iterations too -- so it is only valid when every
+ * read of a DMA'd slot is ordered after its write by an explicit s_waitcnt +
+ * barrier. NULL = untagged (identical to the plain call). */
+void rocke_b_async_buffer_load_lds_addr_scoped(rocke_ir_builder_t* b,
+                                               rocke_value_t* rsrc,
+                                               rocke_value_t* lds_addr,
+                                               rocke_value_t* voffset,
+                                               rocke_value_t* soffset,
+                                               int dwords,
+                                               int coherency,
+                                               const char* lds_dma_scope);
 void rocke_b_async_buffer_load_lds(rocke_ir_builder_t* b,
                                    rocke_value_t* rsrc,
                                    rocke_value_t* lds_ptr,

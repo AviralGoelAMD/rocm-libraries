@@ -558,6 +558,24 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
             rocke_g950_fail(b,
                             ROCKE_ERR_VALUE,
                             "use_v_lds_xor_swizzle requires use_transposed_half_local_pv");
+        if(spec->use_lds_dma_overlap)
+        {
+            if(!transposed32)
+                rocke_g950_fail(b,
+                                ROCKE_ERR_VALUE,
+                                "use_lds_dma_overlap requires the transposed 32x32 path");
+            if(spec->kv_storage_dtype != NULL)
+                rocke_g950_fail(
+                    b, ROCKE_ERR_VALUE, "use_lds_dma_overlap does not support FP8 KV");
+            if(spec->use_grouped_kv2_softmax)
+                rocke_g950_fail(
+                    b, ROCKE_ERR_VALUE, "use_lds_dma_overlap does not support grouped_kv2");
+            if(spec->use_staggered_iter_wait && spec->use_early_v_schedule)
+                rocke_g950_fail(b,
+                                ROCKE_ERR_VALUE,
+                                "use_lds_dma_overlap does not support staggered_iter_wait "
+                                "with early_v_schedule");
+        }
     }
     /* K single-buffer IS ported in the gfx950 C twin (it shares the
      * depth-2 V-single `else` schedule). Mirror Python __post_init__ guards so
@@ -640,6 +658,9 @@ static bool rocke_g950_build_ctx_init_local(rocke_gfx950_attn2d_build_ctx_t* ctx
     ctx->V_DOUBLE_BUF = spec->use_v_double_buffer;
     ctx->K_LDS_SWZ = spec->use_k_lds_xor_swizzle;
     ctx->V_LDS_SWZ = spec->use_v_lds_xor_swizzle;
+    ctx->LDS_DMA_OVERLAP = spec->use_lds_dma_overlap;
+    ctx->LDS_DMA_TAG = spec->use_lds_dma_overlap ? "dma" : NULL;
+    ctx->LDS_READ_TAG = spec->use_lds_dma_overlap ? "read" : NULL;
     {
         /* SWZ_CPR = HD // 8; SWZ_RPP_SHIFT = max(0, (128 // HD).bit_length() - 1);
          * SWZ_HD_SHIFT = HD.bit_length() - 1. */
@@ -1201,6 +1222,7 @@ static rocke_status_t rocke_g950_attn2d_kernel_name(const rocke_attention_tiled_
             s->use_reverse_q_block_order ? "rqb" : "",
             s->use_k_lds_xor_swizzle ? "kswz" : "",
             s->use_v_lds_xor_swizzle ? "vswz" : "",
+            s->use_lds_dma_overlap ? "dmaov" : "",
         };
         size_t num_parts = sizeof(parts) / sizeof(parts[0]);
         return rocke_kernel_name_join(

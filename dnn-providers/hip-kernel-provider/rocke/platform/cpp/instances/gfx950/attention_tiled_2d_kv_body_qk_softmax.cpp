@@ -161,8 +161,8 @@ static rocke_value_t* fh_mfma_32x32x16(rocke_gfx950_attn2d_build_ctx_t* ctx,
     return rocke_mfma_attn_mfma_32x32x16_for_dtype(ctx->b, ctx->dtype, a, bv, c);
 }
 
-/* _read_k8_mfma_operand (shared with the loaders TU: the K swizzle and the
- * fp8-in-LDS dequant live there). */
+/* _read_k8_mfma_operand (shared with the loaders TU: K swizzle, scope tag and
+ * the fp8-in-LDS dequant live there). */
 static rocke_value_t* fh_read_k8_mfma_operand(rocke_gfx950_attn2d_build_ctx_t* ctx,
                                               rocke_value_t* buf,
                                               rocke_value_t* k_row,
@@ -621,7 +621,7 @@ void rocke_gfx950_attn2d_emit_kv_body(rocke_gfx950_attn2d_build_ctx_t* ctx)
 
     /* ---- wait for current K + LDS barrier ---- */
     rocke_b_s_waitcnt(b, /*vmcnt=*/0, /*lgkmcnt=*/0, /*expcnt=*/-1);
-    rocke_b_sync(b);
+    rocke_gfx950_attn2d_kv_publish_sync(ctx);
 
     /* STEP 2 lever (modes 0/1): canned iglp interleave for the whole loop body,
      * placed once after the iter-start K drain (mirrors Python 3093-3094). Level
