@@ -757,8 +757,12 @@ def _d256_gfx950_fast(problem: "UnifiedAttentionProblem") -> bool:
 def _d256_gfx950_spec_overrides() -> dict:
     """Single source of truth for the D256 gfx950 bf16 prefill knob constellation.
 
-    The 32x32 transposed + FA3-style softmax<->MFMA-interleave (mode2/g4) +
-    slab-padded K_lds codegen pins. Consumed by BOTH the builder override in
+    The 32x32 transposed + FA3-style softmax<->MFMA-interleave (mode2/g4)
+    codegen pins, plus the pipelined-prefill levers that carry over to the
+    K-single-buffer body: XOR-swizzled K/V LDS (replaces the slab K_lds pad),
+    heaviest-first Q-block order, the LDS-only publish barrier with alias-scoped
+    K/V DMA, block ids prefetched a tile ahead and the folded-scale softmax.
+    Consumed by BOTH the builder override in
     ``builders.common.attention_spec_builder._tiled_spec_from_problem`` (the
     production path) and the ``dispatch.attention`` gfx950 D256 candidate, so the
     dispatched spec and the built kernel cannot drift.
@@ -782,10 +786,13 @@ def _d256_gfx950_spec_overrides() -> dict:
         softmax_interleave_groups=4,
         use_fast_paged_kv_desc=False,
         use_mfma32_skip_legacy_qreg=False,
-        # Slab-granularity K_lds pad (16 halves): breaks the row-aliased bank
-        # conflict on the QK K read for a ~25% Sq8192 latency win.
-        use_kq_lds_pad=True,
-        kq_lds_pad_halves=16,
+        use_kq_lds_pad=False,
+        use_k_lds_xor_swizzle=True,
+        use_v_lds_xor_swizzle=True,
+        use_reverse_q_block_order=True,
+        use_lds_dma_overlap=True,
+        use_kv_block_id_prefetch=True,
+        use_softmax_scale_fold=True,
     )
 
 
@@ -796,7 +803,7 @@ def _gfx950_prefill_pipeline_cohort(problem: "UnifiedAttentionProblem") -> bool:
     or not): the transposed-32x32 half-local-PV body with the no-SW softmax
     sub-flags (``_enable_transposed_subflags``), i.e. the same body the
     single-seq combo builds. Both without sliding window / ALiBi / QQ-bias /
-    sinks / softcap / FP8, paged ``block_size == 16``, head_size 128.
+    sinks / softcap / FP8, paged ``block_size == 16``, head_size 64 or 128.
     ``_select_2d_compile_backend`` pins this cohort to LLVM-direct.
     """
     if problem.num_seqs == 1:
@@ -816,7 +823,7 @@ def _gfx950_prefill_pipeline_cohort(problem: "UnifiedAttentionProblem") -> bool:
         and problem.softcap == 0
         and not problem.use_fp8
         and problem.block_size == 16
-        and problem.head_size == 128
+        and problem.head_size in (64, 128)
     )
 
 
@@ -827,9 +834,10 @@ def _gfx950_prefill_pipeline(problem: "UnifiedAttentionProblem") -> bool:
     scoped-noalias LDS metadata the stack relies on is LLVM-IR only, and the
     heaviest-first block order measured slower under hipcc); an explicit
     ``compile_backend="hipcc"`` keeps the plain body. The knob constellation
-    is ``_gfx950_prefill_pipeline_overrides``; the tile is 64 tokens
-    (``_select_2d_tile_size``). Heaviest-first order is a pure permutation of
-    the grid's Q-block axis, so it holds across sequences of a ragged batch.
+    is ``_gfx950_prefill_pipeline_overrides``; the tile is 64 tokens at head
+    128 and 128 at head 64 (``_select_2d_tile_size``). Heaviest-first order is
+    a pure permutation of the grid's Q-block axis, so it holds across
+    sequences of a ragged batch.
     """
     return _gfx950_prefill_pipeline_cohort(problem) and (
         _select_2d_compile_backend(problem) == "llvm"
@@ -1185,9 +1193,10 @@ def _select_2d_tile_size(problem: UnifiedAttentionProblem) -> int:
     #     tile feeds the d64 KV loop and was the winner for both MHA and
     #     GQA-8 d64 S2048 (1.19-2.68x over prod).
     if _gfx950_prefill_pipeline(problem):
-        # The pipelined single-seq prefill stack (see
-        # ``_gfx950_prefill_pipeline``) is tuned at a 64-token tile.
-        return 64
+        # The pipelined prefill stack (see ``_gfx950_prefill_pipeline``) is
+        # tuned at a 64-token tile for head 128 and a 128-token tile for
+        # head 64 (the same 16 KiB K/V tile per buffer).
+        return 128 if problem.head_size == 64 else 64
     if _enable_single_batch_combo(problem):
         if problem.head_size == 64:
             # fast_paged_kv_desc (needs T=64) is a ~1.3-1.4x win for the bf16

@@ -552,6 +552,31 @@ class UnifiedAttention2DTiledSpec:
     # _enable_fp_contract).
     use_f32_denormal_flush: bool = False
     use_fp_contract: bool = False
+    # Paged K/V DMA in wave-major order: wave ``w`` fills tile rows
+    # ``[w*T/num_warps, (w+1)*T/num_warps)`` with its consecutive calls instead
+    # of every call spanning all waves. A wave's rows then sit in
+    # ``max(1, T/num_warps/block_size)`` paged blocks, so under
+    # ``use_kv_block_id_prefetch`` it loads that many block ids per tile (not
+    # one per call) and the K and V calls of one block share one scalar
+    # ``soffset``. The LDS layout is unchanged (natural ``[T, HD]`` rows).
+    use_kv_wave_block_dma: bool = False
+    # Transposed 32x32 QK: issue every K operand read of the tile before the
+    # first QK MFMA and emit the MFMAs k-major across the score tiles, so the
+    # LDS reads overlap the whole MFMA chain instead of running one ahead.
+    use_qk_k_read_hoist: bool = False
+    # Transposed 32x32 half-local PV: number of PV V operands (in PV issue
+    # order) read from V_lds right after the QK K reads, ahead of the softmax;
+    # the rest are read together at the top of PV. 0 keeps one read pair per
+    # PV MFMA. Needs the current V slot published by the iteration-start
+    # barrier (double-buffered V, unstaggered wait).
+    pv_v_early_operands: int = 0
+    # Transposed 32x32 PV: emit the PV MFMAs k-major (all output tiles for one
+    # 16-token step, then the next step) instead of output-tile-major, so the
+    # first PV MFMAs need only the first score tile's probabilities.
+    use_pv_k_major: bool = False
+    # Transposed 32x32 softmax: reduce the lane's tile scores to the row max
+    # with a balanced pairwise tree instead of one serial chain (exact).
+    use_softmax_max_tree: bool = False
 
     def __post_init__(self):
         for knob in ("use_f32_denormal_flush", "use_fp_contract"):
@@ -914,6 +939,51 @@ class UnifiedAttention2DTiledSpec:
             self.use_mfma_32x32 and self.use_transposed_qk_32x32
         ):
             raise ValueError("use_permlane32_row_reduce requires the transposed 32x32 path")
+        if self.use_kv_wave_block_dma:
+            if not self.use_kv_block_id_prefetch:
+                raise ValueError("use_kv_wave_block_dma requires use_kv_block_id_prefetch")
+            if self.use_kq_lds_pad or self.use_fp8_mfma_qk or self.use_fp8_mfma_pv:
+                raise ValueError(
+                    "use_kv_wave_block_dma does not support use_kq_lds_pad or "
+                    "the fp8-MFMA K/V LDS layouts"
+                )
+            wave_rows = self.tile_size_eff // self.num_warps
+            if wave_rows * self.num_warps != self.tile_size_eff or not (
+                wave_rows % self.block_size == 0 or self.block_size % wave_rows == 0
+            ):
+                raise ValueError(
+                    "use_kv_wave_block_dma needs tile_size/num_warps to be a "
+                    "multiple or a divisor of block_size"
+                )
+        transposed32 = self.use_mfma_32x32 and self.use_transposed_qk_32x32
+        if self.use_qk_k_read_hoist and not transposed32:
+            raise ValueError("use_qk_k_read_hoist requires the transposed 32x32 path")
+        if self.pv_v_early_operands < 0:
+            raise ValueError("pv_v_early_operands must be >= 0")
+        if self.pv_v_early_operands or self.use_pv_k_major:
+            if not (transposed32 and self.use_transposed_half_local_pv):
+                raise ValueError(
+                    "pv_v_early_operands / use_pv_k_major require the transposed "
+                    "32x32 half-local PV path"
+                )
+            if self.use_grouped_kv2_softmax or self.kv_storage_dtype is not None:
+                raise ValueError(
+                    "pv_v_early_operands / use_pv_k_major do not support "
+                    "grouped_kv2 or FP8 KV"
+                )
+        if self.pv_v_early_operands:
+            if not self.use_v_double_buffer or self.use_staggered_iter_wait:
+                raise ValueError(
+                    "pv_v_early_operands needs double-buffered V published by "
+                    "the unstaggered iteration-start wait"
+                )
+            if self.kv_ring_depth != 2 or self.use_k_single_buffer:
+                raise ValueError(
+                    "pv_v_early_operands does not support kv_ring_depth=3 or "
+                    "use_k_single_buffer"
+                )
+        if self.use_softmax_max_tree and not transposed32:
+            raise ValueError("use_softmax_max_tree requires the transposed 32x32 path")
 
     @property
     def num_queries_per_kv(self) -> int:
@@ -1044,6 +1114,11 @@ class UnifiedAttention2DTiledSpec:
             "bidpf" if self.use_kv_block_id_prefetch else "",
             "ftz" if self.use_f32_denormal_flush else "",
             "fpc" if self.use_fp_contract else "",
+            "wbdma" if self.use_kv_wave_block_dma else "",
+            "kqh" if self.use_qk_k_read_hoist else "",
+            (f"vpre{self.pv_v_early_operands}" if self.pv_v_early_operands else ""),
+            "pvkm" if self.use_pv_k_major else "",
+            "mxtree" if self.use_softmax_max_tree else "",
         )
 
 
@@ -1244,6 +1319,7 @@ def build_unified_attention_2d_tiled(
         USE_SOFTCAP or USE_ALIBI or USE_QQ_BIAS
     )
     PERMLANE32_ROW_REDUCE = bool(spec.use_permlane32_row_reduce)
+    SOFTMAX_MAX_TREE = bool(spec.use_softmax_max_tree)
 
     def _halves_pair(x: Value):
         """``(x[L], x[L ^ 32])`` in some order, per lane, via one
@@ -2166,6 +2242,45 @@ def build_unified_attention_2d_tiled(
         bytes_per_buf_K = bytes_per_buf
         wave_lds_offset_K_i64 = wave_lds_offset_i64
 
+    # ---- per-call DMA geometry (see ``use_kv_wave_block_dma``) ----
+    # Call ``c`` of a lane fetches linear half ``c * DMA_CALL_HALVES +
+    # dma_lane_half_base`` of the tile into LDS ``wave_off + c * call_bytes``.
+    # Default: a call spans all waves. Wave-major: wave ``w`` owns the
+    # ``kv_calls_per_tile`` consecutive wave slabs starting at slab
+    # ``w * kv_calls_per_tile``, so the LDS image is the same natural layout.
+    WAVE_BLOCK_DMA = bool(spec.use_kv_wave_block_dma) and NUM_WARPS > 1
+    DMA_CALL_HALVES = KV_HALVES_PER_CALL
+    dma_lane_half_base = lane_half_base
+    dma_call_bytes_K = bytes_per_call_K
+    dma_call_bytes_V = bytes_per_call
+    dma_wave_off_K_i64 = wave_lds_offset_K_i64
+    dma_wave_off_V_i64 = wave_lds_offset_i64
+    if WAVE_BLOCK_DMA:
+        DMA_CALL_HALVES = WAVE * 8
+        dma_lane_half_base = b.add(
+            lane_half_base,
+            b.mul(wave_id, b.const_i32((kv_calls_per_tile - 1) * WAVE * 8)),
+        )
+        dma_call_bytes_K = WAVE_BYTES
+        dma_call_bytes_V = WAVE_BYTES
+        dma_wave_off_V_i64 = b.zext(
+            b.to_sgpr_u32(
+                b.mul(wave_id, b.const_i32(kv_calls_per_tile * WAVE_BYTES))
+            ),
+            I64,
+        )
+        dma_wave_off_K_i64 = dma_wave_off_V_i64
+
+    # ---- QK/PV LDS operand scheduling (see the spec knobs) ----
+    QK_K_READ_HOIST = bool(spec.use_qk_k_read_hoist)
+    PV_K_MAJOR = bool(spec.use_pv_k_major)
+    PV_ORDER = (
+        [(n, k) for k in range(T // 16) for n in range(ACC_N_TILES)]
+        if PV_K_MAJOR
+        else [(n, k) for n in range(ACC_N_TILES) for k in range(T // 16)]
+    )
+    PV_V_EARLY = min(int(spec.pv_v_early_operands), len(PV_ORDER))
+
     # ---- Paged KV byte descriptor (full transform DAG) ----
     # The paged-KV cache is laid out ``[num_blocks, BS, NUM_KV, HD]`` with
     # *byte* strides. The kernel addresses it via a chain of coordinate
@@ -2318,12 +2433,26 @@ def build_unified_attention_2d_tiled(
     # the per-tile block id becomes the scalar ``soffset``.
     BLOCK_ID_PREFETCH = bool(spec.use_kv_block_id_prefetch)
     _prefetched_ids: dict = {}
+    # Distinct block ids one wave needs per tile (``BID_N``) and the id slot
+    # each DMA call uses. Default: one id per call. Wave-major DMA: a wave's
+    # ``T / NUM_WARPS`` rows span ``max(1, rows / BS)`` blocks.
+    BID_N = kv_calls_per_tile
+    bid_slot = list(range(kv_calls_per_tile))
+    if WAVE_BLOCK_DMA:
+        _wave_rows = T // NUM_WARPS
+        _rows_per_call = DMA_CALL_HALVES // HD
+        if _wave_rows % BS == 0:
+            BID_N = _wave_rows // BS
+            bid_slot = [(c * _rows_per_call) // BS for c in range(kv_calls_per_tile)]
+        else:
+            BID_N = 1
+            bid_slot = [0] * kv_calls_per_tile
     if BLOCK_ID_PREFETCH:
 
         def _dma_call_coords(swz_halves):
             bwt, within = [], []
             for call in range(kv_calls_per_tile):
-                lh = b.add(b.const_i32(call * KV_HALVES_PER_CALL), lane_half_base)
+                lh = b.add(b.const_i32(call * DMA_CALL_HALVES), dma_lane_half_base)
                 row = b.div(lh, b.const_i32(HD))
                 bwt.append(b.div(row, b.const_i32(BS)))
                 if swz_halves is not None:
@@ -2343,9 +2472,18 @@ def build_unified_attention_2d_tiled(
 
         dma_bwt, k_dma_within = _dma_call_coords(_k_swz_halves if K_LDS_SWZ else None)
         _, v_dma_within = _dma_call_coords(_v_swz_halves if V_LDS_SWZ else None)
+        if WAVE_BLOCK_DMA:
+            # First block of the wave's rows; one id per distinct block.
+            dma_bwt = [
+                b.add(
+                    b.div(b.mul(wave_id, b.const_i32(T // NUM_WARPS)), b.const_i32(BS)),
+                    b.const_i32(j),
+                )
+                for j in range(BID_N)
+            ]
 
         def _load_block_ids(tile_idx: Value) -> list:
-            """Per-call physical block ids of ``tile_idx`` (VGPR, wave-uniform).
+            """Physical block ids of ``tile_idx`` per id slot (VGPR, wave-uniform).
 
             Out-of-table indices (over-fetch past the last tile) clamp to
             entry 0 instead of selecting 0 after the load: the loaded value
@@ -2354,16 +2492,28 @@ def build_unified_attention_2d_tiled(
             """
             tile_base = b.add(seq_base, b.mul(tile_idx, b.const_i32(N_BLOCKS_PER_TILE)))
             ids = []
-            for call in range(kv_calls_per_tile):
-                idx = b.add(tile_base, dma_bwt[call])
+            for slot in range(BID_N):
+                idx = b.add(tile_base, dma_bwt[slot])
                 idx = b.select(b.cmp_lt(idx, block_table_max_idx), idx, b.const_i32(0))
                 ids.append(b.global_load(block_tables, idx, I32, align=4))
             return ids
 
         def _block_soffs(ids: list) -> list:
-            return [
+            """Per-call scalar block byte offsets from the per-slot ids."""
+            soffs = [
                 b.mul(b.to_sgpr_u32(i), b.const_i32(kv_stride_blk_b)) for i in ids
             ]
+            return [soffs[bid_slot[call]] for call in range(kv_calls_per_tile)]
+
+        # Ids of the first two tiles (the loop's initial carry), loaded here
+        # so they overlap the Q gather; tile_start's also give the prologue
+        # K/V DMAs their scalar block offsets, so no prologue DMA waits on
+        # its own block-table load.
+        _ts1_raw = b.add(tile_start, b.const_i32(1))
+        _ts1 = b.select(b.cmp_lt(_ts1_raw, tile_end), _ts1_raw, tile_start)
+        bid_init_cur = _load_block_ids(tile_start)
+        bid_init_nxt = _load_block_ids(_ts1)
+        _prefetched_ids[id(tile_start)] = bid_init_cur
 
     def _issue_k_load_runtime(kv_tile_idx: Value, buf_idx: Value) -> None:
         """Issue async K loads for one tile into K_lds[buf_idx].
@@ -2383,7 +2533,7 @@ def build_unified_attention_2d_tiled(
         buf_off_i32 = b.mul(buf_idx, b.const_i32(bytes_per_buf_K))
         buf_off_i64 = b.zext(buf_off_i32, I64)
         K_buf_base = b.smem_ptr_add(K_lds_addr, buf_off_i64)
-        K_wave_base = b.smem_ptr_add(K_buf_base, wave_lds_offset_K_i64)
+        K_wave_base = b.smem_ptr_add(K_buf_base, dma_wave_off_K_i64)
         if FAST_PAGED_KV_DESC:
             fast_block0, fast_block1 = _fast_paged_kv_blocks(kv_tile_idx)
         pf_ids = _prefetched_ids.get(id(kv_tile_idx))
@@ -2402,7 +2552,7 @@ def build_unified_attention_2d_tiled(
                     )
             else:
                 linear_half = b.add(
-                    b.const_i32(call * KV_HALVES_PER_CALL), lane_half_base
+                    b.const_i32(call * DMA_CALL_HALVES), dma_lane_half_base
                 )
                 if K_LDS_SWZ:
                     linear_half = _swizzle_dma_linear_half(linear_half, _k_swz_halves)
@@ -2424,7 +2574,7 @@ def build_unified_attention_2d_tiled(
                         linear_half=linear_half,
                         kv_head=kv_head_idx,
                     )
-            k_dst = b.smem_ptr_add(K_wave_base, b.const_i64(call * bytes_per_call_K))
+            k_dst = b.smem_ptr_add(K_wave_base, b.const_i64(call * dma_call_bytes_K))
             # CACHE_STREAM (SLC): one-shot streaming load, never re-read
             # within this kernel. Documented in
             # ``dsl_docs/primitives/intrinsics_and_primitives.md`` as the
@@ -2446,11 +2596,11 @@ def build_unified_attention_2d_tiled(
         if V_DOUBLE_BUF:
             v_buf_off_i64 = b.zext(b.mul(buf_idx, b.const_i32(T * HD * 2)), I64)
             V_wave_base = b.smem_ptr_add(
-                b.smem_ptr_add(V_lds_addr, v_buf_off_i64), wave_lds_offset_i64
+                b.smem_ptr_add(V_lds_addr, v_buf_off_i64), dma_wave_off_V_i64
             )
         else:
             # V is single-buffered; ignore buf_idx, always write slot 0.
-            V_wave_base = b.smem_ptr_add(V_lds_addr, wave_lds_offset_i64)
+            V_wave_base = b.smem_ptr_add(V_lds_addr, dma_wave_off_V_i64)
         if FAST_PAGED_KV_DESC:
             fast_block0, fast_block1 = _fast_paged_kv_blocks(kv_tile_idx)
         pf_ids = _prefetched_ids.get(id(kv_tile_idx))
@@ -2469,7 +2619,7 @@ def build_unified_attention_2d_tiled(
                     )
             else:
                 linear_half = b.add(
-                    b.const_i32(call * KV_HALVES_PER_CALL), lane_half_base
+                    b.const_i32(call * DMA_CALL_HALVES), dma_lane_half_base
                 )
                 if V_LDS_SWZ:
                     linear_half = _swizzle_dma_linear_half(linear_half, _v_swz_halves)
@@ -2491,7 +2641,7 @@ def build_unified_attention_2d_tiled(
                         linear_half=linear_half,
                         kv_head=kv_head_idx,
                     )
-            v_dst = b.smem_ptr_add(V_wave_base, b.const_i64(call * bytes_per_call))
+            v_dst = b.smem_ptr_add(V_wave_base, b.const_i64(call * dma_call_bytes_V))
             # CACHE_STREAM (SLC): V is consumed once per iter and never
             # re-read within this kernel; see _issue_k_load_runtime for
             # the rationale.
@@ -3251,12 +3401,12 @@ def build_unified_attention_2d_tiled(
     iter_args.append(("cur_buf", cur_buf_init))
     if BLOCK_ID_PREFETCH:
         # Carry the block ids of tile i (``bid_cur``) and tile i+1
-        # (``bid_nxt``); iteration i loads tile i+2's.
-        _ts1_raw = b.add(tile_start, b.const_i32(1))
-        _ts1 = b.select(b.cmp_lt(_ts1_raw, tile_end), _ts1_raw, tile_start)
-        for _c, _v in enumerate(_load_block_ids(tile_start)):
+        # (``bid_nxt``), loaded before the Q gather; iteration i loads tile
+        # i+2's.
+        _prefetched_ids.clear()
+        for _c, _v in enumerate(bid_init_cur):
             iter_args.append((f"bid_cur{_c}", _v))
-        for _c, _v in enumerate(_load_block_ids(_ts1)):
+        for _c, _v in enumerate(bid_init_nxt):
             iter_args.append((f"bid_nxt{_c}", _v))
 
     # ---------------- LICM hoist: per-reg invariants ----------------
@@ -3367,6 +3517,23 @@ def build_unified_attention_2d_tiled(
         m_vals = [carry[2 * r] for r in range(SOFTMAX_STATE_SLOTS)]
         l_vals = [carry[2 * r + 1] for r in range(SOFTMAX_STATE_SLOTS)]
         ml_count = 2 * SOFTMAX_STATE_SLOTS
+        # PV V operands read ahead of PV (``pv_v_early_operands``), by (n, k).
+        pv_v_cache: dict = {}
+
+        def _pv_v_load(v_buf, n, k):
+            return pv32_v_load_paired(
+                b,
+                V_lds=V_lds,
+                v_buf=v_buf,
+                n=n,
+                k=k,
+                lane_half32=lane_half32,
+                lane_col32=lane_col32,
+                dtype=dtype,
+                col_xor_of_row=_v_swz_halves if V_LDS_SWZ else None,
+                lds_alias=LDS_READ_TAG,
+            )
+
         acc_vals = [
             carry[ml_count + n * ACC_M_ATOMS + a]
             for n in range(ACC_N_TILES)
@@ -3380,10 +3547,8 @@ def build_unified_attention_2d_tiled(
         cur_buf = carry[ml_count + ACC_N_TILES * ACC_M_ATOMS]
         if BLOCK_ID_PREFETCH:
             _bid_base = ml_count + ACC_N_TILES * ACC_M_ATOMS + 1
-            bid_cur = list(carry[_bid_base : _bid_base + kv_calls_per_tile])
-            bid_nxt = list(
-                carry[_bid_base + kv_calls_per_tile : _bid_base + 2 * kv_calls_per_tile]
-            )
+            bid_cur = list(carry[_bid_base : _bid_base + BID_N])
+            bid_nxt = list(carry[_bid_base + BID_N : _bid_base + 2 * BID_N])
         if RING3:
             # 3-slot ring: cur_buf holds K[i]; (cur_buf+1)%3 holds K[i+1]
             # (prefetched last iter / prologue); the prefetch target for K[i+2]
@@ -3593,19 +3758,45 @@ def build_unified_attention_2d_tiled(
                 # would silently feed K values into the B operand and
                 # silently corrupt every transposed S^T.
                 ST32_n = [None] * QK_N_TILES
-                for n in range(QK_N_TILES):
-                    acc32 = b.zero_vec_f32(16)
-                    # K row becomes the M dimension of the transposed score
-                    # tile. K_lds layout is [T, HD], so A is K_lds[row, k].
-                    k_row_t = b.add(b.const_i32(n * 32), lane_col32)
+                if QK_K_READ_HOIST:
+                    # Every K operand read first (consumption order), then the
+                    # MFMAs k-major across the score tiles.
+                    k_rows_t = [
+                        b.add(b.const_i32(n * 32), lane_col32) for n in range(QK_N_TILES)
+                    ]
+                    k_ops = {}
                     for k in range(QK_K_ITERS):
                         k_off_t = b.add(
                             b.const_i32(k * 16), b.mul(lane_half32, b.const_i32(8))
                         )
-                        A_k_t = _read_k8_mfma_operand(cur_buf, k_row_t, k_off_t)
+                        for n in range(QK_N_TILES):
+                            k_ops[(n, k)] = _read_k8_mfma_operand(
+                                cur_buf, k_rows_t[n], k_off_t
+                            )
+                    for n, k in PV_ORDER[:PV_V_EARLY]:
+                        pv_v_cache[(n, k)] = _pv_v_load(cur_buf, n, k)
+                    accs = [b.zero_vec_f32(16) for _ in range(QK_N_TILES)]
+                    for k in range(QK_K_ITERS):
                         B_q_t = _read_q32(k) if Q_REREAD else Q32_reg[k]
-                        acc32 = _mfma_32x32x16(b, dtype, A_k_t, B_q_t, acc32)
-                    ST32_n[n] = acc32
+                        for n in range(QK_N_TILES):
+                            accs[n] = _mfma_32x32x16(b, dtype, k_ops[(n, k)], B_q_t, accs[n])
+                    ST32_n = accs
+                else:
+                    for n in range(QK_N_TILES):
+                        acc32 = b.zero_vec_f32(16)
+                        # K row becomes the M dimension of the transposed score
+                        # tile. K_lds layout is [T, HD], so A is K_lds[row, k].
+                        k_row_t = b.add(b.const_i32(n * 32), lane_col32)
+                        for k in range(QK_K_ITERS):
+                            k_off_t = b.add(
+                                b.const_i32(k * 16), b.mul(lane_half32, b.const_i32(8))
+                            )
+                            A_k_t = _read_k8_mfma_operand(cur_buf, k_row_t, k_off_t)
+                            B_q_t = _read_q32(k) if Q_REREAD else Q32_reg[k]
+                            acc32 = _mfma_32x32x16(b, dtype, A_k_t, B_q_t, acc32)
+                        ST32_n[n] = acc32
+                    for n, k in PV_ORDER[:PV_V_EARLY]:
+                        pv_v_cache[(n, k)] = _pv_v_load(cur_buf, n, k)
                 # STEP 2 lever (mode 2): sched_group_barrier grouping to pull
                 # MFMA work INTO the softmax/mask VALU window that follows. We
                 # emit ``softmax_interleave_groups`` alternating (MFMA, VALU)
@@ -3839,7 +4030,22 @@ def build_unified_attention_2d_tiled(
                                 )
                                 score = b.fadd(score, b.fmul(qq_v, rcp_ln2))
                             st_scores[(group_idx, n, reg)] = score
-                            st_local_max = b.fmax(st_local_max, score)
+                            if not SOFTMAX_MAX_TREE:
+                                st_local_max = b.fmax(st_local_max, score)
+                if SOFTMAX_MAX_TREE:
+                    # Balanced 3-ary tree over the lane's scores (exact: max
+                    # is associative). Each fmax(fmax(a, b), c) node is one
+                    # v_max3; depth log3(n) instead of a serial chain.
+                    _mx = list(st_scores.values())
+                    while len(_mx) > 1:
+                        _nxt = []
+                        for i in range(0, len(_mx), 3):
+                            node = _mx[i]
+                            for v in _mx[i + 1 : i + 3]:
+                                node = b.fmax(node, v)
+                            _nxt.append(node)
+                        _mx = _nxt
+                    st_local_max = _mx[0]
                 if PERMLANE32_ROW_REDUCE:
                     st_tile_max = b.fmax(*_halves_pair(st_local_max))
                 else:
@@ -4326,9 +4532,11 @@ def build_unified_attention_2d_tiled(
                 v_buf = cur_buf if V_DOUBLE_BUF else b.const_i32(0)
                 use_hi = b.cmp_eq(lane_half32, b.const_i32(1))
 
-                def _apply_transposed_pv_regs(acc32: Value, n: int, p_regs) -> Value:
+                def _apply_transposed_pv_regs(
+                    acc32: Value, n: int, p_regs, ks=range(T // 16)
+                ) -> Value:
                     v_dim32 = b.add(b.const_i32(n * 32), lane_col32)
-                    for k in range(T // 16):
+                    for k in ks:
                         if TRANSPOSED_HALF_LOCAL_PV:
                             # Half-local K orientation. Each 32-lane half
                             # consumes only the P rows already local to that
@@ -4336,18 +4544,9 @@ def build_unified_attention_2d_tiled(
                             # {4..7, 12..15}. Use matching half-local
                             # transpose LDS reads for V so V and P share the
                             # same permuted K order.
-                            A_v_t = pv32_v_load_paired(
-                                b,
-                                V_lds=V_lds,
-                                v_buf=v_buf,
-                                n=n,
-                                k=k,
-                                lane_half32=lane_half32,
-                                lane_col32=lane_col32,
-                                dtype=dtype,
-                                col_xor_of_row=_v_swz_halves if V_LDS_SWZ else None,
-                                lds_alias=LDS_READ_TAG,
-                            )
+                            A_v_t = pv_v_cache.pop((n, k), None)
+                            if A_v_t is None:
+                                A_v_t = _pv_v_load(v_buf, n, k)
                             b_p_elems = []
                             for kk in range(8):
                                 local_in_group = kk % 4
@@ -4411,6 +4610,10 @@ def build_unified_attention_2d_tiled(
                             acc32 = _mfma_32x32x16(b, dtype, A_v_t, B_p_t, acc32)
                     return acc32
 
+                if PV_V_EARLY:
+                    # The operands not read ahead of the softmax, all at once.
+                    for n, k in PV_ORDER[PV_V_EARLY:]:
+                        pv_v_cache[(n, k)] = _pv_v_load(v_buf, n, k)
                 for n in range(ACC_N_TILES):
                     scaled = []
                     old_acc = _acc_get(n, 0)
@@ -4424,8 +4627,17 @@ def build_unified_attention_2d_tiled(
                             )
                         )
                     acc32 = b.vec_pack(scaled, F32)
+                    if PV_K_MAJOR:
+                        new_acc[n] = acc32
+                        continue
                     acc32 = _apply_transposed_pv_regs(acc32, n, PT32_n)
                     new_acc[n] = acc32
+                if PV_K_MAJOR:
+                    for k in range(T // 16):
+                        for n in range(ACC_N_TILES):
+                            new_acc[n] = _apply_transposed_pv_regs(
+                                new_acc[n], n, PT32_n, ks=(k,)
+                            )
                 if GROUPED_KV2:
                     # V_lds is intentionally still single-buffered. Finish the
                     # tile0 LDS reads before overwriting it with tile1's V, then
