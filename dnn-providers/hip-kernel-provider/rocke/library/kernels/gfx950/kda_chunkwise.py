@@ -3901,6 +3901,25 @@ def kda_chunk_pair_signature(spec: KdaChunkPairSpec):
     return sb.build()
 
 
+def chunk_pair_spec_for(scan: KdaChunkScanSpec, prep_chunk: int):
+    """The pair combiner a scan needs between it and a ``prep_chunk`` tile
+    builder, or None when the scan walks the builder's own chunk."""
+    if scan.tile.chunk == prep_chunk:
+        return None
+    if scan.tile.chunk != 2 * prep_chunk:
+        raise ValueError(
+            f"scan chunk {scan.tile.chunk} is neither the tile builder's chunk "
+            f"{prep_chunk} nor a pair of them"
+        )
+    return KdaChunkPairSpec(
+        head_k=scan.head_k,
+        head_v=scan.head_v,
+        dtype=scan.dtype,
+        chunk=prep_chunk,
+        uw=scan.uw,
+    )
+
+
 @dataclass(frozen=True)
 class KdaChunkOutSpec:
     """Compile-time spec for the parallel output kernel of an ``o_split`` scan.
@@ -4048,6 +4067,15 @@ def kda_chunk_out_signature(spec: KdaChunkOutSpec):
     )
 
 
+def chunk_out_spec_for(scan: KdaChunkScanSpec):
+    """The output kernel an ``o_split`` scan needs, or None when O is in-chain."""
+    if not scan.o_split:
+        return None
+    return KdaChunkOutSpec(
+        head_k=scan.head_k, head_v=scan.head_v, dtype=scan.dtype, chunk=scan.tile.chunk
+    )
+
+
 def kda_chunk_prep_grid(spec: KdaChunkPrepSpec, num_tiles: int) -> Tuple[int, int, int]:
     """One workgroup per chunk. ``num_tiles = BH * NC``."""
     return (int(num_tiles), 1, 1)
@@ -4096,6 +4124,8 @@ __all__ = [
     "build_kda_chunk_pair",
     "build_kda_chunk_prep",
     "build_kda_chunk_scan",
+    "chunk_out_spec_for",
+    "chunk_pair_spec_for",
     "is_valid_fused_spec",
     "is_valid_out_spec",
     "is_valid_pair_spec",
