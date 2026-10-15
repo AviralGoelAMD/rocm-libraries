@@ -105,7 +105,12 @@ class TestD256Gfx950SpecOverrides(unittest.TestCase):
         "use_fast_paged_kv_desc",
         "use_mfma32_skip_legacy_qreg",
         "use_kq_lds_pad",
-        "kq_lds_pad_halves",
+        "use_k_lds_xor_swizzle",
+        "use_v_lds_xor_swizzle",
+        "use_reverse_q_block_order",
+        "use_lds_dma_overlap",
+        "use_kv_block_id_prefetch",
+        "use_softmax_scale_fold",
     }
 
     def setUp(self):
@@ -121,6 +126,8 @@ class TestD256Gfx950SpecOverrides(unittest.TestCase):
         self.assertIs(ov["use_softmax_mfma_interleave"], True)
         self.assertEqual(ov["softmax_interleave_mode"], 2)
         self.assertIs(ov["use_register_pv"], False)
+        self.assertIs(ov["use_kq_lds_pad"], False)
+        self.assertIs(ov["use_k_lds_xor_swizzle"], True)
 
     def test_dispatched_spec_carries_overrides(self):
         # the candidate declares the knobs on the dispatched spec (via the SSOT).
