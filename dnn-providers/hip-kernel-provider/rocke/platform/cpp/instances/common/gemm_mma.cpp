@@ -97,6 +97,8 @@ rocke_value_t* rocke_gemm_emit_mfma(rocke_ir_builder_t* b,
             return rocke_b_mfma_f32_16x16x16_bf16(b, a, bb, c);
         if(km == 16 && kn == 16 && kk == 32)
             return rocke_b_mfma_f32_16x16x32_bf16(b, a, bb, c);
+        if(km == 32 && kn == 32 && kk == 16)
+            return rocke_b_mfma_f32_32x32x16_bf16(b, a, bb, c);
     }
     /* Python: raise NotImplementedError(f"no MFMA emitter for {dtype} {key}"). */
     if(b && b->status == ROCKE_OK)

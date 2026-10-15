@@ -673,6 +673,8 @@ def _emit_mfma(
             return b.mfma_f32_16x16x16_bf16(a, bb, c)
         if key == (16, 16, 32):
             return b.mfma_f32_16x16x32_bf16(a, bb, c)
+        if key == (32, 32, 16):
+            return b.mfma_f32_32x32x16_bf16(a, bb, c)
     raise NotImplementedError(f"no MFMA emitter for {dtype.name} warp_tile {key}")
 
 
