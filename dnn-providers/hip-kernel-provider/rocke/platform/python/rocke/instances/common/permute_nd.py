@@ -51,12 +51,29 @@ DSL's tile / transform-DAG abstractions:
   list ("hard code to vector 1") and we now do it whenever the
   permutation allows.
 
-For permutations that don't share the innermost axis (e.g.
-``perm=(2,0,1)`` on a 3-D tensor, where the output's inner axis maps
-to the input's middle axis), the per-thread inner load is still scalar
--- there is no contiguous chunk of input to vectorise without
-gathering ``vec`` non-adjacent halves. The kernel falls back to the
-``vec=1`` path with the same transform-DAG-derived flat offset.
+For permutations that move the innermost axis (``perm[-1] != rank -
+1``, e.g. NCHW -> NHWC or BSHD -> BHDS) consecutive output elements
+come from input elements ``stride[perm[-1]]`` apart, so a per-element
+gather is uncoalesced on one side. Those permutes take the
+**LDS-tiled transpose path** (same two-phase scheme as
+:mod:`rocke.instances.common.transpose`):
+
+1. Axes that stay adjacent and in order on both sides are merged and
+   size-1 axes dropped, which leaves a batched 2-D transpose: input
+   axis ``A`` (the input's innermost) and input axis ``B`` (the output's
+   innermost); every other axis is a batch axis.
+2. One CTA owns a ``[tile_b, tile_a]`` tile of one batch. Phase 1 issues
+   coalesced ``vec_in``-wide loads along ``A`` into LDS; after a
+   barrier, phase 2 gathers ``vec_out`` elements down an LDS column and
+   issues coalesced ``vec_out``-wide stores along ``B``.
+3. The LDS tile is unpadded; the ``vec_in``-element chunk index of row
+   ``b`` is XOR-swizzled with ``(b // vec_out) % (tile_a // vec_in)``, so
+   the phase-1 vector writes stay 16-byte aligned and the phase-2
+   column gathers of one wave land in distinct bank groups.
+
+Partial edge tiles are masked per vector chunk. Permutes whose merged
+``A`` or ``B`` extent is below ``LDS_MIN_EXTENT`` keep the scalar
+(``vec=1``) gather with the transform-DAG-derived flat offset.
 
 What we cover today
 -------------------
@@ -79,7 +96,7 @@ from __future__ import annotations
 import functools
 import operator
 from dataclasses import dataclass
-from typing import Literal, Tuple
+from typing import Literal, Optional, Tuple
 
 from ...core.ir import BF16, F16, F32, IRBuilder, KernelDef, PtrType, Type
 from ...helpers.io import io_ir_type
@@ -107,6 +124,160 @@ def _vec_candidates(dtype: str) -> Tuple[int, ...]:
     return (8, 4, 2)
 
 
+_ELEM_BYTES = {"f16": 2, "bf16": 2, "f32": 4}
+
+LDS_TILES = (16, 32, 64, 128)
+"""Legal ``PermuteSpec.lds_tile`` values (square tile edge before rebalancing)."""
+
+LDS_MIN_EXTENT = 8
+"""Smallest merged ``A`` / ``B`` extent routed to the LDS-tiled path."""
+
+
+def _pow2_ceil(n: int) -> int:
+    p = 1
+    while p < n:
+        p *= 2
+    return p
+
+
+def _log2(n: int) -> int:
+    return n.bit_length() - 1
+
+
+def _widest_vec(extent: int, dtype: str) -> int:
+    """Widest vector (<= 16 bytes) whose width divides ``extent``."""
+    for v in _vec_candidates(dtype):
+        if extent % v == 0:
+            return v
+    return 1
+
+
+def _row_major_strides(shape: Tuple[int, ...]) -> Tuple[int, ...]:
+    strides = [1] * len(shape)
+    for d in range(len(shape) - 2, -1, -1):
+        strides[d] = strides[d + 1] * shape[d + 1]
+    return tuple(strides)
+
+
+def coalesce_axes(
+    x_shape: Tuple[int, ...], perm: Tuple[int, ...]
+) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    """Drop size-1 axes and merge axes that stay adjacent and in order.
+
+    Returns the ``(x_shape, perm)`` of an equivalent lower-rank permute:
+    the element mapping is unchanged, only the index algebra shrinks.
+    NCHW -> NHWC ``(0, 2, 3, 1)`` becomes ``[N, C, H*W]`` with
+    ``(0, 2, 1)``.
+    """
+    kept = [a for a in range(len(x_shape)) if x_shape[a] != 1]
+    if not kept:
+        return (1,), (0,)
+    # Output-order runs of input axes that are consecutive in the input.
+    groups = []
+    for a in perm:
+        if a not in kept:
+            continue
+        prev = groups[-1][-1] if groups else None
+        if prev is not None and kept.index(a) == kept.index(prev) + 1:
+            groups[-1].append(a)
+        else:
+            groups.append([a])
+    order = sorted(range(len(groups)), key=lambda g: groups[g][0])
+    shape = tuple(
+        functools.reduce(operator.mul, (x_shape[a] for a in groups[g]), 1)
+        for g in order
+    )
+    new_perm = tuple(order.index(g) for g in range(len(groups)))
+    return shape, new_perm
+
+
+@dataclass(frozen=True)
+class LdsTilePlan:
+    """Batched 2-D transpose view of a permute that moves the inner axis.
+
+    ``A`` is the input's innermost (merged) axis and ``B`` the input axis
+    that becomes the output's innermost; the tile is ``[tile_b, tile_a]``.
+    Batch axes are listed in output order with their input / output
+    element strides.
+    """
+
+    n_a: int
+    n_b: int
+    tile_a: int
+    tile_b: int
+    vec_in: int
+    vec_out: int
+    stride_x_b: int
+    stride_y_a: int
+    batch_dims: Tuple[int, ...]
+    batch_x_strides: Tuple[int, ...]
+    batch_y_strides: Tuple[int, ...]
+
+    @property
+    def tiles_a(self) -> int:
+        return (self.n_a + self.tile_a - 1) // self.tile_a
+
+    @property
+    def tiles_b(self) -> int:
+        return (self.n_b + self.tile_b - 1) // self.tile_b
+
+    @property
+    def batch_count(self) -> int:
+        return functools.reduce(operator.mul, self.batch_dims, 1)
+
+    @property
+    def num_tiles(self) -> int:
+        return self.tiles_a * self.tiles_b * self.batch_count
+
+
+def lds_tile_plan(spec: "PermuteSpec") -> Optional[LdsTilePlan]:
+    """The LDS-tiled transpose plan for ``spec``, or ``None`` if it does not apply.
+
+    Applies when ``perm[-1] != rank - 1`` and, after :func:`coalesce_axes`,
+    the permute is a real transpose whose ``A`` and ``B`` extents are both
+    at least ``LDS_MIN_EXTENT``. The tile starts as
+    ``lds_tile x lds_tile``; a side clipped by a short extent hands its
+    area to the other side, and each side stays within one pass of
+    ``block_size`` threads per row.
+    """
+    if spec.rank == 0 or spec.perm[-1] == spec.rank - 1:
+        return None
+    shape, perm = coalesce_axes(tuple(spec.x_shape), tuple(spec.perm))
+    rank = len(shape)
+    if rank < 2 or perm[-1] == rank - 1:
+        return None
+    a_ax = rank - 1
+    b_ax = perm[-1]
+    n_a, n_b = shape[a_ax], shape[b_ax]
+    if n_a < LDS_MIN_EXTENT or n_b < LDS_MIN_EXTENT:
+        return None
+    vec_in = _widest_vec(n_a, spec.dtype)
+    vec_out = _widest_vec(n_b, spec.dtype)
+    t = spec.lds_tile
+    tile_a0 = min(t, _pow2_ceil(n_a))
+    tile_b0 = min(t, _pow2_ceil(n_b))
+    tile_a = min(_pow2_ceil(n_a), (t * t) // tile_b0, spec.block_size * vec_in)
+    tile_b = min(_pow2_ceil(n_b), (t * t) // tile_a0, spec.block_size * vec_out)
+    x_strides = _row_major_strides(shape)
+    y_shape = tuple(shape[p] for p in perm)
+    y_strides = _row_major_strides(y_shape)
+    out_pos = {a: d for d, a in enumerate(perm)}
+    batch_axes = [a for a in perm if a not in (a_ax, b_ax)]
+    return LdsTilePlan(
+        n_a=n_a,
+        n_b=n_b,
+        tile_a=tile_a,
+        tile_b=tile_b,
+        vec_in=vec_in,
+        vec_out=vec_out,
+        stride_x_b=x_strides[b_ax],
+        stride_y_a=y_strides[out_pos[a_ax]],
+        batch_dims=tuple(shape[a] for a in batch_axes),
+        batch_x_strides=tuple(x_strides[a] for a in batch_axes),
+        batch_y_strides=tuple(y_strides[out_pos[a]] for a in batch_axes),
+    )
+
+
 @dataclass(frozen=True)
 class PermuteSpec:
     """One concrete permutation kernel configuration.
@@ -122,6 +293,8 @@ class PermuteSpec:
     dtype: DType = "f16"
     block_size: int = 256
     name: str = "rocke_permute"
+    lds_tile: int = 64
+    """Tile edge of the LDS-tiled transpose path (``perm[-1] != rank - 1``)."""
 
     @property
     def rank(self) -> int:
@@ -162,10 +335,14 @@ class PermuteSpec:
         # ``perm[-1] != rank - 1``: the innermost output axis maps to a
         # non-innermost input axis, so ``vec`` consecutive output
         # elements come from input elements that are ``stride[perm[-1]]``
-        # apart -- not a contiguous chunk. A vec-wide load would gather
-        # the wrong halves, so we fall back to the scalar (vec=1) path
-        # and let the transform-DAG drive each element's source offset.
+        # apart -- not a contiguous chunk. Such permutes take the
+        # LDS-tiled path (see :func:`lds_tile_plan`), which picks its own
+        # per-phase vector widths, or else the scalar (vec=1) gather.
         return 1
+
+    @property
+    def lds_plan(self) -> Optional[LdsTilePlan]:
+        return lds_tile_plan(self)
 
     def kernel_name(self) -> str:
         shape_str = "x".join(str(d) for d in self.x_shape)
@@ -177,6 +354,7 @@ class PermuteSpec:
             self.dtype,
             f"b{self.block_size}",
             f"v{self.vec_width}" if self.vec_width > 1 else "",
+            f"lds{self.lds_tile}" if self.lds_plan is not None else "",
         )
 
 
