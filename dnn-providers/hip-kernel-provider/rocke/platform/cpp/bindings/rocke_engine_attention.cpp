@@ -413,24 +413,60 @@ std::vector<std::string> fp8_verify(const py::dict& d, const std::string& arch)
 
 /* ===================== fmha_bwd (kb, generic _ex lower) ================= */
 
+/* The dict mirrors FmhaBwdSpec (common fields flat). Optional "stage" (int)
+ * selects build_fmha_bwd_kernels(spec)[stage]; absent => build_fmha_bwd. */
 rocke_fmha_bwd_spec_t bwd_build(const py::dict& d, Store& st)
 {
     rocke_fmha_common_spec_t c = common_of(d, st);
     rocke_fmha_bwd_spec_t s
         = rocke_fmha_bwd_spec_default(c, a_int(d, "seqlen_q", 0), a_int(d, "seqlen_k", 0));
+    std::string v;
+    if(a_str(d, "name", v))
+        s.name = st.keep(v);
+    if(a_str(d, "output_grad_dtype", v))
+        s.output_grad_dtype = st.keep(v);
+    if(a_str(d, "bwd_mode", v))
+        s.bwd_mode = st.keep(v);
+    if(a_str(d, "mfma_causal_order", v))
+        s.mfma_causal_order = st.keep(v);
+    s.use_mfma_body = a_bool(d, "use_mfma_body", s.use_mfma_body);
+    s.mfma_dkdv_waves = a_int(d, "mfma_dkdv_waves", s.mfma_dkdv_waves);
+    s.mfma_dkdv_ktiles = a_int(d, "mfma_dkdv_ktiles", s.mfma_dkdv_ktiles);
+    s.mfma_dq_waves = a_int(d, "mfma_dq_waves", s.mfma_dq_waves);
+    s.mfma_dq_qtiles = a_int(d, "mfma_dq_qtiles", s.mfma_dq_qtiles);
+    s.mfma_lds_pad = a_int(d, "mfma_lds_pad", s.mfma_lds_pad);
+    s.mfma_waves_per_eu = a_int(d, "mfma_waves_per_eu", s.mfma_waves_per_eu);
+    s.mfma_exp2_fast = a_bool(d, "mfma_exp2_fast", s.mfma_exp2_fast);
+    s.mfma_natural_rows = a_bool(d, "mfma_natural_rows", s.mfma_natural_rows);
+    s.mfma_causal_split = a_bool(d, "mfma_causal_split", s.mfma_causal_split);
+    s.mfma_fused_dq = a_bool(d, "mfma_fused_dq", s.mfma_fused_dq);
     return s;
+}
+rocke_kernel_def_t* bwd_kernel(rocke_fmha_kernel_builder_t* kb,
+                               const py::dict& d,
+                               const rocke_fmha_bwd_spec_t& s,
+                               const std::string& arch,
+                               const char* what)
+{
+    const char* a = arch.empty() ? "gfx950" : arch.c_str();
+    int stage = a_int(d, "stage", -1);
+    rocke_kernel_def_t* k = stage < 0 ? rocke_build_fmha_bwd(kb, &s, a)
+                                      : rocke_build_fmha_bwd_kernels_stage(kb, &s, a, stage);
+    if(!k)
+    {
+        const char* e = rocke_ir_builder_error(rocke_fmha_kernel_builder_builder(kb));
+        std::string msg = std::string(what) + " build failed: " + (e ? e : "");
+        rocke_fmha_kernel_builder_free(kb);
+        throw std::runtime_error(msg);
+    }
+    return k;
 }
 std::string bwd_lower(const py::dict& d, const std::string& arch)
 {
     Store st;
     rocke_fmha_bwd_spec_t s = bwd_build(d, st);
     rocke_fmha_kernel_builder_t kb;
-    rocke_kernel_def_t* k = rocke_build_fmha_bwd(&kb, &s, arch.empty() ? "gfx950" : arch.c_str());
-    if(!k)
-    {
-        rocke_fmha_kernel_builder_free(&kb);
-        throw std::runtime_error("rocke_engine.fmha_bwd_lower_llvm build failed");
-    }
+    rocke_kernel_def_t* k = bwd_kernel(&kb, d, s, arch, "rocke_engine.fmha_bwd_lower_llvm");
     auto guard = rocke_bindings::own_builder(&kb, rocke_fmha_kernel_builder_free);
     char* ll = nullptr;
     char err[ROCKE_ERR_MSG_CAP];
@@ -449,12 +485,7 @@ std::string bwd_serialize(const py::dict& d, const std::string& arch)
     Store st;
     rocke_fmha_bwd_spec_t s = bwd_build(d, st);
     rocke_fmha_kernel_builder_t kb;
-    rocke_kernel_def_t* k = rocke_build_fmha_bwd(&kb, &s, arch.empty() ? "gfx950" : arch.c_str());
-    if(!k)
-    {
-        rocke_fmha_kernel_builder_free(&kb);
-        throw std::runtime_error("rocke_engine.fmha_bwd_serialize_ir build failed");
-    }
+    rocke_kernel_def_t* k = bwd_kernel(&kb, d, s, arch, "rocke_engine.fmha_bwd_serialize_ir");
     std::string out = ser_kernel(k, "rocke_engine.fmha_bwd_serialize_ir");
     rocke_fmha_kernel_builder_free(&kb);
     return out;
@@ -464,12 +495,7 @@ std::vector<std::string> bwd_verify(const py::dict& d, const std::string& arch)
     Store st;
     rocke_fmha_bwd_spec_t s = bwd_build(d, st);
     rocke_fmha_kernel_builder_t kb;
-    rocke_kernel_def_t* k = rocke_build_fmha_bwd(&kb, &s, arch.empty() ? "gfx950" : arch.c_str());
-    if(!k)
-    {
-        rocke_fmha_kernel_builder_free(&kb);
-        throw std::runtime_error("rocke_engine.fmha_bwd_verify build failed");
-    }
+    rocke_kernel_def_t* k = bwd_kernel(&kb, d, s, arch, "rocke_engine.fmha_bwd_verify");
     std::vector<std::string> out = ver_kernel(k);
     rocke_fmha_kernel_builder_free(&kb);
     return out;

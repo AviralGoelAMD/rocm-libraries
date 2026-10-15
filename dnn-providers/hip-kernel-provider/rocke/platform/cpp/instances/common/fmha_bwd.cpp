@@ -47,6 +47,18 @@ rocke_fmha_bwd_spec_t
     s.name = "rocke_fmha_bwd";
     s.use_mfma_body = false;
     s.output_grad_dtype = "f32";
+    s.bwd_mode = "atomic";
+    s.mfma_dkdv_waves = 4;
+    s.mfma_dkdv_ktiles = 1;
+    s.mfma_dq_waves = 4;
+    s.mfma_dq_qtiles = 2;
+    s.mfma_lds_pad = 16;
+    s.mfma_waves_per_eu = 2;
+    s.mfma_exp2_fast = true;
+    s.mfma_natural_rows = true;
+    s.mfma_causal_order = "lpt";
+    s.mfma_causal_split = true;
+    s.mfma_fused_dq = false;
     return s;
 }
 
@@ -286,6 +298,24 @@ rocke_kernel_def_t* rocke_build_fmha_bwd(rocke_fmha_kernel_builder_t* kb,
         if(arch == NULL)
         {
             arch = "gfx950";
+        }
+
+        /* build_fmha_bwd builds the bwd_mode='atomic' kernel only. */
+        if(spec->bwd_mode == NULL || strcmp(spec->bwd_mode, "atomic") != 0)
+        {
+            if(rocke_fmha_bwd_kernel_name(spec, kname, sizeof(kname)) != ROCKE_OK)
+            {
+                snprintf(kname, sizeof(kname), "rocke_fmha_bwd");
+            }
+            if(rocke_fmha_kernel_builder_init(kb, kname, &spec->common) == ROCKE_OK)
+            {
+                rocke_i_set_err(&kb->b,
+                                ROCKE_ERR_VALUE,
+                                "build_fmha_bwd builds the bwd_mode='atomic' kernel; bwd_mode='%s' "
+                                "is a multi-kernel plan: use build_fmha_bwd_kernels",
+                                spec->bwd_mode ? spec->bwd_mode : "");
+            }
+            return NULL;
         }
 
         /* ok, why = is_valid_spec(spec, arch); raise ValueError on reject. */

@@ -59,10 +59,21 @@ extern "C" {
  *     name: str = "rocke_fmha_bwd"
  *     use_mfma_body: bool = False
  *     output_grad_dtype: str = "f32"
+ *     bwd_mode: str = "atomic"            ("atomic" | "mfma")
+ *     mfma_dkdv_waves: int = 4
+ *     mfma_dkdv_ktiles: int = 1
+ *     mfma_dq_waves: int = 4
+ *     mfma_dq_qtiles: int = 2
+ *     mfma_lds_pad: int = 16
+ *     mfma_waves_per_eu: int = 2           (0 = no attribute)
+ *     mfma_exp2_fast: bool = True
+ *     mfma_natural_rows: bool = True
+ *     mfma_causal_order: str = "lpt"      ("none" | "lpt" | "pair")
+ *     mfma_causal_split: bool = True
+ *     mfma_fused_dq: bool = False
  *
- * `name` / `output_grad_dtype` are referenced as-is (not copied); keep them
- * alive for the spec's use. The default `name` "rocke_fmha_bwd" and
- * output_grad_dtype "f32" are filled by rocke_fmha_bwd_spec_default. */
+ * String fields are referenced as-is (not copied); keep them alive for the
+ * spec's use. rocke_fmha_bwd_spec_default fills every dataclass default. */
 typedef struct rocke_fmha_bwd_spec
 {
     rocke_fmha_common_spec_t common;
@@ -70,13 +81,23 @@ typedef struct rocke_fmha_bwd_spec
     int seqlen_k;
     const char* name; /* default "rocke_fmha_bwd" */
     bool use_mfma_body; /* default false             */
-    const char* output_grad_dtype; /* default "f32"            */
+    const char* output_grad_dtype; /* default "f32"; mfma: "f32" or common.dtype */
+    const char* bwd_mode; /* default "atomic"          */
+    int mfma_dkdv_waves;
+    int mfma_dkdv_ktiles;
+    int mfma_dq_waves;
+    int mfma_dq_qtiles;
+    int mfma_lds_pad;
+    int mfma_waves_per_eu;
+    bool mfma_exp2_fast;
+    bool mfma_natural_rows;
+    const char* mfma_causal_order;
+    bool mfma_causal_split;
+    bool mfma_fused_dq;
 } rocke_fmha_bwd_spec_t;
 
-/* FmhaBwdSpec(common, seqlen_q, seqlen_k, name="rocke_fmha_bwd",
- * use_mfma_body=False, output_grad_dtype="f32"): construct from the required
- * fields with the dataclass defaults for name / use_mfma_body /
- * output_grad_dtype. */
+/* FmhaBwdSpec(common, seqlen_q, seqlen_k): construct from the required fields
+ * with every dataclass default. */
 rocke_fmha_bwd_spec_t
     rocke_fmha_bwd_spec_default(rocke_fmha_common_spec_t common, int seqlen_q, int seqlen_k);
 
@@ -129,6 +150,50 @@ rocke_status_t rocke_fmha_bwd_lower_to_llvm(const rocke_fmha_bwd_spec_t* spec,
                                             char** out_ll,
                                             char* err,
                                             size_t err_cap);
+
+/* ------------------------------------------------------------------ *
+ * Launch plan: build_fmha_bwd_kernels(spec, arch)
+ * ------------------------------------------------------------------ *
+ *
+ * bwd_mode="atomic": one stage (build_fmha_bwd). bwd_mode="mfma": the
+ * build_fmha_bwd_mfma stages "pre", "dkdv" and (unless mfma_fused_dq) "dq",
+ * launched in order on one stream. */
+#define ROCKE_FMHA_BWD_MAX_STAGES 3
+
+typedef struct rocke_fmha_bwd_stage_info
+{
+    const char* stage; /* "atomic" | "pre" | "dkdv" | "dq" (static) */
+    int grid[3];
+    int block[3];
+} rocke_fmha_bwd_stage_info_t;
+
+/* Fill `out` (capacity ROCKE_FMHA_BWD_MAX_STAGES) with the launch plan and
+ * write the stage count to *out_count. On a spec the Python plan rejects
+ * returns ROCKE_ERR_VALUE with the message in `err` (capacity err_cap). */
+rocke_status_t rocke_fmha_bwd_launch_plan(const rocke_fmha_bwd_spec_t* spec,
+                                          const char* arch,
+                                          rocke_fmha_bwd_stage_info_t* out,
+                                          int* out_count,
+                                          char* err,
+                                          size_t err_cap);
+
+/* build_fmha_bwd_kernels(spec, arch)[stage][0]: build stage `stage` of the
+ * launch plan into the uninitialised `kb` (caller frees). NULL + sticky
+ * error on a rejected spec or an out-of-range stage. */
+rocke_kernel_def_t* rocke_build_fmha_bwd_kernels_stage(rocke_fmha_kernel_builder_t* kb,
+                                                       const rocke_fmha_bwd_spec_t* spec,
+                                                       const char* arch,
+                                                       int stage);
+
+/* build_fmha_bwd_kernels(spec, arch)[stage][1]: the stage's signature
+ * (declared on the uninitialised throwaway `kb`; caller frees). */
+rocke_status_t rocke_fmha_bwd_stage_signature(rocke_fmha_kernel_builder_t* kb,
+                                              const rocke_fmha_bwd_spec_t* spec,
+                                              const char* arch,
+                                              int stage,
+                                              rocke_arena_t* arena,
+                                              const rocke_sig_entry_t** out_items,
+                                              size_t* out_count);
 
 #ifdef __cplusplus
 } /* extern "C" */
