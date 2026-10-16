@@ -34,6 +34,15 @@ from pathlib import Path
 
 ROCKE = Path(__file__).resolve().parents[1]  # tools -> rocke
 SCOPE_DIRS = ("library", "platform/python/rocke")
+# Test, benchmark, verify and example code is out of scope: its duplication is
+# harness scaffolding, not kernel-authoring debt.
+_OUT_OF_SCOPE = re.compile(
+    r"(^|/)tests/"
+    r"|^library/benchmarks/"
+    r"|^platform/python/rocke/(benchmark|examples)/"
+    r"|/[^/]*_(verify|sweep)\.py$"
+    r"|/(bench|benchmark|reproduce)_[^/]*\.py$"
+)
 GROUPS_FILE = "tools/clone_groups.toml"
 DEFAULT_UPSTREAM = "origin/develop"
 WINDOW = 5
@@ -66,7 +75,7 @@ def in_scope(path: str) -> bool:
     return (
         path.endswith(".py")
         and any(path.startswith(d + "/") for d in SCOPE_DIRS)
-        and "/tests/" not in "/" + path
+        and not _OUT_OF_SCOPE.search(path)
     )
 
 
@@ -350,8 +359,11 @@ def _window_keys(statements: list[list[str]]) -> tuple[str, str]:
 
 
 def _is_setup(stmt: ast.stmt) -> bool:
-    """Recognised setup: constants, plain values, pass, docstrings."""
-    if isinstance(stmt, ast.Pass):
+    """Recognised setup: constants, plain values, imports, bare field
+    declarations (``x: int``), pass and docstrings."""
+    if isinstance(stmt, (ast.Pass, ast.Import, ast.ImportFrom)):
+        return True
+    if isinstance(stmt, ast.AnnAssign) and stmt.value is None:
         return True
     if isinstance(stmt, ast.Expr):
         return isinstance(stmt.value, ast.Constant) and isinstance(

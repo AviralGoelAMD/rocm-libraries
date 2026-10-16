@@ -342,6 +342,55 @@ def test_declared_global_names_are_not_renamed(repo):
     assert report["findings"] == []
 
 
+def test_bare_field_declarations_are_skipped(repo):
+    base = repo.commit()
+    fields = "".join(f"    f{i}: int\n" for i in range(5))
+    repo.write("library/kernels/a.py", f"class A:\n{fields}\n\nclass B:\n{fields}")
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+
+
+IMPORTS = """\
+from __future__ import annotations
+import argparse
+import json
+import sys
+from pathlib import Path
+"""
+
+
+def test_import_blocks_are_skipped(repo):
+    base = repo.commit()
+    repo.write("library/kernels/a.py", IMPORTS + "A = 1\n")
+    repo.write("library/kernels/b.py", IMPORTS + "B = 2\n")
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "library/benchmarks/common/bench.py",
+        "platform/python/rocke/examples/demo.py",
+        "platform/python/rocke/benchmark/gemm/run.py",
+        "library/builders/gfx950/attention/thing_verify.py",
+        "library/builders/gfx950/attention/thing_sweep.py",
+        "library/builders/gfx950/attention/bench_thing.py",
+        "library/builders/gfx950/attention/benchmark_thing.py",
+        "library/builders/gfx950/attention/reproduce_thing.py",
+    ],
+)
+def test_benchmark_verify_and_example_scripts_are_out_of_scope(repo, path):
+    repo.write("library/kernels/a.py", func("f1"))
+    base = repo.commit()
+    repo.write(path, func("f2"))
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+
+
 def test_constant_setup_windows_are_skipped(repo):
     base = repo.commit()
     setup = "".join(f"    c{i} = b.const_i32({i})\n" for i in range(5))
