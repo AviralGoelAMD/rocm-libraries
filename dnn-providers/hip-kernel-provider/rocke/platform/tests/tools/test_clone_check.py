@@ -366,6 +366,31 @@ def test_text_report_lists_ten_existing_copy_groups_then_counts_the_rest(repo):
     assert "+2 more existing copy groups edited" in text
 
 
+IF_BOTH = """\
+    v1 = b.add(base, row)
+    v2 = b.select(ok, v1, zero)
+    if ok:
+        v3 = b.load(ptr, v2)
+        v4 = b.fmul(v3, b.const_f32(32.0))
+    b.store(out, v2, v4)
+"""
+IF_ONE = IF_BOTH.replace(
+    "        v4 = b.fmul(", "    v4 = b.fmul("
+)  # same lines, different control flow
+
+
+def test_forks_that_differ_only_in_indentation_get_a_sibling_note(repo):
+    repo.write("tools/clone_groups.toml", GROUPS)
+    repo.write("library/kernels/gfx942/k.py", func("f"))
+    repo.write("library/kernels/gfx950/k.py", func("f"))
+    base = repo.commit()
+    repo.write("library/kernels/gfx942/k.py", func("f", IF_BOTH))
+    repo.write("library/kernels/gfx950/k.py", func("f", IF_ONE))
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert [e["kind"] for e in report["existing_copies"]] == ["SIBLING NOTE"]
+
+
 def test_same_edit_on_both_sides_of_an_approved_fork_reports_nothing(repo):
     repo.write("tools/clone_groups.toml", GROUPS)
     repo.write("library/kernels/gfx942/k.py", func("f"))

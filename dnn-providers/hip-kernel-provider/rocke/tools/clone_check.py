@@ -635,9 +635,13 @@ def _base_span(w: Window, fd: FileDiff) -> tuple[int, int] | None:
 
 
 def _code_lines(source: bytes, start: int, end: int) -> tuple[str, ...]:
-    """Stripped, non-blank, non-comment source lines ``start..end`` (1-based)."""
+    """Non-blank, non-comment source lines ``start..end`` (1-based), with the
+    common leading indent removed and relative indentation kept, so that
+    different control flow never compares equal."""
     text = source.decode(errors="replace").splitlines()[start - 1 : end]
-    return tuple(s for s in (t.strip() for t in text) if s and s[0] != "#")
+    lines = [t.rstrip() for t in text if t.strip() and not t.lstrip().startswith("#")]
+    indent = min((len(t) - len(t.lstrip()) for t in lines), default=0)
+    return tuple(t[indent:] for t in lines)
 
 
 def _old_code(w: Window, diffs: Diffs) -> tuple[str, ...] | None:
