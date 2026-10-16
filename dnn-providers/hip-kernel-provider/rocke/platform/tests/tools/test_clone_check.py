@@ -799,6 +799,29 @@ def test_copy_at_a_deeper_nesting_level_is_still_a_copy(repo):
     assert kinds(report) == ["NEW COPY"]
 
 
+STRING_BLOCK = """\
+    v0 = {text}
+    v1 = b.add(base, row)
+    v2 = b.select(ok, v1, zero)
+    v3 = b.load(ptr, v2)
+    b.store(out, v0, v3)
+"""
+
+
+def test_string_values_that_differ_only_in_indentation_are_not_a_copy(repo):
+    # Only docstrings ignore indentation; a string value keeps its exact text.
+    repo.write(
+        "library/kernels/a.py", func("f1", STRING_BLOCK.replace("{text}", '"a\\n  b"'))
+    )
+    base = repo.commit()
+    repo.write(
+        "library/kernels/b.py", func("f2", STRING_BLOCK.replace("{text}", '"a\\nb"'))
+    )
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+
+
 def test_two_separated_copies_in_one_block_are_a_copy(repo):
     base = repo.commit()
     body = BLOCK + "    marker = b.barrier()\n" + BLOCK

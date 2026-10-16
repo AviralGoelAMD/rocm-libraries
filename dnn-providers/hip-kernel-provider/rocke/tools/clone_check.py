@@ -323,8 +323,27 @@ def _scope_locals(scope: ast.AST) -> frozenset[str]:
     return frozenset(names - declared_outer)
 
 
-def _tokens(node: object, local_names: frozenset[str], out: list[str]) -> None:
-    """Serialise an AST subtree; local variable names become ``_LOCAL + name``."""
+_DOC_OWNERS = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def _docstring(body: object) -> str | None:
+    """The docstring of a module/class/function body, else None."""
+    if isinstance(body, list) and body and isinstance(body[0], ast.Expr):
+        value = body[0].value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            return value.value
+    return None
+
+
+def _tokens(
+    node: object, local_names: frozenset[str], out: list[str], doc_body: bool = False
+) -> None:
+    """Serialise an AST subtree; local variable names become ``_LOCAL + name``.
+
+    Docstrings are compared without their common indentation (``cleandoc``):
+    re-indenting copied code re-indents them. Every other string keeps its
+    exact text. ``doc_body`` marks a list that is a module/class/function body.
+    """
     if isinstance(node, ast.Name) and node.id in local_names:
         out.append(_LOCAL + node.id)
     elif isinstance(node, ast.AST):
@@ -333,17 +352,22 @@ def _tokens(node: object, local_names: frozenset[str], out: list[str]) -> None:
             if name in ("ctx", "type_comment"):
                 continue
             out.append("." + name)
-            _tokens(value, local_names, out)
+            _tokens(
+                value,
+                local_names,
+                out,
+                doc_body=name == "body" and isinstance(node, _DOC_OWNERS),
+            )
         out.append(")")
     elif isinstance(node, list):
         out.append("[")
+        doc = _docstring(node) if doc_body else None
+        if doc is not None:
+            out.append("docstring:" + repr(inspect.cleandoc(doc)))
+            node = node[1:]
         for item in node:
             _tokens(item, local_names, out)
         out.append("]")
-    elif isinstance(node, str) and "\n" in node:
-        # Multi-line strings (docstrings) change when the code around them is
-        # re-indented; compare them without their common indentation.
-        out.append(f"str:{inspect.cleandoc(node)!r}")
     else:
         out.append(f"{type(node).__name__}:{node!r}")
 
