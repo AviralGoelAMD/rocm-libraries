@@ -226,7 +226,19 @@ def collect_diffs(
     head_files: set[str],
     untracked: set[str],
 ) -> Diffs:
-    args = ["diff", "-M", "-U0", "--relative", "--no-color", "--no-ext-diff", base]
+    # Pin every option that user git config could change, so hunks (and
+    # therefore occurrence classes) are the same on every machine.
+    args = [
+        "diff",
+        "-M",
+        "-U0",
+        "--diff-algorithm=myers",
+        "--indent-heuristic",
+        "--relative",
+        "--no-color",
+        "--no-ext-diff",
+        base,
+    ]
     if head is not None:
         args.append(head)
     text = _git(root, *args, "--", *SCOPE_DIRS).decode(errors="replace")
