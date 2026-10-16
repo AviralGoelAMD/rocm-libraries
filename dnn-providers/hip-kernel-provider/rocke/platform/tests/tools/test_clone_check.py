@@ -380,12 +380,115 @@ def test_import_blocks_are_skipped(repo):
         "library/builders/gfx950/attention/bench_thing.py",
         "library/builders/gfx950/attention/benchmark_thing.py",
         "library/builders/gfx950/attention/reproduce_thing.py",
+        "platform/python/rocke/portable_ir/examples/demo.py",
     ],
 )
 def test_benchmark_verify_and_example_scripts_are_out_of_scope(repo, path):
     repo.write("library/kernels/a.py", func("f1"))
     base = repo.commit()
     repo.write(path, func("f2"))
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+
+
+@pytest.mark.parametrize("name", ["main", "make_inputs", "parse_args", "_parser"])
+def test_cli_and_input_helper_functions_are_skipped(repo, name):
+    repo.write("library/builders/gfx950/x/a.py", func(name))
+    base = repo.commit()
+    repo.write("library/builders/gfx950/x/b.py", func(name))
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+
+
+AROUND_MAIN = """\
+A1 = b0.add(x, y)
+A2 = b0.mul(A1, y)
+
+
+{main}
+A3 = b0.sub(A2, x)
+A4 = b0.select(A3, A1, A2)
+"""
+
+
+def test_skipped_function_does_not_complete_a_module_window(repo):
+    # Four shared top-level statements plus an excluded main() must not form a
+    # five-statement match.
+    text = AROUND_MAIN.format(main=func("main"))
+    repo.write("library/builders/gfx950/x/a.py", text)
+    base = repo.commit()
+    repo.write("library/builders/gfx950/x/b.py", text)
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+
+
+def test_dunder_main_block_is_skipped(repo):
+    script = 'if __name__ == "__main__":\n' + BLOCK.format(load="load", k="32.0")
+    repo.write("library/builders/gfx950/x/a.py", script)
+    base = repo.commit()
+    repo.write("library/builders/gfx950/x/b.py", script)
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+
+
+@pytest.mark.parametrize("name", ["check", "bench"])
+def test_check_and_bench_functions_are_still_checked(repo, name):
+    repo.write("library/kernels/common/a.py", func(name))
+    base = repo.commit()
+    repo.write("library/kernels/common/b.py", func(name))
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert kinds(report) == ["NEW COPY"]
+
+
+CONFIG = """\
+@dataclass
+class Cfg:
+    data: Spec = Spec(1)
+    tile_m: int = field(default=64)
+    tile_n: int = make_tile(64)
+    warp_m: int = pick(2)
+    warp_n: int = pick(4)
+"""
+
+
+def test_class_fields_with_defaults_are_skipped(repo):
+    repo.write("library/kernels/a.py", CONFIG)
+    base = repo.commit()
+    repo.write("library/kernels/b.py", CONFIG)
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+
+
+def test_field_only_class_does_not_complete_a_module_window(repo):
+    module = IMPORTS + "\n\n" + CONFIG
+    repo.write("library/kernels/a.py", module)
+    base = repo.commit()
+    repo.write("library/kernels/b.py", module)
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+
+
+BOOTSTRAP = """\
+import os
+import sys
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, ".."))
+sys.path.append(_HERE)
+ROOT = Path(__file__).resolve().parents[2]
+"""
+
+
+def test_script_bootstrap_lines_are_setup(repo):
+    repo.write("library/builders/gfx950/x/a.py", BOOTSTRAP)
+    base = repo.commit()
+    repo.write("library/builders/gfx950/x/b.py", BOOTSTRAP)
     head = repo.commit()
     _, report = repo.check("--base", base, "--head", head)
     assert report["findings"] == []

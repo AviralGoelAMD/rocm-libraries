@@ -38,11 +38,16 @@ SCOPE_DIRS = ("library", "platform/python/rocke")
 # harness scaffolding, not kernel-authoring debt.
 _OUT_OF_SCOPE = re.compile(
     r"(^|/)tests/"
+    r"|(^|/)examples/"
     r"|^library/benchmarks/"
-    r"|^platform/python/rocke/(benchmark|examples)/"
+    r"|^platform/python/rocke/benchmark/"
     r"|/[^/]*_(verify|sweep)\.py$"
     r"|/(bench|benchmark|reproduce)_[^/]*\.py$"
 )
+# Host-side command-line and test-input helpers inside builder scripts. They are
+# skipped together with `if __name__ == "__main__":` blocks. `check` and `bench`
+# stay in scope: copies of them were judged real duplication.
+_HARNESS_FUNCTIONS = frozenset({"main", "make_inputs", "parse_args", "_parser"})
 GROUPS_FILE = "tools/clone_groups.toml"
 DEFAULT_UPSTREAM = "origin/develop"
 WINDOW = 5
@@ -358,19 +363,44 @@ def _window_keys(statements: list[list[str]]) -> tuple[str, str]:
     return digest(exact), digest(renamed)
 
 
-def _is_setup(stmt: ast.stmt) -> bool:
-    """Recognised setup: constants, plain values, imports, bare field
-    declarations (``x: int``), pass and docstrings."""
+def _dotted(node: ast.AST) -> str:
+    """``"sys.path.insert"`` for a Name/Attribute chain, ``""`` otherwise."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return ""
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _is_bootstrap(value: ast.AST) -> bool:
+    """Script path set-up: an ``os.path.*`` call or anything built from ``__file__``."""
+    if any(isinstance(n, ast.Name) and n.id == "__file__" for n in ast.walk(value)):
+        return True
+    return isinstance(value, ast.Call) and _dotted(value.func).startswith("os.path.")
+
+
+def _is_setup(stmt: ast.stmt, in_class: bool = False) -> bool:
+    """Recognised setup: constants, plain values, imports, field declarations,
+    script path bootstrap, field-only classes, pass and docstrings."""
     if isinstance(stmt, (ast.Pass, ast.Import, ast.ImportFrom)):
         return True
-    if isinstance(stmt, ast.AnnAssign) and stmt.value is None:
-        return True
+    if isinstance(stmt, ast.AnnAssign) and (stmt.value is None or in_class):
+        return True  # `x: int`, or any typed field directly in a class body
+    if isinstance(stmt, ast.ClassDef):
+        return all(_is_setup(s, in_class=True) for s in stmt.body)
     if isinstance(stmt, ast.Expr):
+        if isinstance(stmt.value, ast.Call):
+            return _dotted(stmt.value.func).startswith("sys.path.")
         return isinstance(stmt.value, ast.Constant) and isinstance(
             stmt.value.value, str
         )
     if isinstance(stmt, ast.Assign) or (isinstance(stmt, ast.AnnAssign) and stmt.value):
         value = stmt.value
+        if _is_bootstrap(value):
+            return True
         if isinstance(value, ast.Call):
             return isinstance(value.func, ast.Attribute) and value.func.attr.startswith(
                 "const_"
@@ -380,6 +410,22 @@ def _is_setup(stmt: ast.stmt) -> bool:
         while isinstance(value, ast.Attribute):
             value = value.value
         return isinstance(value, (ast.Constant, ast.Name))
+    return False
+
+
+def _is_harness(stmt: ast.stmt) -> bool:
+    """A CLI/test-input helper function or an ``if __name__ == "__main__":`` block."""
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return stmt.name in _HARNESS_FUNCTIONS
+    if isinstance(stmt, ast.If) and isinstance(stmt.test, ast.Compare):
+        test = stmt.test
+        return (
+            isinstance(test.left, ast.Name)
+            and test.left.id == "__name__"
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value == "__main__"
+        )
     return False
 
 
@@ -400,7 +446,9 @@ def file_windows(path: str, source: bytes, window: int = WINDOW) -> list[Window]
     windows: list[Window] = []
     next_block = 0
 
-    def visit_block(stmts: list[ast.stmt], local_names: frozenset[str]) -> None:
+    def visit_block(
+        stmts: list[ast.stmt], local_names: frozenset[str], in_class: bool = False
+    ) -> None:
         nonlocal next_block
         block = next_block
         next_block += 1
@@ -409,9 +457,12 @@ def file_windows(path: str, source: bytes, window: int = WINDOW) -> list[Window]
             out: list[str] = []
             _tokens(stmt, local_names, out)
             tokens.append(out)
-        setup = [_is_setup(stmt) for stmt in stmts]
+        setup = [_is_setup(stmt, in_class) for stmt in stmts]
+        # Harness code is skipped entirely: no window may contain it, so it can
+        # neither match nor complete a match with its neighbours.
+        harness = [_is_harness(stmt) for stmt in stmts]
         for i in range(len(stmts) - window + 1):
-            if all(setup[i : i + window]):
+            if all(setup[i : i + window]) or any(harness[i : i + window]):
                 continue
             exact, renamed = _window_keys(tokens[i : i + window])
             last = stmts[i + window - 1]
@@ -426,9 +477,13 @@ def file_windows(path: str, source: bytes, window: int = WINDOW) -> list[Window]
                     renamed,
                 )
             )
-        for stmt in stmts:
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        for stmt, skip in zip(stmts, harness):
+            if skip:
+                continue
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 visit_block(stmt.body, _scope_locals(stmt))
+            elif isinstance(stmt, ast.ClassDef):
+                visit_block(stmt.body, _scope_locals(stmt), in_class=True)
             else:
                 for child in _child_blocks(stmt):
                     visit_block(child, local_names)
