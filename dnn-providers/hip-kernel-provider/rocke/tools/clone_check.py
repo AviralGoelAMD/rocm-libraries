@@ -257,8 +257,14 @@ class Window:
 
 
 def _scope_locals(scope: ast.AST) -> frozenset[str]:
-    """Parameters and names stored in this scope (nested functions/classes excluded)."""
+    """Parameters and names bound in this scope.
+
+    Nested functions, classes and lambdas are their own scopes and are skipped.
+    Names declared ``global`` or ``nonlocal`` bind an outer scope, so they are
+    not local even when assigned here.
+    """
     names: set[str] = set()
+    declared_outer: set[str] = set()
     if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
         args = scope.args
         for arg in (
@@ -281,8 +287,10 @@ def _scope_locals(scope: ast.AST) -> frozenset[str]:
             names.add(node.id)
         elif isinstance(node, ast.ExceptHandler) and node.name:
             names.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            declared_outer.update(node.names)
         stack.extend(ast.iter_child_nodes(node))
-    return frozenset(names)
+    return frozenset(names - declared_outer)
 
 
 def _tokens(node: object, local_names: frozenset[str], out: list[str]) -> None:

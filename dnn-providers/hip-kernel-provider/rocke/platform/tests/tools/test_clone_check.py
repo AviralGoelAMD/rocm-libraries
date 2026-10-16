@@ -322,6 +322,26 @@ def test_nested_function_locals_do_not_rename_outer_helpers(repo):
     assert report["findings"] == []
 
 
+GLOBAL = """\
+    global {mod}
+    {mod} = load_module()
+    v1 = {mod}.add(base, row)
+    v2 = {mod}.select(ok, v1, zero)
+    v3 = {mod}.load(ptr, v2)
+    b.store(out, v2, v3)
+"""
+
+
+def test_declared_global_names_are_not_renamed(repo):
+    # Assigning a `global` name binds the module-level name, not a local one.
+    repo.write("library/kernels/a.py", func("f1", GLOBAL.replace("{mod}", "torch")))
+    base = repo.commit()
+    repo.write("library/kernels/b.py", func("f2", GLOBAL.replace("{mod}", "np")))
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+
+
 def test_constant_setup_windows_are_skipped(repo):
     base = repo.commit()
     setup = "".join(f"    c{i} = b.const_i32({i})\n" for i in range(5))
