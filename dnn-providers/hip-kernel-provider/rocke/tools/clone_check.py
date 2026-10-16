@@ -56,6 +56,8 @@ WORKTREE = "WORKTREE"
 NEW_COPY = "NEW COPY"
 LIKELY_COPY = "LIKELY COPY"
 SIBLING_COPY = "SIBLING COPY"
+EXISTING_EDITED = "EXISTING COPIES EDITED"
+SIBLING_NOTE = "SIBLING NOTE"
 
 _LOCAL = "\x00"
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -187,13 +189,13 @@ class FileDiff:
 class Diffs:
     by_head: dict[str, FileDiff]
     by_base: dict[str, FileDiff]
-    base_files: set[str]
+    base_text: dict[str, bytes]  # in-scope base files, for comparing old code
     head_files: set[str]
 
     def for_head(self, path: str) -> FileDiff:
         if path in self.by_head:
             return self.by_head[path]
-        return FileDiff(path if path in self.base_files else None, path)
+        return FileDiff(path if path in self.base_text else None, path)
 
     def for_base(self, path: str) -> FileDiff:
         if path in self.by_base:
@@ -236,7 +238,7 @@ def collect_diffs(
     root: Path,
     base: str,
     head: str | None,
-    base_files: set[str],
+    base_sources: dict[str, bytes],
     head_files: set[str],
     untracked: set[str],
 ) -> Diffs:
@@ -265,7 +267,7 @@ def collect_diffs(
             by_base[fd.base_path] = fd
     for path in untracked:
         by_head[path] = FileDiff(None, path)
-    return Diffs(by_head, by_base, base_files, head_files)
+    return Diffs(by_head, by_base, base_sources, head_files)
 
 
 # ------------------------------------------------------------------ fingerprints
@@ -606,10 +608,12 @@ class Finding:
 
 
 @dataclass
-class SiblingNote:
-    group: str
-    changed: tuple[str | None, int | None, int | None]
-    sibling: tuple[str | None, int | None, int | None]
+class ExistingCopies:
+    """Copies that already existed and that this change edited."""
+
+    kind: str  # EXISTING_EDITED, or SIBLING_NOTE for an approved fork group
+    group: str | None
+    locations: list[Location]  # cls: edited | unchanged
 
 
 @dataclass
@@ -617,7 +621,7 @@ class Report:
     base: str
     head: str
     findings: list[Finding]
-    notes: list[SiblingNote]
+    existing: list[ExistingCopies]
     skipped: list[dict]
 
 
@@ -627,6 +631,20 @@ def _base_span(w: Window, fd: FileDiff) -> tuple[int, int] | None:
     ]
     lines = [n for n in lines if n is not None]
     return (min(lines), max(lines)) if lines else None
+
+
+def _old_code(w: Window, diffs: Diffs) -> tuple[str, ...] | None:
+    """The base-side code behind a head window: stripped, non-blank, non-comment
+    lines of its mapped base span (at least two), else None."""
+    fd = diffs.for_head(w.path)
+    span = _base_span(w, fd)
+    if span is None or fd.base_path not in diffs.base_text:
+        return None
+    text = diffs.base_text[fd.base_path].decode(errors="replace").splitlines()
+    lines = tuple(
+        s for s in (t.strip() for t in text[span[0] - 1 : span[1]]) if s and s[0] != "#"
+    )
+    return lines if len(lines) >= 2 else None
 
 
 def classify(w: Window, peers: list[Window], diffs: Diffs, base: Side) -> str:
@@ -657,6 +675,13 @@ def classify(w: Window, peers: list[Window], diffs: Diffs, base: Side) -> str:
                     for p in partners
                 ):
                     return "maintained"
+    # Copies too short for a window in the base: identical old code behind two
+    # occurrences means they already existed and were edited, not pasted.
+    mine = _old_code(w, diffs)
+    if mine is not None and any(
+        peer is not w and _old_code(peer, diffs) == mine for peer in peers
+    ):
+        return "maintained"
     return "replaced"
 
 
@@ -723,10 +748,21 @@ def _merge_findings(findings: list[Finding]) -> list[Finding]:
     return merged
 
 
+def _fork_group(paths: list[str], groups: list[Group]) -> Group | None:
+    """The approved fork group holding these locations, one per sibling file."""
+    return next(
+        (g for g in groups if set(paths) <= g.files and len(set(paths)) == len(paths)),
+        None,
+    )
+
+
 def find_copies(
     base: Side, head: Side, diffs: Diffs, groups: list[Group]
-) -> list[Finding]:
+) -> tuple[list[Finding], list[ExistingCopies]]:
+    """Copies the change added, plus existing copies it edited that only the head
+    side can see (copies too short for a window in the base)."""
     findings = []
+    edited: list[ExistingCopies] = []
     for key, occurrences in head.renamed.items():
         before = len(base.renamed.get(key, []))
         if len(occurrences) < 2 or len(occurrences) <= before:
@@ -735,6 +771,18 @@ def find_copies(
             Location(w.path, w.start, w.end, classify(w, occurrences, diffs, base))
             for w in occurrences
         ]
+        existing = [
+            Location(
+                l.path,
+                l.start,
+                l.end,
+                "edited" if l.cls == "maintained" else "unchanged",
+            )
+            for l in locations
+            if l.cls in ("maintained", "unchanged")
+        ]
+        if len(existing) >= 2 and any(l.cls == "edited" for l in existing):
+            edited.append(ExistingCopies(EXISTING_EDITED, None, existing))
         added = [
             (w, loc)
             for w, loc in zip(occurrences, locations)
@@ -747,16 +795,8 @@ def find_copies(
             and len(head.exact.get(w.exact, [])) > len(base.exact.get(w.exact, []))
             for w, _loc in added
         )
-        paths = [w.path for w in occurrences]
         # Approved forks cover copies BETWEEN sibling files: one occurrence per file.
-        group = next(
-            (
-                g
-                for g in groups
-                if set(paths) <= g.files and len(set(paths)) == len(paths)
-            ),
-            None,
-        )
+        group = _fork_group([w.path for w in occurrences], groups)
         if group is not None:
             kind = SIBLING_COPY
         elif any(loc.cls == "new" for _w, loc in added):
@@ -773,74 +813,93 @@ def find_copies(
                 locations,
             )
         )
-    return _merge_findings(findings)
+    return _merge_findings(findings), edited
 
 
-def find_sibling_notes(
-    base: Side, diffs: Diffs, groups: list[Group]
-) -> list[SiblingNote]:
-    notes: dict[tuple, SiblingNote] = {}
-    for group in groups:
-        for occurrences in base.renamed.values():
-            members = [w for w in occurrences if w.path in group.files]
-            if len({w.path for w in members}) < 2:
+def find_existing_copies(
+    base: Side, diffs: Diffs, groups: list[Group], from_head: list[ExistingCopies]
+) -> list[ExistingCopies]:
+    """Copy groups that already existed in the base and that the change edited.
+
+    Each still-existing member is listed as ``edited`` or ``unchanged``; deleted
+    members are dropped, so a moved copy is not an edit. Groups inside an
+    approved fork become SIBLING NOTEs, and only when a sibling was left unchanged.
+    """
+    raw = list(from_head)
+    for occurrences in base.renamed.values():
+        if len(occurrences) < 2:
+            continue
+        locations = []
+        for w in occurrences:
+            fd = diffs.for_base(w.path)
+            if fd.head_path is None:
                 continue
-            for changed in members:
-                cfd = diffs.for_base(changed.path)
-                if not cfd.base_changed(changed.start, changed.end):
-                    continue
-                for sibling in members:
-                    if sibling.path == changed.path:
-                        continue
-                    sfd = diffs.for_base(sibling.path)
-                    if sfd.base_changed(sibling.start, sibling.end):
-                        continue
-                    note = SiblingNote(
-                        group.name,
-                        (
-                            cfd.head_path,
-                            cfd.to_head(changed.start),
-                            cfd.to_head(changed.end),
-                        ),
-                        (
-                            sfd.head_path,
-                            sfd.to_head(sibling.start),
-                            sfd.to_head(sibling.end),
-                        ),
-                    )
-                    _add_note(notes, note)
-    return sorted(notes.values(), key=lambda n: (str(n.changed), str(n.sibling)))
+            mapped = [fd.to_head(n) for n in range(w.start, w.end + 1)]
+            mapped = [n for n in mapped if n is not None]
+            if not mapped:
+                continue
+            edited = fd.base_changed(w.start, w.end)
+            locations.append(
+                Location(
+                    fd.head_path,
+                    min(mapped),
+                    max(mapped),
+                    "edited" if edited else "unchanged",
+                )
+            )
+        if len(locations) >= 2 and any(l.cls == "edited" for l in locations):
+            raw.append(ExistingCopies(EXISTING_EDITED, None, locations))
+    items = []
+    for item in raw:
+        group = _fork_group([l.path for l in item.locations], groups)
+        if group is None:
+            items.append(item)
+        elif any(l.cls == "unchanged" for l in item.locations):
+            items.append(ExistingCopies(SIBLING_NOTE, group.name, item.locations))
+    return _merge_existing(items)
 
 
-def _add_note(notes: dict[tuple, SiblingNote], note: SiblingNote) -> None:
-    """Merge notes whose changed and sibling ranges both overlap an existing note."""
+def _merge_existing(items: list[ExistingCopies]) -> list[ExistingCopies]:
+    """Join entries from overlapping windows of one edited copy group."""
 
-    def touch(a: tuple, b: tuple) -> bool:
-        return (
-            a[0] == b[0]
-            and None not in (a[1], a[2], b[1], b[2])
-            and a[1] <= b[2] + 1
-            and b[1] <= a[2] + 1
+    def touches(x: Location, locations: list[Location]) -> bool:
+        return any(
+            x.path == y.path and x.start <= y.end + 1 and y.start <= x.end + 1
+            for y in locations
         )
 
-    for key, old in notes.items():
-        if (
-            old.group == note.group
-            and touch(old.changed, note.changed)
-            and touch(old.sibling, note.sibling)
+    def edited(e: ExistingCopies) -> list[Location]:
+        return [l for l in e.locations if l.cls == "edited"]
+
+    merged: list[ExistingCopies] = []
+    for item in sorted(items, key=lambda e: (edited(e)[0].path, edited(e)[0].start)):
+        target = next(
+            (
+                m
+                for m in merged
+                if m.kind == item.kind
+                and m.group == item.group
+                and any(touches(x, edited(m)) for x in edited(item))
+                and all(touches(x, m.locations) for x in item.locations)
+            ),
+            None,
+        )
+        if target is None:
+            merged.append(ExistingCopies(item.kind, item.group, list(item.locations)))
+            continue
+        joined: list[Location] = []
+        for loc in sorted(
+            target.locations + item.locations, key=lambda l: (l.path, l.start)
         ):
-            old.changed = (
-                old.changed[0],
-                min(old.changed[1], note.changed[1]),
-                max(old.changed[2], note.changed[2]),
-            )
-            old.sibling = (
-                old.sibling[0],
-                min(old.sibling[1], note.sibling[1]),
-                max(old.sibling[2], note.sibling[2]),
-            )
-            return
-    notes[(note.group, note.changed, note.sibling)] = note
+            prev = joined[-1] if joined else None
+            if prev and prev.path == loc.path and loc.start <= prev.end + 1:
+                prev.end = max(prev.end, loc.end)
+                if loc.cls == "edited":
+                    prev.cls = "edited"
+            else:
+                joined.append(Location(loc.path, loc.start, loc.end, loc.cls))
+        target.locations = joined
+    return merged
 
 
 def analyze(
@@ -860,15 +919,14 @@ def analyze(
         head_sources, untracked = commit_sources(root, head), set()
     base_side = fingerprint(base_sources, "base", skipped, window)
     head_side = fingerprint(head_sources, "head", skipped, window)
-    diffs = collect_diffs(
-        root, base, head, set(base_sources), set(head_sources), untracked
-    )
+    diffs = collect_diffs(root, base, head, base_sources, set(head_sources), untracked)
     groups = load_groups(root, head)
+    findings, from_head = find_copies(base_side, head_side, diffs, groups)
     return Report(
         base,
         head or WORKTREE,
-        find_copies(base_side, head_side, diffs, groups),
-        find_sibling_notes(base_side, diffs, groups),
+        findings,
+        find_existing_copies(base_side, diffs, groups, from_head),
         sorted(skipped, key=lambda s: (s["side"], s["path"])),
     )
 
@@ -883,10 +941,12 @@ _FIX = {
 }
 
 
-def _span(path: str | None, start: int | None, end: int | None) -> str:
-    if path is None or start is None or end is None:
-        return f"{path or '?'} (deleted)"
+def _span(path: str, start: int, end: int) -> str:
     return f"{path}:{start}-{end}"
+
+
+def _spans(locations: list[Location]) -> str:
+    return ", ".join(_span(l.path, l.start, l.end) for l in locations)
 
 
 def render_text(report: Report) -> str:
@@ -917,26 +977,44 @@ def render_text(report: Report) -> str:
         )
         lines.append("  " + _FIX[f.kind])
         lines.append("")
-    for n in report.notes:
-        lines.append(f"SIBLING NOTE  {_span(*n.changed)} changed")
-        lines.append(
-            f"  same block in {_span(*n.sibling)} was not changed   (group: {n.group})"
-        )
+    for e in report.existing:
+        edited = [l for l in e.locations if l.cls == "edited"]
+        unchanged = [l for l in e.locations if l.cls == "unchanged"]
+        if e.kind == SIBLING_NOTE:
+            lines.append(f"SIBLING NOTE  {_spans(edited)} changed")
+            lines.append(
+                f"  same block in {_spans(unchanged)} was not changed   (group: {e.group})"
+            )
+        else:
+            lines.append(f"EXISTING COPIES EDITED  {_spans(edited)}")
+            if unchanged:
+                lines.append(f"  same code, not changed here, at {_spans(unchanged)}")
+            lines.append(
+                f"  This code already existed in {len(e.locations)} places before this change."
+            )
+            lines.append(
+                "  Fix: extract one helper now, so the next change touches one place."
+            )
         lines.append("")
     for s in report.skipped:
         lines.append(f"SKIPPED ({s['side']})  {s['path']}: {s['error']}")
     count = lambda kind: sum(f.kind == kind for f in report.findings)  # noqa: E731
+    edits = sum(e.kind == EXISTING_EDITED for e in report.existing)
     lines.append(
         f"Summary: new copies {count(NEW_COPY)} · likely copies {count(LIKELY_COPY)} · "
-        f"sibling copies {count(SIBLING_COPY)} · sibling notes {len(report.notes)} · "
+        f"sibling copies {count(SIBLING_COPY)} · existing copies edited {edits} · "
+        f"sibling notes {len(report.existing) - edits} · "
         f"skipped files {len(report.skipped)}"
     )
     return "\n".join(lines)
 
 
 def render_json(report: Report) -> str:
-    def span(t: tuple) -> dict:
-        return {"path": t[0], "start": t[1], "end": t[2]}
+    def locations(items: list[Location]) -> list[dict]:
+        return [
+            {"path": l.path, "start": l.start, "end": l.end, "class": l.cls}
+            for l in items
+        ]
 
     data = {
         "base": report.base,
@@ -949,16 +1027,13 @@ def render_json(report: Report) -> str:
                 "group": f.group,
                 "copies_before": f.before,
                 "copies_after": f.after,
-                "locations": [
-                    {"path": l.path, "start": l.start, "end": l.end, "class": l.cls}
-                    for l in f.locations
-                ],
+                "locations": locations(f.locations),
             }
             for f in report.findings
         ],
-        "sibling_notes": [
-            {"group": n.group, "changed": span(n.changed), "sibling": span(n.sibling)}
-            for n in report.notes
+        "existing_copies": [
+            {"kind": e.kind, "group": e.group, "locations": locations(e.locations)}
+            for e in report.existing
         ],
         "skipped": report.skipped,
     }

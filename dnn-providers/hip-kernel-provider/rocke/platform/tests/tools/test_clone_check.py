@@ -188,9 +188,17 @@ def test_moving_a_block_or_renaming_a_file_is_not_a_copy(repo):
     head = repo.commit()
     _, report = repo.check("--base", base, "--head", head)
     assert report["findings"] == []
+    assert report["existing_copies"] == []  # a moved copy was not edited
 
 
-def test_same_fix_in_both_existing_copies_is_not_a_copy(repo):
+def existing(report: dict) -> list[tuple]:
+    return [
+        (e["kind"], sorted((loc["path"], loc["class"]) for loc in e["locations"]))
+        for e in report["existing_copies"]
+    ]
+
+
+def test_same_fix_in_both_existing_copies_is_reported_as_existing_copies(repo):
     repo.write("library/kernels/a.py", func("f1"))
     repo.write("library/kernels/b.py", func("f2"))
     base = repo.commit()
@@ -200,6 +208,62 @@ def test_same_fix_in_both_existing_copies_is_not_a_copy(repo):
     head = repo.commit()
     _, report = repo.check("--base", base, "--head", head)
     assert report["findings"] == []
+    assert existing(report) == [
+        (
+            "EXISTING COPIES EDITED",
+            [("library/kernels/a.py", "edited"), ("library/kernels/b.py", "edited")],
+        )
+    ]
+
+
+def test_editing_one_of_three_existing_copies_lists_the_others(repo):
+    for name in "abc":
+        repo.write(f"library/kernels/{name}.py", func(f"f_{name}"))
+    base = repo.commit()
+    repo.write("library/kernels/a.py", func("f_a", BLOCK.replace("b.add(", "b.mul(")))
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+    assert existing(report) == [
+        (
+            "EXISTING COPIES EDITED",
+            [
+                ("library/kernels/a.py", "edited"),
+                ("library/kernels/b.py", "unchanged"),
+                ("library/kernels/c.py", "unchanged"),
+            ],
+        )
+    ]
+
+
+SHORT = """\
+    v1 = b.add(base, row)
+    v2 = b.select(ok, v1, zero)
+    b.store(out, v2, v1)
+"""
+
+
+def test_short_existing_copies_edited_the_same_way_are_not_a_new_copy(repo):
+    # Three shared statements are below the window, so the base shows no copy.
+    # Adding the same two lines to both makes them visible; they already existed.
+    repo.write("library/kernels/a.py", func("f1", SHORT))
+    repo.write("library/kernels/b.py", func("f2", SHORT))
+    base = repo.commit()
+    grown = SHORT.replace(
+        "    b.store(",
+        "    v3 = b.load(ptr, v2)\n    v4 = b.fmul(v3, v1)\n    b.store(",
+    )
+    repo.write("library/kernels/a.py", func("f1", grown))
+    repo.write("library/kernels/b.py", func("f2", grown))
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+    assert existing(report) == [
+        (
+            "EXISTING COPIES EDITED",
+            [("library/kernels/a.py", "edited"), ("library/kernels/b.py", "edited")],
+        )
+    ]
 
 
 def test_replacing_unrelated_code_with_a_pasted_block_is_a_likely_copy(repo):
@@ -235,9 +299,30 @@ def test_editing_one_side_of_an_approved_fork_names_the_unchanged_sibling(repo):
     head = repo.commit()
     _, report = repo.check("--base", base, "--head", head)
     assert report["findings"] == []
-    (note,) = report["sibling_notes"]
-    assert note["changed"]["path"] == "library/kernels/gfx942/k.py"
-    assert note["sibling"]["path"] == "library/kernels/gfx950/k.py"
+    assert existing(report) == [
+        (
+            "SIBLING NOTE",
+            [
+                ("library/kernels/gfx942/k.py", "edited"),
+                ("library/kernels/gfx950/k.py", "unchanged"),
+            ],
+        )
+    ]
+    assert report["existing_copies"][0]["group"] == "per-arch"
+
+
+def test_same_edit_on_both_sides_of_an_approved_fork_reports_nothing(repo):
+    repo.write("tools/clone_groups.toml", GROUPS)
+    repo.write("library/kernels/gfx942/k.py", func("f"))
+    repo.write("library/kernels/gfx950/k.py", func("f"))
+    base = repo.commit()
+    fixed = func("f", BLOCK.replace("b.add(", "b.sub("))
+    repo.write("library/kernels/gfx942/k.py", fixed)
+    repo.write("library/kernels/gfx950/k.py", fixed)
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+    assert report["existing_copies"] == []  # the fork was kept in sync
 
 
 def test_copy_between_approved_fork_files_is_a_sibling_copy(repo):
