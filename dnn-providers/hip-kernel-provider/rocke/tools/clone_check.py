@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import inspect
 import json
 import re
 import subprocess
@@ -339,6 +340,10 @@ def _tokens(node: object, local_names: frozenset[str], out: list[str]) -> None:
         for item in node:
             _tokens(item, local_names, out)
         out.append("]")
+    elif isinstance(node, str) and "\n" in node:
+        # Multi-line strings (docstrings) change when the code around them is
+        # re-indented; compare them without their common indentation.
+        out.append(f"str:{inspect.cleandoc(node)!r}")
     else:
         out.append(f"{type(node).__name__}:{node!r}")
 

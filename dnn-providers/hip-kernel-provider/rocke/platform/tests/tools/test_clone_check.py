@@ -769,6 +769,36 @@ def test_overlapping_windows_in_one_run_are_not_a_copy(repo):
     assert report["findings"] == []
 
 
+DOC_BLOCK = '''\
+    v1 = b.add(base, row)
+    v2 = b.select(ok, v1, zero)
+
+    def inner():
+        """Line one.
+
+        Line two.
+        """
+        return v2
+
+    v3 = b.load(ptr, inner())
+    b.store(out, v2, v3)
+'''
+
+
+def test_copy_at_a_deeper_nesting_level_is_still_a_copy(repo):
+    # Re-indenting the copy also re-indents the nested docstring's text.
+    repo.write("library/kernels/a.py", func("f1", DOC_BLOCK))
+    base = repo.commit()
+    deeper = "    if ok:\n" + "".join(
+        "    " + line if line.strip() else line
+        for line in DOC_BLOCK.splitlines(keepends=True)
+    )
+    repo.write("library/kernels/b.py", func("f2", deeper))
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert kinds(report) == ["NEW COPY"]
+
+
 def test_two_separated_copies_in_one_block_are_a_copy(repo):
     base = repo.commit()
     body = BLOCK + "    marker = b.barrier()\n" + BLOCK
