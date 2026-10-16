@@ -11,12 +11,14 @@
 # parity pair requires NO edit to this script or any checklist doc -- it is
 # picked up automatically, so a new test never has to be registered by hand.
 #
-# Stages, selected with --steps (default: all, in this order):
+# Stages, selected with --steps (default: every stage except `clones`, in this order):
 #   guard    -- relative-path guard        (platform tests/run_all.py)
 #   gate     -- byte-identity gate         (BOTH llvm20 and llvm22 unless --flavor pins one)
 #   parity   -- platform instance .py/.c parity emitters
 #   pytest   -- auto-globs platform/tests + library/tests
 #   numeric  -- on-GPU numeric correctness (needs a HIP device)
+#   clones   -- advisory Python copy report (tools/clone_check.py); opt-in only,
+#               never part of the default run
 #
 # --steps picks a subset, e.g. `--steps numeric` (just the correctness lane) or
 # `--steps gate,parity`. --op scopes an OPERATOR/family across the stages that
@@ -50,6 +52,8 @@ EMIT_COMMON_DIR = PLATFORM / "tests" / "instances" / "parity"
 
 FLAVORS = ("llvm20", "llvm22")
 STAGES = ("guard", "gate", "parity", "pytest", "numeric")
+OPTIONAL_STAGES = ("clones",)  # run only when named in --steps
+ALL_STAGES = STAGES + OPTIONAL_STAGES
 
 
 def _env() -> dict:
@@ -94,11 +98,11 @@ def _parse_steps(raw: str) -> list[str]:
     if not raw:
         return list(STAGES)
     picked = [s.strip() for s in raw.split(",") if s.strip()]
-    bad = [s for s in picked if s not in STAGES]
+    bad = [s for s in picked if s not in ALL_STAGES]
     if bad:
-        raise SystemExit(f"unknown --steps {bad}; valid: {', '.join(STAGES)}")
+        raise SystemExit(f"unknown --steps {bad}; valid: {', '.join(ALL_STAGES)}")
     # preserve canonical order regardless of how the user listed them
-    return [s for s in STAGES if s in picked]
+    return [s for s in ALL_STAGES if s in picked]
 
 
 def main() -> int:
@@ -108,7 +112,7 @@ def main() -> int:
     ap.add_argument(
         "--steps",
         default="",
-        help=f"comma-separated subset of stages to run (default: all). Stages: {', '.join(STAGES)}",
+        help=f"comma-separated subset of stages to run (default: {', '.join(STAGES)}). Stages: {', '.join(ALL_STAGES)}",
     )
     ap.add_argument(
         "--op",
@@ -163,6 +167,7 @@ def main() -> int:
             )
         else:
             print("  numeric lane : skip")
+        print(f"  clone check  : {'yes (advisory)' if 'clones' in steps else 'skip'}")
         return 0
 
     status = 0
@@ -262,6 +267,15 @@ def main() -> int:
             return 1
         else:
             print("\n== numeric: SKIPPED (no HIP device visible) ==")
+
+    # clones -- advisory copy report; clone_check.py exits 0 even when it finds copies
+    if "clones" in steps:
+        status |= _run(
+            "clone check (advisory)",
+            [sys.executable, str(ROCKE / "tools" / "clone_check.py")],
+            env,
+            cwd=ROCKE,
+        )
 
     print(
         f"\n{'=' * 48}\nrocke checks: {'ALL PASSED' if status == 0 else 'FAILURES PRESENT'}\n{'=' * 48}"
