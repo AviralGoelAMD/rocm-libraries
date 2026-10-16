@@ -38,7 +38,7 @@ SCOPE_DIRS = ("library", "platform/python/rocke")
 # harness scaffolding, not kernel-authoring debt.
 _OUT_OF_SCOPE = re.compile(
     r"(^|/)tests/"
-    r"|(^|/)examples/"
+    r"|(^|/)(examples|experiments)/"
     r"|^library/benchmarks/"
     r"|^platform/python/rocke/benchmark/"
     r"|/[^/]*_(verify|sweep)\.py$"

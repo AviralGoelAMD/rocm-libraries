@@ -381,6 +381,7 @@ def test_import_blocks_are_skipped(repo):
         "library/builders/gfx950/attention/benchmark_thing.py",
         "library/builders/gfx950/attention/reproduce_thing.py",
         "platform/python/rocke/portable_ir/examples/demo.py",
+        "library/kernels/gfx942/experiments/d256/p1_prefetch.py",
     ],
 )
 def test_benchmark_verify_and_example_scripts_are_out_of_scope(repo, path):
