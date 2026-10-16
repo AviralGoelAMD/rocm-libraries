@@ -311,6 +311,61 @@ def test_editing_one_side_of_an_approved_fork_names_the_unchanged_sibling(repo):
     assert report["existing_copies"][0]["group"] == "per-arch"
 
 
+def test_different_edits_on_both_sides_of_an_approved_fork_get_a_sibling_note(repo):
+    repo.write("tools/clone_groups.toml", GROUPS)
+    repo.write("library/kernels/gfx942/k.py", func("f"))
+    repo.write("library/kernels/gfx950/k.py", func("f"))
+    base = repo.commit()
+    repo.write(
+        "library/kernels/gfx942/k.py", func("f", BLOCK.replace("b.add(", "b.mul("))
+    )
+    repo.write(
+        "library/kernels/gfx950/k.py", func("f", BLOCK.replace("b.add(", "b.sub("))
+    )
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert existing(report) == [
+        (
+            "SIBLING NOTE",
+            [
+                ("library/kernels/gfx942/k.py", "edited"),
+                ("library/kernels/gfx950/k.py", "edited"),
+            ],
+        )
+    ]
+
+
+def test_text_report_lists_ten_existing_copy_groups_then_counts_the_rest(repo):
+    # Twelve separate copy pairs, one function per file, so no larger window
+    # joins them into a single group.
+    for i in range(12):
+        repo.write(f"library/kernels/a{i}.py", func("f", k=f"{i}.0"))
+        repo.write(f"library/kernels/b{i}.py", func("f", k=f"{i}.0"))
+    base = repo.commit()
+    for i in range(12):
+        edited = func("f", BLOCK.replace("b.add(", "b.mul("), k=f"{i}.0")
+        repo.write(f"library/kernels/a{i}.py", edited)
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert len(report["existing_copies"]) == 12  # JSON keeps every entry
+    text = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL),
+            "--root",
+            str(repo.path),
+            "--base",
+            base,
+            "--head",
+            head,
+        ],
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert text.count("EXISTING COPIES EDITED  ") == 10
+    assert "+2 more existing copy groups edited" in text
+
+
 def test_same_edit_on_both_sides_of_an_approved_fork_reports_nothing(repo):
     repo.write("tools/clone_groups.toml", GROUPS)
     repo.write("library/kernels/gfx942/k.py", func("f"))

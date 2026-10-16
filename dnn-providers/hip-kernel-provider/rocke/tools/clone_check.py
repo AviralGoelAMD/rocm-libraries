@@ -58,6 +58,7 @@ LIKELY_COPY = "LIKELY COPY"
 SIBLING_COPY = "SIBLING COPY"
 EXISTING_EDITED = "EXISTING COPIES EDITED"
 SIBLING_NOTE = "SIBLING NOTE"
+MAX_EXISTING_SHOWN = 10  # text report; JSON always lists every entry
 
 _LOCAL = "\x00"
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -633,17 +634,19 @@ def _base_span(w: Window, fd: FileDiff) -> tuple[int, int] | None:
     return (min(lines), max(lines)) if lines else None
 
 
+def _code_lines(source: bytes, start: int, end: int) -> tuple[str, ...]:
+    """Stripped, non-blank, non-comment source lines ``start..end`` (1-based)."""
+    text = source.decode(errors="replace").splitlines()[start - 1 : end]
+    return tuple(s for s in (t.strip() for t in text) if s and s[0] != "#")
+
+
 def _old_code(w: Window, diffs: Diffs) -> tuple[str, ...] | None:
-    """The base-side code behind a head window: stripped, non-blank, non-comment
-    lines of its mapped base span (at least two), else None."""
+    """The base-side code behind a head window (at least two lines), else None."""
     fd = diffs.for_head(w.path)
     span = _base_span(w, fd)
     if span is None or fd.base_path not in diffs.base_text:
         return None
-    text = diffs.base_text[fd.base_path].decode(errors="replace").splitlines()
-    lines = tuple(
-        s for s in (t.strip() for t in text[span[0] - 1 : span[1]]) if s and s[0] != "#"
-    )
+    lines = _code_lines(diffs.base_text[fd.base_path], *span)
     return lines if len(lines) >= 2 else None
 
 
@@ -817,13 +820,18 @@ def find_copies(
 
 
 def find_existing_copies(
-    base: Side, diffs: Diffs, groups: list[Group], from_head: list[ExistingCopies]
+    base: Side,
+    diffs: Diffs,
+    groups: list[Group],
+    from_head: list[ExistingCopies],
+    head_text: dict[str, bytes],
 ) -> list[ExistingCopies]:
     """Copy groups that already existed in the base and that the change edited.
 
     Each still-existing member is listed as ``edited`` or ``unchanged``; deleted
     members are dropped, so a moved copy is not an edit. Groups inside an
-    approved fork become SIBLING NOTEs, and only when a sibling was left unchanged.
+    approved fork become SIBLING NOTEs when a sibling was left unchanged or the
+    edited siblings now differ; a fork whose sides end up identical is in sync.
     """
     raw = list(from_head)
     for occurrences in base.renamed.values():
@@ -854,7 +862,13 @@ def find_existing_copies(
         group = _fork_group([l.path for l in item.locations], groups)
         if group is None:
             items.append(item)
-        elif any(l.cls == "unchanged" for l in item.locations):
+            continue
+        codes = {
+            _code_lines(head_text[l.path], l.start, l.end)
+            for l in item.locations
+            if l.path in head_text
+        }
+        if any(l.cls == "unchanged" for l in item.locations) or len(codes) > 1:
             items.append(ExistingCopies(SIBLING_NOTE, group.name, item.locations))
     return _merge_existing(items)
 
@@ -926,7 +940,7 @@ def analyze(
         base,
         head or WORKTREE,
         findings,
-        find_existing_copies(base_side, diffs, groups, from_head),
+        find_existing_copies(base_side, diffs, groups, from_head, head_sources),
         sorted(skipped, key=lambda s: (s["side"], s["path"])),
     )
 
@@ -977,15 +991,22 @@ def render_text(report: Report) -> str:
         )
         lines.append("  " + _FIX[f.kind])
         lines.append("")
+    shown_edits = 0
     for e in report.existing:
         edited = [l for l in e.locations if l.cls == "edited"]
         unchanged = [l for l in e.locations if l.cls == "unchanged"]
         if e.kind == SIBLING_NOTE:
             lines.append(f"SIBLING NOTE  {_spans(edited)} changed")
-            lines.append(
-                f"  same block in {_spans(unchanged)} was not changed   (group: {e.group})"
-            )
-        else:
+            if unchanged:
+                lines.append(
+                    f"  same block in {_spans(unchanged)} was not changed   (group: {e.group})"
+                )
+            else:
+                lines.append(
+                    f"  the sides were changed differently; check they should differ   (group: {e.group})"
+                )
+        elif shown_edits < MAX_EXISTING_SHOWN:
+            shown_edits += 1
             lines.append(f"EXISTING COPIES EDITED  {_spans(edited)}")
             if unchanged:
                 lines.append(f"  same code, not changed here, at {_spans(unchanged)}")
@@ -995,6 +1016,14 @@ def render_text(report: Report) -> str:
             lines.append(
                 "  Fix: extract one helper now, so the next change touches one place."
             )
+        else:
+            continue
+        lines.append("")
+    hidden = sum(e.kind == EXISTING_EDITED for e in report.existing) - shown_edits
+    if hidden:
+        lines.append(
+            f"+{hidden} more existing copy groups edited; run with --format json for the full list"
+        )
         lines.append("")
     for s in report.skipped:
         lines.append(f"SKIPPED ({s['side']})  {s['path']}: {s['error']}")
