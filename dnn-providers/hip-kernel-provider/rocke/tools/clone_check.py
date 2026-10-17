@@ -5,10 +5,11 @@
 # clone_check.py -- report Python code copies that a change ADDS (advisory).
 #
 # Compares a base commit with either the working tree (default) or a head
-# commit. Every run parses all in-scope Python files on both sides, fingerprints
-# every window of WINDOW consecutive statements, and reports a fingerprint only
-# when the change adds a genuine new occurrence of code that now exists in two
-# or more places. Python only: C++ duplication is not measured.
+# commit. Every run tokenises all in-scope Python files on both sides,
+# fingerprints every window of MIN_TOKENS consecutive code tokens (across
+# statement boundaries, local variable names normalised), and reports a
+# fingerprint only when the change adds a genuine new occurrence of code that
+# now exists in two or more places. Python only: C++ duplication is not measured.
 #
 # Usage:
 #   python tools/clone_check.py                   # base = merge-base with origin/develop, head = working tree
@@ -23,13 +24,17 @@ from __future__ import annotations
 
 import argparse
 import ast
+import bisect
 import hashlib
 import inspect
+import io
 import json
 import re
 import subprocess
 import sys
+import tokenize
 import tomllib
+from array import array
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -51,7 +56,10 @@ _OUT_OF_SCOPE = re.compile(
 _HARNESS_FUNCTIONS = frozenset({"main", "make_inputs", "parse_args", "_parser"})
 GROUPS_FILE = "tools/clone_groups.toml"
 DEFAULT_UPSTREAM = "origin/develop"
-WINDOW = 5
+# Smallest copy reported, in code tokens (names, operators, literals; comments
+# and layout excluded). Measured on rocKE history: 30 doubles the noise, 100
+# finds little more than whole-statement windows.
+MIN_TOKENS = 50
 WORKTREE = "WORKTREE"
 
 NEW_COPY = "NEW COPY"
@@ -61,7 +69,6 @@ EXISTING_EDITED = "EXISTING COPIES EDITED"
 SIBLING_NOTE = "SIBLING NOTE"
 MAX_EXISTING_SHOWN = 10  # text report; JSON always lists every entry
 
-_LOCAL = "\x00"
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -278,12 +285,11 @@ def collect_diffs(
 @dataclass(frozen=True)
 class Window:
     path: str
-    block: int  # block id, unique within the file
-    first: int  # index of the window's first statement in its block
+    first: int  # index of the window's first token in its file
     start: int  # first source line
     end: int  # last source line
-    exact: str
-    renamed: str
+    exact: int
+    renamed: int
 
 
 def _scope_locals(scope: ast.AST) -> frozenset[str]:
@@ -321,78 +327,6 @@ def _scope_locals(scope: ast.AST) -> frozenset[str]:
             declared_outer.update(node.names)
         stack.extend(ast.iter_child_nodes(node))
     return frozenset(names - declared_outer)
-
-
-_DOC_OWNERS = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
-
-
-def _docstring(body: object) -> str | None:
-    """The docstring of a module/class/function body, else None."""
-    if isinstance(body, list) and body and isinstance(body[0], ast.Expr):
-        value = body[0].value
-        if isinstance(value, ast.Constant) and isinstance(value.value, str):
-            return value.value
-    return None
-
-
-def _tokens(
-    node: object, local_names: frozenset[str], out: list[str], doc_body: bool = False
-) -> None:
-    """Serialise an AST subtree; local variable names become ``_LOCAL + name``.
-
-    Docstrings are compared without their common indentation (``cleandoc``):
-    re-indenting copied code re-indents them. Every other string keeps its
-    exact text. ``doc_body`` marks a list that is a module/class/function body.
-    """
-    if isinstance(node, ast.Name) and node.id in local_names:
-        out.append(_LOCAL + node.id)
-    elif isinstance(node, ast.AST):
-        out.append(type(node).__name__)
-        for name, value in ast.iter_fields(node):
-            if name in ("ctx", "type_comment"):
-                continue
-            out.append("." + name)
-            _tokens(
-                value,
-                local_names,
-                out,
-                doc_body=name == "body" and isinstance(node, _DOC_OWNERS),
-            )
-        out.append(")")
-    elif isinstance(node, list):
-        out.append("[")
-        doc = _docstring(node) if doc_body else None
-        if doc is not None:
-            out.append("docstring:" + repr(inspect.cleandoc(doc)))
-            node = node[1:]
-        for item in node:
-            _tokens(item, local_names, out)
-        out.append("]")
-    else:
-        out.append(f"{type(node).__name__}:{node!r}")
-
-
-def _window_keys(statements: list[list[str]]) -> tuple[str, str]:
-    """Exact and renamed keys; ONE rename map is shared by the whole window."""
-    exact: list[str] = []
-    renamed: list[str] = []
-    mapping: dict[str, str] = {}
-    for tokens in statements:
-        for token in tokens:
-            if token.startswith(_LOCAL):
-                name = token[1:]
-                mapping.setdefault(name, f"V{len(mapping) + 1}")
-                exact.append("local:" + name)
-                renamed.append(mapping[name])
-            else:
-                exact.append(token)
-                renamed.append(token)
-        exact.append("\n")
-        renamed.append("\n")
-    digest = lambda parts: hashlib.sha256(
-        "\x1f".join(parts).encode()
-    ).hexdigest()  # noqa: E731
-    return digest(exact), digest(renamed)
 
 
 def _dotted(node: ast.AST) -> str:
@@ -472,72 +406,239 @@ def _child_blocks(stmt: ast.stmt):
         yield case.body
 
 
-def file_windows(path: str, source: bytes, window: int = WINDOW) -> list[Window]:
-    """Every non-trivial window of ``window`` consecutive statements in one file."""
-    tree = ast.parse(source, filename=path)
-    windows: list[Window] = []
-    next_block = 0
+_SKIPPED_TOKENS = frozenset(
+    {
+        tokenize.COMMENT,
+        tokenize.NL,
+        tokenize.NEWLINE,
+        tokenize.INDENT,
+        tokenize.DEDENT,
+        tokenize.ENCODING,
+        tokenize.ENDMARKER,
+    }
+)
+# Polynomial rolling hash modulo a Mersenne prime: window keys are 61-bit.
+_MOD = (1 << 61) - 1
+_BASE = 1_000_003
+_values: dict[str, int] = {}
 
-    def visit_block(
-        stmts: list[ast.stmt], local_names: frozenset[str], in_class: bool = False
-    ) -> None:
-        nonlocal next_block
-        block = next_block
-        next_block += 1
-        tokens = []
+
+def _value(text: str) -> int:
+    """A fixed pseudo-random value per token text (stable across runs)."""
+    value = _values.get(text)
+    if value is None:
+        digest = hashlib.blake2b(text.encode(), digest_size=8).digest()
+        value = _values[text] = int.from_bytes(digest, "little") % _MOD
+    return value
+
+
+# A local name's renamed value is this plus the distance (in tokens) to the
+# previous use of the same name inside the window, or plus 0 for its first use.
+# One rename map is therefore shared by the whole window: two windows match
+# only when their variables flow the same way.
+_LOCAL_VALUE = _value("\x00local")
+
+
+Pos = tuple[int, int]  # (line, column) of a token or node start
+
+
+@dataclass
+class _Marks:
+    """What the AST says about individual tokens of one file."""
+
+    local: set[Pos] = field(default_factory=set)  # local variable names
+    docstrings: dict[Pos, str] = field(default_factory=dict)  # -> cleandoc text
+    # (start, end, is_setup) for every statement, outer before inner
+    statements: list[tuple[Pos, Pos, bool]] = field(default_factory=list)
+    harness: list[tuple[Pos, Pos]] = field(default_factory=list)
+
+
+def _statement_start(stmt: ast.stmt) -> Pos:
+    decorators = getattr(stmt, "decorator_list", None) or []
+    return min(
+        [(stmt.lineno, stmt.col_offset)]
+        + [(d.lineno, d.col_offset - 1) for d in decorators]  # include the "@"
+    )
+
+
+def _mark(tree: ast.Module) -> _Marks:
+    marks = _Marks()
+
+    def docstring(body: list[ast.stmt]) -> None:
+        if body and isinstance(body[0], ast.Expr):
+            value = body[0].value
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                # Re-indenting copied code re-indents its docstrings, so they
+                # are compared without their common indentation. Every other
+                # string keeps its exact text.
+                text = "docstring:" + repr(inspect.cleandoc(value.value))
+                marks.docstrings[(value.lineno, value.col_offset)] = text
+
+    def locals_of(body: list[ast.stmt], local_names: frozenset[str]) -> None:
+        stack: list[ast.AST] = list(body)
+        while stack:
+            node = stack.pop()
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+            ):
+                continue  # its own scope
+            if isinstance(node, ast.Name) and node.id in local_names:
+                marks.local.add((node.lineno, node.col_offset))
+            stack.extend(ast.iter_child_nodes(node))
+
+    def visit(stmts: list[ast.stmt], in_class: bool = False) -> None:
         for stmt in stmts:
-            out: list[str] = []
-            _tokens(stmt, local_names, out)
-            tokens.append(out)
-        setup = [_is_setup(stmt, in_class) for stmt in stmts]
-        # Harness code is skipped entirely: no window may contain it, so it can
-        # neither match nor complete a match with its neighbours.
-        harness = [_is_harness(stmt) for stmt in stmts]
-        for i in range(len(stmts) - window + 1):
-            if all(setup[i : i + window]) or any(harness[i : i + window]):
+            span = (_statement_start(stmt), (stmt.end_lineno, stmt.end_col_offset))
+            # Harness code is skipped entirely: no window may contain it, so it
+            # can neither match nor complete a match with its neighbours.
+            if _is_harness(stmt):
+                marks.harness.append(span)
                 continue
-            exact, renamed = _window_keys(tokens[i : i + window])
-            last = stmts[i + window - 1]
-            windows.append(
-                Window(
-                    path,
-                    block,
-                    i,
-                    stmts[i].lineno,
-                    last.end_lineno or last.lineno,
-                    exact,
-                    renamed,
-                )
+            # A def/class header (decorators, signature) may be part of a copy
+            # but cannot make one: its body statements override this mark.
+            header = isinstance(
+                stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
             )
-        for stmt, skip in zip(stmts, harness):
-            if skip:
-                continue
+            marks.statements.append((*span, header or _is_setup(stmt, in_class)))
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                visit_block(stmt.body, _scope_locals(stmt))
+                args = stmt.args
+                for arg in (
+                    *args.posonlyargs,
+                    *args.args,
+                    *args.kwonlyargs,
+                    args.vararg,
+                    args.kwarg,
+                ):
+                    if arg is not None:
+                        marks.local.add((arg.lineno, arg.col_offset))
+                docstring(stmt.body)
+                locals_of(stmt.body, _scope_locals(stmt))
+                visit(stmt.body)
             elif isinstance(stmt, ast.ClassDef):
-                visit_block(stmt.body, _scope_locals(stmt), in_class=True)
+                docstring(stmt.body)
+                locals_of(stmt.body, _scope_locals(stmt))
+                visit(stmt.body, in_class=True)
             else:
                 for child in _child_blocks(stmt):
-                    visit_block(child, local_names)
+                    visit(child)
 
-    visit_block(tree.body, _scope_locals(tree))
-    return windows
+    docstring(tree.body)
+    locals_of(tree.body, _scope_locals(tree))
+    visit(tree.body)
+    return marks
 
 
-def occurrence_table(
-    windows: list[Window], attr: str, window: int = WINDOW
-) -> dict[str, list[Window]]:
-    """key -> non-overlapping occurrences (overlapping windows in one block count once)."""
-    grouped: dict[tuple[str, str, int], list[Window]] = {}
+@dataclass
+class FileKeys:
+    """Every non-trivial token window of one file, in compact arrays."""
+
+    first: array = field(default_factory=lambda: array("l"))
+    start: array = field(default_factory=lambda: array("l"))
+    end: array = field(default_factory=lambda: array("l"))
+    exact: array = field(default_factory=lambda: array("q"))
+    renamed: array = field(default_factory=lambda: array("q"))
+
+
+def file_windows(path: str, source: bytes, size: int = MIN_TOKENS) -> FileKeys:
+    """Every window of ``size`` consecutive code tokens that is neither all
+    setup nor touches harness code."""
+    marks = _mark(ast.parse(source, filename=path))
+    tokens = [
+        t
+        for t in tokenize.tokenize(io.BytesIO(source).readline)
+        if t.type not in _SKIPPED_TOKENS
+    ]
+    keys = FileKeys()
+    count = len(tokens)
+    if count < size:
+        return keys
+    starts = [t.start for t in tokens]
+
+    def token_range(span_start: Pos, span_end: Pos) -> range:
+        return range(
+            bisect.bisect_left(starts, span_start), bisect.bisect_left(starts, span_end)
+        )
+
+    # Tokens outside every statement (none in valid code) count as setup.
+    setup = [True] * count
+    for span_start, span_end, is_setup in marks.statements:  # inner ones override
+        for i in token_range(span_start, span_end):
+            setup[i] = is_setup
+    harness = [False] * count
+    for span_start, span_end in marks.harness:
+        for i in token_range(span_start, span_end):
+            harness[i] = True
+
+    text = [_value(marks.docstrings.get(t.start, t.string)) for t in tokens]
+    local = [t.type == tokenize.NAME and t.start in marks.local for t in tokens]
+    prev = [-1] * count  # previous use of the same local name
+    nxt = [-1] * count  # next use of the same local name
+    last_use: dict[str, int] = {}
+    for i, t in enumerate(tokens):
+        if local[i]:
+            p = last_use.get(t.string, -1)
+            prev[i] = p
+            if p >= 0:
+                nxt[p] = i
+            last_use[t.string] = i
+
+    def renamed_value(i: int, window_start: int) -> int:
+        if not local[i]:
+            return text[i]
+        return _LOCAL_VALUE + (i - prev[i] if prev[i] >= window_start else 0)
+
+    power = [1] * size
+    for i in range(1, size):
+        power[i] = power[i - 1] * _BASE % _MOD
+    exact = renamed = 0
+    for i in range(size):
+        exact = (exact * _BASE + text[i]) % _MOD
+        renamed = (renamed * _BASE + renamed_value(i, 0)) % _MOD
+    setup_sum = [0]
+    harness_sum = [0]
+    for i in range(count):
+        setup_sum.append(setup_sum[-1] + setup[i])
+        harness_sum.append(harness_sum[-1] + harness[i])
+
+    s = 0
+    while True:
+        e = s + size - 1
+        if (
+            harness_sum[e + 1] == harness_sum[s]
+            and setup_sum[e + 1] - setup_sum[s] < size
+        ):
+            keys.first.append(s)
+            keys.start.append(tokens[s].start[0])
+            keys.end.append(tokens[e].end[0])
+            keys.exact.append(exact)
+            keys.renamed.append(renamed)
+        if e + 1 == count:
+            return keys
+        # Slide by one token. When the outgoing token is a local name, its next
+        # use inside the window becomes a first use: its value drops to 0.
+        exact = ((exact - text[s] * power[-1]) * _BASE + text[e + 1]) % _MOD
+        renamed = (renamed - renamed_value(s, s) * power[-1]) % _MOD
+        k = nxt[s]
+        if k != -1 and k <= e:
+            renamed = (renamed - (k - s) * power[e - k]) % _MOD
+        renamed = (renamed * _BASE + renamed_value(e + 1, s + 1)) % _MOD
+        s += 1
+
+
+def occurrence_table(windows: list[Window], attr: str) -> dict[int, list[Window]]:
+    """key -> occurrences, one per run: same-key windows in one file that
+    overlap one another (a block, or a repetitive stretch such as an unrolled
+    loop) count once."""
+    grouped: dict[tuple[int, str], list[Window]] = {}
     for w in windows:
-        grouped.setdefault((getattr(w, attr), w.path, w.block), []).append(w)
-    table: dict[str, list[Window]] = {}
-    for (key, _path, _block), ws in grouped.items():
+        grouped.setdefault((getattr(w, attr), w.path), []).append(w)
+    table: dict[int, list[Window]] = {}
+    for (key, _path), ws in grouped.items():
         last = -1
         for w in sorted(ws, key=lambda w: w.first):
             if w.first > last:
                 table.setdefault(key, []).append(w)
-                last = w.first + window - 1
+            last = w.first + MIN_TOKENS - 1
     for occurrences in table.values():
         occurrences.sort(key=lambda w: (w.path, w.start))
     return table
@@ -545,29 +646,61 @@ def occurrence_table(
 
 @dataclass
 class Side:
-    windows: list[Window]
-    renamed: dict[str, list[Window]]
-    exact: dict[str, list[Window]]
+    renamed: dict[int, list[Window]]
+    exact: dict[int, list[Window]]
     by_path: dict[str, list[Window]]
 
 
 def fingerprint(
-    sources: dict[str, bytes], side: str, skipped: list[dict], window: int = WINDOW
-) -> Side:
-    windows: list[Window] = []
+    sources: dict[str, bytes],
+    side: str,
+    skipped: list[dict],
+    cache: dict[tuple[str, bytes], FileKeys | str],
+) -> dict[str, FileKeys]:
+    """Token windows per file; files identical on both sides are keyed once."""
+    keys: dict[str, FileKeys] = {}
     for path, source in sources.items():
-        try:
-            windows.extend(file_windows(path, source, window))
-        except (SyntaxError, ValueError) as exc:
-            skipped.append(
-                {"side": side, "path": path, "error": f"{type(exc).__name__}: {exc}"}
-            )
-    renamed = occurrence_table(windows, "renamed", window)
-    by_path: dict[str, list[Window]] = {}
-    for occurrences in renamed.values():
-        for w in occurrences:
-            by_path.setdefault(w.path, []).append(w)
-    return Side(windows, renamed, occurrence_table(windows, "exact", window), by_path)
+        entry = cache.get((path, source))
+        if entry is None:
+            try:
+                entry = file_windows(path, source)
+            except (SyntaxError, ValueError, tokenize.TokenError) as exc:
+                entry = f"{type(exc).__name__}: {exc}"
+            cache[(path, source)] = entry
+        if isinstance(entry, str):
+            skipped.append({"side": side, "path": path, "error": entry})
+        else:
+            keys[path] = entry
+    return keys
+
+
+def build_sides(
+    base: dict[str, FileKeys], head: dict[str, FileKeys]
+) -> tuple[Side, Side]:
+    """Window objects only for keys that repeat on either side: a key seen once
+    on both sides can never be a copy. Its count on the other side is kept."""
+
+    def repeated(files: dict[str, FileKeys]) -> set[int]:
+        ordered = sorted(k for f in files.values() for k in f.renamed)
+        return {a for a, b in zip(ordered, ordered[1:]) if a == b}
+
+    relevant = repeated(base) | repeated(head)
+
+    def side(files: dict[str, FileKeys]) -> Side:
+        windows = [
+            Window(path, *row)
+            for path, f in files.items()
+            for row in zip(f.first, f.start, f.end, f.exact, f.renamed)
+            if row[4] in relevant
+        ]
+        renamed = occurrence_table(windows, "renamed")
+        by_path: dict[str, list[Window]] = {}
+        for occurrences in renamed.values():
+            for w in occurrences:
+                by_path.setdefault(w.path, []).append(w)
+        return Side(renamed, occurrence_table(windows, "exact"), by_path)
+
+    return side(base), side(head)
 
 
 # ------------------------------------------------------------------------ groups
@@ -949,9 +1082,7 @@ def _merge_existing(items: list[ExistingCopies]) -> list[ExistingCopies]:
     return merged
 
 
-def analyze(
-    root: Path, base_rev: str | None, head_rev: str | None, window: int = WINDOW
-) -> Report:
+def analyze(root: Path, base_rev: str | None, head_rev: str | None) -> Report:
     head = resolve(root, head_rev) if head_rev else None
     if base_rev is None:
         base_rev = (
@@ -964,8 +1095,11 @@ def analyze(
         head_sources, untracked = worktree_sources(root)
     else:
         head_sources, untracked = commit_sources(root, head), set()
-    base_side = fingerprint(base_sources, "base", skipped, window)
-    head_side = fingerprint(head_sources, "head", skipped, window)
+    cache: dict[tuple[str, bytes], FileKeys | str] = {}
+    base_side, head_side = build_sides(
+        fingerprint(base_sources, "base", skipped, cache),
+        fingerprint(head_sources, "head", skipped, cache),
+    )
     diffs = collect_diffs(root, base, head, base_sources, set(head_sources), untracked)
     groups = load_groups(root, head)
     findings, from_head = find_copies(base_side, head_side, diffs, groups)

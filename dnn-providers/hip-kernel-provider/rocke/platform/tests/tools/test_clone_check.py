@@ -24,13 +24,15 @@ _GIT_ENV = dict(
     GIT_COMMITTER_EMAIL="t@example.com",
 )
 
-# One copied region: five non-trivial emitter statements.
+# One copied region: five non-trivial emitter statements, 66 tokens. {load}
+# and {k} sit mid-block: a change there leaves fewer than 50 matching tokens on
+# either side, even counting the shared end of the signature.
 BLOCK = """\
     v1 = b.add(base, b.mul(row, stride))
-    v2 = b.select(ok, v1, zero)
-    v3 = b.{load}(ptr, v2)
-    v4 = b.fmul(v3, b.const_f32({k}))
-    b.store(out, v2, v4)
+    v2 = b.{load}(v1, b.const_f32({k}), ptr)
+    v3 = b.select(ok, v2, zero)
+    v4 = b.fmul(v3, v1)
+    b.store(out, v3, v4)
 """
 
 
@@ -168,11 +170,61 @@ def test_different_method_or_constant_is_not_a_copy(repo, variant):
 def test_rename_map_spans_the_whole_window(repo):
     repo.write("library/kernels/a.py", func("f1"))
     base = repo.commit()
-    # Same statements, but the last one stores v1 instead of v2: a different data flow.
+    # Same statements, but the second one reads v2 instead of v1: a different data flow.
     repo.write(
         "library/kernels/b.py",
-        func("g", BLOCK.replace("b.store(out, v2, v4)", "b.store(out, v1, v4)")),
+        func("g", BLOCK.replace("{load}(v1,", "{load}(v2,")),
     )
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+
+
+# Two statements, well over the 50-token minimum.
+LONG = """\
+    acc = b.mfma(b.load(a_ptr, b.add(base, b.mul(row, stride))), b.load(q_ptr, b.add(base, b.mul(stride, row))), acc)
+    b.store(out, b.add(base, b.mul(row, stride)), b.select(ok, acc, zero))
+"""
+
+
+def test_copy_of_two_long_statements_is_a_copy(repo):
+    repo.write("library/kernels/a.py", func("f1", LONG))
+    base = repo.commit()
+    repo.write("library/kernels/b.py", func("g", LONG))
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert kinds(report) == ["NEW COPY"]
+
+
+ARGS = (
+    "    {callee}(kernel, grid=(n_blocks, 1, 1), block=(256, 1, 1), shared=lds_bytes,"
+    " args=[a_ptr, b_ptr, c_ptr, n_elems, stride_a, stride_b, stride_c, alpha, beta, gamma])\n"
+)
+
+
+def test_argument_list_copied_into_a_different_call_is_a_copy(repo):
+    repo.write("library/kernels/a.py", func("f1", ARGS.format(callee="launch")))
+    base = repo.commit()
+    repo.write("library/kernels/b.py", func("g", ARGS.format(callee="run_kernel")))
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert kinds(report) == ["NEW COPY"]
+
+
+# Five statements, but under 50 tokens even with the shared end of the signature.
+TINY = """\
+    x1 = b.f(base)
+    x2 = b.g(x1)
+    x3 = b.h(x2)
+    x4 = b.k(x3)
+    b.st(x4)
+"""
+
+
+def test_copy_below_the_token_minimum_is_not_a_copy(repo):
+    repo.write("library/kernels/a.py", "def f1(b, base):\n" + TINY)
+    base = repo.commit()
+    repo.write("library/kernels/b.py", "def g(b, base, extra):\n" + TINY)
     head = repo.commit()
     _, report = repo.check("--base", base, "--head", head)
     assert report["findings"] == []
