@@ -68,6 +68,9 @@ SIBLING_COPY = "SIBLING COPY"
 EXISTING_EDITED = "EXISTING COPIES EDITED"
 SIBLING_NOTE = "SIBLING NOTE"
 MAX_EXISTING_SHOWN = 10  # text report; JSON always lists every entry
+COPY_GROUP = "COPY GROUP"
+APPROVED_FORK = "APPROVED FORK"
+MAX_BACKLOG_SHOWN = 50  # text backlog; JSON always lists every group
 
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -920,6 +923,15 @@ class Report:
     skipped: list[dict]
 
 
+@dataclass
+class Backlog:
+    """Every copy group in one revision (``--backlog``)."""
+
+    head: str
+    groups: list[Finding]  # kind COPY_GROUP or APPROVED_FORK; location cls "copy"
+    skipped: list[dict]
+
+
 def _base_span(w: Window, fd: FileDiff) -> tuple[int, int] | None:
     lines = [
         fd.to_base(n) for n in range(w.start, w.end + 1) if fd.head_kind(n) != "added"
@@ -986,17 +998,20 @@ def classify(w: Window, peers: list[Window], diffs: Diffs, base: Side) -> str:
     return "replaced"
 
 
-def _merge_findings(findings: list[Finding]) -> list[Finding]:
+def _merge_findings(
+    findings: list[Finding], anchor: tuple[str, ...] = ("new", "replaced")
+) -> list[Finding]:
     """Join findings from overlapping windows of one copied region.
 
-    Two findings merge only when their added ranges overlap AND every location
-    of the newer one overlaps a location of the merged one AND all locations
-    advance by the same number of tokens: overlapping windows copied from
-    different sources, or from one source in a different order, stay separate.
+    Two findings merge only when their anchor ranges (added code, or every
+    copy for the backlog) overlap AND every location of the newer one overlaps
+    a location of the merged one AND all locations advance by the same number
+    of tokens: overlapping windows copied from different sources, or from one
+    source in a different order, stay separate.
     """
 
     def contributing(f: Finding) -> list[Location]:
-        return [loc for loc in f.locations if loc.cls in ("new", "replaced")]
+        return [loc for loc in f.locations if loc.cls in anchor]
 
     def touches(x: Location, locations: list[Location]) -> bool:
         return any(
@@ -1022,7 +1037,7 @@ def _merge_findings(findings: list[Finding]) -> list[Finding]:
                 return False
         return True
 
-    rank = {"new": 3, "replaced": 2, "maintained": 1, "unchanged": 0}
+    rank = {"new": 3, "replaced": 2, "maintained": 1, "unchanged": 0, "copy": 0}
     order = sorted(
         findings,
         key=lambda f: (
@@ -1033,19 +1048,33 @@ def _merge_findings(findings: list[Finding]) -> list[Finding]:
         ),
     )
     merged: list[Finding] = []
+    # Merged findings by file. A finding can only join one that has a location
+    # in the file of its own leading location, ending at or after its start;
+    # leads arrive in (path, start) order, so earlier ones can be dropped.
+    active: dict[str, list[Finding]] = {}
     for f in order:
+        lead = contributing(f)[0]
+        pool = active.setdefault(lead.path, [])
+        pool[:] = [
+            m
+            for m in pool
+            if max(l.end for l in m.locations if l.path == lead.path) >= lead.start
+        ]
         target = next(
             (
                 m
-                for m in merged
+                for m in pool
                 if m.kind == f.kind and m.group == f.group and overlaps(m, f)
             ),
             None,
         )
         if target is None:
-            merged.append(
-                Finding(f.kind, f.match, f.group, f.before, f.after, list(f.locations))
+            new = Finding(
+                f.kind, f.match, f.group, f.before, f.after, list(f.locations)
             )
+            merged.append(new)
+            for path in {loc.path for loc in new.locations}:
+                active.setdefault(path, []).append(new)
             continue
         if f.match == "renamed":
             target.match = "renamed"
@@ -1268,6 +1297,51 @@ def analyze(root: Path, base_rev: str | None, head_rev: str | None) -> Report:
     )
 
 
+def duplicated_lines(group: Finding) -> int:
+    """Lines a cleanup could remove: every copy but the largest."""
+    spans = [loc.end - loc.start + 1 for loc in group.locations]
+    return sum(spans) - max(spans)
+
+
+def find_backlog(side: Side, groups: list[Group]) -> list[Finding]:
+    """Every copy group in one side, most duplicated lines first."""
+    found = []
+    for occurrences in side.renamed.values():
+        if len(occurrences) < 2:
+            continue
+        fork = _fork_group([w.path for w in occurrences], groups)
+        found.append(
+            Finding(
+                APPROVED_FORK if fork else COPY_GROUP,
+                "exact" if len({w.exact for w in occurrences}) == 1 else "renamed",
+                fork.name if fork else None,
+                len(occurrences),
+                len(occurrences),
+                [
+                    Location(w.path, w.start, w.end, "copy", w.first)
+                    for w in occurrences
+                ],
+            )
+        )
+    merged = _merge_findings(found, anchor=("copy",))
+    return sorted(
+        merged,
+        key=lambda g: (-duplicated_lines(g), g.locations[0].path, g.locations[0].start),
+    )
+
+
+def backlog(root: Path, head_rev: str | None) -> Backlog:
+    head = resolve(root, head_rev) if head_rev else None
+    skipped: list[dict] = []
+    sources = commit_sources(root, head) if head else worktree_sources(root)[0]
+    _, side = build_sides({}, fingerprint(sources, "head", skipped, {}))
+    return Backlog(
+        head or WORKTREE,
+        find_backlog(side, load_groups(root, head)),
+        sorted(skipped, key=lambda s: s["path"]),
+    )
+
+
 # ------------------------------------------------------------------------ output
 
 
@@ -1392,6 +1466,63 @@ def render_json(report: Report) -> str:
     return json.dumps(data, indent=2, sort_keys=True)
 
 
+def render_backlog_text(report: Backlog) -> str:
+    head = "<working tree>" if report.head == WORKTREE else report.head[:11]
+    lines = [
+        f"rocKE clone backlog  at {head}",
+        "Python only; C++ duplication not measured. Most duplicated lines first.",
+        "",
+    ]
+    copies = [g for g in report.groups if g.kind == COPY_GROUP]
+    for g in copies[:MAX_BACKLOG_SHOWN]:
+        lines.append(
+            f"{COPY_GROUP} ({g.match})  {len(g.locations)} copies, "
+            f"{duplicated_lines(g)} duplicated lines"
+        )
+        lines.append("  " + _spans(g.locations))
+        lines.append("")
+    if len(copies) > MAX_BACKLOG_SHOWN:
+        lines.append(
+            f"+{len(copies) - MAX_BACKLOG_SHOWN} more copy groups; "
+            "run with --format json for the full list"
+        )
+        lines.append("")
+    for s in report.skipped:
+        lines.append(f"SKIPPED  {s['path']}: {s['error']}")
+    forks = len(report.groups) - len(copies)
+    lines.append(
+        f"Summary: copy groups {len(copies)} · "
+        f"duplicated lines {sum(duplicated_lines(g) for g in copies)} · "
+        f"approved-fork groups {forks} (JSON only) · "
+        f"skipped files {len(report.skipped)}"
+    )
+    return "\n".join(lines)
+
+
+def render_backlog_json(report: Backlog) -> str:
+    data = {
+        "mode": "backlog",
+        "head": report.head,
+        "scope": "python",
+        "groups": [
+            {
+                "kind": g.kind,
+                "match": g.match,
+                "group": g.group,
+                "copies": len(g.locations),
+                "duplicated_lines": duplicated_lines(g),
+                "locations": [
+                    {"path": l.path, "start": l.start, "end": l.end}
+                    for l in g.locations
+                ],
+            }
+            for g in report.groups
+        ],
+        "skipped": report.skipped,
+    }
+    return json.dumps(data, indent=2, sort_keys=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="report Python code copies a change adds (advisory)"
@@ -1409,12 +1540,29 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--root", default=str(ROCKE), help="rocKE root (default: this tool's parent)"
     )
+    ap.add_argument(
+        "--backlog",
+        action="store_true",
+        help="list every copy group in one revision (--head, default: the working "
+        "tree), most duplicated lines first; no comparison",
+    )
     args = ap.parse_args(argv)
+    if args.backlog and (args.base or args.fail_on_new):
+        ap.error(
+            "--backlog lists one revision; it takes --head, not --base or --fail-on-new"
+        )
     try:
-        report = analyze(Path(args.root), args.base, args.head)
+        if args.backlog:
+            listing = backlog(Path(args.root), args.head)
+        else:
+            report = analyze(Path(args.root), args.base, args.head)
     except ToolError as exc:
         print(f"clone_check: error: {exc}", file=sys.stderr)
         return 2
+    if args.backlog:
+        render = render_backlog_json if args.format == "json" else render_backlog_text
+        print(render(listing))
+        return 0
     print(render_json(report) if args.format == "json" else render_text(report))
     blocking = any(f.kind in (NEW_COPY, LIKELY_COPY) for f in report.findings)
     return 1 if args.fail_on_new and blocking else 0

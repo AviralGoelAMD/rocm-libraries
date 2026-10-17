@@ -951,6 +951,81 @@ def test_group_without_reason_is_a_tool_error(repo):
     assert rc == 2
 
 
+def backlog_groups(report: dict) -> list[tuple]:
+    return [
+        (g["kind"], g["copies"], sorted(loc["path"] for loc in g["locations"]))
+        for g in report["groups"]
+    ]
+
+
+def test_backlog_lists_copies_that_already_exist_in_the_working_tree(repo):
+    repo.write("library/kernels/a.py", func("f1"))
+    repo.write("library/kernels/b.py", func("f2"))
+    repo.commit()
+    rc, report = repo.check("--backlog")
+    assert rc == 0
+    assert report["head"] == "WORKTREE"
+    assert backlog_groups(report) == [
+        ("COPY GROUP", 2, ["library/kernels/a.py", "library/kernels/b.py"])
+    ]
+    assert report["groups"][0]["duplicated_lines"] > 0
+
+
+def test_backlog_of_a_commit_ignores_the_working_tree(repo):
+    repo.write("library/kernels/a.py", func("f1"))
+    repo.write("library/kernels/b.py", func("f2"))
+    head = repo.commit()
+    (repo.path / "library/kernels/b.py").unlink()
+    _, at_commit = repo.check("--backlog", "--head", head)
+    _, in_tree = repo.check("--backlog")
+    assert len(at_commit["groups"]) == 1
+    assert in_tree["groups"] == []
+
+
+def test_backlog_puts_the_most_duplicated_lines_first(repo):
+    repo.write("library/kernels/a.py", func("f1"))
+    repo.write("library/kernels/b.py", func("f2"))
+    for name in "cde":
+        repo.write(f"library/kernels/{name}.py", func("g", k="16.0"))
+    repo.commit()
+    _, report = repo.check("--backlog")
+    assert [g["copies"] for g in report["groups"]] == [3, 2]
+    sizes = [g["duplicated_lines"] for g in report["groups"]]
+    assert sizes == sorted(sizes, reverse=True)
+
+
+def test_backlog_labels_approved_forks_separately(repo):
+    repo.write("tools/clone_groups.toml", GROUPS)
+    repo.write("library/kernels/gfx942/k.py", func("f"))
+    repo.write("library/kernels/gfx950/k.py", func("f"))
+    repo.commit()
+    _, report = repo.check("--backlog")
+    assert [(g["kind"], g["group"]) for g in report["groups"]] == [
+        ("APPROVED FORK", "per-arch")
+    ]
+
+
+@pytest.mark.parametrize("extra", [["--base", "HEAD"], ["--fail-on-new"]])
+def test_backlog_rejects_options_that_compare_two_revisions(repo, extra):
+    repo.commit()
+    rc, _ = repo.check("--backlog", *extra)
+    assert rc == 2
+
+
+def test_backlog_text_lists_fifty_groups_then_counts_the_rest(repo):
+    for i in range(52):
+        repo.write(f"library/kernels/a{i}.py", func("f", k=f"{i}.0"))
+        repo.write(f"library/kernels/b{i}.py", func("f", k=f"{i}.0"))
+    repo.commit()
+    text = subprocess.run(
+        [sys.executable, str(TOOL), "--root", str(repo.path), "--backlog"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert text.count("COPY GROUP ") == 50
+    assert "+2 more copy groups" in text
+
+
 def test_same_inputs_give_identical_output(repo):
     repo.write("library/kernels/a.py", func("f1"))
     base = repo.commit()
