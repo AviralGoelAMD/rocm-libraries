@@ -1026,26 +1026,33 @@ def test_backlog_text_lists_fifty_groups_then_counts_the_rest(repo):
     assert "+2 more copy groups" in text
 
 
-ONE_LINE_TWICE = "    v1 = b.add(base, b.mul(row, b.const_i32(7)), b.add(b.const_i32(1), b.const_i32(2)), b.add(b.const_i32(3), b.const_i32(4)), b.add(b.const_i32(5), b.const_i32(6))); b.store(out, v1, v1)\n"
+# One statement of well over 50 tokens, written twice on ONE source line of ONE file.
+STMT = (
+    "v1 = b.add(base, b.mul(row, b.const_i32(7)), b.add(b.const_i32(1), b.const_i32(2)),"
+    " b.add(b.const_i32(3), b.const_i32(4)), b.add(b.const_i32(5), b.const_i32(6)))"
+)
 
 
-def test_two_adjacent_copies_on_one_line_count_twice(repo):
-    repo.write("library/kernels/a.py", "def f(b, base, row, out):\n" + ONE_LINE_TWICE)
+def test_two_copies_on_one_line_of_one_file_stay_two_copies(repo):
+    # Line ranges alone would join them into a single location (copies: 1).
+    repo.write("library/kernels/a.py", f"def f(b, base, row):\n    {STMT}; {STMT}\n")
+    repo.commit()
+    _, report = repo.check("--backlog")
+    assert report["groups"], "the backlog must list the repeated statement"
+    assert {g["copies"] for g in report["groups"]} == {2}
+    for g in report["groups"]:
+        assert {loc["start"] for loc in g["locations"]} == {2}
+
+
+def test_new_copy_on_the_same_line_as_an_old_one_is_reported(repo):
+    repo.write("library/kernels/a.py", f"def f(b, base, row):\n    {STMT}\n")
     base = repo.commit()
-    repo.write("library/kernels/b.py", "def g(b, base, row, out):\n" + ONE_LINE_TWICE)
-    repo.commit()
-    _, report = repo.check("--backlog")
-    (group,) = report["groups"]
-    assert group["copies"] == 2
-
-
-def test_backlog_regions_come_from_token_runs_not_line_ranges(repo):
-    # One copy of the shared block: the backlog must not split one copied
-    # region into a small overlapping-window group plus a separate 1-copy group.
-    repo.write("library/kernels/a.py", func("f1"))
-    repo.commit()
-    _, report = repo.check("--backlog")
-    assert all(g["copies"] >= 2 for g in report["groups"])
+    repo.write("library/kernels/a.py", f"def f(b, base, row):\n    {STMT}; {STMT}\n")
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"], "the pasted second statement is a new copy"
+    for f in report["findings"]:
+        assert len(f["locations"]) >= 2
 
 
 def test_a_region_shared_by_fewer_files_is_a_separate_group(repo):
