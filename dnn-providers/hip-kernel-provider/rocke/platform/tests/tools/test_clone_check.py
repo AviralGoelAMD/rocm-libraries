@@ -1026,6 +1026,28 @@ def test_backlog_text_lists_fifty_groups_then_counts_the_rest(repo):
     assert "+2 more copy groups" in text
 
 
+ONE_LINE_TWICE = "    v1 = b.add(base, b.mul(row, b.const_i32(7)), b.add(b.const_i32(1), b.const_i32(2)), b.add(b.const_i32(3), b.const_i32(4)), b.add(b.const_i32(5), b.const_i32(6))); b.store(out, v1, v1)\n"
+
+
+def test_two_adjacent_copies_on_one_line_count_twice(repo):
+    repo.write("library/kernels/a.py", "def f(b, base, row, out):\n" + ONE_LINE_TWICE)
+    base = repo.commit()
+    repo.write("library/kernels/b.py", "def g(b, base, row, out):\n" + ONE_LINE_TWICE)
+    repo.commit()
+    _, report = repo.check("--backlog")
+    (group,) = report["groups"]
+    assert group["copies"] == 2
+
+
+def test_backlog_regions_come_from_token_runs_not_line_ranges(repo):
+    # One copy of the shared block: the backlog must not split one copied
+    # region into a small overlapping-window group plus a separate 1-copy group.
+    repo.write("library/kernels/a.py", func("f1"))
+    repo.commit()
+    _, report = repo.check("--backlog")
+    assert all(g["copies"] >= 2 for g in report["groups"])
+
+
 def test_same_inputs_give_identical_output(repo):
     repo.write("library/kernels/a.py", func("f1"))
     base = repo.commit()

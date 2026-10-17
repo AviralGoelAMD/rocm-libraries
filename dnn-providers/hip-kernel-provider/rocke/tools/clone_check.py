@@ -894,6 +894,9 @@ class Location:
     # Token index of the (latest merged) window start; used only to merge
     # windows of one copied region, never reported.
     first: int = -1
+    # Window length in tokens, so same-file locations can be joined by token
+    # interval instead of by line range (they can sit on one line).
+    tokens: int = MIN_TOKENS
 
 
 @dataclass
@@ -1087,14 +1090,24 @@ def _merge_findings(
         joined: list[Location] = []
         for loc in locations:
             prev = joined[-1] if joined else None
-            if prev and prev.path == loc.path and loc.start <= prev.end:
+            # Same file: join only when the token intervals meet or overlap.
+            # Line ranges alone would merge two copies that sit on one line,
+            # or that merely begin inside an earlier copy's last line.
+            if (
+                prev
+                and prev.path == loc.path
+                and (loc.start <= prev.end and (loc.first < prev.first + prev.tokens))
+            ):
                 prev.end = max(prev.end, loc.end)
-                prev.first = max(prev.first, loc.first)
+                prev.first = min(prev.first, loc.first)
+                prev.tokens = max(prev.tokens, loc.first + loc.tokens - prev.first)
                 if rank[loc.cls] > rank[prev.cls]:
                     prev.cls = loc.cls
             else:
                 joined.append(
-                    Location(loc.path, loc.start, loc.end, loc.cls, loc.first)
+                    Location(
+                        loc.path, loc.start, loc.end, loc.cls, loc.first, loc.tokens
+                    )
                 )
         target.locations = joined
     merged.sort(key=lambda f: (contributing(f)[0].path, contributing(f)[0].start))
