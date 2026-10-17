@@ -17,6 +17,7 @@
 #   python tools/clone_check.py --head <commit>   # compare two commits (PR mode)
 #   python tools/clone_check.py --format json     # machine-readable
 #   python tools/clone_check.py --fail-on-new     # exit 1 when a copy is found (off by default)
+#   python tools/clone_check.py --backlog         # every existing copy group in the working tree (or --head), largest first
 #
 # Exit codes: 0 ran (advisory), 1 copies found with --fail-on-new, 2 tool error.
 

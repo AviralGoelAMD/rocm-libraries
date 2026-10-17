@@ -95,7 +95,8 @@ when no device). Scope while iterating with:
   Run the tool directly while editing: `python dnn-providers/hip-kernel-provider/rocke/tools/clone_check.py`
   compares your working tree with its merge-base on `origin/develop`. Python only;
   C++ duplication is not measured. Approved forks live in
-  [`tools/clone_groups.toml`](tools/clone_groups.toml).
+  [`tools/clone_groups.toml`](tools/clone_groups.toml). Add `--backlog` to list
+  every copy group that already exists (largest first) as a cleanup worklist.
 
 This replaces hand-maintaining a list of tests to run.
 
