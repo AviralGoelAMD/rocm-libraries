@@ -90,6 +90,13 @@ when no device). Scope while iterating with:
 - `--op <operator>` — scope to one operator/family across parity, pytest,
   numeric, and the gate, e.g. `--steps numeric --op fmha_bwd`.
 - `--flavor <llvm>` — pin one LLVM flavor; `--list` — dry-run.
+- `--steps clones` — advisory report of Python code copies your change adds
+  ([`tools/clone_check.py`](tools/clone_check.py); never part of the default run).
+  Run the tool directly while editing: `python dnn-providers/hip-kernel-provider/rocke/tools/clone_check.py`
+  compares your working tree with its merge-base on `origin/develop`. Python only;
+  C++ duplication is not measured. Approved forks live in
+  [`tools/clone_groups.toml`](tools/clone_groups.toml). Add `--backlog` to list
+  every copy group that already exists (largest first) as a cleanup worklist.
 
 This replaces hand-maintaining a list of tests to run.
 

@@ -1,0 +1,20 @@
+# Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# Approved forks for tools/clone_check.py: files that are deliberately kept as
+# copies of each other (for example per-architecture schedules).
+#
+# - A copy between files of one group is reported as SIBLING COPY, not NEW COPY.
+# - A second copy inside one file of a group is still reported as NEW COPY.
+# - Editing one file of a group while a matching block in a sibling stays
+#   unchanged adds a SIBLING NOTE naming the sibling.
+# - A copy into a file outside the group is reported as NEW COPY.
+#
+# Every group needs a name, at least two files (paths relative to the rocKE
+# root) and a reason; a missing field makes clone_check.py exit with code 2.
+#
+# [[group]]
+# name   = "attention_tiled_2d per-arch"
+# files  = ["library/kernels/gfx942/attention_tiled_2d.py",
+#           "library/kernels/gfx950/attention_tiled_2d.py"]
+# reason = "arch-specific MFMA/LDS schedules"
