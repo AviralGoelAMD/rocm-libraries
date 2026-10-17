@@ -400,36 +400,48 @@ def _is_forwarding_call(node: ast.AST | None) -> bool:
     )
 
 
-def _is_message(node: ast.AST | None) -> bool:
-    """A literal result or message: constants, f-strings, plain names,
-    ``str(e)``/``repr(e)``, or a tuple of those."""
-    if node is None or isinstance(
-        node, (ast.Constant, ast.JoinedStr, ast.Name, ast.Attribute)
-    ):
-        return True
-    if isinstance(node, ast.Tuple):
-        return all(_is_message(e) for e in node.elts)
-    return (
+_DIAGNOSTIC_LISTS = ("error", "problem", "reason", "issue", "warning", "message", "msg")
+
+
+def _is_text(node: ast.AST) -> bool:
+    """A message string: a string constant, an f-string or ``str(...)``/``repr(...)``."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str)
+    return isinstance(node, ast.JoinedStr) or (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id in ("str", "repr")
-        and all(_is_message(a) for a in node.args)
+    )
+
+
+def _is_message(node: ast.AST | None) -> bool:
+    """A rejection result: nothing, a constant, a message, or a tuple of those
+    such as ``(False, f"...")``. A variable is a value, not a message."""
+    if node is None or isinstance(node, ast.Constant) or _is_text(node):
+        return True
+    return isinstance(node, ast.Tuple) and all(
+        isinstance(e, ast.Constant) or _is_text(e) for e in node.elts
     )
 
 
 def _is_rejection(stmt: ast.stmt) -> bool:
-    """``raise ...``, ``return <message>`` or ``errors.append(<message>)``."""
+    """``raise ...``, ``return <message>`` or ``errors.append(<message>)``
+    on a diagnostics list (errors, problems, reasons, ...)."""
     if isinstance(stmt, ast.Raise):
         return True
     if isinstance(stmt, ast.Return):
         return _is_message(stmt.value)
-    return (
+    if not (
         isinstance(stmt, ast.Expr)
         and isinstance(stmt.value, ast.Call)
         and isinstance(stmt.value.func, ast.Attribute)
         and stmt.value.func.attr == "append"
-        and all(_is_message(a) for a in stmt.value.args)
-    )
+        and stmt.value.args
+        and all(_is_text(a) for a in stmt.value.args)
+    ):
+        return False
+    target = _dotted(stmt.value.func.value).rsplit(".", 1)[-1].lower()
+    return any(word in target for word in _DIAGNOSTIC_LISTS)
 
 
 def _is_guard(stmt: ast.stmt) -> bool:

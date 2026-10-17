@@ -825,6 +825,27 @@ def test_guard_with_logic_in_its_body_is_still_compared(repo):
     assert kinds(report) == ["NEW COPY"]
 
 
+CONDITIONAL_PARTS = "".join(
+    f"    if {flag}:\n        parts.append({flag})\n"
+    for flag in "prologue smem_block launch_bounds extern_c debug_hooks epilogue".split()
+)
+DISPATCH = "".join(
+    f'    if spec.kind == "{kind}":\n        return {kind}_kernel\n'
+    for kind in "gemm conv norm moe attn gdn".split()
+)
+
+
+@pytest.mark.parametrize("body", [CONDITIONAL_PARTS, DISPATCH])
+def test_conditional_appends_and_returns_of_values_are_compared(repo, body):
+    # Only messages make a guard: appending or returning a value is logic.
+    repo.write("library/kernels/a.py", func("f1", body))
+    base = repo.commit()
+    repo.write("library/kernels/b.py", func("f2", body))
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert kinds(report) == ["NEW COPY"]
+
+
 FORWARDED = "".join(
     f"        {name}=self.{name},\n"
     for name in (
