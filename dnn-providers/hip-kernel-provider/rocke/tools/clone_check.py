@@ -916,6 +916,9 @@ class ExistingCopies:
     kind: str  # EXISTING_EDITED, or SIBLING_NOTE for an approved fork group
     group: str | None
     locations: list[Location]  # cls: edited | unchanged
+    # Which file revision ``Location.first`` indexes: "base" (copies that
+    # existed in the base) or "head" (copies only the head side can see).
+    origin: str = "base"
 
 
 @dataclass
@@ -1079,10 +1082,16 @@ def _merge_findings(
 def _pair_copies(a: Finding, b: Finding) -> list[tuple[Location, Location]] | None:
     """Pair each location of ``b`` with the one copy of ``a`` it continues, or
     None when ``b`` is not a window of the same copied region as ``a``."""
-    if len(a.locations) != len(b.locations):
+    return _pair_locations(a.locations, b.locations)
+
+
+def _pair_locations(
+    a: list[Location], b: list[Location]
+) -> list[tuple[Location, Location]] | None:
+    if len(a) != len(b):
         return None
     order = lambda l: (l.path, l.first)  # noqa: E731
-    pairs = list(zip(sorted(a.locations, key=order), sorted(b.locations, key=order)))
+    pairs = list(zip(sorted(a, key=order), sorted(b, key=order)))
     shift = None
     for old, loc in pairs:
         if old.path != loc.path:
@@ -1129,12 +1138,14 @@ def find_copies(
                 l.start,
                 l.end,
                 "edited" if l.cls == "maintained" else "unchanged",
+                l.first,
+                l.tokens,
             )
             for l in locations
             if l.cls in ("maintained", "unchanged")
         ]
         if len(existing) >= 2 and any(l.cls == "edited" for l in existing):
-            edited.append(ExistingCopies(EXISTING_EDITED, None, existing))
+            edited.append(ExistingCopies(EXISTING_EDITED, None, existing, "head"))
         added = [
             (w, loc)
             for w, loc in zip(occurrences, locations)
@@ -1202,6 +1213,7 @@ def find_existing_copies(
                     min(mapped),
                     max(mapped),
                     "edited" if edited else "unchanged",
+                    w.first,
                 )
             )
         if len(locations) >= 2 and any(l.cls == "edited" for l in locations):
@@ -1218,51 +1230,91 @@ def find_existing_copies(
             if l.path in head_text
         }
         if any(l.cls == "unchanged" for l in item.locations) or len(codes) > 1:
-            items.append(ExistingCopies(SIBLING_NOTE, group.name, item.locations))
+            items.append(
+                ExistingCopies(SIBLING_NOTE, group.name, item.locations, item.origin)
+            )
     return _merge_existing(items)
 
 
 def _merge_existing(items: list[ExistingCopies]) -> list[ExistingCopies]:
-    """Join entries from overlapping windows of one edited copy group."""
+    """Join entries from windows of one edited copy group.
 
-    def touches(x: Location, locations: list[Location]) -> bool:
-        return any(
-            x.path == y.path and x.start <= y.end + 1 and y.start <= x.end + 1
-            for y in locations
-        )
+    Entries merge only when they describe the same set of copies (same origin,
+    equally many locations, paired by token position with one shift), so an
+    entry for a region shared by five files is never grown by one that only
+    four of them share."""
 
     def edited(e: ExistingCopies) -> list[Location]:
         return [l for l in e.locations if l.cls == "edited"]
 
     merged: list[ExistingCopies] = []
-    for item in sorted(items, key=lambda e: (edited(e)[0].path, edited(e)[0].start)):
-        target = next(
-            (
-                m
-                for m in merged
-                if m.kind == item.kind
-                and m.group == item.group
-                and any(touches(x, edited(m)) for x in edited(item))
-                and all(touches(x, m.locations) for x in item.locations)
-            ),
-            None,
-        )
+    by_path: dict[str, list[ExistingCopies]] = {}
+    order = sorted(
+        items,
+        key=lambda e: (edited(e)[0].path, edited(e)[0].start, edited(e)[0].first),
+    )
+    for item in order:
+        lead = edited(item)[0]
+        pool = by_path.setdefault(lead.path, [])
+        pool[:] = [
+            m
+            for m in pool
+            if max(l.end for l in m.locations if l.path == lead.path) + 1 >= lead.start
+        ]
+        target, pairs, same_origin = None, None, False
+        for m in pool:
+            if (m.kind, m.group) != (item.kind, item.group):
+                continue
+            same_origin = m.origin == item.origin
+            pairs = (
+                _pair_locations(m.locations, item.locations)
+                if same_origin
+                else _pair_by_lines(m.locations, item.locations)
+            )
+            if pairs is not None:
+                target = m
+                break
         if target is None:
-            merged.append(ExistingCopies(item.kind, item.group, list(item.locations)))
+            new = ExistingCopies(
+                item.kind,
+                item.group,
+                [
+                    Location(l.path, l.start, l.end, l.cls, l.first, l.tokens)
+                    for l in item.locations
+                ],
+                item.origin,
+            )
+            merged.append(new)
+            for path in {l.path for l in new.locations}:
+                by_path.setdefault(path, []).append(new)
             continue
-        joined: list[Location] = []
-        for loc in sorted(
-            target.locations + item.locations, key=lambda l: (l.path, l.start)
-        ):
-            prev = joined[-1] if joined else None
-            if prev and prev.path == loc.path and loc.start <= prev.end + 1:
-                prev.end = max(prev.end, loc.end)
-                if loc.cls == "edited":
-                    prev.cls = "edited"
-            else:
-                joined.append(Location(loc.path, loc.start, loc.end, loc.cls))
-        target.locations = joined
+        for old, loc in pairs:
+            if same_origin:
+                lo = min(old.first, loc.first)
+                old.tokens = max(old.first + old.tokens, loc.first + loc.tokens) - lo
+                old.first = lo
+            old.start = min(old.start, loc.start)
+            old.end = max(old.end, loc.end)
+            if loc.cls == "edited":
+                old.cls = "edited"
     return merged
+
+
+def _pair_by_lines(
+    a: list[Location], b: list[Location]
+) -> list[tuple[Location, Location]] | None:
+    """One-to-one pairing by file and touching line ranges, for entries whose
+    token positions come from different revisions (base vs head)."""
+    if len(a) != len(b):
+        return None
+    order = lambda l: (l.path, l.start)  # noqa: E731
+    pairs = list(zip(sorted(a, key=order), sorted(b, key=order)))
+    for old, loc in pairs:
+        if old.path != loc.path or not (
+            loc.start <= old.end + 1 and old.start <= loc.end + 1
+        ):
+            return None
+    return pairs
 
 
 def analyze(root: Path, base_rev: str | None, head_rev: str | None) -> Report:

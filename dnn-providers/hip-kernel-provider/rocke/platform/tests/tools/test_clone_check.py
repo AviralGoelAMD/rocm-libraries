@@ -1071,6 +1071,29 @@ def test_a_region_shared_by_fewer_files_is_a_separate_group(repo):
     assert any(g["copies"] == 2 for g in report["groups"])
 
 
+def test_existing_copy_entries_with_different_copy_sets_stay_separate(repo):
+    # R is in five files; the stretch R+Z only in four. Editing R in one of the
+    # four touches both: a five-copy entry and a four-copy entry. The five-copy
+    # entry must stay R-wide in every file, not grow to R+Z in four of them.
+    z = BLOCK.replace("b.add(", "b.sub(")
+    for name in "abcd":
+        repo.write(f"library/kernels/{name}.py", func("f" + name, BLOCK + z))
+    repo.write("library/kernels/e.py", func("fe", BLOCK))
+    base = repo.commit()
+    repo.write(
+        "library/kernels/a.py",
+        func("fa", BLOCK.replace("b.fmul", "b.fadd") + z),
+    )
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    entries = report["existing_copies"]
+    five = [e for e in entries if len(e["locations"]) == 5]
+    four = [e for e in entries if len(e["locations"]) == 4]
+    assert len(five) == 1 and four
+    assert len({l["end"] - l["start"] for l in five[0]["locations"]}) == 1
+    assert {l["path"][-4] for l in four[0]["locations"]} == set("abcd")
+
+
 def test_same_inputs_give_identical_output(repo):
     repo.write("library/kernels/a.py", func("f1"))
     base = repo.commit()
