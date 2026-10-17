@@ -1048,6 +1048,22 @@ def test_backlog_regions_come_from_token_runs_not_line_ranges(repo):
     assert all(g["copies"] >= 2 for g in report["groups"])
 
 
+def test_a_region_shared_by_fewer_files_is_a_separate_group(repo):
+    # X is in a, b and c; the X+Y stretch only in a and b. The three-copy
+    # group must cover X in all three files, not grow to X+Y in a and b only.
+    y = BLOCK.replace("b.add(", "b.sub(")
+    repo.write("library/kernels/a.py", func("fa", BLOCK + y))
+    repo.write("library/kernels/b.py", func("fb", BLOCK + y))
+    repo.write("library/kernels/c.py", func("fc", BLOCK))
+    repo.commit()
+    _, report = repo.check("--backlog")
+    assert all(g["copies"] >= 2 for g in report["groups"])
+    (triple,) = [g for g in report["groups"] if g["copies"] == 3]
+    spans = {loc["end"] - loc["start"] for loc in triple["locations"]}
+    assert len(spans) == 1
+    assert any(g["copies"] == 2 for g in report["groups"])
+
+
 def test_same_inputs_give_identical_output(repo):
     repo.write("library/kernels/a.py", func("f1"))
     base = repo.commit()

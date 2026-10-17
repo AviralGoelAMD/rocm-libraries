@@ -1005,43 +1005,20 @@ def classify(w: Window, peers: list[Window], diffs: Diffs, base: Side) -> str:
 def _merge_findings(
     findings: list[Finding], anchor: tuple[str, ...] = ("new", "replaced")
 ) -> list[Finding]:
-    """Join findings from overlapping windows of one copied region.
+    """Join per-key findings of one copied region.
 
-    Two findings merge only when their anchor ranges (added code, or every
-    copy for the backlog) overlap AND every location of the newer one overlaps
-    a location of the merged one AND all locations advance by the same number
-    of tokens: overlapping windows copied from different sources, or from one
-    source in a different order, stay separate.
+    Two findings merge only when they describe the same set of copies: equally
+    many locations, paired in file order, each pair in one file with
+    overlapping token intervals, and one token shift for every pair. A finding
+    that matches only some of another's copies is a different, smaller shared
+    region and stays separate. Merged locations are token-interval unions, so
+    two copies that sit on one source line stay two copies.
     """
+    rank = {"new": 3, "replaced": 2, "maintained": 1, "unchanged": 0, "copy": 0}
 
     def contributing(f: Finding) -> list[Location]:
         return [loc for loc in f.locations if loc.cls in anchor]
 
-    def touches(x: Location, locations: list[Location]) -> bool:
-        return any(
-            x.path == y.path and x.start <= y.end and y.start <= x.end
-            for y in locations
-        )
-
-    def shifts(x: Location, locations: list[Location]) -> set[int]:
-        return {
-            x.first - y.first
-            for y in locations
-            if x.path == y.path and x.start <= y.end and y.start <= x.end
-        }
-
-    def overlaps(a: Finding, b: Finding) -> bool:
-        if not any(touches(x, contributing(a)) for x in contributing(b)):
-            return False
-        common: set[int] | None = None
-        for x in b.locations:
-            s = shifts(x, a.locations)
-            common = s if common is None else common & s
-            if not common:
-                return False
-        return True
-
-    rank = {"new": 3, "replaced": 2, "maintained": 1, "unchanged": 0, "copy": 0}
     order = sorted(
         findings,
         key=lambda f: (
@@ -1064,18 +1041,21 @@ def _merge_findings(
             for m in pool
             if max(l.end for l in m.locations if l.path == lead.path) >= lead.start
         ]
-        target = next(
-            (
-                m
-                for m in pool
-                if m.kind == f.kind and m.group == f.group and overlaps(m, f)
-            ),
-            None,
-        )
+        target, pairs = None, None
+        for m in pool:
+            if m.kind == f.kind and m.group == f.group:
+                pairs = _pair_copies(m, f)
+                if pairs is not None:
+                    target = m
+                    break
         if target is None:
             new = Finding(
                 f.kind, f.match, f.group, f.before, f.after, list(f.locations)
             )
+            new.locations = [
+                Location(l.path, l.start, l.end, l.cls, l.first, l.tokens)
+                for l in f.locations
+            ]
             merged.append(new)
             for path in {loc.path for loc in new.locations}:
                 active.setdefault(path, []).append(new)
@@ -1084,34 +1064,38 @@ def _merge_findings(
             target.match = "renamed"
         if f.after > target.after:
             target.before, target.after = f.before, f.after
-        locations = sorted(
-            target.locations + f.locations, key=lambda loc: (loc.path, loc.start)
-        )
-        joined: list[Location] = []
-        for loc in locations:
-            prev = joined[-1] if joined else None
-            # Same file: join only when the token intervals meet or overlap.
-            # Line ranges alone would merge two copies that sit on one line,
-            # or that merely begin inside an earlier copy's last line.
-            if (
-                prev
-                and prev.path == loc.path
-                and (loc.start <= prev.end and (loc.first < prev.first + prev.tokens))
-            ):
-                prev.end = max(prev.end, loc.end)
-                prev.first = min(prev.first, loc.first)
-                prev.tokens = max(prev.tokens, loc.first + loc.tokens - prev.first)
-                if rank[loc.cls] > rank[prev.cls]:
-                    prev.cls = loc.cls
-            else:
-                joined.append(
-                    Location(
-                        loc.path, loc.start, loc.end, loc.cls, loc.first, loc.tokens
-                    )
-                )
-        target.locations = joined
+        for old, loc in pairs:
+            lo = min(old.first, loc.first)
+            old.tokens = max(old.first + old.tokens, loc.first + loc.tokens) - lo
+            old.first = lo
+            old.start = min(old.start, loc.start)
+            old.end = max(old.end, loc.end)
+            if rank[loc.cls] > rank[old.cls]:
+                old.cls = loc.cls
     merged.sort(key=lambda f: (contributing(f)[0].path, contributing(f)[0].start))
     return merged
+
+
+def _pair_copies(a: Finding, b: Finding) -> list[tuple[Location, Location]] | None:
+    """Pair each location of ``b`` with the one copy of ``a`` it continues, or
+    None when ``b`` is not a window of the same copied region as ``a``."""
+    if len(a.locations) != len(b.locations):
+        return None
+    order = lambda l: (l.path, l.first)  # noqa: E731
+    pairs = list(zip(sorted(a.locations, key=order), sorted(b.locations, key=order)))
+    shift = None
+    for old, loc in pairs:
+        if old.path != loc.path:
+            return None
+        if not (
+            loc.first < old.first + old.tokens and old.first < loc.first + loc.tokens
+        ):
+            return None
+        if shift is None:
+            shift = loc.first - old.first
+        elif shift != loc.first - old.first:
+            return None
+    return pairs
 
 
 def _fork_group(paths: list[str], groups: list[Group]) -> Group | None:
