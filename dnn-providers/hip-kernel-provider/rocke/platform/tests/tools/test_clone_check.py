@@ -502,6 +502,45 @@ SIX = [
 ]
 
 
+PIECE_P = [
+    "p1 = b.add(base, b.mul(row, stride))",
+    "p2 = b.select(ok, p1, b.const_f32(1.0))",
+    "p3 = b.fmul(p2, b.load(ptr, p1))",
+    "b.store(out, p3, p2)",
+]
+PIECE_Q = [
+    "q1 = b.sub(stride, b.mod(row, base))",
+    "q2 = b.cmp_lt(q1, b.const_i32(64))",
+    "q3 = b.land(q2, ok)",
+    "b.barrier(q3, b.load(ptr, q1))",
+]
+
+
+def two_pieces(name: str, first: list[str], second: list[str]) -> str:
+    """Two pieces whose junction shares one line, so their windows overlap in lines."""
+    lines = first[:-1] + [first[-1] + "; " + second[0]] + second[1:]
+    head = f"def {name}(b, base, row, stride, ok, ptr, out):\n"
+    return head + "".join(f"    {line}\n" for line in lines)
+
+
+def test_reordered_pieces_from_one_source_stay_separate_findings(repo):
+    repo.write("library/kernels/a.py", two_pieces("fa", PIECE_P, PIECE_Q))
+    base = repo.commit()
+    # Q then P: the copy advances while its source jumps backwards, so the two
+    # pieces must not merge into one region that claims a:2-6 was copied as b:2-6.
+    repo.write("library/kernels/b.py", two_pieces("fb", PIECE_Q, PIECE_P))
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    spans = sorted(
+        tuple((loc["path"][-4:], loc["start"], loc["end"]) for loc in f["locations"])
+        for f in report["findings"]
+    )
+    assert spans == [
+        (("a.py", 2, 5), ("b.py", 5, 8)),  # P
+        (("a.py", 5, 8), ("b.py", 2, 5)),  # Q
+    ]
+
+
 def test_overlapping_fragments_from_two_sources_stay_separate(repo):
     repo.write("library/kernels/a.py", "def fa(b, x, y):\n" + "".join(SIX[:5]))
     # t1 is a parameter here, so it is a local variable like in fa and fc.

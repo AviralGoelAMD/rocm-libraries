@@ -758,6 +758,9 @@ class Location:
     start: int
     end: int
     cls: str  # unchanged | maintained | new | replaced
+    # Token index of the (latest merged) window start; used only to merge
+    # windows of one copied region, never reported.
+    first: int = -1
 
 
 @dataclass
@@ -858,8 +861,9 @@ def _merge_findings(findings: list[Finding]) -> list[Finding]:
     """Join findings from overlapping windows of one copied region.
 
     Two findings merge only when their added ranges overlap AND every location
-    of the newer one overlaps a location of the merged one: overlapping windows
-    copied from different sources stay separate findings.
+    of the newer one overlaps a location of the merged one AND all locations
+    advance by the same number of tokens: overlapping windows copied from
+    different sources, or from one source in a different order, stay separate.
     """
 
     def contributing(f: Finding) -> list[Location]:
@@ -871,15 +875,33 @@ def _merge_findings(findings: list[Finding]) -> list[Finding]:
             for y in locations
         )
 
+    def shifts(x: Location, locations: list[Location]) -> set[int]:
+        return {
+            x.first - y.first
+            for y in locations
+            if x.path == y.path and x.start <= y.end and y.start <= x.end
+        }
+
     def overlaps(a: Finding, b: Finding) -> bool:
-        return any(touches(x, contributing(a)) for x in contributing(b)) and all(
-            touches(x, a.locations) for x in b.locations
-        )
+        if not any(touches(x, contributing(a)) for x in contributing(b)):
+            return False
+        common: set[int] | None = None
+        for x in b.locations:
+            s = shifts(x, a.locations)
+            common = s if common is None else common & s
+            if not common:
+                return False
+        return True
 
     rank = {"new": 3, "replaced": 2, "maintained": 1, "unchanged": 0}
     order = sorted(
         findings,
-        key=lambda f: (contributing(f)[0].path, contributing(f)[0].start, f.kind),
+        key=lambda f: (
+            contributing(f)[0].path,
+            contributing(f)[0].start,
+            contributing(f)[0].first,
+            f.kind,
+        ),
     )
     merged: list[Finding] = []
     for f in order:
@@ -908,10 +930,13 @@ def _merge_findings(findings: list[Finding]) -> list[Finding]:
             prev = joined[-1] if joined else None
             if prev and prev.path == loc.path and loc.start <= prev.end:
                 prev.end = max(prev.end, loc.end)
+                prev.first = max(prev.first, loc.first)
                 if rank[loc.cls] > rank[prev.cls]:
                     prev.cls = loc.cls
             else:
-                joined.append(Location(loc.path, loc.start, loc.end, loc.cls))
+                joined.append(
+                    Location(loc.path, loc.start, loc.end, loc.cls, loc.first)
+                )
         target.locations = joined
     merged.sort(key=lambda f: (contributing(f)[0].path, contributing(f)[0].start))
     return merged
@@ -937,7 +962,9 @@ def find_copies(
         if len(occurrences) < 2 or len(occurrences) <= before:
             continue
         locations = [
-            Location(w.path, w.start, w.end, classify(w, occurrences, diffs, base))
+            Location(
+                w.path, w.start, w.end, classify(w, occurrences, diffs, base), w.first
+            )
             for w in occurrences
         ]
         existing = [
