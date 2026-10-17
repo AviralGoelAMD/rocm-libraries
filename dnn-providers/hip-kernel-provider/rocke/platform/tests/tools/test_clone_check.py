@@ -751,6 +751,109 @@ def test_script_bootstrap_lines_are_setup(repo):
     assert report["findings"] == []
 
 
+KERNEL_SIGNATURE = """\
+    b = IRBuilder(spec.kernel_name())
+    b.kernel.attrs["max_workgroup_size"] = THREADS
+    A = b.param("A", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
+    Bp = b.param("B", PtrType(F16, "global"), noalias=True, readonly=True, align=16)
+    D = b.param("D", PtrType(F16, "global"), noalias=True, writeonly=True, align=16)
+    N = b.param("N", I32)
+"""
+SIGNATURE_CHAIN = """\
+    sig = (
+        SignatureBuilder("kernel")
+        .ptr("q_ptr", io_dtype)
+        .ptr("k_ptr", io_dtype)
+        .ptr("v_ptr", io_dtype)
+        .ptr("o_ptr", io_dtype)
+        .scalar("scale", "f32")
+        .scalar("num_seqs", "i32")
+        .build()
+    )
+"""
+# Braces are doubled: func() passes the body through str.format.
+GUARDS = """\
+    try:
+        target = ArchTarget.from_gfx(arch)
+    except KeyError as e:
+        return False, str(e)
+    if spec.dtype not in ("f16", "bf16"):
+        return False, f"unsupported dtype {{spec.dtype!r}}"
+    if spec.head_size % 16 != 0:
+        raise ValueError(f"head_size must be a multiple of 16, got {{spec.head_size}}")
+    if spec.mask_mode not in ("none", "causal"):
+        errors.append(f"unsupported mask_mode {{spec.mask_mode!r}}")
+"""
+PASS_THROUGH = """\
+    return GemmSpec(
+        tile_m=self.tile_m,
+        tile_n=self.tile_n,
+        tile_k=self.tile_k,
+        warp_m=self.warp_m,
+        warp_n=self.warp_n,
+        wave_size=self.wave_size,
+        pipeline=pipeline,
+        epilogue=epilogue,
+    )
+"""
+
+
+@pytest.mark.parametrize(
+    "body", [KERNEL_SIGNATURE, SIGNATURE_CHAIN, GUARDS, PASS_THROUGH]
+)
+def test_declaration_validation_and_pass_through_boilerplate_is_not_a_copy(repo, body):
+    repo.write("library/kernels/a.py", func("f1", body))
+    base = repo.commit()
+    repo.write("library/kernels/b.py", func("f2", body))
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+
+
+def test_guard_with_logic_in_its_body_is_still_compared(repo):
+    # One statement, so only what it does decides whether the `if` is a guard.
+    body = GUARDS.replace(
+        '        errors.append(f"unsupported mask_mode {{spec.mask_mode!r}}")\n',
+        "        b.store(out, b.add(base, b.mul(row, stride)),"
+        " b.select(ok, b.fmul(row, stride), b.const_f32(0.0)))\n",
+    )
+    repo.write("library/kernels/a.py", func("f1", body))
+    base = repo.commit()
+    repo.write("library/kernels/b.py", func("f2", body))
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert kinds(report) == ["NEW COPY"]
+
+
+FORWARDED = "".join(
+    f"        {name}=self.{name},\n"
+    for name in (
+        "tile_m tile_n tile_k warp_m warp_n warp_tile_m warp_tile_n warp_tile_k"
+        " wave_size pipeline epilogue"
+    ).split()
+)
+
+
+def test_pass_through_keywords_inside_a_different_call_are_not_a_copy(repo):
+    repo.write(
+        "library/kernels/a.py",
+        func(
+            "f1",
+            '    return ConvSpec(\n        problem=p.with_layout("nhwc"),\n'
+            + FORWARDED
+            + "    )\n",
+        ),
+    )
+    base = repo.commit()
+    repo.write(
+        "library/kernels/b.py",
+        func("f2", "    return GemmSpec(\n        layout=q,\n" + FORWARDED + "    )\n"),
+    )
+    head = repo.commit()
+    _, report = repo.check("--base", base, "--head", head)
+    assert report["findings"] == []
+
+
 def test_constant_setup_windows_are_skipped(repo):
     base = repo.commit()
     setup = "".join(f"    c{i} = b.const_i32({i})\n" for i in range(5))

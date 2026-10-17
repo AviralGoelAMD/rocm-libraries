@@ -350,13 +350,16 @@ def _is_bootstrap(value: ast.AST) -> bool:
 
 def _is_setup(stmt: ast.stmt, in_class: bool = False) -> bool:
     """Recognised setup: constants, plain values, imports, field declarations,
-    script path bootstrap, field-only classes, pass and docstrings."""
+    kernel parameter declarations, script path bootstrap, field-only classes,
+    pass and docstrings."""
     if isinstance(stmt, (ast.Pass, ast.Import, ast.ImportFrom)):
         return True
     if isinstance(stmt, ast.AnnAssign) and (stmt.value is None or in_class):
         return True  # `x: int`, or any typed field directly in a class body
     if isinstance(stmt, ast.ClassDef):
         return all(_is_setup(s, in_class=True) for s in stmt.body)
+    if isinstance(stmt, (ast.Return, ast.Expr)) and _is_forwarding_call(stmt.value):
+        return True
     if isinstance(stmt, ast.Expr):
         if isinstance(stmt.value, ast.Call):
             return _dotted(stmt.value.func).startswith("sys.path.")
@@ -365,11 +368,18 @@ def _is_setup(stmt: ast.stmt, in_class: bool = False) -> bool:
         )
     if isinstance(stmt, ast.Assign) or (isinstance(stmt, ast.AnnAssign) and stmt.value):
         value = stmt.value
-        if _is_bootstrap(value):
+        if (
+            _is_bootstrap(value)
+            or _is_signature_chain(value)
+            or _is_forwarding_call(value)
+        ):
             return True
         if isinstance(value, ast.Call):
-            return isinstance(value.func, ast.Attribute) and value.func.attr.startswith(
-                "const_"
+            func = value.func
+            if isinstance(func, ast.Name):
+                return func.id == "IRBuilder"
+            return isinstance(func, ast.Attribute) and (
+                func.attr.startswith("const_") or func.attr == "param"
             )
         if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.USub):
             value = value.operand
@@ -377,6 +387,91 @@ def _is_setup(stmt: ast.stmt, in_class: bool = False) -> bool:
             value = value.value
         return isinstance(value, (ast.Constant, ast.Name))
     return False
+
+
+def _is_forwarding_call(node: ast.AST | None) -> bool:
+    """A call whose only arguments are pass-through keywords:
+    ``GemmSpec(tile_m=self.tile_m, warp_m=self.warp_m)``."""
+    return (
+        isinstance(node, ast.Call)
+        and not node.args
+        and bool(node.keywords)
+        and all(_is_pass_through(k) for k in node.keywords)
+    )
+
+
+def _is_message(node: ast.AST | None) -> bool:
+    """A literal result or message: constants, f-strings, plain names,
+    ``str(e)``/``repr(e)``, or a tuple of those."""
+    if node is None or isinstance(
+        node, (ast.Constant, ast.JoinedStr, ast.Name, ast.Attribute)
+    ):
+        return True
+    if isinstance(node, ast.Tuple):
+        return all(_is_message(e) for e in node.elts)
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in ("str", "repr")
+        and all(_is_message(a) for a in node.args)
+    )
+
+
+def _is_rejection(stmt: ast.stmt) -> bool:
+    """``raise ...``, ``return <message>`` or ``errors.append(<message>)``."""
+    if isinstance(stmt, ast.Raise):
+        return True
+    if isinstance(stmt, ast.Return):
+        return _is_message(stmt.value)
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Attribute)
+        and stmt.value.func.attr == "append"
+        and all(_is_message(a) for a in stmt.value.args)
+    )
+
+
+def _is_guard(stmt: ast.stmt) -> bool:
+    """A validation guard: an ``if`` whose only statement rejects, or a ``try``
+    around one statement whose handlers only reject (``ArchTarget.from_gfx``)."""
+    if isinstance(stmt, ast.If):
+        return not stmt.orelse and len(stmt.body) == 1 and _is_rejection(stmt.body[0])
+    if isinstance(stmt, ast.Try):
+        return (
+            len(stmt.body) == 1
+            and isinstance(stmt.body[0], (ast.Assign, ast.Expr))
+            and not stmt.orelse
+            and not stmt.finalbody
+            and all(
+                len(h.body) == 1 and _is_rejection(h.body[0]) for h in stmt.handlers
+            )
+        )
+    return False
+
+
+def _is_signature_chain(node: ast.AST) -> bool:
+    """``SignatureBuilder(...).ptr(...).scalar(...).build()``."""
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+        return False
+    while isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        node = node.func.value
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "SignatureBuilder"
+    )
+
+
+def _is_pass_through(node: ast.AST) -> bool:
+    """A keyword argument that forwards a value of the same name:
+    ``tile_m=self.tile_m`` or ``grid=grid``."""
+    if not isinstance(node, ast.keyword) or node.arg is None:
+        return False
+    value = node.value
+    if isinstance(value, ast.Name):
+        return value.id == node.arg
+    return isinstance(value, ast.Attribute) and value.attr == node.arg
 
 
 def _is_harness(stmt: ast.stmt) -> bool:
@@ -406,6 +501,7 @@ def _child_blocks(stmt: ast.stmt):
         yield case.body
 
 
+_DELIMITERS = frozenset({",", "(", ")", "[", "]", "{", "}", ":", "=", "."})
 _SKIPPED_TOKENS = frozenset(
     {
         tokenize.COMMENT,
@@ -450,6 +546,9 @@ class _Marks:
     docstrings: dict[Pos, str] = field(default_factory=dict)  # -> cleandoc text
     # (start, end, is_setup) for every statement, outer before inner
     statements: list[tuple[Pos, Pos, bool]] = field(default_factory=list)
+    # setup expressions inside other code (signature chains, pass-through
+    # keyword arguments); applied after the statements
+    setup_expressions: list[tuple[Pos, Pos]] = field(default_factory=list)
     harness: list[tuple[Pos, Pos]] = field(default_factory=list)
 
 
@@ -494,6 +593,10 @@ def _mark(tree: ast.Module) -> _Marks:
             if _is_harness(stmt):
                 marks.harness.append(span)
                 continue
+            # Validation guards are setup as a whole, body included.
+            if _is_guard(stmt):
+                marks.statements.append((*span, True))
+                continue
             # A def/class header (decorators, signature) may be part of a copy
             # but cannot make one: its body statements override this mark.
             header = isinstance(
@@ -525,6 +628,11 @@ def _mark(tree: ast.Module) -> _Marks:
     docstring(tree.body)
     locals_of(tree.body, _scope_locals(tree))
     visit(tree.body)
+    for node in ast.walk(tree):
+        if _is_pass_through(node) or _is_signature_chain(node):
+            marks.setup_expressions.append(
+                ((node.lineno, node.col_offset), (node.end_lineno, node.end_col_offset))
+            )
     return marks
 
 
@@ -564,6 +672,9 @@ def file_windows(path: str, source: bytes, size: int = MIN_TOKENS) -> FileKeys:
     for span_start, span_end, is_setup in marks.statements:  # inner ones override
         for i in token_range(span_start, span_end):
             setup[i] = is_setup
+    for span_start, span_end in marks.setup_expressions:
+        for i in token_range(span_start, span_end):
+            setup[i] = True
     harness = [False] * count
     for span_start, span_end in marks.harness:
         for i in token_range(span_start, span_end):
@@ -594,10 +705,16 @@ def file_windows(path: str, source: bytes, size: int = MIN_TOKENS) -> FileKeys:
     for i in range(size):
         exact = (exact * _BASE + text[i]) % _MOD
         renamed = (renamed * _BASE + renamed_value(i, 0)) % _MOD
-    setup_sum = [0]
+    # Delimiters belong to whatever surrounds them: a window whose only
+    # non-setup tokens are commas and brackets holds no code of its own.
+    plain = [
+        setup[i] or (t.type == tokenize.OP and t.string in _DELIMITERS)
+        for i, t in enumerate(tokens)
+    ]
+    plain_sum = [0]
     harness_sum = [0]
     for i in range(count):
-        setup_sum.append(setup_sum[-1] + setup[i])
+        plain_sum.append(plain_sum[-1] + plain[i])
         harness_sum.append(harness_sum[-1] + harness[i])
 
     s = 0
@@ -605,7 +722,7 @@ def file_windows(path: str, source: bytes, size: int = MIN_TOKENS) -> FileKeys:
         e = s + size - 1
         if (
             harness_sum[e + 1] == harness_sum[s]
-            and setup_sum[e + 1] - setup_sum[s] < size
+            and plain_sum[e + 1] - plain_sum[s] < size
         ):
             keys.first.append(s)
             keys.start.append(tokens[s].start[0])
